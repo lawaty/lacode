@@ -5,15 +5,48 @@
 // own once it is installed, and would make every agent silently lose its
 // instructions in a published install. Inline text always works.
 //
-// Nothing here names a provider or a model except through the pool. The base
-// agents carry no `model` and neither do the hidden variants: a model written
-// next to an agent is a second source of truth that silently wins whenever
-// routing falls through. The pool is the only thing that decides which model
-// runs a pooled agent (see src/lib/pool.ts and plugins/agent-pool.ts).
+// Nothing here names a provider or a model. The pooled bases carry no `model`
+// and neither do the hidden variants: a model written next to an agent is a
+// second source of truth that silently wins whenever routing falls through.
+// The pool is the only thing that decides which model runs a pooled agent (see
+// src/lib/pool.ts and plugins/agent-pool.ts).
+//
+// The two deep tiers are the deliberate exception, and the reason is structural:
+// they are NOT in POOLED_BASES, so the pool never touches them and nothing else
+// would ever write a model. Left unset, opencode resolves them to the user's
+// main model -- so "escalate because explore-fast is stuck" silently escalates
+// from the cheapest pooled model to the most expensive model in the setup,
+// which is the opposite of what an escalation ladder is for. They therefore take
+// a model from the `deepModel` plugin option (see applyAgents), never from a
+// literal in this file: `opencode-go/deepseek-v4-flash` is the author's
+// provider, and a published package cannot ship someone else's provider. With
+// no `deepModel` configured the behaviour is unchanged -- no model is written.
 //
 // ---------------------------------------------------------------------------
-// WHAT WAS DROPPED from the author's opencode.jsonc, and why
+// WHAT IS INJECTED, AND WHAT WAS DROPPED from the author's opencode.jsonc
 // ---------------------------------------------------------------------------
+//
+// INJECTED, 19 keys: the 7 bases below plus one hidden `<base>-1..4` variant per
+// pool slot for each of the 3 pooled bases (build, plan, explore-fast,
+// explore-deep, implement-fast, implement-deep, context-manager).
+//
+//   tools: { "playwright_*": true } on the four explore/implement bases
+//           `tools` is a real per-agent field in the SDK's AgentConfig
+//           (`tools?: { [key: string]: boolean }`), and this grant is on the
+//           author's explore/implement tiers too. It is injected rather than
+//           dropped because the two failure modes are not symmetric: without a
+//           Playwright MCP server the grant grants a tool namespace that does
+//           not exist, which is a no-op, whereas a client who DOES install
+//           Playwright and has any global `"tools": { "playwright_*": false }`
+//           (the author's own config carries exactly that) silently loses
+//           browser access on precisely the agents whose prompts drive a
+//           browser. A no-op for people who did not ask for it beats a silent
+//           feature loss for people who did. A user who disagrees overrides it,
+//           because merge-without-clobber never patches an agent they defined.
+//           context-manager gets no grant: it writes the context map and has no
+//           business in a browser.
+//
+// NOT INJECTED, 5 keys, each for a stated reason:
 //
 //   basic   byte-for-byte a duplicate of `plan`, differing only in a pinned
 //           `opencode-go/deepseek-v4-flash`. `plan` is injected instead.
@@ -28,10 +61,10 @@
 //           built-ins is a decision about one person's configuration, not a
 //           default a package should impose on a stranger's. The author still
 //           has them disabled in their own opencode.jsonc.
-//   tools: { "playwright_*": true } on the explore/implement tiers
-//           an MCP-specific tool grant. A package cannot assume the Playwright
-//           MCP server is installed; a user who has it enables it in their own
-//           config, where the same merge-without-clobber rule protects it.
+//   build / plan are injected, but on a client that already has opencode's
+//           built-ins under those names, merge-without-clobber keeps the
+//           built-in and the LaCode definition is not applied. That is the
+//           documented behaviour of US-16, not a gap.
 //
 // ---------------------------------------------------------------------------
 // INJECTION IS MERGE-WITHOUT-CLOBBER (US-16)
@@ -606,8 +639,26 @@ export type AgentDef = {
   temperature?: number
   prompt?: string
   permission?: Record<string, unknown>
+  /** Per-agent tool grants, e.g. `{"playwright_*": true}`. A valid AgentConfig field. */
+  tools?: Record<string, boolean>
   [key: string]: unknown
 }
+
+/**
+ * The tiers that are NOT pooled: nothing routes them, so nothing writes their
+ * model either. They exist to be the deliberate, expensive escalation above a
+ * pooled tier, which is only true if their model is pinned rather than left to
+ * fall through to the user's main model.
+ */
+export const DEEP_TIERS = ["explore-deep", "implement-deep"] as const
+
+/**
+ * The browser tool grant the author's own config carries on its exploration and
+ * implementation tiers. See the header note: granting a tool namespace that the
+ * user has not installed is a no-op, while omitting it when they have installed
+ * it and globally disabled it is a silent feature loss.
+ */
+const BROWSER_GRANT: Record<string, boolean> = { "playwright_*": true }
 
 /**
  * The agent types the pool routes. Slot N of every base is the SAME model, which
@@ -861,6 +912,7 @@ You may only escalate to @explore-deep. Do not attempt to call @implement-fast,
         "explore-deep": "allow"
       }
     },
+    tools: BROWSER_GRANT,
   },
   "explore-deep": {
     "description": "Last-resort read-only exploration for genuinely hard problems @explore-fast fails on. Most expensive explore tier — use deliberately.",
@@ -934,6 +986,7 @@ or any other agent.`,
         "*": "deny"
       }
     },
+    tools: BROWSER_GRANT,
   },
   "implement-fast": {
     "description": "Default agent that executes a finalized plan. Escalates to @implement-deep when stuck or looping.",
@@ -1022,6 +1075,7 @@ you escalate so @implement-deep can decide whether to explore first.`,
         "implement-deep": "allow"
       }
     },
+    tools: BROWSER_GRANT,
   },
   "implement-deep": {
     "description": "Last-resort executor for genuinely hard problems @implement-fast fails on. Most expensive implement tier — use deliberately.",
@@ -1099,6 +1153,7 @@ trying to explore yourself.`,
         "*": "deny"
       }
     },
+    tools: BROWSER_GRANT,
   },
   "context-manager": {
     "description": "Repository cartographer and memory maintainer. Bootstraps and incrementally maintains .opencode/context/ (architecture, contexts, conventions, workflows, decisions) as a small navigation map for future agents. Runs automatically after sessions that changed files; can also be invoked with /context-init, /context-update, /context-review. Never use it for general coding tasks.",
@@ -1390,6 +1445,24 @@ export function buildAgentSet(): Record<string, AgentDef> {
 
 export type InjectionResult = { added: string[]; kept: string[] }
 
+export type ApplyAgentsOptions = {
+  /**
+   * `provider/model-id` pinned onto the unpooled deep tiers (`explore-deep`,
+   * `implement-deep`) when LaCode is the one injecting them.
+   *
+   * It is an option rather than a literal here because the only model the author
+   * has for these tiers is on their own provider, and a published package cannot
+   * ship someone else's provider. Unset (the default) writes no model at all, so
+   * the deep tiers fall through to the user's default model exactly as before.
+   *
+   * It is applied ONLY to an agent LaCode injects. An agent the user already
+   * defined keeps their model, byte-for-byte, like every other field (US-16).
+   */
+  deepModel?: string
+}
+
+const DEEP_TIER_SET = new Set<string>(DEEP_TIERS)
+
 /**
  * Add every LaCode agent the user's config does not already define (US-16).
  *
@@ -1397,10 +1470,15 @@ export type InjectionResult = { added: string[]; kept: string[] }
  * no model is forced, no permission is merged. That is what lets the package
  * author run the exact setup they publish and get their own config back.
  */
-export function applyAgents(cfg: Record<string, unknown>, agents: Record<string, AgentDef> = buildAgentSet()): InjectionResult {
+export function applyAgents(
+  cfg: Record<string, unknown>,
+  agents: Record<string, AgentDef> = buildAgentSet(),
+  opts: ApplyAgentsOptions = {},
+): InjectionResult {
   const target = (cfg.agent ??= {}) as Record<string, AgentDef>
   const added: string[] = []
   const kept: string[] = []
+  const deepModel = typeof opts.deepModel === "string" ? opts.deepModel.trim() : ""
   for (const [name, def] of Object.entries(agents)) {
     if (target[name] !== undefined) {
       kept.push(name)
@@ -1408,7 +1486,9 @@ export function applyAgents(cfg: Record<string, unknown>, agents: Record<string,
     }
     // Deep copy: the same object would otherwise be shared between every opencode
     // config object in this process, and the pool mutates def.model in place.
-    target[name] = JSON.parse(JSON.stringify(def)) as AgentDef
+    const copy = JSON.parse(JSON.stringify(def)) as AgentDef
+    if (deepModel && DEEP_TIER_SET.has(name) && !copy.model) copy.model = deepModel
+    target[name] = copy
     added.push(name)
   }
   return { added, kept }

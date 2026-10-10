@@ -26,21 +26,75 @@ and it never overwrites one you already defined.
 
 ## Install
 
-```bash
-npm i -g @lawaty/lacode
-```
-
-Then add the plugin to your opencode config:
+Add one line to your opencode config — `~/.config/opencode/opencode.json`, or
+the `.jsonc` beside it:
 
 ```json
 { "plugin": ["@lawaty/lacode"] }
 ```
 
-Restart opencode. Nothing here hot-reloads: without a restart the config change
-does not take effect and the agent set will look stale for no visible reason.
+**That is the entire install.** opencode resolves an npm plugin specifier itself
+and installs it at startup, so there is no `npm install` to run first and no
+directory to create. Do not run `npm i -g @lawaty/lacode`: a global npm install
+is never consulted by opencode, so it changes nothing about whether the plugin
+loads.
 
-The install also puts a `lacode` CLI on your `PATH` (`lacode notify`,
-`lacode forward`, `lacode doctor`) — see [Remote hosts](#remote-hosts).
+To install it explicitly instead — or to install it once for every project on
+the machine rather than per config — use the CLI, which does the same thing:
+
+```bash
+opencode plugin @lawaty/lacode        # this project
+opencode plugin @lawaty/lacode -g     # global, for every project on the machine
+```
+
+**Restart opencode afterwards.** Nothing here hot-reloads: the `plugin` array is
+read at startup, so without a restart the change does not take effect and the
+agent set will look stale for no visible reason.
+
+### Where it is installed
+
+opencode installs npm plugins itself, into one directory per specifier under
+its cache — not into your project's `node_modules`, and not from anywhere a
+global npm install put them:
+
+```
+$XDG_CACHE_HOME/opencode/packages/<specifier>/node_modules/
+# ~/.cache/opencode/packages/@lawaty/lacode@latest/node_modules/ by default
+```
+
+`$XDG_CACHE_HOME` defaults to `~/.cache`; set it if you keep a cache elsewhere.
+To inspect what a specifier actually resolved to, list its directory under
+`~/.cache/opencode/packages/`. An empty directory with no `node_modules` inside
+it means the install failed — almost always an unpublished or misspelled package
+— and opencode starts normally **without** the plugin.
+
+### Verifying the install
+
+A plugin that fails to install is silent: there is no error, opencode starts,
+and it simply does not have the agents. Check for them:
+
+```bash
+opencode agent list | grep -E '^(explore-fast|implement-fast|explore-deep|implement-deep)'
+```
+
+A working install prints `explore-fast`, `implement-fast`, `explore-deep` and
+`implement-deep`, each with the hidden `-1`..`-4` pool variants alongside. If the
+grep returns nothing but opencode's built-ins, the plugin did not load: check the
+cache directory above, and check that `plugin` is in the config file opencode
+actually reads. Run this in the same shell environment opencode runs in — an
+`agent list` under a different `HOME` or `XDG_CONFIG_HOME` tests a different
+machine.
+
+### The `lacode` CLI
+
+The package also ships the `lacode` CLI (`notify`, `forward`, `doctor`) — see
+[Remote hosts](#remote-hosts). The plugin install does **not** put it on your
+`PATH`; run it from the package's `node_modules/.bin`, or install just the CLI
+globally with `npm i -g @lawaty/lacode` if you want the bare command. (That
+global install is for the command only — it is still never what makes the plugin
+load.)
+
+### What the install gives you
 
 Two things are worth knowing about what npm actually hands you:
 
@@ -84,6 +138,7 @@ option is optional:
 | `enabled` | `true` | The single off switch. `false` injects nothing at all and does no writes. |
 | `models` | — | An inline slot list. Highest-priority source. |
 | `modelsFile` | — | An explicit slot file; short-circuits the chain below. |
+| `deepModel` | — | A `provider/model-id` pinned onto `explore-deep` and `implement-deep`. |
 | `reapMs` | `30000` | Hang-reaper interval. |
 
 ### Pool preset resolution
@@ -103,6 +158,59 @@ change a preset, then restart every opencode process.
 allowlist anywhere in the package, and no cost check of any kind: only the
 structure is validated. The bundled preset is built from free models because
 that is a sensible default, not because the pool requires it.
+
+### Which models run which agent
+
+Only the **pool** writes a model onto a pooled agent, from whichever source wins
+above. The pooled bases (`explore-fast`, `implement-fast`, `context-manager`)
+and their hidden `-1`..`-4` variants therefore carry no model of their own: a
+model written next to an agent would be a second source of truth that silently
+wins whenever routing falls through. Spawn a base and let the pool route it.
+
+`explore-deep` and `implement-deep` are **not** pooled — they are the deliberate
+escalation above a pooled tier — so nothing routes them and nothing writes their
+model. Left alone they fall through to your default model, which turns "I am
+stuck, escalate" into an unannounced jump to the most expensive model in your
+setup. Set `deepModel` to pin them:
+
+```jsonc
+"plugin": [["@lawaty/lacode", { "deepModel": "your-provider/your-deep-model" }]]
+```
+
+It is an option and not a literal in the package because which model to escalate
+onto is a property of your providers, not of LaCode. LaCode also adds the pinned
+model to that provider's whitelist for you: opencode drops any model a provider
+offers that is not whitelisted, so an unlisted pin would resolve to nothing at
+all. With `deepModel` unset, no model is written and the deep tiers use your
+default model — the behaviour of earlier versions.
+
+### What gets injected
+
+**19 agent keys**: the 7 bases `build`, `plan`, `explore-fast`, `explore-deep`,
+`implement-fast`, `implement-deep`, `context-manager`, plus one hidden
+`<base>-1`..`-4` pool variant for each of the 3 pooled bases.
+
+`build` and `plan` exist in opencode as built-ins, so on a stock config those
+two keys are already taken and merge-without-clobber keeps the built-in — the
+LaCode definitions of `build` and `plan` are what you get if you remove the
+built-ins of those names first.
+
+**Five keys are deliberately not injected.** `basic` is a byte-for-byte
+duplicate of `plan` apart from a pinned model, and `plan` is injected instead.
+`expert` pins a specific model and carries a personal benchmark note in its
+description — a package cannot ship someone else's provider, quota or benchmark
+results — though its escalation ladder still resolves, because the two deep
+tiers it escalates to *are* injected. And `explore`, `general` and `implement`
+are only `{ "disable": true }` stubs in the author's own config: turning off
+opencode's built-in agents is a decision about one person's configuration, not
+a default a package should impose on a stranger.
+
+The four exploration and implementation tiers carry `tools: {"playwright_*": true}`.
+A grant for a tool namespace you have not installed is a no-op, whereas omitting
+it from a user who *has* installed Playwright and globally disabled it — as the
+author's own config does — silently strips browser access from exactly the
+agents whose prompts drive a browser. `context-manager` gets no grant; it writes
+the context map.
 
 **Installation merges, it does not clobber** (US-16). An agent, command or
 instruction is added only when that key is absent from your config. A

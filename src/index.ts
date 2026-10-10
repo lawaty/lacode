@@ -33,6 +33,16 @@
 //     dir?: string           claim directory (tests)
 //     modelsFile?: string    an explicit slot file, short-circuits the chain
 //
+//     deepModel?: string
+//       A `provider/model-id` pinned onto the two unpooled deep tiers,
+//       `explore-deep` and `implement-deep`. Nothing routes those tiers, so
+//       nothing else would ever write their model and they would fall through
+//       to your default (usually the most expensive) model -- turning "I am
+//       stuck, escalate" into an unannounced jump to the main model. It is an
+//       option and not a literal in the package because the model to use here
+//       is a property of your providers, not of LaCode. Unset: no model is
+//       written and the previous behaviour is unchanged. See src/agents.ts.
+//
 // ---------------------------------------------------------------------------
 // POOL PRESET RESOLUTION CHAIN, in priority order
 // ---------------------------------------------------------------------------
@@ -75,6 +85,7 @@ export type LacodeOptions = {
   id?: string
   dir?: string
   modelsFile?: string
+  deepModel?: string
   [key: string]: unknown
 }
 
@@ -114,7 +125,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   // exist, and the agent set must exist before the pool writes models into it.
   const config = async (cfg: Parameters<NonNullable<Hooks["config"]>>[0]) => {
     try {
-      const injected = applyAgents(cfg as Record<string, unknown>, agentSet)
+      const injected = applyAgents(cfg as Record<string, unknown>, agentSet, { deepModel: opts.deepModel })
       if (injected.added.length > 0) {
         await log("info", `agents: added ${injected.added.length}, kept ${injected.kept.length} already defined by the user`)
       }

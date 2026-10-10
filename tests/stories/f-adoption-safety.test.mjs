@@ -240,6 +240,84 @@ test("[US-15] the published package loads and runs from inside node_modules, whe
 })
 
 // ---------------------------------------------------------------------------
+// US-15 -- the injected set is COMPLETE, not merely present
+//
+// Both of these were found by diffing the injected agent set against the
+// author's own working config: the keys were there, so "the agent exists" tests
+// passed while the setup a client actually gets was quietly incomplete.
+// ---------------------------------------------------------------------------
+
+test("[US-15] the exploration and implementation tiers carry the browser tool grant, so a global playwright_* deny cannot silently strip it", async () => {
+  const stub = stubInput()
+  const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
+  const hooks = await LaCode(stub.input)
+  // A client who installed Playwright and disabled it globally, exactly as the
+  // author's own config does. The per-agent grant is what re-enables it.
+  const cfg = { tools: { "playwright_*": false } }
+  await hooks.config(cfg)
+
+  // `tools` is a real AgentConfig field ({ [key: string]: boolean }), so the
+  // grant is read by opencode and not silently ignored as an unknown key.
+  const tiers = ["explore-fast", "explore-deep", "implement-fast", "implement-deep"]
+  for (const name of tiers) {
+    assert.deepEqual(cfg.agent[name].tools, { "playwright_*": true }, `${name} must re-grant the browser tools`)
+  }
+  // Every hidden pool variant inherits its base's grant.
+  for (const name of ["explore-fast-1", "implement-fast-4", "explore-fast-2"]) {
+    assert.deepEqual(cfg.agent[name].tools, { "playwright_*": true }, `${name} must inherit the grant`)
+  }
+  // The cartographer writes the context map and has no business in a browser.
+  assert.equal(cfg.agent["context-manager"].tools, undefined, "context-manager must not get a browser grant")
+  await hooks.dispose()
+})
+
+test("[US-15] the deep tiers are not left on the main model: deepModel pins them, and nothing is pinned without it", async () => {
+  const stub = stubInput()
+  const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
+
+  // Unset: unchanged behaviour, no model written, so the tiers fall through to
+  // whatever the user's default is. A package must not ship a provider.
+  const bare = await LaCode(stub.input)
+  const bareCfg = {}
+  await bare.config(bareCfg)
+  for (const name of ["explore-deep", "implement-deep"]) {
+    assert.equal(bareCfg.agent[name].model, undefined, `${name} must carry no model when deepModel is unset`)
+  }
+  // The pooled bases are unaffected by the option: the pool owns those models.
+  assert.equal(bareCfg.agent["explore-fast"].model, undefined, "a pooled base is still model-less")
+  await bare.dispose()
+
+  // Set: both unpooled tiers are pinned, and only they are.
+  const pinned = await LaCode(stub.input, { deepModel: "example/deep-tier" })
+  const pinnedCfg = { provider: { example: {} } }
+  await pinned.config(pinnedCfg)
+  for (const name of ["explore-deep", "implement-deep"]) {
+    assert.equal(pinnedCfg.agent[name].model, "example/deep-tier", `${name} must be pinned to the configured model`)
+  }
+  assert.equal(pinnedCfg.agent["explore-fast"].model, undefined, "deepModel must not touch a pooled base")
+
+  // opencode drops every model a provider offers that is not whitelisted, so an
+  // un-whitelisted pin would resolve to nothing at all -- the same silent
+  // failure the pool already prevents for slot models.
+  assert.deepEqual(pinnedCfg.provider.example.whitelist, ["deep-tier"], "the pinned model must be whitelisted or it resolves to nothing")
+  await pinned.dispose()
+})
+
+test("[US-16] a deepModel never overwrites a deep tier the user defined themselves", async () => {
+  const stub = stubInput()
+  const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
+  const hooks = await LaCode(stub.input, { deepModel: "example/deep-tier" })
+  const mine = { description: "MY deep explorer", mode: "subagent", model: "mine/own-choice" }
+  const cfg = { agent: { "explore-deep": { ...mine } } }
+  await hooks.config(cfg)
+
+  assert.deepEqual(cfg.agent["explore-deep"], mine, "merge-without-clobber outranks the deepModel option")
+  // The sibling tier LaCode DID inject is still pinned, so the option is not inert.
+  assert.equal(cfg.agent["implement-deep"].model, "example/deep-tier")
+  await hooks.dispose()
+})
+
+// ---------------------------------------------------------------------------
 // US-16 -- merge, never clobber
 // ---------------------------------------------------------------------------
 

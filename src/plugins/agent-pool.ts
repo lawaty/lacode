@@ -69,6 +69,8 @@ export type AgentPoolOptions = {
   modelsFile?: string
   /** Inline `{ slots: [...] }`, highest priority in the resolution chain. */
   models?: unknown
+  /** `provider/model-id` pinned onto explore-deep / implement-deep; see src/agents.ts. */
+  deepModel?: string
 }
 
 // Typed as a factory returning hooks, NOT as a Plugin: only src/index.ts may
@@ -190,6 +192,30 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
           list.push(id)
           await log("info", `whitelisted ${id} on ${provider} (${s.origin} slot ${slot.index})`)
         }
+      }
+
+      // The deep tiers are unpooled, so nothing above whitelists the model the
+      // user pinned for them via `deepModel`. opencode drops every model a
+      // provider offers that is not whitelisted, so an un-whitelisted deep model
+      // resolves to NOTHING at all and the tier silently falls back -- the same
+      // silent failure the slot loop exists to prevent, one layer out.
+      const deepModel = typeof opts.deepModel === "string" ? opts.deepModel.trim() : ""
+      const deepSlash = deepModel.indexOf("/")
+      if (deepModel && deepSlash > 0) {
+        const provider = deepModel.slice(0, deepSlash)
+        const id = deepModel.slice(deepSlash + 1)
+        const entry = providers?.[provider]
+        if (!entry) {
+          await warnOnce(`deepModel ${deepModel} names provider ${provider}, which is not configured in opencode.jsonc; explore-deep and implement-deep cannot resolve it`)
+        } else {
+          const list = (entry.whitelist ??= [])
+          if (!list.includes(id)) {
+            list.push(id)
+            await log("info", `whitelisted ${id} on ${provider} (deepModel)`)
+          }
+        }
+      } else if (deepModel) {
+        await warnOnce(`deepModel ${deepModel} is not in provider/model-id form and was ignored`)
       }
       s.known = known
       await log(
