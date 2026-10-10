@@ -30,21 +30,34 @@
 // pool slot for each of the 3 pooled bases (build, plan, explore-fast,
 // explore-deep, implement-fast, implement-deep, context-manager).
 //
-//   tools: { "playwright_*": true } on the four explore/implement bases
-//           `tools` is a real per-agent field in the SDK's AgentConfig
-//           (`tools?: { [key: string]: boolean }`), and this grant is on the
-//           author's explore/implement tiers too. It is injected rather than
-//           dropped because the two failure modes are not symmetric: without a
-//           Playwright MCP server the grant grants a tool namespace that does
-//           not exist, which is a no-op, whereas a client who DOES install
-//           Playwright and has any global `"tools": { "playwright_*": false }`
-//           (the author's own config carries exactly that) silently loses
-//           browser access on precisely the agents whose prompts drive a
-//           browser. A no-op for people who did not ask for it beats a silent
-//           feature loss for people who did. A user who disagrees overrides it,
-//           because merge-without-clobber never patches an agent they defined.
-//           context-manager gets no grant: it writes the context map and has no
-//           business in a browser.
+// NOT INJECTED, 1 field: `tools`. It used to carry a
+// `{ "playwright_*": true }` grant on the four explore/implement bases, and that
+// grant was DEAD CODE -- an earlier version of this comment claimed it rescued a
+// user who had Playwright plus a global `"tools": { "playwright_*": false }`, and
+// it did not. The reason is load-time folding, and it is structural: a plugin
+// cannot inject tool grants at all.
+//
+//   opencode decodes every agent through an `AgentConfig` schema transform that
+//   rewrites `tools` into `permission` entries (folding `write`/`edit`/`patch`
+//   onto `edit`, and letting `agent.permission` win over a same-named key). That
+//   decode runs when the config is loaded -- before any plugin is called. A
+//   plugin's `config` hook mutates the ALREADY-DECODED object, so the transform
+//   never re-runs and the injected value is never read by anything. The runtime
+//   gate is `visibleTools(tools, merge(agent.permission, session.permission))`,
+//   which never consults `agent.tools` at all. The agent assembly loop that runs
+//   after the hook reads `model`, `prompt`, `description`, `temperature`, `mode`,
+//   `hidden` and `permission` -- `tools` is the one field it does not read,
+//   because the schema already consumed it.
+//
+//   Verified against opencode 1.18.34/1.18.35 with `opencode debug agent`: with a
+//   global `"tools": { "playwright_*": false }`, an agent whose grant lives in the
+//   user's own config shows TWO `playwright_*` entries (deny, then allow --
+//   findLast picks allow); the same agent injected by this plugin shows ONE (deny).
+//   So per-agent tool grants are real and work -- they just have to be declared
+//   in the user's own config, because the plugin structurally cannot set them.
+//   README.md documents this for users, because browser automation silently
+//   breaks otherwise. Do not re-add the grant: it would pass every test and
+//   change nothing at runtime.
 //
 // NOT INJECTED, 5 keys, each for a stated reason:
 //
@@ -639,8 +652,6 @@ export type AgentDef = {
   temperature?: number
   prompt?: string
   permission?: Record<string, unknown>
-  /** Per-agent tool grants, e.g. `{"playwright_*": true}`. A valid AgentConfig field. */
-  tools?: Record<string, boolean>
   [key: string]: unknown
 }
 
@@ -651,14 +662,6 @@ export type AgentDef = {
  * fall through to the user's main model.
  */
 export const DEEP_TIERS = ["explore-deep", "implement-deep"] as const
-
-/**
- * The browser tool grant the author's own config carries on its exploration and
- * implementation tiers. See the header note: granting a tool namespace that the
- * user has not installed is a no-op, while omitting it when they have installed
- * it and globally disabled it is a silent feature loss.
- */
-const BROWSER_GRANT: Record<string, boolean> = { "playwright_*": true }
 
 /**
  * The agent types the pool routes. Slot N of every base is the SAME model, which
@@ -912,7 +915,6 @@ You may only escalate to @explore-deep. Do not attempt to call @implement-fast,
         "explore-deep": "allow"
       }
     },
-    tools: BROWSER_GRANT,
   },
   "explore-deep": {
     "description": "Last-resort read-only exploration for genuinely hard problems @explore-fast fails on. Most expensive explore tier — use deliberately.",
@@ -986,7 +988,6 @@ or any other agent.`,
         "*": "deny"
       }
     },
-    tools: BROWSER_GRANT,
   },
   "implement-fast": {
     "description": "Default agent that executes a finalized plan. Escalates to @implement-deep when stuck or looping.",
@@ -1075,7 +1076,6 @@ you escalate so @implement-deep can decide whether to explore first.`,
         "implement-deep": "allow"
       }
     },
-    tools: BROWSER_GRANT,
   },
   "implement-deep": {
     "description": "Last-resort executor for genuinely hard problems @implement-fast fails on. Most expensive implement tier — use deliberately.",
@@ -1153,7 +1153,6 @@ trying to explore yourself.`,
         "*": "deny"
       }
     },
-    tools: BROWSER_GRANT,
   },
   "context-manager": {
     "description": "Repository cartographer and memory maintainer. Bootstraps and incrementally maintains .opencode/context/ (architecture, contexts, conventions, workflows, decisions) as a small navigation map for future agents. Runs automatically after sessions that changed files; can also be invoked with /context-init, /context-update, /context-review. Never use it for general coding tasks.",

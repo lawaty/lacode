@@ -3,6 +3,7 @@
 //   US-15  one-line install with sane defaults
 //   US-16  merges, never clobbers
 //   US-17  a single off switch
+//   US-24  tool grants are documented, not injected
 //
 // US-15 and US-17 are tested against an "installed package" fixture: the exact
 // file set `package.json.files` publishes (dist/, presets/, package.json), in a
@@ -20,7 +21,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, st
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 import { build } from "../../scripts/build.mjs"
-import { ROOT, cleanupAll, scratch, spawn, stubInput } from "./_harness.mjs"
+import { ROOT, bootLaCode, cleanupAll, scratch, spawn, stubInput } from "./_harness.mjs"
 
 test.after(cleanupAll)
 
@@ -245,31 +246,8 @@ test("[US-15] the published package loads and runs from inside node_modules, whe
 // Both of these were found by diffing the injected agent set against the
 // author's own working config: the keys were there, so "the agent exists" tests
 // passed while the setup a client actually gets was quietly incomplete.
+//
 // ---------------------------------------------------------------------------
-
-test("[US-15] the exploration and implementation tiers carry the browser tool grant, so a global playwright_* deny cannot silently strip it", async () => {
-  const stub = stubInput()
-  const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
-  const hooks = await LaCode(stub.input)
-  // A client who installed Playwright and disabled it globally, exactly as the
-  // author's own config does. The per-agent grant is what re-enables it.
-  const cfg = { tools: { "playwright_*": false } }
-  await hooks.config(cfg)
-
-  // `tools` is a real AgentConfig field ({ [key: string]: boolean }), so the
-  // grant is read by opencode and not silently ignored as an unknown key.
-  const tiers = ["explore-fast", "explore-deep", "implement-fast", "implement-deep"]
-  for (const name of tiers) {
-    assert.deepEqual(cfg.agent[name].tools, { "playwright_*": true }, `${name} must re-grant the browser tools`)
-  }
-  // Every hidden pool variant inherits its base's grant.
-  for (const name of ["explore-fast-1", "implement-fast-4", "explore-fast-2"]) {
-    assert.deepEqual(cfg.agent[name].tools, { "playwright_*": true }, `${name} must inherit the grant`)
-  }
-  // The cartographer writes the context map and has no business in a browser.
-  assert.equal(cfg.agent["context-manager"].tools, undefined, "context-manager must not get a browser grant")
-  await hooks.dispose()
-})
 
 test("[US-15] the deep tiers are not left on the main model: deepModel pins them, and nothing is pinned without it", async () => {
   const stub = stubInput()
@@ -475,5 +453,132 @@ test("[US-17] with the off switch unset, behaviour is otherwise identical to ena
 
   assert.equal(JSON.stringify(cfgDisabled), "{}", "the off switch must be the only difference")
   assert.ok(Object.keys(cfgUnset.agent).length > 0, "control: the enabled boot really does inject agents")
+})
+
+// ---------------------------------------------------------------------------
+// US-24 -- the tool grant is DOCUMENTED, not injected
+//
+// LaCode used to inject `tools: { "playwright_*": true }` on the four
+// exploration and implementation tiers, with a comment claiming it rescued a
+// user who had Playwright plus a global `"tools": { "playwright_*": false }`.
+//
+// That claim was false. opencode folds an agent's `tools` into its permission
+// list while DECODING the config, before any plugin runs; a plugin's `config`
+// hook mutates the already-decoded object, so the fold never re-runs and the
+// injected value is read by nothing. Verified on opencode 1.18.34/1.18.35 with
+// `opencode debug agent explore-fast`: the same grant written in the USER's own
+// config produces two `playwright_*` entries (deny, then allow -- last wins),
+// while the plugin-injected one produces only the deny.
+//
+// These tests pin the LIMITATION rather than the removed behaviour, so the dead
+// grant cannot be quietly reintroduced on the belief that it is merely missing.
+// ---------------------------------------------------------------------------
+
+test("[US-24] no injected agent carries a `tools` grant: the host folds agent.tools before the config hook runs, so an injected one is inert", async () => {
+  const stub = stubInput()
+  const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
+  const hooks = await LaCode(stub.input)
+  // The author's own config shape: a global deny on the browser namespace.
+  const cfg = { tools: { "playwright_*": false } }
+  await hooks.config(cfg)
+
+  const names = Object.keys(cfg.agent)
+  assert.ok(names.length > 0, "control: agents really are injected")
+  for (const name of names) {
+    assert.ok(!("tools" in cfg.agent[name]), `${name} must not carry a tools field -- it is folded at load time and never read`)
+  }
+
+  // The tiers the dead grant used to sit on are named explicitly, so removing
+  // the test above cannot quietly remove the check along with the field.
+  for (const name of ["explore-fast", "explore-deep", "implement-fast", "implement-deep"]) {
+    assert.equal(cfg.agent[name]?.tools, undefined, `${name} is the tier the phantom grant targeted`)
+  }
+  // ...and so is every hidden pool variant, which inherited it from its base.
+  for (const name of ["explore-fast-1", "explore-fast-4", "implement-fast-1", "implement-fast-4"]) {
+    assert.equal(cfg.agent[name]?.tools, undefined, `${name} inherited the phantom grant from its base`)
+  }
+  await hooks.dispose()
+})
+
+test("[US-24] removing the tools field removed nothing else: every agent field the host reads after the hook is still injected", async () => {
+  const stub = stubInput()
+  const hooks = await bootLaCode(stub)
+  const cfg = {}
+  await hooks.config(cfg)
+
+  // These are exactly the fields opencode's post-hook agent assembly loop reads.
+  // If one of them ever goes missing the grant removal has broken something real.
+  for (const name of Object.keys(cfg.agent)) {
+    const def = cfg.agent[name]
+    assert.equal(typeof def.description, "string", `${name} must carry a description`)
+    assert.equal(typeof def.prompt, "string", `${name} must carry a prompt`)
+    assert.equal(typeof def.permission, "object", `${name} must carry a permission block`)
+    assert.equal(typeof def.mode, "string", `${name} must carry a mode`)
+    assert.equal(typeof def.temperature, "number", `${name} must carry a temperature`)
+  }
+  // `hidden` is the one field only some agents carry, so it is checked on the
+  // pool variants specifically rather than on every agent.
+  for (const name of ["explore-fast-1", "implement-fast-4", "context-manager-2"]) {
+    assert.equal(cfg.agent[name]?.hidden, true, `${name} must stay hidden`)
+  }
+  await hooks.dispose()
+})
+
+test("[US-24] the limitation is documented for users: README states it above the injection list and shows the config that actually works", async () => {
+  const readme = readFileSync(join(ROOT, "README.md"), "utf8")
+
+  // Prominent, not buried: the warning heading appears BEFORE "What gets
+  // injected", so a reader meets it before the list of what the plugin provides.
+  const warningAt = readme.indexOf("Per-agent tool grants must be in your own config")
+  const injectedAt = readme.indexOf("### What gets injected")
+  assert.ok(warningAt !== -1, `README must carry the tool-grant warning; found none:\n${readme}`)
+  assert.ok(injectedAt !== -1, "README must still have its injection section")
+  assert.ok(warningAt < injectedAt, "the warning must come BEFORE the injection list, not after it")
+
+  // It must say the thing that is actually true, and not the thing that was
+  // previously claimed.
+  assert.match(readme, /config-load\s+time/, "the README must give the load-time-folding reason, or the grant gets re-added")
+  assert.match(readme, /cannot grant tools to its agents/, "the README must state plainly that the plugin cannot do this")
+  assert.ok(
+    !/carry `tools: \{"playwright_\*": true\}`/.test(readme),
+    "README must not still claim the tiers carry the grant",
+  )
+
+  // And a minimal example the reader can paste, naming all four tiers plus the
+  // global deny it exists to work around.
+  //
+  // The example is looked for INSIDE the warning section, not anywhere in the
+  // README: the README's first ```jsonc block is the plugin-options tuple under
+  // "Configuration", and matching that would assert the fix lives in an
+  // unrelated place. Scoping the search to the prose that explains the problem
+  // is also what makes this an assertion about placement -- an example parked
+  // below "What gets injected", away from the reason, fails here.
+  const section = readme.slice(warningAt, injectedAt)
+  assert.ok(section.length > 0, "the warning section must not be empty")
+  const example = section.match(/```jsonc\n([\s\S]*?)```/)
+  assert.ok(example, "the warning section must show a copy-pasteable example next to the reason")
+  assert.match(example[1], /"playwright_\*": false/, "the example must show the global deny being worked around")
+  for (const tier of ["explore-fast", "explore-deep", "implement-fast", "implement-deep"]) {
+    assert.ok(example[1].includes(`"${tier}"`), `the example must grant the browser tools to ${tier}`)
+  }
+})
+
+test("[US-24] the source records why the grant is absent, so a future reader does not re-add it", async () => {
+  const source = readFileSync(join(ROOT, "src", "agents.ts"), "utf8")
+
+  // The header must name the mechanism, not just the conclusion.
+  assert.match(source, /schema transform/, "agents.ts must cite the AgentConfig decode that folds tools")
+  assert.match(source, /visibleTools/, "agents.ts must name the runtime gate that never reads agent.tools")
+
+  // And the code itself must not have crept back. The header comment is allowed
+  // to NAME the playwright namespace -- it has to, to explain the scenario --
+  // so the check is for an actual `tools:` key in an agent literal, not for the
+  // string. The agent literals in this file use QUOTED keys, so both spellings
+  // are matched; the unquoted-only form misses a `"tools": {` re-introduction.
+  // The authoritative check remains the injected config in the first test, which
+  // catches the grant however it is spelled.
+  assert.ok(!/BROWSER_GRANT/.test(source), "the BROWSER_GRANT constant must not come back")
+  assert.ok(!/tools\??:\s*Record<string, boolean>/.test(source), "the AgentDef.tools field must not come back")
+  assert.ok(!/^\s+"?tools"?:\s*\{/m.test(source), "no agent literal may carry a tools grant")
 })
 

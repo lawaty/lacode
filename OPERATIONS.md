@@ -130,7 +130,11 @@ Audited, and most of it is structural rather than redundant:
   `opencode debug agent` never lists MCP tools at all -- so neither it nor the schema can
   confirm a working grant. Verified end to end instead: `explore-fast-3` reports all 26
   `playwright_browser_*` tools, and the top-level `tools.playwright_*: false` keeps them
-  away from every other agent.
+  away from every other agent. This grant lives here, in this file, and must stay here:
+  opencode folds `agent.tools` into the permission list at config-load time, while
+  decoding the config, so a `tools` value a plugin writes from its `config` hook is never
+  read by anything. Do not move it into `src/agents.ts` -- see the NOT INJECTED note in
+  that file's header.
 - `explore`, `general` and `implement` are disabled. These are opencode's built-in
   generic subagents; they would always be spawnable, cost a full-price model, and bypass
   `explore-fast*` / `implement-fast*` entirely. Only `basic`, `expert`, the pool bases and

@@ -184,6 +184,48 @@ offers that is not whitelisted, so an unlisted pin would resolve to nothing at
 all. With `deepModel` unset, no model is written and the deep tiers use your
 default model — the behaviour of earlier versions.
 
+### ⚠️ Per-agent tool grants must be in your own config
+
+**LaCode cannot grant tools to its agents, and this is not an oversight you can
+work around by configuring it.** If you keep a global `"tools"` block in your
+config — for example `"tools": { "playwright_*": false }` — then the four
+exploration and implementation tiers (`explore-fast`, `explore-deep`,
+`implement-fast`, `implement-deep`, plus their hidden `-1`..`-4` pool variants)
+lose browser access, and **nothing tells them why**: the tool call is simply
+refused mid-task. `context-manager` gets no grant either, which is correct — it
+writes the context map and has no business in a browser.
+
+opencode folds an agent's `tools` into its permission list **at config-load
+time**, while decoding the config — before any plugin runs. A plugin's `config`
+hook mutates the already-decoded config, so the fold never re-runs and anything
+it puts in `agent.tools` is inert. (Verified on opencode 1.18.34/1.18.35 with
+`opencode debug agent explore-fast`: a grant written in your own config shows two
+`playwright_*` entries — `deny` then `allow`, last one winning — while the same
+grant injected by the plugin shows only the `deny`.) LaCode's other injected
+fields are not affected; `permission`, `prompt`, `model`, `description`,
+`temperature`, `mode` and `hidden` are all read after the plugin hook runs.
+
+**So if you use a global `"tools"` block, declare the grants yourself:**
+
+```jsonc
+{
+  "tools": { "playwright_*": false },
+  "agent": {
+    "explore-fast": { "tools": { "playwright_*": true } },
+    "explore-deep": { "tools": { "playwright_*": true } },
+    "implement-fast": { "tools": { "playwright_*": true } },
+    "implement-deep": { "tools": { "playwright_*": true } }
+  }
+}
+```
+
+The hidden pool variants (`explore-fast-1`, `implement-fast-2`, …) inherit
+nothing here — add a line per variant you actually spawn, or drop the global
+deny and scope it to the agents that should not have browser access instead.
+
+Nothing hot-reloads: after editing your config, restart every running opencode
+process.
+
 ### What gets injected
 
 **19 agent keys**: the 7 bases `build`, `plan`, `explore-fast`, `explore-deep`,
@@ -205,12 +247,9 @@ are only `{ "disable": true }` stubs in the author's own config: turning off
 opencode's built-in agents is a decision about one person's configuration, not
 a default a package should impose on a stranger.
 
-The four exploration and implementation tiers carry `tools: {"playwright_*": true}`.
-A grant for a tool namespace you have not installed is a no-op, whereas omitting
-it from a user who *has* installed Playwright and globally disabled it — as the
-author's own config does — silently strips browser access from exactly the
-agents whose prompts drive a browser. `context-manager` gets no grant; it writes
-the context map.
+One **field** is deliberately not injected either: `tools`, for the
+load-time-folding reason explained above. Nothing else the plugin writes into
+an agent is subject to it.
 
 **Installation merges, it does not clobber** (US-16). An agent, command or
 instruction is added only when that key is absent from your config. A

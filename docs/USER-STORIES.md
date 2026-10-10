@@ -252,6 +252,18 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given the off switch is set, When the bootstrap runs, Then it makes no writes at all.
 - [ ] Given the off switch is unset, When LaCode boots, Then injection behaves exactly as before — disabling is the only behavioural difference.
 
+### US-24: Tool grants are documented, not injected, because a plugin cannot set them
+**As a** user who keeps a global `"tools"` block, **I want** to know that per-agent tool grants must be declared in my own config, **so that** browser automation is not silently denied on the agents that need it.
+
+The pain: LaCode once shipped a `tools: { "playwright_*": true }` grant on its four exploration and implementation tiers, with a comment claiming it rescued anyone who had globally disabled Playwright. It did not. opencode folds an agent's `tools` into its permission list **at config-load time**, inside the schema decode that runs before any plugin is called; a plugin's `config` hook mutates the already-decoded object, so the fold never re-runs and the injected value is read by nothing. The grant was dead code asserting a rescue it never performed. The fix is not to re-inject it — it is to tell the truth about it and document the one-line fix the user can apply themselves.
+
+**Story ID(s) for tests:** US-24
+**Acceptance criteria:**
+- [ ] Given the config hook runs on a config that globally disables a tool namespace, When the agent set is injected, Then no injected agent carries a `tools` field at all — not on the four exploration and implementation tiers, and not on any hidden pool variant.
+- [ ] Given a config with a global `"tools"` block, When LaCode is asked to inject, Then every other agent field it does own — `permission`, `prompt`, `description`, `temperature`, `mode`, `hidden` — is still written, so the removal is scoped to the one field the host folds before the plugin runs.
+- [ ] Given the README, When a reader looks for what the plugin injects, Then the tool-grant limitation is stated plainly, above the injection list rather than buried under it, and a minimal copy-pasteable example of declaring the grants in the user's own config is shown.
+- [ ] Given a reader who has never seen the source, When they read the README section, Then the load-time-folding reason is given in one sentence, so the grant is not re-added on the belief that it is merely missing.
+
 ---
 
 ## Epic G — Context and cost (a maintained map instead of cold exploration)
@@ -342,6 +354,7 @@ table was filled in.
 | US-15 | F | `tests/stories/f-adoption-safety.test.mjs` |
 | US-16 | F | `tests/stories/f-adoption-safety.test.mjs` |
 | US-17 | F | `tests/stories/f-adoption-safety.test.mjs` |
+| US-24 | F | `tests/stories/f-adoption-safety.test.mjs` |
 | US-19 | G | `tests/stories/g-context-management.test.mjs` |
 | US-20 | G | `tests/stories/g-context-management.test.mjs` |
 | US-21 | G | `tests/stories/g-context-management.test.mjs`, `tests/permission-test.mjs` |
