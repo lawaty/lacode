@@ -39,6 +39,25 @@ Then add the plugin to your opencode config:
 Restart opencode. Nothing here hot-reloads: without a restart the config change
 does not take effect and the agent set will look stale for no visible reason.
 
+The install also puts a `lacode` CLI on your `PATH` (`lacode notify`,
+`lacode forward`, `lacode doctor`) — see [Remote hosts](#remote-hosts).
+
+Two things are worth knowing about what npm actually hands you:
+
+- **`@opencode-ai/plugin` is a peer dependency.** It is not vendored into this
+  package and never will be: a second copy of the SDK inside the tarball would
+  mean opencode and the plugin holding two different module instances, and
+  instance identity is what plugin state hangs on. npm installs the peer for you;
+  if you install with a tool that does not, install `@opencode-ai/plugin` at the
+  same version yourself.
+- **You get compiled JavaScript, not TypeScript sources.** The tarball ships
+  `dist/`, built from `src/` at pack time (`prepack` runs the build, so a stale
+  `dist/` cannot be published). This is not a preference: node strips types
+  natively from 22.18 but **refuses to for files under `node_modules`**, so a
+  package that shipped `.ts` worked fine in a checkout and failed on install —
+  `lacode --help` died with `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`. A
+  published package cannot depend on its consumer's loader being lenient.
+
 ## Configuration
 
 Plugin options are a tuple — the package name, then an options object. Every
@@ -216,11 +235,24 @@ the Given/When/Then criteria, and the story-to-test mapping are in
 ## Development
 
 ```bash
-npm test              # node --test tests/ — offline, no network, no running server
-npm run benchmark     # the cost harness; see docs/BENCHMARKS.md
+npm run build          # esbuild -> dist/ (what the tarball ships)
+npm test               # node --test tests/ — offline, no network, no running server
+npm run benchmark      # the cost harness; see docs/BENCHMARKS.md
 ```
 
 Node ≥ 22.18.
+
+`npm run build` compiles each entry point in `package.json` (`exports` and
+`bin`) into `dist/` with esbuild, one bundle per entry point, so nothing in
+`src/` has to be renamed to satisfy node's ESM resolver. `@opencode-ai/plugin`
+and the node builtins are external — see the header of `scripts/build.mjs` for
+why a peer dependency must never be inlined. `dist/` is generated and
+gitignored; `prepack` builds it, so `npm pack` cannot produce a stale tarball.
+
+The sources are TypeScript and the tests import `src/` directly (node strips the
+types outside `node_modules`, which is exactly where the tests live), so the
+loop stays: edit `src/`, run `npm test`. Only the packaging fixtures build, and
+they call the same `scripts/build.mjs` the tarball does.
 
 `tests/stories/` holds the story suites and `tests/stories/coverage.test.mjs`
 is the guard: it reads the `### US-N:` headings out of `docs/USER-STORIES.md`

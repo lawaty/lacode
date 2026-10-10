@@ -5,21 +5,34 @@
 //   US-17  a single off switch
 //
 // US-15 and US-17 are tested against an "installed package" fixture: the exact
-// file set `package.json.files` publishes (src/, presets/, package.json), in a
+// file set `package.json.files` publishes (dist/, presets/, package.json), in a
 // temp directory with a temp HOME. That is the only honest way to test "a fresh
 // machine with no LaCode config" -- running from the working tree would find
 // this repo's own opencode.jsonc and its own ~/.config/lacode, and quietly pass
-// for the wrong reason.
+// for the wrong reason. The fixture builds dist/ through the same
+// `scripts/build.mjs` that `prepack` runs, so the tests and the tarball cannot
+// disagree about what ships.
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs"
+import { spawnSync } from "node:child_process"
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+import { pathToFileURL } from "node:url"
+import { build } from "../../scripts/build.mjs"
 import { ROOT, cleanupAll, scratch, spawn, stubInput } from "./_harness.mjs"
 
 test.after(cleanupAll)
 
 const manifest = () => JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"))
+
+let built = false
+/** Compile dist/ once per test process — the fixture ships whatever files ships. */
+const ensureBuilt = async () => {
+  if (built) return
+  await build()
+  built = true
+}
 
 /** A recursive listing, used to prove a directory was left completely untouched. */
 const existing = (dir, prefix = "") => {
@@ -30,9 +43,8 @@ const existing = (dir, prefix = "") => {
   })
 }
 
-/** A temp directory holding exactly the files the published package ships. */
-const installedPackage = () => {
-  const dir = scratch("installed-")
+/** Copy the file set the published package ships into `pkgDir`. */
+const copyPublishedFiles = (pkgDir) => {
   for (const entry of manifest().files) {
     if (entry.endsWith(".md")) {
       // Document entries are optional for behaviour; skip so the fixture does
@@ -41,9 +53,16 @@ const installedPackage = () => {
     }
     const from = join(ROOT, entry)
     if (!existsSync(from)) continue
-    cpSync(from, join(dir, entry), { recursive: true })
+    cpSync(from, join(pkgDir, entry), { recursive: true })
   }
-  writeFileSync(join(dir, "package.json"), JSON.stringify(manifest(), null, 2))
+  writeFileSync(join(pkgDir, "package.json"), JSON.stringify(manifest(), null, 2))
+}
+
+/** A temp directory holding exactly the files the published package ships. */
+const installedPackage = async () => {
+  await ensureBuilt()
+  const dir = scratch("installed-")
+  copyPublishedFiles(dir)
   // The peer dependency is supplied by the HOST, never shipped: linking the
   // repo's copy into node_modules is exactly what `npm install @lawaty/lacode`
   // produces, and it is what proves the package resolves without vendoring.
@@ -67,8 +86,9 @@ const withHome = async (home, fn) => {
   }
 }
 
+/** Boot the plugin the way a consumer does: through the `.` the manifest declares. */
 const bootFrom = async (dir, options) => {
-  const { default: LaCode } = await import(join(dir, "src", "index.ts"))
+  const { default: LaCode } = await import(pathToFileURL(join(dir, manifest().exports["."])).href)
   const stub = stubInput()
   const hooks = await LaCode(stub.input, options)
   return { stub, hooks }
@@ -104,12 +124,13 @@ test("[US-15] one config line is enough: a bare config boots and delivers the wh
 })
 
 test("[US-15] with no configuration at all, the installed package falls back to shipped defaults and works", async () => {
-  const dir = installedPackage()
+  const dir = await installedPackage()
   const home = scratch("fresh-home-")
   // Control: the fixture really is the published shape, and really has no
   // user config for the pool to read.
-  assert.ok(existsSync(join(dir, "src", "index.ts")))
+  assert.ok(existsSync(join(dir, manifest().exports["."])), "the entry point the manifest declares must be present")
   assert.ok(existsSync(join(dir, "presets", "free-tier.json")))
+  assert.ok(!existsSync(join(dir, "src")), "the tarball carries the built package, not the TypeScript sources")
   assert.ok(!existsSync(join(dir, "opencode.jsonc")), "an installed package has no opencode.jsonc")
 
   const { hooks, stub } = await withHome(home, async () => {
@@ -143,6 +164,79 @@ test("[US-15] the peer dependency is declared, not duplicated inside the package
     assert.match(source, /from "@opencode-ai\/plugin"/, `${file} must import the declared peer`)
   }
   assert.ok(!existsSync(join(ROOT, "src", "node_modules")), "the SDK must never be vendored into the package")
+})
+
+test("[US-15] every entry point the manifest publishes is built JavaScript, not a TypeScript source", async () => {
+  await ensureBuilt()
+  const pkg = manifest()
+
+  // The manifest is the contract, so read it rather than a copy of it: a new
+  // subpath added without a build is the exact defect this asserts against.
+  const entryPoints = [
+    ...Object.entries(pkg.exports).map(([subpath, target]) => ({ subpath, target })),
+    ...Object.entries(pkg.bin).map(([subpath, target]) => ({ subpath: `bin ${subpath}`, target })),
+  ].filter(({ subpath }) => subpath !== "./package.json")
+
+  assert.ok(entryPoints.length >= 6, "the plugin, four subpaths and the CLI are all published")
+
+  for (const { subpath, target } of entryPoints) {
+    assert.equal(typeof target, "string", `${subpath} must be a single path`)
+    assert.ok(!target.endsWith(".ts"), `${subpath} must not publish TypeScript: node refuses to strip types under node_modules (${target})`)
+    assert.ok(!target.includes("node_modules"), `${subpath} must not point into node_modules (${target})`)
+    assert.ok(!target.startsWith("./src/"), `${subpath} must point at the build, not the sources (${target})`)
+    assert.ok(target.startsWith("./dist/"), `${subpath} must point into dist/ (${target})`)
+    assert.ok(pkg.files.includes(target.replace(/^\.\/([^/]+)\/.*$/, "$1")), `files must ship ${target}, or the tarball has a dangling entry point`)
+
+    const file = join(ROOT, target)
+    assert.ok(existsSync(file), `${subpath} -> ${target} does not exist; run \`npm run build\``)
+
+    // `node --check` parses as JavaScript and REJECTS type syntax, so this is a
+    // real proof of "plain JS" rather than a regex that a comment could fake.
+    const checked = spawnSync(process.execPath, ["--check", file], { encoding: "utf8" })
+    assert.equal(checked.status, 0, `${target} is not plain JavaScript:\n${checked.stderr}`)
+  }
+
+  // The CLI is spawned, not imported: it has to arrive executable.
+  const cli = join(ROOT, pkg.bin.lacode)
+  assert.ok(readFileSync(cli, "utf8").startsWith("#!/usr/bin/env node"), "the built CLI must keep its shebang so npm can link it")
+  assert.ok(statSync(cli).mode & 0o111, "the built CLI must ship with the executable bit set")
+})
+
+test("[US-15] the published package loads and runs from inside node_modules, where node refuses to strip types", async () => {
+  await ensureBuilt()
+  // Laid out the way npm lays it out, because the location IS the bug: node
+  // strips types natively from 22.18 and refuses to under node_modules, which
+  // is why `lacode --help` died with ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING
+  // on a global install while opencode (a Bun binary) kept working perfectly.
+  const dir = scratch("installed-nm-")
+  const pkgDir = join(dir, "node_modules", "@lawaty", "lacode")
+  mkdirSync(pkgDir, { recursive: true })
+  copyPublishedFiles(pkgDir)
+  mkdirSync(join(dir, "node_modules", "@opencode-ai"), { recursive: true })
+  symlinkSync(join(ROOT, "node_modules", "@opencode-ai", "plugin"), join(dir, "node_modules", "@opencode-ai", "plugin"), "dir")
+
+  // A consumer importing the package BY NAME, the way a plugin host does.
+  const consumer = join(dir, "consumer.mjs")
+  writeFileSync(
+    consumer,
+    [
+      'import plugin from "@lawaty/lacode"',
+      'import { encodePayload } from "@lawaty/lacode/tunnel"',
+      'import { splitModel } from "@lawaty/lacode/pool"',
+      'console.log(JSON.stringify({ plugin: typeof plugin, payload: encodePayload({ title: "t" }), model: splitModel("openrouter/nvidia/x:free") }))',
+    ].join("\n"),
+  )
+  const imported = spawnSync(process.execPath, [consumer], { cwd: dir, encoding: "utf8" })
+  assert.equal(imported.status, 0, `a plain node consumer must be able to import the installed package:\n${imported.stderr}`)
+  const seen = JSON.parse(imported.stdout.trim())
+  assert.equal(seen.plugin, "function", "the default export must be the plugin factory")
+  assert.match(seen.payload, /^t\n/, `the tunnel subpath must resolve to real code: ${seen.payload}`)
+  assert.deepEqual(seen.model, { provider: "openrouter", id: "nvidia/x:free" }, "the pool subpath must resolve to real code")
+
+  // And the CLI, run exactly as npm's bin link would run it.
+  const help = spawnSync(process.execPath, [join(pkgDir, manifest().bin.lacode), "--help"], { encoding: "utf8" })
+  assert.equal(help.status, 0, `\`lacode --help\` must exit 0 on an install:\n${help.stderr}`)
+  assert.match(help.stdout, /lacode notify TITLE/, `the CLI must print its usage:\n${help.stdout}`)
 })
 
 // ---------------------------------------------------------------------------
@@ -261,7 +355,7 @@ test("[US-17] with the off switch set, nothing at all is injected", async () => 
 test("[US-17] with the off switch set, the bootstrap makes no writes at all", async () => {
   // "Off" means off. Not "off but it still creates a config directory", which
   // is the shape a half-wired switch takes.
-  const dir = installedPackage()
+  const dir = await installedPackage()
   const home = scratch("off-home-")
   const before = new Set(existing(home))
 

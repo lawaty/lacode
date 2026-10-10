@@ -102,9 +102,11 @@ The receiver must satisfy this contract:
 5. resolve `DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the session it is running
    in, then `exec notify-send "$TITLE" "$MSG" --urgency=… --icon=…`.
 
-> **Note.** The published package ships `bin/lacode` and `src/tunnel/`, not a
-> receiver script. The receiver is the desktop-side half and is yours to install
-> — keep it out of your shell's `$PATH` reach and pinned in `authorized_keys`.
+> **Note.** The published package ships the built CLI (`dist/lacode.js`, linked
+> as `lacode`) and the tunnel behind it (`dist/tunnel.js`, importable as
+> `@lawaty/lacode/tunnel`), not a receiver script. The receiver is the
+> desktop-side half and is yours to install — keep it out of your shell's
+> `$PATH` reach and pinned in `authorized_keys`.
 
 If the two halves disagree you get a blank popup, which points nowhere. A
 receiver that sees a payload with no newline in it should say so on stderr

@@ -17,12 +17,20 @@
 // topology and systemd units. This is the generic subset, published on its own.
 
 import { fileURLToPath } from "node:url"
-import { dirname, join } from "node:path"
+// A STATIC import, not a computed one: this file is an esbuild entry point
+// (scripts/build.mjs -> dist/lacode.js), and a bundler can only follow a
+// specifier it can read at build time. The old `import(join(here, "..", "src",
+// "tunnel", "index.ts"))` survived type stripping but was opaque to esbuild, so
+// the shipped CLI would have reached back into a `src/` the tarball no longer
+// carries. It still runs unbundled straight from a git checkout.
+import { describe, forward, notify, safeTitle } from "../src/tunnel/index.ts"
 
-// The module is TypeScript, loaded unbundled, exactly like the opencode plugins.
-// Node strips the types on load from 22.18 / 23.6; on 22.6-22.17 the flag is
-// still required, and older node cannot run this at all. Re-exec once with the
-// flag rather than printing a second implementation of the same code in JS.
+// Two forms of this file exist and both must work. Run from a checkout it IS
+// TypeScript-in-Node, exactly like the opencode plugins: node strips the types on
+// load from 22.18 / 23.6, and on 22.6-22.17 the flag is still required, so
+// re-exec once with it rather than printing a second implementation of the same
+// code in JS. Installed from npm it is dist/lacode.js -- plain JavaScript, built
+// ahead of the tarball -- and this branch simply never runs.
 if (!process.features?.typescript) {
   if (process.env.LACODE_STRIP_TYPECHECKED === "1") {
     console.error("lacode: this node cannot load TypeScript sources; node >= 22.18 is required.")
@@ -36,9 +44,6 @@ if (!process.features?.typescript) {
   )
   process.exit(result.status ?? 1)
 }
-
-const here = dirname(fileURLToPath(import.meta.url))
-const { notify, forward, describe, safeTitle } = await import(join(here, "..", "src", "tunnel", "index.ts"))
 
 const USAGE = `lacode — portable notifications and remote exec for LaCode
 

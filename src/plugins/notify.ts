@@ -3,6 +3,7 @@ import { existsSync } from "node:fs"
 import * as path from "node:path"
 import type { Hooks } from "@opencode-ai/plugin"
 import { Notifier, questionHeadline, shouldNotify, type Outcome, type SessionInfo } from "../lib/notify.ts"
+import { PACKAGE_ROOT } from "../lib/pool.ts"
 
 // Desktop notification when a session needs you: a finished turn, or a question
 // it cannot proceed without.
@@ -40,20 +41,28 @@ const COOLDOWN_MS = 5_000
 
 // Where the notification helper lives, in order:
 //   1. OC_NOTIFY_HELPER -- an explicit override, so a user can point at their own
-//   2. ~/bin/lacode or ~/bin/oc-notify -- what an install puts on PATH
-//   3. the repo copy, found by walking up from this module (src/plugins -> bin/)
+//   2. ~/bin/lacode or ~/bin/oc-notify -- what a hand-made install puts on PATH
+//   3. the package's own bin/ -- the author's checkout, where bin/oc-notify exists
+//   4. dist/lacode.js -- the BUILT cli, which is all an npm install ships. The
+//      shipped package no longer carries the TypeScript sources, so pointing at
+//      the package's bin/lacode there would hand a broken helper to every
+//      consumer: found, spawned, and dead on arrival with node refusing to strip
+//      types under node_modules. The built CLI is the same program with the
+//      types already gone.
+// Candidates are anchored on PACKAGE_ROOT rather than on this module's own
+// directory, because bundling moves this file from src/plugins/ to dist/ and a
+// relative hop would resolve outside the package.
 // Nothing here throws: a missing helper warns once and notifications are lost,
 // which is strictly better than taking the server down with them.
 const findHelper = (): string | undefined => {
-  const here = (import.meta as { dir?: string }).dir ?? path.dirname(new URL(import.meta.url).pathname)
   const home = process.env.HOME ?? ""
   const candidates = [
     process.env.OC_NOTIFY_HELPER,
     path.join(home, "bin", "lacode"),
     path.join(home, "bin", "oc-notify"),
-    path.join(here, "oc-notify"),
-    path.join(here, "..", "..", "bin", "oc-notify"),
-    path.join(here, "..", "..", "bin", "lacode"),
+    path.join(PACKAGE_ROOT, "bin", "oc-notify"),
+    path.join(PACKAGE_ROOT, "dist", "lacode.js"),
+    path.join(PACKAGE_ROOT, "bin", "lacode"),
   ].filter((candidate): candidate is string => typeof candidate === "string" && candidate.length > 0)
   for (const candidate of candidates) if (existsSync(candidate)) return candidate
   return undefined

@@ -413,14 +413,18 @@ test("[US-14] a failing hop never produces a desktop notification on the remote 
 })
 
 test("[US-14] a missing notify helper warns once and the plugin keeps working", async () => {
-  // An installed package ships src/, presets/ and bin/lacode -- but NOT
-  // bin/oc-notify. So on a real install the helper genuinely cannot be found,
-  // and this fixture reproduces that shape rather than simulating it.
+  // The machine under test has NO helper anywhere: no OC_NOTIFY_HELPER, an empty
+  // HOME, and a package directory with none of the candidates findHelper looks
+  // for — no bin/oc-notify (author-local, never published) and no dist/lacode.js
+  // (built here, since this fixture copies the sources only). That is what the
+  // warning exists for, and it is why the fixture reproduces the shape rather
+  // than simulating it.
   const installed = scratch("installed-pkg-")
   cpSync(join(ROOT, "src"), join(installed, "src"), { recursive: true })
   cpSync(join(ROOT, "presets"), join(installed, "presets"), { recursive: true })
   cpSync(join(ROOT, "package.json"), join(installed, "package.json"))
   assert.ok(!existsSync(join(installed, "bin", "oc-notify")), "control: the published files list has no oc-notify")
+  assert.ok(!existsSync(join(installed, "dist", "lacode.js")), "control: this fixture has no built CLI either")
 
   const { notifyHooks } = await import(join(installed, "src", "plugins", "notify.ts"))
   const home = scratch("no-home-")

@@ -166,8 +166,8 @@ export const settle = (ms = 20) => new Promise((resolve) => setTimeout(resolve, 
  * A recursive copy that skips node_modules and .git.
  *
  * Used to build an "installed package" fixture: the published `files` list
- * ships `src/`, `presets/` and `bin/lacode` and NOT `bin/oc-notify`, which is
- * precisely why the notify plugin's helper lookup can come up empty in the wild.
+ * ships `dist/` and `presets/` and NOT `bin/oc-notify`, which is precisely why
+ * the notify plugin's helper lookup can come up empty in the wild.
  */
 export const copyTree = (from, to, { skip = new Set(["node_modules", ".git"]) } = {}) => {
   mkdirSync(to, { recursive: true })

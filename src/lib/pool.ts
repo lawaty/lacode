@@ -96,8 +96,35 @@ export const BASES = ["explore-fast", "implement-fast", "context-manager"]
 // The explicit `modelsFile` option (tests, and anyone pointing at one file
 // explicitly) short-circuits the chain.
 
-/** Package root: two levels up from src/lib/, i.e. the repo or the installed package. */
-export const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..")
+/**
+ * Package root: the directory holding `presets/`, `bin/` and `package.json`.
+ *
+ * This module is `src/lib/pool.ts` in a checkout — two levels down — but the
+ * published package ships the very same code bundled into `dist/index.js`, one
+ * level down. A fixed "two levels up" hop therefore resolves to the package's
+ * PARENT once installed, the bundled preset is not found, and the pool falls
+ * through to FALLBACK_SLOTS — still routing, still passing a test that only
+ * checks that routing happened, and quietly not the preset the user installed.
+ * So walk up to the manifest that names this package instead of counting
+ * directories, which is correct from any depth; the old hop is the last resort
+ * for a `dist/` copied somewhere with no manifest above it.
+ */
+const findPackageRoot = (start: string): string => {
+  let dir = start
+  for (let up = 0; up < 6; up++) {
+    try {
+      if (JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).name === "@lawaty/lacode") return dir
+    } catch {
+      // No manifest, or one that is not ours: keep walking.
+    }
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return join(start, "..", "..")
+}
+
+export const PACKAGE_ROOT = findPackageRoot(dirname(fileURLToPath(import.meta.url)))
 export const PRESETS_DIR = join(PACKAGE_ROOT, "presets")
 export const DEFAULT_PRESET = join(PRESETS_DIR, "free-tier.json")
 /** The user's own pool file. Absent is normal and never an error. */

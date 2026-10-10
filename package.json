@@ -27,28 +27,32 @@
   "engines": {
     "node": ">=22.18"
   },
-  "exports": {
-    ".": "./src/index.ts",
-    "./pool": "./src/lib/pool.ts",
-    "./agents": "./src/agents.ts",
-    "./commands": "./src/commands.ts",
-    "./tunnel": "./src/tunnel/index.ts",
+"exports": {
+    ".": "./dist/index.js",
+    "./pool": "./dist/pool.js",
+    "./agents": "./dist/agents.js",
+    "./commands": "./dist/commands.js",
+    "./tunnel": "./dist/tunnel.js",
     "./package.json": "./package.json"
   },
   "bin": {
-    "lacode": "./bin/lacode"
+    "lacode": "./dist/lacode.js"
   },
   "files": [
-    "src",
+    "dist",
     "presets",
-    "bin/lacode",
     "LICENSE",
     "README.md",
     "docs"
   ],
   "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
     "test": "node --test tests/",
     "benchmark": "node tests/benchmark/run.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "1.18.34"

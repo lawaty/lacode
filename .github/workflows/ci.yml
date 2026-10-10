@@ -79,6 +79,8 @@ jobs:
         # a published tarball, so it is checked mechanically instead of trusted.
         # Every name below is a path that EXISTS in the repo but is deliberately
         # not shipped — a name that no longer exists would assert nothing.
+        # `npm pack` runs `prepack`, so this also builds dist/ first: the tarball
+        # cannot be produced without a fresh build, and cannot be produced stale.
         run: |
           npm pack --dry-run --json > pack.json
           node -e '
@@ -89,17 +91,22 @@ jobs:
               f === "OPERATIONS.md" ||
               /(^|\/)\.env/.test(f) ||
               f.startsWith("opencode.jsonc") ||
-              // the working tree only: root plugin shims, the author's prompts,
-              // and every bin/ script except the one CLI that IS shipped
+              // the working tree only: root plugin shims, the author'"'"'s prompts,
+              // every bin/ script, and the TypeScript sources. Node refuses to
+              // strip types for anything under node_modules, so a shipped .ts is
+              // an entry point that cannot load — dist/ is the shipped form.
               f.startsWith("plugins/") ||
               f.startsWith(".opencode/") ||
-              (f.startsWith("bin/") && f !== "bin/lacode");
+              f.startsWith("src/") ||
+              f.startsWith("bin/") ||
+              f.startsWith("scripts/") ||
+              f.endsWith(".ts");
             const bad = files.filter(forbidden);
             if (bad.length > 0) {
               console.error("these files must never be published:\n  " + bad.join("\n  "));
               process.exit(1);
             }
-            const required = ["package.json", "src/index.ts", "presets/free-tier.json", "bin/lacode"];
+            const required = ["package.json", "dist/index.js", "dist/lacode.js", "presets/free-tier.json"];
             const missing = required.filter((f) => !files.includes(f));
             if (missing.length > 0) {
               console.error("the package would be published without:\n  " + missing.join("\n  "));
