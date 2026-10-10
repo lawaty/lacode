@@ -9,9 +9,10 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
+import { shippedConfig } from "./fixtures/config.mjs"
+
 const HERE = dirname(fileURLToPath(import.meta.url))
-const CONFIG = join(HERE, "..", "opencode.jsonc")
-const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
+const cfg = shippedConfig()
 
 // presets/free-tier.json owns the pool's models. Test 4 is about a provider-wide
 // cooldown, so it is written against whichever provider slot 1 runs on and the

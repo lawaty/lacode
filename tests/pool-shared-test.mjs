@@ -8,10 +8,11 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
+import { shippedConfig } from "./fixtures/config.mjs"
+
 const HERE = dirname(fileURLToPath(import.meta.url))
-const CONFIG = join(HERE, "..", "opencode.jsonc")
 const POOL = join(HERE, "..", "src", "lib", "pool.ts")
-const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
+const cfg = shippedConfig()
 
 // presets/free-tier.json owns the pool's models; the tests below refer to slot N's
 // model, so swapping a model is not a test edit.
@@ -53,7 +54,7 @@ const mk = async (id, dir) => {
 }
 
 const BASES = ["explore-fast", "implement-fast", "context-manager"]
-// A spawn the pool could not rewrite (because opencode.jsonc declares no variant
+// A spawn the pool could not rewrite (because the injected config declares no variant
 // for that slot) comes back unrouted, so return -1 rather than throwing.
 const slotOf = (variant) => (variant === null || variant === undefined ? -1 : Number(/-(\d+)$/.exec(variant)?.[1] ?? -1))
 // Slot numbers per weight, so these checks hold whatever weights and order
@@ -74,14 +75,14 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
 // 1. slot N is the same model for every base, so the pool is genuinely shared
 {
   for (const i of ALL_SLOTS) {
-    // A slot with no declared variant in opencode.jsonc is a config gap, not a
+    // A slot with no declared variant in the injected config is a config gap, not a
     // sharing failure: report it instead of dereferencing undefined.
     const declared = BASES.map((b) => cfg.agent[`${b}-${i}`])
     const missing = BASES.filter((b) => !cfg.agent[`${b}-${i}`])
     if (missing.length > 0) {
       // this assert only records a failure and continues, so the body must not
       // run on the missing variants
-      assert(false, `slot ${i} has no variant in opencode.jsonc for ${missing.join(",")}; add them or drop the slot from presets/free-tier.json`)
+      assert(false, `slot ${i} has no variant in the injected config for ${missing.join(",")}; add them or drop the slot from presets/free-tier.json`)
       continue
     }
     const models = declared.map((d) => d.model)

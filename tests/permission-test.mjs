@@ -30,13 +30,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { buildAgentSet } from "../src/agents.ts"
 import { verifyWriterRule } from "../src/lib/writer-rule.ts"
 
 const REL = '".opencode/context/**":"allow"'
 const ABS = '"*/.opencode/context/**":"allow"'
-// The detector must track the real opencode.jsonc, not a fixture. Derived from this
-// file's own location so the suite survives the repo moving on disk.
-const live = join(dirname(fileURLToPath(import.meta.url)), "..", "opencode.jsonc")
 // This repo, and this repo as seen from a project root of "/". Derived from this
 // file's own location so the suite survives the repo moving on disk, and from the
 // running user's home rather than hardcoded, so the fixtures are not pinned to one
@@ -46,6 +44,20 @@ const REPO = dirname(dirname(fileURLToPath(import.meta.url)))
 const REPO_MAP = `${REPO}/.opencode/context`
 
 const dir = mkdtempSync(join(tmpdir(), "pool-perm-"))
+// The package injects its agent table rather than shipping an opencode.jsonc, so
+// the "live config" this detector must track is that injected table, written to a
+// file in the shape opencode reads. It is `src/agents.ts` buildAgentSet() -- the
+// exact set src/index.ts pushes into every consumer's config -- so there is
+// nothing here from a personal config outside the repo.
+const live = join(dir, "shipped-agents.jsonc")
+writeFileSync(
+  live,
+  JSON.stringify({
+    agent: Object.fromEntries(
+      Object.entries(buildAgentSet()).map(([name, def]) => [name, { permission: def.permission }]),
+    ),
+  }),
+)
 // Fixtures declare only `edit`, the way LaCode now emits them: opencode folds
 // "write" and "apply_patch" onto "edit", so a `write` key is never read and
 // declaring one here would assert a rule opencode would ignore.
@@ -108,13 +120,13 @@ try {
   assert.equal(verifyWriterRule(config(ABS), REPO_MAP), undefined)
   ok("absolute check still used when no project root is supplied")
 
-  // The live config must declare `edit` and only `edit`. opencode's tool-permission
+  // The shipped config must declare `edit` and only `edit`. opencode's tool-permission
   // lookup folds "write" and "apply_patch" onto "edit", so a `write` key is never read:
   // it is not a weaker spelling of the rule, it is no spelling at all. Asserting the
   // absence is what stops the dead key from creeping back as decoration.
   const liveRaw = readFileSync(live, "utf8")
-  assert.ok(/"write"\s*:/.test(liveRaw) === false, "opencode.jsonc must not declare a `write` permission key")
-  ok("live opencode.jsonc declares no `write` permission key")
+  assert.ok(/"write"\s*:/.test(liveRaw) === false, "the shipped agent set must not declare a `write` permission key")
+  ok("the shipped agent set declares no `write` permission key")
 
   // A `write` block cannot rescue a broken `edit` grant, because nothing reads it.
   // The allow rule below names the map and sits in the `write` block; the `edit` block
@@ -132,17 +144,17 @@ try {
   assert.match(rescued, /not writable/, "it must be reported as the map not being writable")
   ok("a write-only grant does not satisfy the writer rule (edit is the only key read)")
 
-  // The detector must track the real opencode.jsonc, not a fixture. If the live config
-  // ever drops either form, this fails on the spot.
+  // The detector must track the shipped agent table. If it ever drops either form,
+  // this fails on the spot.
   for (const [root, map] of [
     [REPO, REPO_MAP],
     ["/", `${HOME}/.opencode/context`],
     ["/srv/work/app", "/srv/work/app/.opencode/context"],
   ]) {
     const result = verifyWriterRule(live, map, root)
-    assert.equal(result, undefined, `live config not writable for root ${root}: ${result}`)
+    assert.equal(result, undefined, `shipped config not writable for root ${root}: ${result}`)
   }
-  ok("live opencode.jsonc is writable for every project root")
+  ok("the shipped agent set is writable for every project root")
 
   // …and on every host, since the rules must not be tied to one absolute path.
   for (const [root, map] of [

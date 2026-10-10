@@ -3,13 +3,16 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
+import { shippedConfig } from "./fixtures/config.mjs"
+
 // Resolved relative to this file so the suite survives a /tmp clean and can
-// live anywhere inside the config tree.
+// live anywhere inside the config tree. The config under test is the committed
+// fixture plus the package's own injected agent set (see fixtures/config.mjs),
+// never a personal opencode.jsonc outside the repo.
 const HERE = dirname(fileURLToPath(import.meta.url))
-const CONFIG = join(HERE, "..", "opencode.jsonc")
 const PLUGIN = join(HERE, "..", "src", "plugins", "agent-pool.ts")
 const SNAPSHOT = join(HERE, "models-snapshot.json")
-const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
+const cfg = shippedConfig()
 
 // presets/free-tier.json is the single source of truth for the pool, so the test reads
 // it rather than repeating the models: swapping one is not a test edit.
@@ -288,12 +291,12 @@ await a.finish("nonexistent")
 // 10. config invariants: every pooled base has one hidden variant per slot in
 //     presets/free-tier.json, each running that slot's model -- and none of them
 //     hard-codes one, so the file really is the only place a pool model lives
-const rawCfg = JSON.parse(readFileSync(CONFIG, "utf8"))
+const rawCfg = shippedConfig()
 const BASES = ["explore-fast", "implement-fast", "context-manager"]
 for (const base of BASES) {
   SLOT_MODELS.forEach((_, i) => {
     const v = `${base}-${i + 1}`
-    assert(rawCfg.agent[v] !== undefined, `${v} must be declared in opencode.jsonc`)
+    assert(rawCfg.agent[v] !== undefined, `${v} must be declared in the injected agent set`)
     assert(rawCfg.agent[v].model === undefined, `${v} must not hard-code a model; presets/free-tier.json injects it`)
   })
 }
@@ -367,7 +370,7 @@ for (const [name, def] of Object.entries(rawCfg.agent)) {
 //      reintroduces (or adds) one fails here rather than quietly doubling the
 //      delegation paths.
 for (const builtin of ["explore", "general", "implement"]) {
-  assert(rawCfg.agent[builtin]?.disable === true, `${builtin} must be disabled in opencode.jsonc`)
+  assert(rawCfg.agent[builtin]?.disable === true, `${builtin} must be disabled in the fixture config`)
 }
 // Only the pool's implement variants may be real agents; a bare "implement" must
 // stay disabled, so it must not be declared with anything but disable.

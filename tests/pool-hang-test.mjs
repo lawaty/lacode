@@ -7,10 +7,11 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
+import { shippedConfig } from "./fixtures/config.mjs"
+
 const HERE = dirname(fileURLToPath(import.meta.url))
-const CONFIG = join(HERE, "..", "opencode.jsonc")
 const PLUGIN = join(HERE, "..", "src", "plugins", "agent-pool.ts")
-const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
+const cfg = shippedConfig()
 
 // presets/free-tier.json owns the pool's models, so the model a hang cools is read
 // from it rather than repeated here.

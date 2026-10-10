@@ -598,14 +598,10 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
     assert.equal(problem, undefined, `the shipped agent table must be clean for project root ${root}: ${problem}`)
   }
 
-  // And the author's own live config agrees with the package — otherwise the
-  // published setup and the setup it actually runs have drifted apart.
-  const live = join(ROOT, "opencode.jsonc")
-  for (const root of [ROOT_UNDER_TEST, "/"]) {
-    const map = root === ROOT_UNDER_TEST ? MAP_UNDER_TEST : "/home/someone/.opencode/context"
-    const problem = verifyWriterRule(live, map, root)
-    assert.equal(problem, undefined, `opencode.jsonc must be clean for project root ${root}: ${problem}`)
-  }
+  // The author's personal opencode.jsonc is no longer part of this repo (the
+  // package injects its agent table instead of shipping one), so there is no
+  // "live config" left to cross-check. The shippedFile loop above already pins
+  // the contract that matters: the table the package injects is clean.
 
   // Direction 2 bites: a gap agent holding a blanket grant is reported, naming
   // the agent and the rule that wins for the map. The blanket is written by

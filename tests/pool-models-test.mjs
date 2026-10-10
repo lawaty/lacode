@@ -1,11 +1,12 @@
 // presets/free-tier.json is the one file a user edits to change which models the pool
 // runs, and what share of the work each one takes. This suite drives the config
-// hook against temporary copies of that file and against the real opencode.jsonc,
-// proving:
+// hook against temporary copies of that file and against the injected config
+// (fixtures/config.mjs: the fixture provider block plus the package's own agent
+// set), proving:
 //
 //   1. the shipped file parses, and its slots are distinct models with valid weights
-//   2. the config hook rewrites every variant agent's model from the file, so
-//      opencode.jsonc can disagree and still lose
+//   2. the config hook rewrites every variant agent's model from the file, so the
+//      injected config can disagree and still lose
 //   3. a model absent from a provider whitelist is whitelisted automatically,
 //      since opencode deletes every model a provider offers that is not
 //   4. a missing or broken file degrades to the built-in defaults with a warning
@@ -15,19 +16,20 @@
 //   6. weight is a ceiling and a priority: the heaviest slot fills to its own weight
 //      before the next slot starts, a bad weight warns and keeps the slot, and the
 //      pre-weight `tier` spelling still maps to the weight it used to imply
-//   7. the pool is capped at pool.MAX_SLOTS, because opencode.jsonc declares one
-//      variant per base per slot and a bigger pool would route to nothing
+//   7. the pool is capped at pool.MAX_SLOTS, because the injected agent set declares
+//      one variant per base per slot and a bigger pool would route to nothing
 
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
+import { shippedConfig } from "./fixtures/config.mjs"
+
 const HERE = dirname(fileURLToPath(import.meta.url))
-const CONFIG = join(HERE, "..", "opencode.jsonc")
 const MODELS = join(HERE, "..", "presets", "free-tier.json")
 const PLUGIN = join(HERE, "..", "src", "plugins", "agent-pool.ts")
-const realCfg = () => JSON.parse(readFileSync(CONFIG, "utf8"))
+const realCfg = () => shippedConfig()
 
 // Each pool instance gets its own log buffer: warnOnce state is per instance, so
 // sharing one buffer would let an earlier instance's warnings satisfy a later one.
@@ -89,7 +91,7 @@ assert(providers.size >= 2, `the pool must span at least two providers, got ${[.
 
 // 2. a different file rewrites every variant agent, even against a config that
 //    names different models and carries no whitelist entry for the new ones.
-//    The fixture must name models opencode.jsonc has never heard of (that is
+//    The fixture must name models the injected config has never heard of (that is
 //    what proves auto-whitelisting), so it invents ids and borrows only the
 //    provider names, which must exist in the config for the hook to touch them.
 const [PROV_A, PROV_B] = [...providers]
@@ -102,7 +104,7 @@ const a = await apply(file("swapped.json", { slots: swapped }))
 for (const base of BASES) {
   swapped.forEach((slot, i) => {
     const variant = a.cfg.agent[`${base}-${i + 1}`]
-    assert(variant, `${base}-${i + 1} must exist in opencode.jsonc`)
+    assert(variant, `${base}-${i + 1} must exist in the injected config`)
     assert(variant.model === slot.model, `${base}-${i + 1} must run ${slot.model} from the file, got ${variant.model}`)
   })
 }
@@ -111,7 +113,7 @@ for (const base of BASES) {
 //    provider and the agent resolves to no model at all
 for (const slot of swapped) {
   const { provider, id } = pool.splitModel(slot.model)
-  assert(a.cfg.provider[provider] !== undefined, `provider ${provider} must be configured in opencode.jsonc`)
+  assert(a.cfg.provider[provider] !== undefined, `provider ${provider} must be configured in the fixture config`)
   assert(a.cfg.provider[provider].whitelist.includes(id), `${slot.model} must be whitelisted on ${provider}`)
 }
 assert(
@@ -227,7 +229,7 @@ assert(
   `primary must bind as weight 2 and overflow as weight 1, got ${legacy.lines.join(" | ")}`,
 )
 
-// 9. the pool is capped: opencode.jsonc declares exactly one variant per base per
+// 9. the pool is capped: the injected config declares exactly one variant per base per
 //    slot, so a longer file would route spawns at agents that do not exist. Both
 //    halves of that are checked -- the extra entries are dropped with a warning,
 //    and the shipped file is not over the cap.
@@ -245,9 +247,9 @@ assert(
 )
 assert(shipped.slots.length <= pool.MAX_SLOTS, `presets/free-tier.json lists ${shipped.slots.length} slots, over the ${pool.MAX_SLOTS} cap`)
 const shippedVariants = Object.keys(realCfg().agent).filter((n) => /-[5-9]$/.test(n))
-assert(shippedVariants.length === 0, `opencode.jsonc must not declare a variant beyond the cap, got ${shippedVariants.join(", ")}`)
+assert(shippedVariants.length === 0, `the injected config must not declare a variant beyond the cap, got ${shippedVariants.join(", ")}`)
 
-// 10. opencode.jsonc declares the variants with no model at all: the hook is the
+// 10. the injected config declares the variants with no model at all: the hook is the
 //    only thing that puts one there, so there is nothing left to fall out of sync
 const declared = realCfg()
 for (const base of BASES) {
@@ -270,7 +272,7 @@ shipped.slots.forEach((slot, i) => {
     assert(live.cfg.agent[`${base}-${i + 1}`].model === slot.model, `${base}-${i + 1} must run ${slot.model}`)
   }
 })
-// and nothing is routed to a variant opencode.jsonc does not define
+// and nothing is routed to a variant the injected config does not define
 for (let i = 1; i <= shipped.slots.length; i++) {
   for (const base of BASES) assert(live.cfg.agent[`${base}-${i}`], `${base}-${i} must exist for slot ${i} of ${shipped.slots.length}`)
 }
