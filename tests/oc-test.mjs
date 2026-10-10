@@ -34,6 +34,22 @@ const assert = (condition, message) => {
 
 const read = (name) => readFileSync(path.join(BIN, name), "utf8")
 
+// Every run of oc-sync from this file must be hermetic.
+//
+// With no OC_SYNC_ENV_FILE the script sources the personal
+// ~/.config/opencode/.env, and that file carries the real OC_HOSTS. The checks
+// below that only mean to exercise flag parsing would then deploy to actual
+// machines: `--scripts-only --no-config` with OC_HOSTS="" got past the (now
+// overridden) empty host list, walked two real hosts and rsynced `oc` to them,
+// and the check passed because it only asserts that no flag was rejected.
+// Pointing OC_SYNC_ENV_FILE at a path that does not exist is what makes
+// "OC_HOSTS='' means no hosts" true again.
+const hermeticEnv = (extra = {}) => ({
+  ...process.env,
+  OC_SYNC_ENV_FILE: path.join(tmpdir(), "nonexistent-ocsync-env"),
+  ...extra,
+})
+
 // ---------------------------------------------------------------------------
 // Syntax
 // ---------------------------------------------------------------------------
@@ -68,17 +84,122 @@ check("oc-sync still offers a scripts-only opt-out", () => {
 check("oc-sync scripts-only actually disables config", () => {
   // Run the parser with a bogus host list so it exits before doing any work,
   // and confirm the flag pair is still accepted rather than rejected as unknown.
+  // It must also actually stop at the empty host list: this check once ran for
+  // 23 seconds against two real machines, because the personal .env supplied
+  // OC_HOSTS and overrode the empty one, and it still "passed" on the flag
+  // assertion alone. Asserting the guard keeps that from being invisible.
   const result = spawnSync("bash", [path.join(BIN, "oc-sync"), "--scripts-only", "--no-config"], {
     encoding: "utf8",
-    env: { ...process.env, OC_HOSTS: "", OC_HOSTS_FILE: path.join(tmpdir(), "nonexistent-oc-hosts") },
+    env: hermeticEnv({ OC_HOSTS: "", OC_HOSTS_FILE: path.join(tmpdir(), "nonexistent-oc-hosts") }),
   })
   const output = (result.stdout || "") + (result.stderr || "")
   assert(!/unknown option/.test(output), `--scripts-only/--no-config rejected: ${output.trim()}`)
+  assert(/no hosts configured/.test(output),
+    `an empty host list must stop the run before any ssh or rsync: ${output.trim()}`)
 })
 
 check("oc-sync rejects an unknown flag", () => {
-  const result = spawnSync("bash", [path.join(BIN, "oc-sync"), "--bogus-flag"], { encoding: "utf8" })
+  const result = spawnSync("bash", [path.join(BIN, "oc-sync"), "--bogus-flag"], {
+    encoding: "utf8",
+    env: hermeticEnv(),
+  })
   assert(result.status === 2, `expected exit 2 for an unknown flag, got ${result.status}`)
+})
+
+// ---------------------------------------------------------------------------
+// The repo and the config dir are two trees
+//
+// The regression: this repo used to BE the opencode config dir, so
+// CONFIG_DIR defaulted to $REPO_DIR and every path in the sync set was a
+// repo path. They were split — the package lives in the repo, the personal
+// config (opencode.jsonc, AGENTS.md, commands/, rules/) lives beside it — and
+// plain `oc-sync --with-config` then died on `opencode.jsonc not found` while
+// `bin/oc` was synced from a directory that no longer had one.
+// ---------------------------------------------------------------------------
+
+const resolveConfigDir = (home) => execFileSync("bash", ["-c",
+  'eval "$(grep -E \'^CONFIG_DIR=\' "$1")"; printf "%s" "$CONFIG_DIR"', "_", path.join(BIN, "oc-sync"),
+], { encoding: "utf8", env: { ...process.env, HOME: home, OC_SYNC_CONFIG_DIR: undefined } })
+
+check("the config dir defaults to the personal config, not to the repo", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ocsync-cfgdir-"))
+  try {
+    const resolved = resolveConfigDir(home)
+    assert(resolved === path.join(home, ".config", "opencode"),
+      `CONFIG_DIR should resolve under $HOME/.config/opencode, got ${resolved}`)
+    assert(resolved !== REPO, `CONFIG_DIR must not default to the repo (${REPO})`)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+check("OC_SYNC_CONFIG_DIR still overrides the config dir", () => {
+  const out = execFileSync("bash", ["-c",
+    'eval "$(grep -E \'^CONFIG_DIR=\' "$1")"; printf "%s" "$CONFIG_DIR"', "_", path.join(BIN, "oc-sync"),
+  ], { encoding: "utf8", env: { ...process.env, OC_SYNC_CONFIG_DIR: "/tmp/somewhere-else" } })
+  assert(out === "/tmp/somewhere-else", `the override must win, got ${out}`)
+})
+
+check("every synced item is read from the tree that owns it", () => {
+  // Static, because the two trees do not exist together in CI. A path pointed
+  // at the wrong one is silent: rsync reports the failure, but only after the
+  // host has been reached and the earlier items have already landed.
+  const src = read("oc-sync")
+  const fromRepo = ['$REPO_DIR/bin/$SCRIPT', '$REPO_DIR/src/', '$REPO_DIR/presets/', '$REPO_DIR/plugins/']
+  const fromConfig = [
+    '$CONFIG_DIR/opencode.jsonc', '$CONFIG_DIR/AGENTS.md', '$CONFIG_DIR/$DIR',
+    '$CONFIG_DIR/.opencode/prompts', '$CONFIG_DIR/.opencode/prompts/',
+  ]
+  for (const needle of fromRepo) {
+    assert(src.includes(needle), `the repo owns this and it must be sourced there: ${needle}`)
+  }
+  for (const needle of fromConfig) {
+    assert(src.includes(needle), `the config dir owns this and it must be sourced there: ${needle}`)
+  }
+  // The inverse, which is how the regression presents: a package path read out
+  // of the config dir, where it does not exist.
+  for (const stale of ['$CONFIG_DIR/bin/', '$CONFIG_DIR/src', '$CONFIG_DIR/presets', '$CONFIG_DIR/plugins']) {
+    assert(!src.includes(stale), `nothing may be read out of the config dir that lives in the repo: ${stale}`)
+  }
+  // .opencode/ carries a package.json, a lockfile and tens of megabytes of
+  // node_modules in both trees, so only prompts/ may be pushed.
+  assert(!/push "\.opencode\/" /.test(src), "the whole .opencode/ must not be pushed, only .opencode/prompts/")
+})
+
+check("the host list still comes from .env, found in the config dir", () => {
+  // Same split, same class of bug: .env is host-specific, so it moved with the
+  // rest of the personal config. Pointed at the repo it finds nothing and the
+  // script falls through to the legacy ~/.oc-hosts list -- which still works,
+  // so the drift is invisible until the two disagree.
+  const home = mkdtempSync(path.join(tmpdir(), "ocsync-envfile-"))
+  try {
+    const script = path.join(home, "probe.sh")
+    mkdirSync(path.join(home, "repo", "bin"), { recursive: true })
+    writeFileSync(path.join(home, "repo", "bin", "oc-sync"), read("oc-sync"))
+    writeFileSync(script, 'REPO_DIR="$1"\n' +
+      read("oc-sync").split("\n").slice(
+        read("oc-sync").split("\n").findIndex((l) => l.startsWith("ENV_FILE_DEFAULT=")),
+        read("oc-sync").split("\n").findIndex((l) => l.startsWith("fi")) + 1,
+      ).join("\n") + '\nprintf "%s" "$ENV_FILE"\n')
+    // The config dir's .env exists, the repo's does not: the config dir wins.
+    mkdirSync(path.join(home, ".config", "opencode"), { recursive: true })
+    writeFileSync(path.join(home, ".config", "opencode", ".env"), "OC_HOSTS=\"\"\n")
+    const withConfig = execFileSync("bash", [script, path.join(home, "repo")], {
+      encoding: "utf8", env: { ...process.env, HOME: home, OC_SYNC_ENV_FILE: undefined },
+    })
+    assert(withConfig === path.join(home, ".config", "opencode", ".env"),
+      `expected the config dir's .env, got ${withConfig}`)
+    // With neither present, the repo path is still the fallback, so an older
+    // checkout that keeps .env beside the script is not silently ignored.
+    rmSync(path.join(home, ".config", "opencode", ".env"))
+    const fallback = execFileSync("bash", [script, path.join(home, "repo")], {
+      encoding: "utf8", env: { ...process.env, HOME: home, OC_SYNC_ENV_FILE: undefined },
+    })
+    assert(fallback === path.join(home, "repo", ".env"),
+      `expected the repo .env as the fallback, got ${fallback}`)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -469,7 +590,10 @@ check("dry run writes nothing and reports no failure", () => {
 })
 
 check("--help exits 0 and prints usage", () => {
-  const result = spawnSync("bash", [path.join(BIN, "oc-sync"), "--help"], { encoding: "utf8" })
+  const result = spawnSync("bash", [path.join(BIN, "oc-sync"), "--help"], {
+    encoding: "utf8",
+    env: hermeticEnv(),
+  })
   assert(result.status === 0, `--help exited ${result.status}`)
   assert(/--scripts-only/.test(result.stdout), "help should document the opt-out")
 })

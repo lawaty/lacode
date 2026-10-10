@@ -1,13 +1,30 @@
 #!/usr/bin/env bash
-# oc-sync — distribute the `oc` helper AND the whole opencode config to the
+# oc-sync — distribute the `oc` helper AND the whole opencode setup to the
 # remote hosts listed in .env.
+#
+# This repo is no longer the opencode config dir. The package lives here
+# ($REPO_DIR, normally ~/Projects/lacode); the personal opencode config lives in
+# $HOME/.config/opencode. So each item in the sync set is sourced from whichever
+# of the two actually owns it:
+#
+#   from CONFIG_DIR  opencode.jsonc, AGENTS.md, commands/, rules/, .opencode/prompts/
+#   from REPO_DIR    bin/oc, bin/oc-notify, src/, presets/, plugins/
+#
+# Get this wrong and the sync is silently wrong in one of two directions: a path
+# pointed at the repo silently transfers nothing (rsync's exit status is checked,
+# so it fails loudly), while a path pointed at the config dir pushes the config
+# dir's 63 MB of .opencode/node_modules to every host. When CONFIG_DIR still
+# defaulted to REPO_DIR this script died at "opencode.jsonc not found" the moment
+# the two trees were split.
 #
 # Usage:
 # The DEFAULT is --with-config. Syncing only `oc` leaves every host running the
 # old global AGENTS.md, so agents there skip the .opencode/context map while the
 # local machine enforces it -- the drift that shipped a fix nobody received.
+# AGENTS.md comes from CONFIG_DIR now, but it is still the file that must reach
+# the hosts, so the default has not changed.
 #
-#   bin/oc-sync                 sync `oc` AND the whole opencode config to every host
+#   bin/oc-sync                 sync `oc` AND the whole opencode setup to every host
 #   bin/oc-sync --scripts-only  sync only `oc`, skipping the config
 #   bin/oc-sync --no-config     alias for --scripts-only
 #   bin/oc-sync --with-auth     also copy MISSING provider credentials into each host's
@@ -53,7 +70,18 @@ REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 # be set there instead of exported by the caller. Sourced before the defaults
 # below, so .env wins when both are present; with no .env, exported variables
 # work on their own.
-ENV_FILE="${OC_SYNC_ENV_FILE:-$REPO_DIR/.env}"
+#
+# .env is host-specific configuration, so it lives in the CONFIG dir with the
+# rest of it and NOT in this repo -- which it did, until the two were split, at
+# which point this default silently found nothing and the script fell through to
+# the legacy ~/.oc-hosts list: a stale host list that still "worked", which is
+# the exact kind of quiet drift this script exists to prevent. First existing
+# wins, so a repo-local .env (older checkout, another tool) is still honoured
+# rather than dropped on the floor; the fallback order only matters when both
+# exist, and CONFIG_DIR is the one that is supposed to be authoritative.
+ENV_FILE_DEFAULT="$HOME/.config/opencode/.env"
+[[ -f "$ENV_FILE_DEFAULT" ]] || ENV_FILE_DEFAULT="$REPO_DIR/.env"
+ENV_FILE="${OC_SYNC_ENV_FILE:-$ENV_FILE_DEFAULT}"
 if [[ -f "$ENV_FILE" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -63,7 +91,12 @@ fi
 
 HOSTS_FILE="${OC_HOSTS_FILE:-$HOME/.oc-hosts}"
 OC_SCRIPT="${OC_SCRIPT:-$SCRIPT_DIR/oc}"
-CONFIG_DIR="${OC_SYNC_CONFIG_DIR:-$REPO_DIR}"
+# The opencode CONFIG dir, which is NOT this repo. The repo used to be both, so
+# this defaulted to $REPO_DIR; after the split that pointed at a tree with no
+# opencode.jsonc in it and every --with-config run died on the guard below.
+# Override stays: OC_SYNC_CONFIG_DIR, for a config somewhere other than the
+# default (a second setup, or a test's temp HOME).
+CONFIG_DIR="${OC_SYNC_CONFIG_DIR:-$HOME/.config/opencode}"
 LOCAL_USER="${OC_LOCAL_USER:-$(whoami)}"
 SSH_TIMEOUT="${OC_SYNC_SSH_TIMEOUT:-90}"
 RSYNC_TIMEOUT="${OC_SYNC_RSYNC_TIMEOUT:-120}"
@@ -416,7 +449,11 @@ drop_config_remoteforward
 
 [[ -f "$OC_SCRIPT" ]] || { echo "Error: $OC_SCRIPT not found (set OC_SCRIPT to the oc helper)." >&2; exit 1; }
 if [[ $WITH_CONFIG -eq 1 && ! -f "$CONFIG_DIR/opencode.jsonc" ]]; then
+  # Naming both the path and the override: this guard fires on a wrong
+  # OC_SYNC_CONFIG_DIR and on a stale symlink, and the two are fixed differently.
   echo "Error: $CONFIG_DIR/opencode.jsonc not found; cannot sync config." >&2
+  echo "  CONFIG_DIR is the opencode config dir ($HOME/.config/opencode by default)." >&2
+  echo "  Set OC_SYNC_CONFIG_DIR to point at yours, or re-run with --scripts-only." >&2
   exit 1
 fi
 
@@ -712,12 +749,15 @@ for HOST in "${HOSTS[@]}"; do
     ok "[dry-run] would rsync oc, oc-notify -> ~/bin/"
     [[ $TUNNEL_AUTH_FAILED -eq 0 && -f "$TUNNEL_KEY" ]] && ok "[dry-run] would send tunnel key -> ~/.ssh/oc_notify"
   else
-    mkdir -p "$CONFIG_DIR/bin" 2>/dev/null
+    # `oc` and `oc-notify` are repo files: they ship in this package's bin/ and
+    # have never lived in the config dir. Pointing this at $CONFIG_DIR was only
+    # correct while one tree was both.
+    mkdir -p "$REPO_DIR/bin" 2>/dev/null
     for SCRIPT in oc oc-notify; do
-      [[ -f "$CONFIG_DIR/bin/$SCRIPT" ]] || continue
+      [[ -f "$REPO_DIR/bin/$SCRIPT" ]] || continue
       if rsync -az --no-owner --no-group \
             -e "ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes" \
-            "$CONFIG_DIR/bin/$SCRIPT" "${HOST}:~/bin/" >/dev/null 2>&1; then
+            "$REPO_DIR/bin/$SCRIPT" "${HOST}:~/bin/" >/dev/null 2>&1; then
         ok "$SCRIPT synced"
       else
         bad "rsync of $SCRIPT failed"
@@ -745,7 +785,7 @@ for HOST in "${HOSTS[@]}"; do
   if [[ $WITH_CONFIG -eq 1 ]]; then
     echo "  --- opencode config ---"
     if [[ $DRY_RUN -eq 1 ]]; then
-      ok "[dry-run] would rsync opencode.jsonc, src/, presets/, plugins/, .opencode/, AGENTS.md, commands/, rules/ (remote backed up first)"
+      ok "[dry-run] would rsync src/, presets/, plugins/ (from $REPO_DIR) and opencode.jsonc, AGENTS.md, commands/, rules/, .opencode/prompts/ (from $CONFIG_DIR) (remote backed up first)"
     else
       if timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" \
            "tar czf ~/opencode-config-backup-\$(date +%Y%m%d-%H%M%S).tar.gz --ignore-failed-read -C ~/.config/opencode opencode.jsonc presets src plugins .opencode AGENTS.md commands rules 2>/dev/null" >/dev/null 2>&1; then
@@ -755,30 +795,37 @@ for HOST in "${HOSTS[@]}"; do
         FAILED+=("$HOST")
         continue
       fi
+      # --- from REPO_DIR: the package itself ---------------------------------
       # src/ must land before plugins/: the plugins/ shims re-export ../src/, and
       # src/plugins/ imports ../lib/, so a plugins-first sync would leave the host
       # unable to resolve either and every hook dispatch dead until the next run.
-      if [[ -d "$CONFIG_DIR/src" ]]; then
+      if [[ -d "$REPO_DIR/src" ]]; then
         timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/src' >/dev/null 2>&1
-        push "src/" "$CONFIG_DIR/src/" "${HOST}:~/.config/opencode/src/" || continue
+        push "src/" "$REPO_DIR/src/" "${HOST}:~/.config/opencode/src/" || continue
       fi
-      push "opencode.jsonc" "$CONFIG_DIR/opencode.jsonc" "${HOST}:~/.config/opencode/" || continue
       # presets/free-tier.json decides which models the pool runs: src/lib/pool.ts
       # reads it through the resolution chain, so a host missing it silently falls
       # back to the built-in defaults instead of the intended models.
-      if [[ -d "$CONFIG_DIR/presets" ]]; then
+      if [[ -d "$REPO_DIR/presets" ]]; then
         timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/presets' >/dev/null 2>&1
-        push "presets/" "$CONFIG_DIR/presets/" "${HOST}:~/.config/opencode/presets/" || continue
+        push "presets/" "$REPO_DIR/presets/" "${HOST}:~/.config/opencode/presets/" || continue
       fi
-      if [[ -d "$CONFIG_DIR/plugins" ]]; then
+      if [[ -d "$REPO_DIR/plugins" ]]; then
         timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/plugins' >/dev/null 2>&1
-        push "plugins/" "$CONFIG_DIR/plugins/" "${HOST}:~/.config/opencode/plugins/" || continue
+        push "plugins/" "$REPO_DIR/plugins/" "${HOST}:~/.config/opencode/plugins/" || continue
       fi
+
+      # --- from CONFIG_DIR: this machine's opencode config -------------------
+      push "opencode.jsonc" "$CONFIG_DIR/opencode.jsonc" "${HOST}:~/.config/opencode/" || continue
       # AGENTS.md is the global instruction file opencode auto-loads into every
       # session, and commands/ + rules/ back it. Without these three a host runs
       # agents that were never told the .opencode/context map exists: one host
       # carried a 368-byte stub pointing at a rules file no config ever loaded,
       # another had no AGENTS.md at all. Both then reported skipping the map.
+      #
+      # None of the three is in this repo any more -- they moved to the config dir
+      # with the split -- but they are exactly as load-bearing on the hosts as they
+      # were, so they are sourced there and still shipped.
       if [[ -f "$CONFIG_DIR/AGENTS.md" ]]; then
         push "AGENTS.md" "$CONFIG_DIR/AGENTS.md" "${HOST}:~/.config/opencode/" || continue
       fi
@@ -788,15 +835,28 @@ for HOST in "${HOSTS[@]}"; do
           push "$DIR/" "$CONFIG_DIR/$DIR/" "${HOST}:~/.config/opencode/$DIR/" || continue
         fi
       done
-      if [[ -d "$CONFIG_DIR/.opencode" ]]; then
-        timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/.opencode' >/dev/null 2>&1
-        # .opencode/context/ is the derived map of whatever projects a host
-        # works on, so each host regenerates its own and it is never shipped.
-        push ".opencode/" "$CONFIG_DIR/.opencode/" "${HOST}:~/.config/opencode/.opencode/" \
-          --exclude='.opencode/context/' || continue
+      # .opencode/ narrows to prompts/ and is sourced from CONFIG_DIR. Two
+      # changes, both forced by the split:
+      #   * contents -- .opencode/ carries a package.json, a lockfile and a
+      #     63 MB node_modules in BOTH trees (the per-agent @opencode-ai/plugin
+      #     install). Syncing the directory wholesale pushed all of it; the one
+      #     file the hosts actually read is the prompt opencode.jsonc resolves
+      #     through {file:./.opencode/prompts/...}.
+      #   * source -- prompts exist in the config dir AND, tracked, in the repo.
+      #     The config dir wins because the host must match the machine that runs,
+      #     which is what this script exists to guarantee. The repo's copy is
+      #     version-controlled, so if the two drift the tracked one is the one to
+      #     update and re-copy; that duplication is a known open question, not
+      #     something to resolve by picking the other source here.
+      if [[ -d "$CONFIG_DIR/.opencode/prompts" ]]; then
+        timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/.opencode/prompts' >/dev/null 2>&1
+        push ".opencode/prompts/" "$CONFIG_DIR/.opencode/prompts/" "${HOST}:~/.config/opencode/.opencode/prompts/" || continue
       fi
-      # node_modules / package-lock.json / tests/ are intentionally not synced:
-      # each host keeps its own install and SDK version.
+      # .opencode/context/ is the derived map of whatever projects a host works
+      # on, so each host regenerates its own and it is never shipped -- which the
+      # narrowed path above now makes structural rather than an --exclude.
+      # node_modules / package-lock.json / tests/ / dist/ are intentionally not
+      # synced: each host keeps its own install and SDK version.
     fi
   fi
 
