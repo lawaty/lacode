@@ -125,6 +125,20 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given a slot names a paid model, When the pool loads, Then the slot is accepted and routed to without a free-tier filter rejecting it.
 - [ ] Given a model id contains a vendor prefix with slashes (e.g. `openrouter/nvidia/model:free`), When it is split into provider and model id, Then the split is on the first slash only and the id tail is preserved.
 - [ ] Given more slots are declared than the pool allows, When the pool loads, Then the surplus entries are dropped with a warning naming the cap.
+- [ ] Given a provider configured with **no** `whitelist` key, When the config hook binds a slot or a `deepModel` on that provider, Then no `whitelist` is written for it, because an absent whitelist already allows every model the provider offers.
+- [ ] Given a provider the pool never names a slot or a `deepModel` on, When the config hook runs, Then that provider entry is left exactly as it was, with no `whitelist` key added.
+- [ ] Given a provider that already carries a `whitelist`, When the config hook binds a slot model or a `deepModel` on it, Then the model id is appended and every entry the user wrote is preserved in order.
+- [ ] Given any provider after the config hook has run, When its whitelist is inspected, Then it is either absent or non-empty, because an empty allowlist names no model at all and opencode deletes the provider outright.
+
+`provider.<name>.whitelist` is an **allowlist**, not a to-do list: opencode
+deletes every model a provider offers that the whitelist does not name, and
+deletes the provider itself if nothing survives. An absent whitelist is the open
+form — everything is allowed. That makes writing one where the user had none the
+single most destructive thing the plugin could do, since a list holding only the
+pool's models silently deletes everything else they run there. So appending is
+correct exactly when a whitelist exists (it is a real restriction, and the pool
+models would otherwise resolve to nothing) and is not merely unnecessary when one
+does not.
 
 ---
 

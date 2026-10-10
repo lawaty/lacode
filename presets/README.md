@@ -110,10 +110,12 @@ the rest of your config:
 ```
 
 Whichever provider a slot names must be configured in your own opencode config,
-or the model cannot resolve. The pool adds the model id to that provider's
-`whitelist` automatically — without it opencode deletes the model from the
-provider and the agent silently resolves to nothing — but it cannot invent a
-provider.
+or the model cannot resolve. The pool appends the model id to that provider's
+`whitelist` if it has one — the whitelist is an allowlist, so opencode deletes
+the model from the provider without it and the agent silently resolves to
+nothing — but it cannot invent a provider, and it never writes a whitelist you
+did not already have: an absent one already allows every model the provider
+offers.
 
 Check what it did with the `pool_status` tool: it prints the resolved source,
 each slot with its weight and live load, and which slot the next spawn takes.

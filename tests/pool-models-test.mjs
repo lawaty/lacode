@@ -7,8 +7,10 @@
 //   1. the shipped file parses, and its slots are distinct models with valid weights
 //   2. the config hook rewrites every variant agent's model from the file, so the
 //      injected config can disagree and still lose
-//   3. a model absent from a provider whitelist is whitelisted automatically,
-//      since opencode deletes every model a provider offers that is not
+//   3. a model missing from a provider's existing whitelist is appended to it,
+//      since opencode deletes every model a provider offers that an allowlist
+//      does not name (and a provider with no whitelist is left alone: absent
+//      already means everything is allowed)
 //   4. a missing or broken file degrades to the built-in defaults with a warning
 //      instead of a pool that cannot route
 //   5. slot count is data, not code: three slots route 1,2,3 and the fourth agent
@@ -109,8 +111,10 @@ for (const base of BASES) {
   })
 }
 
-// 3. whitelisting is automatic: without it opencode deletes the model from the
-//    provider and the agent resolves to no model at all
+// 3. whitelisting is automatic on a provider that has one: without it opencode
+//    deletes the model from the provider and the agent resolves to no model at
+//    all. The fixture providers do carry whitelists, which is what makes this
+//    the append path rather than the leave-alone path the story suite covers.
 for (const slot of swapped) {
   const { provider, id } = pool.splitModel(slot.model)
   assert(a.cfg.provider[provider] !== undefined, `provider ${provider} must be configured in the fixture config`)

@@ -178,10 +178,12 @@ setup. Set `deepModel` to pin them:
 ```
 
 It is an option and not a literal in the package because which model to escalate
-onto is a property of your providers, not of LaCode. LaCode also adds the pinned
-model to that provider's whitelist for you: opencode drops any model a provider
-offers that is not whitelisted, so an unlisted pin would resolve to nothing at
-all. With `deepModel` unset, no model is written and the deep tiers use your
+onto is a property of your providers, not of LaCode. If you keep a `whitelist`
+on that provider, LaCode appends the pinned model to it for you: the whitelist is
+an allowlist, so opencode drops any model a provider offers that it does not
+name, and an unlisted pin would resolve to nothing at all. If you have no
+whitelist there, none is written — an absent one already allows every model. With
+`deepModel` unset, no model is written and the deep tiers use your
 default model — the behaviour of earlier versions.
 
 ### ⚠️ Per-agent tool grants must be in your own config

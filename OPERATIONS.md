@@ -91,7 +91,9 @@ of headroom.
 
 Do **not** add a `model` to a variant agent anywhere — they carry none on purpose. The
 plugin's config hook writes `<base>-<slot>` for `explore-fast`, `implement-fast` and
-`context-manager` from this file, and adds any missing provider whitelist entry. A
+`context-manager` from this file, and appends a slot's model id to a provider whitelist that
+already exists (it never writes one where you have none — an absent whitelist already allows
+every model). A
 `model` that reappears on a variant is stale: the plugin logs `still hard-codes …
 presets/free-tier.json wins` on every start. There is usually nothing to edit — the
 variants are injected, not declared — so a hit here means the config defines one itself,
@@ -102,7 +104,7 @@ tool-call capable — check with `curl -sS https://models.dev/api.json` or `open
 <provider>`. **Cost is never checked**: the loader validates shape only, and a paid or
 proprietary model is as valid as a free one. The bundled preset is built from free models
 because that is a good default, not because the pool requires it. What the pool *does*
-need is the provider: it can add a model id to a provider's `whitelist`, but it cannot
+need is the provider: it can append a model id to a provider's existing `whitelist`, but it cannot
 invent a provider, so an unconfigured one leaves the slot resolving to nothing. Then
 restart every opencode process and confirm what is actually live:
 

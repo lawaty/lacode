@@ -274,11 +274,22 @@ test("[US-15] the deep tiers are not left on the main model: deepModel pins them
   }
   assert.equal(pinnedCfg.agent["explore-fast"].model, undefined, "deepModel must not touch a pooled base")
 
-  // opencode drops every model a provider offers that is not whitelisted, so an
-  // un-whitelisted pin would resolve to nothing at all -- the same silent
-  // failure the pool already prevents for slot models.
-  assert.deepEqual(pinnedCfg.provider.example.whitelist, ["deep-tier"], "the pinned model must be whitelisted or it resolves to nothing")
+  // This provider has NO whitelist, which opencode already reads as "every model
+  // the provider offers is allowed". Writing one to hold a single id would turn
+  // it into an allowlist naming nothing else, so opencode would delete every
+  // other model the user runs there -- the pin is the plugin's business, their
+  // provider list is not.
+  assert.ok(!("whitelist" in pinnedCfg.provider.example), `an absent whitelist must stay absent, got ${JSON.stringify(pinnedCfg.provider.example)}`)
   await pinned.dispose()
+
+  // A provider the user HAS restricted still needs the pin listed: opencode drops
+  // every model an allowlist does not name, so without it the deep tiers resolve
+  // to nothing and silently fall back to the session's model.
+  const restricted = await LaCode(stub.input, { deepModel: "example/deep-tier" })
+  const restrictedCfg = { provider: { example: { whitelist: ["their-own"] } } }
+  await restricted.config(restrictedCfg)
+  assert.deepEqual(restrictedCfg.provider.example.whitelist, ["their-own", "deep-tier"], "an existing whitelist must gain the pin without losing its own entries")
+  await restricted.dispose()
 })
 
 test("[US-16] a deepModel never overwrites a deep tier the user defined themselves", async () => {

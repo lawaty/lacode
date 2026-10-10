@@ -174,9 +174,13 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
           s.models.set(name, slot.model)
         }
 
-        // opencode deletes every model a provider offers that is not whitelisted,
-        // so a slot whose model is missing from the whitelist silently resolves to
-        // no model at all. Add it instead of making the user edit a second file.
+        // A provider whitelist is an ALLOWLIST: opencode deletes every model a
+        // provider offers that the list does not name. So a whitelist the user
+        // wrote really is a restriction, and a slot whose model is missing from
+        // it silently resolves to no model at all -- append it rather than making
+        // the user edit a second file. An ABSENT whitelist already allows
+        // everything, and creating one here would delete every model of theirs the
+        // pool does not name, so an absent list stays absent.
         // Split on the first slash only: some providers (openrouter) put a vendor
         // segment in the model id itself, e.g. openrouter/nvidia/nemotron-3-ultra:free.
         const slash = slot.model.indexOf("/")
@@ -187,18 +191,19 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
           await warnOnce(`provider ${provider} is not configured in opencode.jsonc; slot ${slot.index} (${slot.model}) cannot resolve`)
           continue
         }
-        const list = (entry.whitelist ??= [])
-        if (!list.includes(id)) {
+        const list = entry.whitelist
+        if (list && !list.includes(id)) {
           list.push(id)
           await log("info", `whitelisted ${id} on ${provider} (${s.origin} slot ${slot.index})`)
         }
       }
 
       // The deep tiers are unpooled, so nothing above whitelists the model the
-      // user pinned for them via `deepModel`. opencode drops every model a
-      // provider offers that is not whitelisted, so an un-whitelisted deep model
-      // resolves to NOTHING at all and the tier silently falls back -- the same
-      // silent failure the slot loop exists to prevent, one layer out.
+      // user pinned for them via `deepModel`. When the user HAS a whitelist on
+      // that provider, an unlisted deep model resolves to NOTHING at all and the
+      // tier silently falls back -- the same silent failure the slot loop exists
+      // to prevent, one layer out. An absent whitelist is left absent, for the
+      // same reason as above: it already resolves.
       const deepModel = typeof opts.deepModel === "string" ? opts.deepModel.trim() : ""
       const deepSlash = deepModel.indexOf("/")
       if (deepModel && deepSlash > 0) {
@@ -208,8 +213,8 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
         if (!entry) {
           await warnOnce(`deepModel ${deepModel} names provider ${provider}, which is not configured in opencode.jsonc; explore-deep and implement-deep cannot resolve it`)
         } else {
-          const list = (entry.whitelist ??= [])
-          if (!list.includes(id)) {
+          const list = entry.whitelist
+          if (list && !list.includes(id)) {
             list.push(id)
             await log("info", `whitelisted ${id} on ${provider} (deepModel)`)
           }

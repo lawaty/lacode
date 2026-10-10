@@ -37,6 +37,15 @@ const bootPool = async (slots, id, options = {}) => {
   return { stub, dir, hooks, cfg, models: slots.map((s) => s.model) }
 }
 
+/** Boot a pool over a config the test supplies, not one seeded from the models. */
+const bootConfig = async (slots, cfg, id, options = {}) => {
+  const stub = stubInput()
+  const dir = scratch()
+  const hooks = await bootLaCode(stub, { id, dir, models: { slots }, ...options })
+  await hooks.config(cfg)
+  return { stub, dir, hooks, cfg, models: slots.map((s) => s.model) }
+}
+
 /** Route `n` spawns concurrently and report the variant each one was sent to. */
 const burst = async (hooks, cfg, n, base = "explore-fast") => {
   const out = []
@@ -373,7 +382,17 @@ test("[US-6] the slot the next spawn would take is marked, including when it is 
 })
 
 // ---------------------------------------------------------------------------
-// US-7 — any model is a valid slot
+// US-7 — any model is a valid slot, and the pool restricts nothing of the
+// user's own.
+//
+// `provider.<name>.whitelist` is an ALLOWLIST in opencode, not a shopping list:
+// a model the whitelist does not name is deleted from the provider, and a
+// provider left with no models is deleted outright. An ABSENT whitelist is the
+// open form -- every model the provider offers survives. So the only correct
+// thing for the pool to do is append to a whitelist the user actually wrote and
+// otherwise keep its hands off, because writing one where there was none
+// silently deletes every model of theirs the pool does not name.
+//
 // ---------------------------------------------------------------------------
 
 test("[US-7] a paid model is accepted as a slot and routed to, with no free-tier filter", async () => {
@@ -437,5 +456,89 @@ test("[US-7] the shipped preset's slots are all routable and all whitelisted on 
     assert.ok(provider, `provider ${model.slice(0, slash)} must be configured`)
     assert.ok(provider.whitelist.includes(model.slice(slash + 1)), `${model} must be whitelisted, got ${JSON.stringify(provider.whitelist)}`)
   }
+  await hooks.dispose()
+})
+
+// The regression: the pool used to charge a missing whitelist as if it were an
+// empty one and create it anyway. A user who installed LaCode with an open
+// provider lost every non-pool model on every provider the pool touched, with
+// nothing in the config to show for it. Asserting "the pool models are present"
+// cannot see this bug -- the old code satisfied that too -- so every test here
+// asks about the KEY, not its contents.
+
+test("[US-7] a provider configured with no whitelist is left with none: creating one would delete every model the user runs on it", async () => {
+  const cfg = { provider: { someprovider: {} }, agent: {}, command: {} }
+  const { hooks } = await bootConfig([{ model: "someprovider/slot-model", weight: 1 }], cfg, "us7-open-provider")
+
+  const entry = cfg.provider.someprovider
+  assert.ok(!("whitelist" in entry), `an absent whitelist must stay absent, got ${JSON.stringify(entry)}`)
+  assert.equal(entry.whitelist, undefined, `nothing may stand in for the key either, got ${JSON.stringify(entry)}`)
+  // Not a failure mode: an absent whitelist is precisely what makes the slot
+  // resolvable, so the pool still works over the provider it did not restrict.
+  assert.equal(cfg.agent["explore-fast-1"].model, "someprovider/slot-model", "the slot must still bind over an open provider")
+  await hooks.dispose()
+})
+
+test("[US-7] a provider the pool does not route to is never given a whitelist either", async () => {
+  const cfg = { provider: { someprovider: {}, unrelated: {} }, agent: {}, command: {} }
+  const { hooks } = await bootConfig([{ model: "someprovider/slot-model", weight: 1 }], cfg, "us7-untouched")
+
+  assert.ok(!("whitelist" in cfg.provider.unrelated), `a provider the pool never names must be untouched, got ${JSON.stringify(cfg.provider.unrelated)}`)
+  assert.deepEqual(Object.keys(cfg.provider.unrelated), [], "and nothing else about it may change either")
+  assert.ok(!("whitelist" in cfg.provider.someprovider), `the pool's own provider stays open too, got ${JSON.stringify(cfg.provider.someprovider)}`)
+  await hooks.dispose()
+})
+
+test("[US-7] a whitelist the user did write is extended, never replaced: the slot models are appended and their entries kept", async () => {
+  // The other half of the contract. A whitelist the user wrote IS a restriction,
+  // and opencode deletes any model it does not name -- so the pool models have
+  // to go in or the slots resolve to nothing. Removal of the whole mutation
+  // would "fix" the open-provider bug by breaking this user instead.
+  const cfg = { provider: { someprovider: { whitelist: ["theirs", "and-theirs-too"] } }, agent: {}, command: {} }
+  const { hooks } = await bootConfig(
+    [
+      { model: "someprovider/slot-a", weight: 2 },
+      { model: "someprovider/slot-b", weight: 1 },
+    ],
+    cfg,
+    "us7-existing",
+  )
+
+  assert.deepEqual(
+    cfg.provider.someprovider.whitelist,
+    ["theirs", "and-theirs-too", "slot-a", "slot-b"],
+    `the user's entries must survive in order, got ${JSON.stringify(cfg.provider.someprovider.whitelist)}`,
+  )
+  await hooks.dispose()
+})
+
+test("[US-7] no provider is ever left holding an empty whitelist, which opencode reads as delete this provider", async () => {
+  // An empty allowlist matches no model at all, so opencode drops the provider
+  // whole. This is the invariant over every provider in the config, asserted
+  // from one boot that covers all four shapes at once: open, restricted, a
+  // deepModel provider, and one the pool never names.
+  const cfg = {
+    provider: {
+      opened: {},
+      restricted: { whitelist: ["theirs"] },
+      deep: {},
+      unrelated: {},
+    },
+    agent: {},
+    command: {},
+  }
+  const { hooks } = await bootConfig([{ model: "opened/slot-model", weight: 1 }], cfg, "us7-no-empty", { deepModel: "deep/deep-tier" })
+
+  for (const [name, entry] of Object.entries(cfg.provider)) {
+    assert.ok(entry.whitelist === undefined || entry.whitelist.length > 0, `provider ${name} must not end up with an empty whitelist: ${JSON.stringify(entry)}`)
+  }
+  // And every provider ends up exactly as its shape dictates: the restricted one
+  // is never named by a slot, so it is not touched; the slot's own provider and
+  // the deepModel's stay open, and both models still bind.
+  assert.deepEqual(cfg.provider.restricted.whitelist, ["theirs"], "a whitelist on an untouched provider must be left alone")
+  assert.ok(!("whitelist" in cfg.provider.opened), `the slot's own provider stays open, got ${JSON.stringify(cfg.provider.opened)}`)
+  assert.equal(cfg.agent["explore-fast-1"].model, "opened/slot-model")
+  assert.equal(cfg.agent["explore-deep"].model, "deep/deep-tier", "the deep pin still binds")
+  assert.ok(!("whitelist" in cfg.provider.deep), `the deepModel provider stays open too, got ${JSON.stringify(cfg.provider.deep)}`)
   await hooks.dispose()
 })
