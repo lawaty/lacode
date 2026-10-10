@@ -91,21 +91,6 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
 
   pool.init(s, (m) => void warnOnce(m))
 
-  // Cost advisory (US-23). The pool is for MECHANICAL work — reading, grepping,
-  // mechanical edits, cartography — because that is what keeps those tokens off
-  // the expensive main model. A slot priced above zero in the pinned snapshot
-  // is therefore usually paying more than it saves. It is only a heads-up: the
-  // pool accepts any model list by design (US-7), so a user who has priced a
-  // model in on purpose is never blocked, second-guessed twice, or warned about
-  // a model this snapshot cannot price at all.
-  for (const model of pool.costAdvisory(pool.ensureSlots(s, (m) => void warnOnce(m)))) {
-    await warnOnce(
-      `pool slot model ${model} is priced above zero in the pinned snapshot; the pool is for mechanical work, `
-        + `where a free model usually costs less than it saves. Nothing is blocked — this is a heads-up. `
-        + `To go back to free models, edit presets/free-tier.json or ~/.config/lacode/pool.json.`,
-    )
-  }
-
   const abortSession = async (sessionID: string) => {
     if (!serverUrl) return false
     try {

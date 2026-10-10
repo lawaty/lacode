@@ -685,12 +685,9 @@ missing). Never paste context file contents into the report.`,
       "glob": "deny",
       "grep": "deny",
       "list": "deny",
+      // No "write" key appears in any permission block below: opencode folds the
+      // write and apply_patch tools onto "edit", so a "write" rule is never read.
       "edit": {
-        "*": "allow",
-        "*/.opencode/context/**": "deny",
-        ".opencode/context/**": "deny"
-      },
-      "write": {
         "*": "allow",
         "*/.opencode/context/**": "deny",
         ".opencode/context/**": "deny"
@@ -765,7 +762,6 @@ Once the plan is complete, present it clearly so the caller can implement it ste
         "*/.opencode/plans/*.md": "allow",
         "../../.local/share/opencode/plans/*.md": "allow"
       },
-      "write": "deny",
       "bash": "deny",
       "webfetch": "deny",
       "websearch": "deny",
@@ -856,7 +852,6 @@ You may only escalate to @explore-deep. Do not attempt to call @implement-fast,
       "grep": "allow",
       "list": "allow",
       "edit": "deny",
-      "write": "deny",
       "bash": "allow",
       "webfetch": "allow",
       "websearch": "allow",
@@ -931,7 +926,6 @@ or any other agent.`,
       "grep": "allow",
       "list": "allow",
       "edit": "deny",
-      "write": "deny",
       "bash": "allow",
       "webfetch": "allow",
       "websearch": "allow",
@@ -1019,11 +1013,6 @@ you escalate so @implement-deep can decide whether to explore first.`,
         "*/.opencode/context/**": "deny",
         ".opencode/context/**": "deny"
       },
-      "write": {
-        "*": "allow",
-        "*/.opencode/context/**": "deny",
-        ".opencode/context/**": "deny"
-      },
       "bash": "allow",
       "webfetch": "allow",
       "websearch": "allow",
@@ -1098,11 +1087,6 @@ trying to explore yourself.`,
       "grep": "allow",
       "list": "allow",
       "edit": {
-        "*": "allow",
-        "*/.opencode/context/**": "deny",
-        ".opencode/context/**": "deny"
-      },
-      "write": {
         "*": "allow",
         "*/.opencode/context/**": "deny",
         ".opencode/context/**": "deny"
@@ -1322,11 +1306,6 @@ Finish with a short report:
       "grep": "allow",
       "list": "allow",
       "edit": {
-        "*": "deny",
-        "*/.opencode/context/**": "allow",
-        ".opencode/context/**": "allow"
-      },
-      "write": {
         "*": "deny",
         "*/.opencode/context/**": "allow",
         ".opencode/context/**": "allow"

@@ -3,7 +3,7 @@
 // stale snapshot behind (pool-test.mjs fails on any slot the snapshot has never
 // seen). Run after editing presets/free-tier.json:
 //
-//   node ~/.config/opencode/tests/refresh-models-snapshot.mjs
+//   node tests/refresh-models-snapshot.mjs
 //
 // The snapshot is the record of what each model cost and whether it can call
 // tools at the moment it was picked; pool-test.mjs asserts against it rather than

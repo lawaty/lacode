@@ -66,19 +66,21 @@ spawn recorded in `claims.<pid>.json`. A *context map* is the five-file
 - [ ] Given a slot's model is free, When the benchmark prices it, Then its cost is 0 rather than unknown or omitted.
 - [ ] Given the benchmark runs with no network access, When it cannot reach a pricing source, Then it fails loudly instead of reporting 0 cost for a paid model.
 
-### US-23: Pool models are for mechanical work, so free is the policy
-**As a** user, **I want** the shipped pool to be free models doing mechanical work, **so that** the tokens I am actually trying to save — the main model's — are not spent on reading files.
+### US-23: The pool takes any model; free is the shipped default, not an enforced rule
+**As a** user, **I want** the pool to accept whatever models I give it and only default to free ones, **so that** I keep full control of what the pool runs on instead of being second-guessed about it.
 
 **Story ID(s) for tests:** US-23
 
-This is the policy behind US-1 and it does not contradict US-7. The pool exists to take **mechanical** work — reading, searching, mechanical edits, cartography — off the main model, so the shipped slots are free. Free is the default and the documented policy; **supplying a paid model remains a supported, deliberate override**, which is why nothing here rejects one. The reconciliation is that acceptance and endorsement are different claims: the pool accepts anything, and the preset states what it is for.
+This is the policy behind US-1 and it does not contradict US-7. The pool exists to take **mechanical** work — reading, searching, mechanical edits, cartography — off the main model, so the bundled preset ships free models: that is what those tokens cost when you have not said otherwise. It is a **default, not a restriction**. LaCode holds no opinion about which models a user may run: no whitelist, no filter, no per-model rule beyond the structural `provider/model-id` shape a slot must have to be addressable at all. There is no cost advisory either — a plugin that guesses what a model costs from a pinned snapshot it does not ship would be advisory theatre, so the shipped default is expressed once, in `presets/free-tier.json`, where a user reads it and edits it.
+
+The reconciliation with US-7 is that **acceptance and endorsement are different claims**: the pool accepts anything, and the preset states what it is for.
 
 **Acceptance criteria:**
 - [ ] Given the bundled preset, When its slots are priced against the pinned models.dev snapshot, Then every slot is free or very cheap, and any slot the snapshot cannot price is named as unknown rather than assumed to be free.
-- [ ] Given a configured slot model the pinned snapshot prices above zero, When the plugin boots, Then it warns once, says that a priced model in a pool for mechanical work likely costs more than it saves, and names the model — and the warning never appears twice.
-- [ ] Given a configured slot model the snapshot has no price for, When the plugin boots, Then it says nothing, because an unknown price is not evidence of an expensive one and this project refuses to guess prices.
-- [ ] Given the price snapshot is absent entirely, When the advisory runs, Then it is a no-op rather than an error, and plugin startup is unaffected.
-- [ ] Given a priced model is configured in the pool, When a spawn is routed, Then it is routed to that model exactly as before: the advisory reports and never blocks, because rejecting it would break US-7.
+- [ ] Given a pool configured with any arbitrary `provider/model-id` string — a paid one, an exotic one, an invented one — When the plugin boots and a spawn is routed, Then the model binds verbatim and runs, with no warning about it, no rejection of it, and no special-casing of it.
+- [ ] Given the shipped preset, When a user reads it, Then it says the pool is for mechanical work, and says they MAY substitute their own list via `~/.config/lacode/pool.json`, so the free default never reads as a prohibition.
+- [ ] Given no price information exists for a configured model, When the plugin boots, Then it is silent: the pool does not inspect, fetch, or infer prices at all, because a default is expressed in the preset and not enforced at runtime.
+- [ ] Given a paid or exotic model is configured in the pool, When a spawn is routed, Then it is routed to that model exactly as any other slot would be, because rejecting it would break US-7.
 
 ---
 

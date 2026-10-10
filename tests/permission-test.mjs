@@ -14,7 +14,7 @@
 // opencode evaluates a file permission against the path RELATIVE TO THE PROJECT ROOT.
 // Handing the write tool /repo/.opencode/context/architecture.md is logged and evaluated
 // as ".opencode/context/architecture.md". Patterns compile to anchored regexes (* -> .*)
-// and the longest match wins, so:
+// and the LAST match wins, so:
 //
 //   ".opencode/context/**"    fires for a normally-rooted project, but not when the
 //                             project root is "/" (where the form is home/.../...)
@@ -23,29 +23,35 @@
 // Both forms are therefore required. These tests pin the detector that turns this class
 // of bug into a startup error instead of a silently stale map.
 //
-// Run: node ~/.config/opencode/tests/permission-test.mjs
+// Run: node tests/permission-test.mjs   (from anywhere: the repo root is derived
+// from this file's own location, not from a hardcoded path)
 import { strict as assert } from "node:assert"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { verifyWriterRule } from "../src/lib/writer-rule.ts"
 
 const REL = '".opencode/context/**":"allow"'
 const ABS = '"*/.opencode/context/**":"allow"'
-// This repo, and this repo as seen from a project root of "/". Derived from the
-// running user's home rather than hardcoded, so the fixtures are not pinned to
-// one machine's username.
+// The detector must track the real opencode.jsonc, not a fixture. Derived from this
+// file's own location so the suite survives the repo moving on disk.
+const live = join(dirname(fileURLToPath(import.meta.url)), "..", "opencode.jsonc")
+// This repo, and this repo as seen from a project root of "/". Derived from this
+// file's own location so the suite survives the repo moving on disk, and from the
+// running user's home rather than hardcoded, so the fixtures are not pinned to one
+// machine's username either.
 const HOME = homedir()
-const REPO = `${HOME}/.config/opencode`
+const REPO = dirname(dirname(fileURLToPath(import.meta.url)))
 const REPO_MAP = `${REPO}/.opencode/context`
 
 const dir = mkdtempSync(join(tmpdir(), "pool-perm-"))
+// Fixtures declare only `edit`, the way LaCode now emits them: opencode folds
+// "write" and "apply_patch" onto "edit", so a `write` key is never read and
+// declaring one here would assert a rule opencode would ignore.
 const config = (rules) => {
   const file = join(dir, "opencode.jsonc")
-  writeFileSync(
-    file,
-    `{"agent":{"context-manager-1":{"permission":{"edit":{"*":"deny",${rules}},"write":{"*":"deny",${rules}}}}}}`,
-  )
+  writeFileSync(file, `{"agent":{"context-manager-1":{"permission":{"edit":{"*":"deny",${rules}}}}}}`)
   return file
 }
 
@@ -102,9 +108,32 @@ try {
   assert.equal(verifyWriterRule(config(ABS), REPO_MAP), undefined)
   ok("absolute check still used when no project root is supplied")
 
+  // The live config must declare `edit` and only `edit`. opencode's tool-permission
+  // lookup folds "write" and "apply_patch" onto "edit", so a `write` key is never read:
+  // it is not a weaker spelling of the rule, it is no spelling at all. Asserting the
+  // absence is what stops the dead key from creeping back as decoration.
+  const liveRaw = readFileSync(live, "utf8")
+  assert.ok(/"write"\s*:/.test(liveRaw) === false, "opencode.jsonc must not declare a `write` permission key")
+  ok("live opencode.jsonc declares no `write` permission key")
+
+  // A `write` block cannot rescue a broken `edit` grant, because nothing reads it.
+  // The allow rule below names the map and sits in the `write` block; the `edit` block
+  // holds only an unrelated allow. Reading `write` here would report the map writable
+  // and re-introduce exactly the silent-stale-map bug this suite exists to catch.
+  const writeOnly = join(dir, "write-only.jsonc")
+  writeFileSync(
+    writeOnly,
+    `{"agent":{"context-manager-1":{"permission":{`
+      + `"edit":{"*":"deny","src/*.ts":"allow"},`
+      + `"write":{"*":"deny",${REL},${ABS}}}}}}`,
+  )
+  const rescued = verifyWriterRule(writeOnly, REPO_MAP, REPO)
+  assert.ok(rescued, "a matching `write` rule must NOT rescue a broken `edit` grant")
+  assert.match(rescued, /not writable/, "it must be reported as the map not being writable")
+  ok("a write-only grant does not satisfy the writer rule (edit is the only key read)")
+
   // The detector must track the real opencode.jsonc, not a fixture. If the live config
   // ever drops either form, this fails on the spot.
-  const live = new URL("../opencode.jsonc", import.meta.url).pathname
   for (const [root, map] of [
     [REPO, REPO_MAP],
     ["/", `${HOME}/.opencode/context`],

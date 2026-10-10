@@ -1,7 +1,7 @@
 // Hang-reaping tests: a stuck subagent is detected from silence, its child
 // session is aborted, the slot is freed, and the model is cooled. Also proves
 // the reaper never kills a task that is still producing output.
-// Run: node ~/.config/opencode/tests/pool-hang-test.mjs
+// Run: node tests/pool-hang-test.mjs
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"

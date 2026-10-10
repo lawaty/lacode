@@ -1,6 +1,6 @@
 // Limit-awareness tests for the agent-pool plugin: strike recording, cooldown
 // routing, stuck-claim recovery, catalog gating, and shared cross-process
-// state. Run with: node ~/.config/opencode/tests/pool-limits-test.mjs
+// state. Run with: node tests/pool-limits-test.mjs
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"

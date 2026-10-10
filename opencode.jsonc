@@ -21,11 +21,6 @@
           "*/.opencode/context/**": "deny",
           ".opencode/context/**": "deny"
         },
-        "write": {
-          "*": "allow",
-          "*/.opencode/context/**": "deny",
-          ".opencode/context/**": "deny"
-        },
         "bash": "allow",
         "webfetch": "deny",
         "websearch": "deny",
@@ -53,7 +48,6 @@
           "*/.opencode/plans/*.md": "allow",
           "../../.local/share/opencode/plans/*.md": "allow"
         },
-        "write": "deny",
         "bash": "deny",
         "webfetch": "deny",
         "websearch": "deny",
@@ -77,7 +71,6 @@
         "grep": "deny",
         "list": "deny",
         "edit": "deny",
-        "write": "deny",
         "bash": "deny",
         "webfetch": "deny",
         "websearch": "deny",
@@ -101,7 +94,6 @@
         "grep": "deny",
         "list": "deny",
         "edit": "deny",
-        "write": "deny",
         "bash": "deny",
         "webfetch": "deny",
         "websearch": "deny",
@@ -130,7 +122,6 @@
         "grep": "allow",
         "list": "allow",
         "edit": "deny",
-        "write": "deny",
         "bash": "allow",
         "webfetch": "allow",
         "websearch": "allow",
@@ -156,7 +147,6 @@
         "grep": "allow",
         "list": "allow",
         "edit": "deny",
-        "write": "deny",
         "bash": "allow",
         "webfetch": "allow",
         "websearch": "allow",
@@ -182,7 +172,6 @@
         "grep": "allow",
         "list": "allow",
         "edit": "deny",
-        "write": "deny",
         "bash": "allow",
         "webfetch": "allow",
         "websearch": "allow",
@@ -208,7 +197,6 @@
         "grep": "allow",
         "list": "allow",
         "edit": "deny",
-        "write": "deny",
         "bash": "allow",
         "webfetch": "allow",
         "websearch": "allow",
@@ -234,7 +222,6 @@
         "grep": "allow",
         "list": "allow",
         "edit": "deny",
-        "write": "deny",
         "bash": "allow",
         "webfetch": "allow",
         "websearch": "allow",
@@ -260,7 +247,6 @@
         "grep": "allow",
         "list": "allow",
         "edit": "deny",
-        "write": "deny",
         "bash": "allow",
         "webfetch": "allow",
         "websearch": "allow",
@@ -285,11 +271,6 @@
         "grep": "allow",
         "list": "allow",
         "edit": {
-          "*": "allow",
-          "*/.opencode/context/**": "deny",
-          ".opencode/context/**": "deny"
-        },
-        "write": {
           "*": "allow",
           "*/.opencode/context/**": "deny",
           ".opencode/context/**": "deny"
@@ -323,11 +304,6 @@
           "*/.opencode/context/**": "deny",
           ".opencode/context/**": "deny"
         },
-        "write": {
-          "*": "allow",
-          "*/.opencode/context/**": "deny",
-          ".opencode/context/**": "deny"
-        },
         "bash": "allow",
         "webfetch": "allow",
         "websearch": "allow",
@@ -349,11 +325,6 @@
         "grep": "allow",
         "list": "allow",
         "edit": {
-          "*": "deny",
-          "*/.opencode/context/**": "allow",
-          ".opencode/context/**": "allow"
-        },
-        "write": {
           "*": "deny",
           "*/.opencode/context/**": "allow",
           ".opencode/context/**": "allow"
@@ -422,11 +393,6 @@
           "*/.opencode/context/**": "deny",
           ".opencode/context/**": "deny"
         },
-        "write": {
-          "*": "allow",
-          "*/.opencode/context/**": "deny",
-          ".opencode/context/**": "deny"
-        },
         "bash": "allow",
         "webfetch": "allow",
         "websearch": "allow",
@@ -452,11 +418,6 @@
         "grep": "allow",
         "list": "allow",
         "edit": {
-          "*": "allow",
-          "*/.opencode/context/**": "deny",
-          ".opencode/context/**": "deny"
-        },
-        "write": {
           "*": "allow",
           "*/.opencode/context/**": "deny",
           ".opencode/context/**": "deny"
@@ -490,11 +451,6 @@
           "*/.opencode/context/**": "deny",
           ".opencode/context/**": "deny"
         },
-        "write": {
-          "*": "allow",
-          "*/.opencode/context/**": "deny",
-          ".opencode/context/**": "deny"
-        },
         "bash": "allow",
         "webfetch": "allow",
         "websearch": "allow",
@@ -524,11 +480,6 @@
           "*/.opencode/context/**": "deny",
           ".opencode/context/**": "deny"
         },
-        "write": {
-          "*": "allow",
-          "*/.opencode/context/**": "deny",
-          ".opencode/context/**": "deny"
-        },
         "bash": "allow",
         "webfetch": "allow",
         "websearch": "allow",
@@ -551,11 +502,6 @@
         "grep": "allow",
         "list": "allow",
         "edit": {
-          "*": "deny",
-          "*/.opencode/context/**": "allow",
-          ".opencode/context/**": "allow"
-        },
-        "write": {
           "*": "deny",
           "*/.opencode/context/**": "allow",
           ".opencode/context/**": "allow"
@@ -621,11 +567,6 @@
           "*/.opencode/context/**": "allow",
           ".opencode/context/**": "allow"
         },
-        "write": {
-          "*": "deny",
-          "*/.opencode/context/**": "allow",
-          ".opencode/context/**": "allow"
-        },
         "bash": {
           "*": "deny",
           "ls": "allow",
@@ -687,11 +628,6 @@
           "*/.opencode/context/**": "allow",
           ".opencode/context/**": "allow"
         },
-        "write": {
-          "*": "deny",
-          "*/.opencode/context/**": "allow",
-          ".opencode/context/**": "allow"
-        },
         "bash": {
           "*": "deny",
           "ls": "allow",
@@ -749,11 +685,6 @@
         "grep": "allow",
         "list": "allow",
         "edit": {
-          "*": "deny",
-          "*/.opencode/context/**": "allow",
-          ".opencode/context/**": "allow"
-        },
-        "write": {
           "*": "deny",
           "*/.opencode/context/**": "allow",
           ".opencode/context/**": "allow"

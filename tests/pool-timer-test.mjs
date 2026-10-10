@@ -3,7 +3,7 @@
 // (observed: 18 minutes, slot held). Also covers the provider-wide free_tier_limit
 // signal opencode reports itself, and the AI_APICallError limit-detection case that
 // pool-limits-test.mjs owns.
-// Run: node ~/.config/opencode/tests/pool-timer-test.mjs
+// Run: node tests/pool-timer-test.mjs
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"

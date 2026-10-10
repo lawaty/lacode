@@ -81,9 +81,9 @@ logs one warning; nothing here throws into opencode. Nothing hot-reloads —
 change a preset, then restart every opencode process.
 
 **Any model list is accepted, including paid ones** (US-7). There is no free-tier
-allowlist anywhere in the package; only the structure is validated. The bundled
-preset happens to be built from free models because that is a sensible default,
-not because the pool requires it.
+allowlist anywhere in the package, and no cost check of any kind: only the
+structure is validated. The bundled preset is built from free models because
+that is a sensible default, not because the pool requires it.
 
 **Installation merges, it does not clobber** (US-16). An agent, command or
 instruction is added only when that key is absent from your config. A
@@ -158,12 +158,12 @@ because pulling a difficult conclusion back through a subagent costs more
 context on the far side than reading the file directly would have.
 
 That scoping is why the bundled preset is free: pooled work is work you would
-not have wanted the main model to do anyway. **Free is the shipped default and
-the documented policy — accepting any model list is a deliberate override, not
-a supported alternative to it.** Nothing rejects a priced model, because a
-user may have priced one in on purpose (US-7), but when the pinned snapshot can
-price a slot the plugin says so once at startup, and it never says so about a
-model it cannot price, because this project does not guess prices.
+not have wanted the main model to do anyway. **Free is the shipped default, not
+an enforced restriction.** The pool is open — it accepts any model you give it,
+free, cheap or expensive, and never inspects, prices, warns about, filters or
+rewrites one. The only per-model rule is structural: a slot must be written
+`provider/model-id` so it is addressable at all. That default lives in exactly one
+place, `presets/free-tier.json`, where you can read it and change it (US-7, US-23).
 
 Agents start from the maintained context map above rather than exploring cold, so
 the structure of your codebase is written down once instead of re-derived on

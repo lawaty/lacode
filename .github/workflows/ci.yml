@@ -77,6 +77,8 @@ jobs:
       - name: Assert the published file list excludes tests, the runbook, and secrets
         # `files` in package.json is the only thing standing between the repo and
         # a published tarball, so it is checked mechanically instead of trusted.
+        # Every name below is a path that EXISTS in the repo but is deliberately
+        # not shipped — a name that no longer exists would assert nothing.
         run: |
           npm pack --dry-run --json > pack.json
           node -e '
@@ -87,7 +89,11 @@ jobs:
               f === "OPERATIONS.md" ||
               /(^|\/)\.env/.test(f) ||
               f.startsWith("opencode.jsonc") ||
-              f.startsWith("pool-models.json");
+              // the working tree only: root plugin shims, the author's prompts,
+              // and every bin/ script except the one CLI that IS shipped
+              f.startsWith("plugins/") ||
+              f.startsWith(".opencode/") ||
+              (f.startsWith("bin/") && f !== "bin/lacode");
             const bad = files.filter(forbidden);
             if (bad.length > 0) {
               console.error("these files must never be published:\n  " + bad.join("\n  "));

@@ -381,7 +381,7 @@ for (const [name, def] of Object.entries(rawCfg.agent)) {
 //     what each model cost when it was picked, and a model missing from it has not
 //     been checked at all. Regenerate with the helper, which reads the current
 //     presets/free-tier.json so nothing has to be listed twice:
-//       node ~/.config/opencode/tests/refresh-models-snapshot.mjs
+//       node tests/refresh-models-snapshot.mjs
 assert(existsSync(SNAPSHOT), `missing ${SNAPSHOT}; run: node tests/refresh-models-snapshot.mjs`)
 const snapshot = JSON.parse(readFileSync(SNAPSHOT, "utf8"))
 for (const model of SLOT_MODELS) {

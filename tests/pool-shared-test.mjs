@@ -2,7 +2,7 @@
 // implement-fast and context-manager compete for the same four models, so a
 // busy agent type cannot protect its own capacity. Also checks that the
 // context-autoupdate plugin borrows a slot correctly.
-// Run: node ~/.config/opencode/tests/pool-shared-test.mjs
+// Run: node tests/pool-shared-test.mjs
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"

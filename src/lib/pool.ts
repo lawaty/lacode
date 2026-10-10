@@ -104,61 +104,6 @@ export const DEFAULT_PRESET = join(PRESETS_DIR, "free-tier.json")
 export const USER_CONFIG_DIR = join(homedir(), ".config", "lacode")
 export const USER_MODELS_PATH = join(USER_CONFIG_DIR, "pool.json")
 
-/**
- * The pinned models.dev price snapshot.
- *
- * It lives under `tests/`, which is NOT in package.json `files`, so an installed
- * package has no snapshot at all. That is deliberate rather than an oversight: the
- * cost advisory below is a courtesy about the model's own price, and a package
- * that ships prices would be shipping data that goes stale silently. Absent
- * snapshot means the advisory has nothing to say and says nothing (US-23).
- */
-export const COST_SNAPSHOT = join(PACKAGE_ROOT, "tests", "models-snapshot.json")
-
-/**
- * Slot models that the pinned snapshot prices above zero (US-23).
- *
- * This is an ADVISORY and never a filter. The pool accepts any model list,
- * including paid ones, because a paid slot is a deliberate override a user may
- * have reasons for that this function cannot see (US-7). Nothing here rejects,
- * drops, or rewrites a slot; it only reports what the pinned prices say.
- *
- * Three cases, and the third is the important one:
- *   * priced above zero -> reported, because the pool exists to move MECHANICAL
- *     work (reading, grepping, mechanical edits, cartography) off the expensive
- *     main model, and paying per token for that work usually costs more than it
- *     saves.
- *   * priced at zero      -> silent. That is the shipped policy working.
- *   * not in the snapshot -> SILENT. The project refuses to guess prices (see
- *     docs/BENCHMARKS.md), so a model it cannot price is a model it has no
- *     opinion about. Warning on missing data would train the user to ignore the
- *     warning that means something.
- *
- * Returns an empty list — not an error — when the snapshot is absent or
- * unreadable, which is the normal state for an installed package.
- */
-export function costAdvisory(slots: Slot[], snapshotPath: string = COST_SNAPSHOT): string[] {
-  let prices: Record<string, { cost_input?: unknown; cost_output?: unknown }>
-  try {
-    const models = (JSON.parse(readFileSync(snapshotPath, "utf8")) as { models?: unknown }).models
-    if (!models || typeof models !== "object") return []
-    prices = models as Record<string, { cost_input?: unknown; cost_output?: unknown }>
-  } catch {
-    return [] // no snapshot, or not one this reader understands: no opinion
-  }
-  const priced: string[] = []
-  for (const slot of slots ?? []) {
-    const price = prices[slot?.model]
-    if (!price || typeof price !== "object") continue // unknown -> silence, never a guess
-    const input = Number(price.cost_input ?? 0)
-    const output = Number(price.cost_output ?? 0)
-    // Non-numeric or missing components count as zero, matching how the benchmark
-    // harness prices a model: absent data is not evidence of a price.
-    if ((Number.isFinite(input) ? input : 0) + (Number.isFinite(output) ? output : 0) > 0) priced.push(slot.model)
-  }
-  return [...new Set(priced)]
-}
-
 export const FALLBACK_SLOTS: Slot[] = [
   { index: 1, model: "opencode/space-bunny-free", weight: 3 },
   { index: 2, model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", weight: 2 },

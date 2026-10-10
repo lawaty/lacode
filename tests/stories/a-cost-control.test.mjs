@@ -3,8 +3,8 @@
 //   US-1  bulk exploration runs on cheap/free subagents, never on the main model
 //   US-2  one knob (the pool preset) selects the exploration/implementation model
 //   US-3  a benchmark that MEASURES a cost comparison instead of asserting one
-//   US-23 the pool is for mechanical work, so free is the shipped policy (and any
-//         model is still accepted — see US-7)
+//   US-23 the pool is for mechanical work, so free is the shipped DEFAULT —
+//         not a restriction: any model is accepted, and never warned about (US-7)
 //
 // US-3's behavioural contract is exercised here by driving the real harness in
 // tests/benchmark/run.mjs as a subprocess; the harness itself is not imported,
@@ -340,21 +340,15 @@ test("[US-2] the shipped preset parses into distinct models with valid weights",
 })
 
 // ---------------------------------------------------------------------------
-// US-23 -- the pool is for mechanical work, so free is the shipped policy
+// US-23 -- the pool takes ANY model; free is the shipped default, not a rule
 // ---------------------------------------------------------------------------
 //
-// The tension this story lives inside: the pool must keep accepting ANY model
-// list (US-7, tested above and in pool-models-test.mjs), while the shipped
-// preset is free because the pool exists to move mechanical work off the
-// expensive main model. Nothing here validates, filters, or rejects a priced
-// model. The advisory reports; it never blocks.
-
-/** A price snapshot shaped exactly like the pinned one, for the advisory to read. */
-const snapshotFile = (models) => {
-  const file = join(scratch("snap-"), "models-snapshot.json")
-  writeFileSync(file, JSON.stringify({ _source: "test", models }))
-  return file
-}
+// The tension this story lives inside: the pool must accept ANY model list
+// (US-7, tested above and in pool-models-test.mjs) while the shipped preset is
+// free because the pool exists to move mechanical work off the expensive main
+// model. That free choice lives in presets/free-tier.json and nowhere else.
+// There is no cost advisory, no whitelist and no identity check in the pool:
+// nothing here validates, filters, warns about, or rejects a model.
 
 test("[US-23] every slot in the shipped preset is free, and any slot the snapshot cannot price is named unknown", () => {
   const prices = snapshotModels()
@@ -368,8 +362,8 @@ test("[US-23] every slot in the shipped preset is free, and any slot the snapsho
       unknown.push(slot.model)
       continue // NOT assumed free: the project refuses to guess prices
     }
-    assert.equal(price.cost_input, 0, `${slot.model} is priced — the shipped preset is the free-or-cheap default (US-23)`)
-    assert.equal(price.cost_output, 0, `${slot.model} is priced — the shipped preset is the free-or-cheap default (US-23)`)
+    assert.equal(price.cost_input, 0, `${slot.model} is priced — the shipped preset is the free default (US-23)`)
+    assert.equal(price.cost_output, 0, `${slot.model} is priced — the shipped preset is the free default (US-23)`)
     free++
   }
 
@@ -377,7 +371,6 @@ test("[US-23] every slot in the shipped preset is free, and any slot the snapsho
   // story would be asserting nothing, so say so explicitly rather than passing
   // vacuously on "unknown".
   assert.ok(free > 0, `no slot could be priced from the snapshot (unknown: ${unknown.join(", ")}) — run tests/refresh-models-snapshot.mjs`)
-  assert.deepEqual(pool.costAdvisory(slots), [], "the shipped preset must never trigger its own cost advisory")
 
   // A price the snapshot cannot supply is reported as unknown, never as zero.
   if (unknown.length > 0) {
@@ -385,62 +378,69 @@ test("[US-23] every slot in the shipped preset is free, and any slot the snapsho
   }
 })
 
-test("[US-23] a slot priced above zero is advised about once; an unpriced one is left alone", () => {
-  const priced = snapshotFile({
-    "someone/expensive": { cost_input: 3, cost_output: 15 },
-    "someone/cheap": { cost_input: 0, cost_output: 0 },
-    "someone/half-priced": { cost_input: 0, cost_output: 0.5 },
-  })
-  const absent = snapshotFile({})
-  const noFile = join(scratch("gone-"), "models-snapshot.json")
+test("[US-23] the pool has no model whitelist: an arbitrary exotic model binds verbatim, with no warning and no special-casing", async () => {
+  // Three shapes a whitelist would have to name to reject: a paid provider, a
+  // vendor-prefixed id, and a model nobody has heard of. None is in the preset,
+  // so any identity check at all would have to be reading something else.
+  const exotic = [
+    "anthropic/claude-opus-4-20260101",
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    "some-vendor-nobody-has-heard-of/a-model-with-no-price",
+  ]
 
-  // Fires for a model the snapshot knows costs money…
-  assert.deepEqual(
-    pool.costAdvisory([{ index: 1, model: "someone/expensive", weight: 1 }], priced),
-    ["someone/expensive"],
-    "a priced slot must be flagged",
-  )
-  // …including a price that is only nonzero on one side, which a truthiness
-  // check on cost_input alone would miss.
-  assert.deepEqual(pool.costAdvisory([{ index: 1, model: "someone/half-priced", weight: 1 }], priced), ["someone/half-priced"])
+  for (const [index, model] of exotic.entries()) {
+    const stub = stubInput()
+    const hooks = await bootLaCode(stub, { id: `us23-open-${index}`, dir: scratch(), models: { slots: [{ model, weight: 2 }] } })
+    const cfg = configFor([model])
+    await hooks.config(cfg)
 
-  // Silent for a model it can price as free.
-  assert.deepEqual(pool.costAdvisory([{ index: 1, model: "someone/cheap", weight: 1 }], priced), [], "a free slot must not warn")
+    // Bound verbatim — not normalised, not swapped for a preset model, not dropped.
+    assert.equal(cfg.agent["explore-fast-1"].model, model, `${model} must bind verbatim`)
 
-  // Silent for a model it CANNOT price: unknown is not evidence of expensive,
-  // and warning on missing data would make the real warning easy to ignore.
-  assert.deepEqual(pool.costAdvisory([{ index: 1, model: "someone/unheard-of", weight: 1 }], priced), [], "an unpriced model must not warn")
+    // No warning of any kind, and in particular nothing about cost or price:
+    // the pool does not inspect prices, so it has no basis to comment on one.
+    const suspicious = stub.lines.filter((l) => l.level === "warn" && /cost|price|expensive|free/i.test(l.message))
+    assert.deepEqual(suspicious.map((w) => w.message), [], `${model} must produce no advisory of any kind`)
 
-  // No snapshot at all is a no-op, not an error — and the default an installed
-  // package actually runs with, since `files` does not ship tests/.
-  assert.deepEqual(pool.costAdvisory([{ index: 1, model: "someone/expensive", weight: 1 }], absent), [], "an empty snapshot must not warn")
-  assert.deepEqual(pool.costAdvisory([{ index: 1, model: "someone/expensive", weight: 1 }], noFile), [], "an absent snapshot must not warn")
-  assert.doesNotThrow(() => pool.costAdvisory([{ index: 1, model: "x", weight: 1 }], noFile))
+    // And it actually runs.
+    const routed = []
+    for (let i = 0; i < 3; i++) {
+      routed.push((await spawn(hooks, cfg, { callID: `c${i}`, sessionID: `s${i}` })).model)
+    }
+    assert.deepEqual(routed, [model, model, model], `${model} must route every spawn to itself`)
 
-  // Duplicate slots of the same priced model are reported once, because the
-  // caller warns once per message.
-  assert.deepEqual(
-    pool.costAdvisory(
-      [
-        { index: 1, model: "someone/expensive", weight: 2 },
-        { index: 2, model: "someone/expensive", weight: 1 },
-      ],
-      priced,
-    ),
-    ["someone/expensive"],
-  )
+    await hooks.dispose()
+  }
 })
 
-test("[US-23] the advisory never blocks: a priced model still routes, and warns at most once", async () => {
-  // Invented ids, so the pinned snapshot cannot price them: which is precisely
-  // the silent case, and the one that proves the advisory is advisory. US-7
-  // requires that this spawn succeeds — rejecting it would be the regression.
+test("[US-23] removing the advisory changed nothing: resolution, routing and the two-direction writer rule are untouched", async () => {
+  // The cost advisory is gone, so the proof that deleting it was safe is that the
+  // pool still behaves identically on every axis it used to touch — and silently
+  // on the one it no longer does.
+
+  // 1. Resolution and validation are intact: the only per-model rule left is the
+  //    structural `provider/model-id` shape a slot needs to be addressable.
   const slots = [
     { model: PAID, weight: 2 },
     { model: "another/provider-model", weight: 1 },
   ]
+  assert.deepEqual(
+    pool.resolveModels({ models: { slots: [{ model: PAID, weight: 2 }] } }).slots.map((s) => s.model),
+    [PAID],
+    "an arbitrary model must resolve through the explicit chain unchanged",
+  )
+  const malformed = pool.parseSlots({ slots: [{ model: "no-provider-prefix" }] }, "test")
+  assert.ok(
+    malformed.problems.some((p) => /provider\/model-id/.test(p)),
+    "the structural shape check must survive: a slot must be addressable",
+  )
+  const duplicated = pool.parseSlots({ slots: [{ model: PAID }, { model: PAID }] }, "test")
+  assert.ok(duplicated.problems.some((p) => /distinct models/.test(p)), "the duplicate-model check must survive")
+  assert.equal(pool.parseSlots({ slots: [{ model: PAID }] }, "test").problems.length, 0, "a paid model is not a problem")
+
+  // 2. Routing is untouched: a priced model still takes its slot, every spawn.
   const stub = stubInput()
-  const hooks = await bootLaCode(stub, { id: "us23-advisory", dir: scratch(), models: { slots } })
+  const hooks = await bootLaCode(stub, { id: "us23-unchanged", dir: scratch(), models: { slots } })
   const cfg = configFor(slots.map((s) => s.model))
   await hooks.config(cfg)
 
@@ -450,18 +450,19 @@ test("[US-23] the advisory never blocks: a priced model still routes, and warns 
   }
   assert.equal(routed.length, 6, "every spawn must route")
   for (const model of routed) {
-    assert.ok(slots.some((s) => s.model === model), `spawn went to ${model}, which is not a configured slot — the advisory must never block routing`)
+    assert.ok(slots.some((s) => s.model === model), `spawn went to ${model}, which is not a configured slot`)
   }
   assert.equal(cfg.agent["explore-fast-1"].model, PAID, "the configured (priced) model must be bound, not replaced")
 
-  // An unpriced model never produces a cost warning — no guessing, no noise.
+  // 3. And the pool is still silent about cost — with no advisory left in the
+  //    codebase, that silence is now the whole policy rather than a happy accident.
   const costWarnings = stub.lines.filter((l) => l.level === "warn" && /cost|price/i.test(l.message))
-  assert.deepEqual(costWarnings.map((w) => w.message), [], "an unpriced model must produce no cost advisory")
+  assert.deepEqual(costWarnings.map((w) => w.message), [], "the pool must produce no cost advisory")
 
   await hooks.dispose()
 })
 
-test("[US-23] the shipped preset documents the free-or-cheap policy and the override, without inventing a number", () => {
+test("[US-23] the shipped preset documents the free default and the override, without inventing a number", () => {
   const comment = preset().$comment.join("\n")
 
   // The policy has to be written down, or "free" is an accident of a file
@@ -473,6 +474,10 @@ test("[US-23] the shipped preset documents the free-or-cheap policy and the over
   // The override must stay documented, or US-7 reads as a prohibition it is not.
   assert.match(comment, /MAY substitute your own list/i, "the preset must state a user may substitute their own models")
   assert.match(comment, /pool\.json/, "the preset must name the one-line way to do it")
+
+  // …and it must say so in the terms of the new policy: a default the user may
+  // change, not a restriction the pool enforces.
+  assert.match(comment, /default|not enforced|no restriction/i, "the preset must frame free as a default, not a rule")
 
   // And the standing no-unsupported-percentage rule still holds here.
   assert.doesNotMatch(comment, /\d+\s*%/, "the preset must not print a percentage it cannot derive")

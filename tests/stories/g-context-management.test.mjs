@@ -75,9 +75,14 @@ const verdict = (rule, file) => {
   return winner
 }
 
-/** Could this agent write inside the codemap at all? */
-const canWriteMap = (permission) =>
-  verdict(permission?.edit, MAP_FILE) === "allow" || verdict(permission?.write, MAP_FILE) === "allow"
+/**
+ * Could this agent write inside the codemap at all?
+ *
+ * `edit` alone, because that is the only key opencode reads: its tool-permission
+ * lookup folds the tool names "write" and "apply_patch" onto "edit", so a `write`
+ * key in a permission block is never consulted. LaCode emits none (asserted below).
+ */
+const canWriteMap = (permission) => verdict(permission?.edit, MAP_FILE) === "allow"
 
 /**
  * Run with a temporary HOME.
@@ -407,16 +412,18 @@ test("[US-20] a failed run releases its slot and requeues its paths instead of s
 // US-21 — one writer keeps the map coherent
 // ---------------------------------------------------------------------------
 
-/** Is the map granted to this agent by an explicit allow RULE (not a blanket tool grant)? */
+/**
+ * Is the map granted to this agent by an explicit allow RULE (not a blanket tool grant)?
+ *
+ * Only the `edit` key is consulted — see canWriteMap. A `write` block would be dead
+ * config, so looking for a grant in one would assert a rule opencode ignores.
+ */
 const grantsMapByRule = (permission) =>
-  [permission?.edit, permission?.write].some(
-    (rule) =>
-      rule !== null &&
-      typeof rule === "object" &&
-      Object.entries(rule).some(
-        ([pattern, value]) => pattern !== "*" && value === "allow" && patternMatches(pattern, MAP_FILE),
-      ),
-  )
+  (permission?.edit !== null &&
+    typeof permission?.edit === "object" &&
+    Object.entries(permission.edit).some(
+      ([pattern, value]) => pattern !== "*" && value === "allow" && patternMatches(pattern, MAP_FILE),
+    ))
 
 test("[US-21] only the cartographer is granted the map by permission, and it may write nothing else", async () => {
   const stub = stubInput()
@@ -447,10 +454,28 @@ test("[US-21] only the cartographer is granted the map by permission, and it may
   }
 
   // And the cartographer's grant is narrow: the map, and nothing else.
+  //
+  // `edit` is the only key that needs checking, and it is the only key the
+  // injected config carries. Asserting the absence of `write` is what keeps
+  // the claim honest: a `write` block would look identical here while being
+  // dead config, because opencode folds write/apply_patch onto `edit`.
   const cm = cfg.agent["context-manager"]
-  for (const tool of ["edit", "write"]) {
-    assert.equal(verdict(cm.permission[tool], MAP_FILE), "allow", `the cartographer must be able to ${tool} inside the map`)
-    assert.equal(verdict(cm.permission[tool], "src/index.ts"), "deny", `the cartographer must not be able to ${tool} source code`)
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(cm.permission, "write"),
+    false,
+    "the cartographer must not carry a `write` key: opencode reads `edit`",
+  )
+  assert.equal(verdict(cm.permission.edit, MAP_FILE), "allow", "the cartographer must be able to write inside the map")
+  assert.equal(verdict(cm.permission.edit, "src/index.ts"), "deny", "the cartographer must not be able to write source code")
+
+  // No agent anywhere may carry one: it is never read, so it is pure decoration
+  // that a future edit could mistake for the real rule.
+  for (const [name, def] of Object.entries(cfg.agent)) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(def.permission ?? {}, "write"),
+      false,
+      `${name} must not declare a \`write\` permission key (it folds onto \`edit\`)`,
+    )
   }
 })
 

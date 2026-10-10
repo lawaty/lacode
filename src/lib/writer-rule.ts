@@ -143,11 +143,11 @@ const evaluatedForm = (mapDir: string, projectRoot?: string) => {
 //                                         agent's own winning rule — not by looking for
 //                                         the word "allow" anywhere in its table)
 //
-// Only `edit` is evaluated in direction 2, because that is the only key opencode
-// consults: its tool-permission lookup folds the tool names "write" and "apply_patch"
-// onto "edit", so a `write` key in a permission block is never read. The `write` blocks
-// LaCode still emits are therefore decorative, kept identical to their `edit` twin so
-// nobody has to re-derive that folding to know what the rule really says.
+// Only `edit` is read anywhere, because that is the only key opencode consults: its
+// tool-permission lookup folds the tool names "write" and "apply_patch" onto "edit",
+// so a `write` key in a permission block is never read. LaCode therefore emits no
+// `write` keys, and this scanner does not look for them: matching one would assert a
+// rule opencode would ignore.
 export const verifyWriterRule = (configPath: string, mapDir: string, projectRoot?: string) => {
   let raw: string
   try {
@@ -156,8 +156,8 @@ export const verifyWriterRule = (configPath: string, mapDir: string, projectRoot
     return undefined // no config to inspect (custom config path, or stripped deploy)
   }
   const rules: string[] = []
-  for (const block of raw.matchAll(/"(edit|write)"\s*:\s*\{([^}]*)\}/g)) {
-    for (const rule of block[2].matchAll(/"((?:[^"\\]|\\.)*)"\s*:\s*"(allow|ask|deny)"/g)) {
+  for (const block of raw.matchAll(/"edit"\s*:\s*\{([^}]*)\}/g)) {
+    for (const rule of block[1].matchAll(/"((?:[^"\\]|\\.)*)"\s*:\s*"(allow|ask|deny)"/g)) {
       if (rule[2] === "allow") rules.push(rule[1].replace(/\\"/g, '"'))
     }
   }

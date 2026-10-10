@@ -385,10 +385,23 @@ check("oc-sync's env marker is written with an absolute path and read back", () 
   // Shipped bug: ENV_PATH was "~/.config/opencode/remote.env" inside double
   // quotes, so the shell created a literal directory named "~" on both hosts and
   // the run still printed success. The redirect returning 0 proves nothing.
+  //
+  // What is actually under test is the SHAPE of the path, not its directory: it
+  // must expand $HOME and must never carry a quoted tilde. The directory itself
+  // is deliberately not pinned here — this line runs inside the <<'REMOTE'
+  // heredoc, so it names the REMOTE host's opencode config dir, which is the
+  // consumer's layout and does not move when this repository does.
   const src = read("oc-sync")
-  assert(/ENV_PATH="\$HOME\/\.config\/opencode\/remote\.env"/.test(src),
-    "the path must expand $HOME, not a quoted tilde")
+  assert(/ENV_PATH="\$HOME\//.test(src), "the path must expand $HOME, not a quoted tilde")
+  assert(!/ENV_PATH="~/.test(src), "a quoted ~ is not expanded by the shell and creates a literal ~ directory")
+  assert(/ENV_PATH="\$HOME\/[^"]*remote\.env"/.test(src), "the marker must still be named remote.env under $HOME")
   assert(/grep -q "\^export OC_LOCAL_USER="/.test(src), "the file must be verified after writing")
+
+  // It is a REMOTE-side path: it must stay inside the heredoc piped to the host,
+  // so a change to this repo's own location can never move it.
+  const heredoc = src.indexOf("<<'REMOTE'")
+  assert(heredoc !== -1, "oc-sync must still pipe a script to the remote host")
+  assert(heredoc < src.indexOf('ENV_PATH="$HOME/'), "ENV_PATH must be inside the remote heredoc")
 })
 
 check("oc-notify propagates a failed delivery as its exit status", () => {
