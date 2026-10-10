@@ -16,14 +16,19 @@ const INTERNAL_TITLE_PREFIXES = [
   "context-manager (auto",
 ]
 
-// The three things worth interrupting someone for. Wording is deliberately about
+// The four things worth interrupting someone for. Wording is deliberately about
 // what *they* must do, not about what opencode did: a notification is only
 // actionable if the reader can tell, in one line, whether they are the bottleneck.
 //
 // "Finished" is deliberately not "session finished". The session is still open --
 // this is the agent handing control back, and saying "session ended" implies the
 // work is over and the conversation closed, which is neither true nor useful.
-export const NOTIFY_OUTCOMES = ["done", "question", "error"] as const
+//
+// `permission` is kept separate from `question` rather than folded into it: the
+// two are answered in different places and mean different things. "Awaiting your
+// response" on a directory-access prompt tells the user nothing about what they
+// are being asked to hand over.
+export const NOTIFY_OUTCOMES = ["done", "question", "permission", "error"] as const
 export type Outcome = (typeof NOTIFY_OUTCOMES)[number]
 
 export const notifyMessage = (outcome: Outcome, detail?: string) => {
@@ -32,6 +37,7 @@ export const notifyMessage = (outcome: Outcome, detail?: string) => {
   // notification you must open a terminal to act on and one you can answer from
   // the notification itself, which is the whole reason to interrupt someone.
   if (outcome === "question") return detail ? `Awaiting your response — ${detail}` : "Awaiting your response"
+  if (outcome === "permission") return detail ? `Awaiting your permission — ${detail}` : "Awaiting your permission"
   return "Task finished, waiting for your review"
 }
 
@@ -117,6 +123,108 @@ export const questionHeadline = (questions: Array<{ question?: string }> | undef
   if (!first?.question) return ""
   const clean = safeTitle(first.question)
   return clean.length > 70 ? `${clean.slice(0, 69)}…` : clean
+}
+
+// ---------------------------------------------------------------------------
+// Permissions
+// ---------------------------------------------------------------------------
+
+/**
+ * A `permission.asked` payload as the RUNTIME emits it.
+ *
+ * The field names here are not the SDK's, and that is the whole point of the
+ * comment. `types.gen.d.ts` declares
+ *
+ *     type Permission = { id, type, pattern?, sessionID, title, metadata, time }
+ *
+ * and the v1 Event union offers `permission.updated` on that shape. Neither is
+ * what the server actually emits. Decoded from the v1.18.35 bundle:
+ *
+ *     SX = D.Struct({ id, sessionID, permission: D.String,
+ *                     patterns: D.Array(D.String), metadata, always,
+ *                     tool: D.optional(...) }).annotate({identifier:"PermissionRequest"})
+ *     _5 = Q_({ type: "permission.asked", schema: SX.fields })
+ *
+ * So the event is `permission.asked` and the fields are `permission`/`patterns`
+ * -- different names, and `pattern` is an array here, not `string | string[]`.
+ * The string never appears in the binary at all; `permission.ask` is declared by
+ * the pinned `Hooks` type but `trigger("permission.ask")` is never called, so a
+ * handler wired to it is dead code that looks live.
+ *
+ * Both spellings are therefore accepted, runtime-first. `permission` is the
+ * field the server sends; `type` is the SDK's, kept so a payload shaped that way
+ * still produces a named notification instead of the word "undefined".
+ */
+export type PermissionRequest = {
+  sessionID?: string
+  /** The RUNTIME's field: the permission kind, e.g. `external_directory`. */
+  permission?: string
+  /** The RUNTIME's field: always an array, even for a single pattern. */
+  patterns?: string[]
+  metadata?: Record<string, unknown>
+  /** The stale SDK spelling. Never sent by this runtime; tolerated. */
+  type?: string
+  /** The stale SDK spelling: `string | string[]`, singular. */
+  pattern?: string | string[]
+}
+
+const str = (value: unknown): string | undefined => (typeof value === "string" && value.trim() ? value : undefined)
+
+/** The permission kind, from whichever field this payload happens to carry. */
+export const permissionKind = (request: PermissionRequest) => (str(request.permission) ?? str(request.type) ?? "")
+
+/** The requested patterns, normalized across the array/scalar spellings. */
+export const permissionPatterns = (request: PermissionRequest): string[] => {
+  const list = Array.isArray(request.patterns) ? request.patterns : Array.isArray(request.pattern) ? request.pattern : [request.pattern]
+  return list.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+}
+
+// A pattern is a glob, and `~/Projects/foo/*` tells the user less at a glance
+// than `~/Projects/foo`. Trimmed exactly the way opencode's own TUI trims it
+// when it renders this prompt (`slice(0, indexOf("*")).replace(/[\\/]+$/, "")`),
+// so the notification names the same directory the prompt names.
+const trimGlob = (raw: string) => {
+  const star = raw.indexOf("*")
+  return (star === -1 ? raw : raw.slice(0, star)).replace(/[\\/]+$/, "")
+}
+
+const shortenHome = (raw: string) => {
+  const home = process.env.HOME ?? ""
+  return home && raw.startsWith(`${home}/`) ? `~${raw.slice(home.length)}` : raw
+}
+
+/**
+ * What the notification says is being asked for.
+ *
+ * A notification reading only "permission" is useless -- the user has to come
+ * back to find out whether the agent wants a directory or a command. So the
+ * kind and the thing it applies to are both in the message, and the field
+ * precedence follows opencode's own: `metadata.parentDir` / `metadata.filepath`
+ * before `patterns[0]`, because the metadata holds the real directory while the
+ * pattern holds the glob written over it.
+ */
+export const permissionHeadline = (request: PermissionRequest) => {
+  const kind = permissionKind(request)
+  const patterns = permissionPatterns(request)
+  const metadata = request.metadata ?? {}
+  const meta = (key: string) => str(metadata[key])
+
+  const requested = shortenHome(trimGlob(meta("parentDir") ?? meta("filepath") ?? patterns[0] ?? ""))
+
+  if (kind === "external_directory") {
+    return requested ? `access external directory ${requested}` : "access an external directory"
+  }
+
+  // A command is the thing itself, not a pattern to be rendered as a glob.
+  const command = meta("command")
+  if (kind === "bash" || kind === "shell") {
+    return command ? `run \`${safeTitle(command, "a shell command")}\`` : "run a shell command"
+  }
+
+  const label = kind || "a tool"
+  if (requested) return `${label} — ${requested}`
+  if (patterns.length) return `${label} — ${patterns.join(", ")}`
+  return `${label} is asking for permission`
 }
 
 // Rate limit. A root session can idle more than once in quick succession (a

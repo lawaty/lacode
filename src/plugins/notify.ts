@@ -2,7 +2,15 @@ import { spawn } from "node:child_process"
 import { existsSync } from "node:fs"
 import * as path from "node:path"
 import type { Hooks } from "@opencode-ai/plugin"
-import { Notifier, questionHeadline, shouldNotify, type Outcome, type SessionInfo } from "../lib/notify.ts"
+import {
+  Notifier,
+  permissionHeadline,
+  questionHeadline,
+  shouldNotify,
+  type Outcome,
+  type PermissionRequest,
+  type SessionInfo,
+} from "../lib/notify.ts"
 import { PACKAGE_ROOT } from "../lib/pool.ts"
 
 // Desktop notification when a session needs you: a finished turn, or a question
@@ -29,9 +37,15 @@ import { PACKAGE_ROOT } from "../lib/pool.ts"
 //   done      the agent finished a turn and handed control back
 //   question  the agent is blocked on an answer and cannot continue
 //
-// Both are suppressed for subagents and the cartographer. A session.started
-// notification was removed: it interrupts to say nothing, and it fires before
-// there is any result to name.
+// A third joins them (US-25): a permission prompt. It is the same class of
+// silent stall as a question -- opencode blocks and waits -- but it was
+// invisible here, so a directory-access prompt looked like a hung agent. It
+// notifies on the ASK and never on the reply: the user needs to know they are
+// being asked, and telling them what they then decided only adds noise.
+//
+// All of them are suppressed for subagents and the cartographer. A
+// session.started notification was removed: it interrupts to say nothing, and
+// it fires before there is any result to name.
 //
 // This module is a HOOK FACTORY, not a plugin -- see the note at the top of
 // ./agent-pool.ts. It must export the factory and nothing else.
@@ -99,6 +113,12 @@ export const notifyHooks = (async ({ client, directory }, _options?: unknown, de
   // (and more urgent) reason to look than "finished". Tracked so the idle event
   // that follows a question does not also claim the task finished.
   const pending = new Set<string>()
+  // Sessions with an unanswered PERMISSION request outstanding. Tracked
+  // separately from `pending` rather than sharing the set, because the two have
+  // independent lifecycles: a question can be answered while a permission is
+  // still open, and one set would drop the other's block and let a parked
+  // session announce itself as finished.
+  const permissions = new Set<string>()
   let warnedHelper = false
 
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
@@ -191,28 +211,32 @@ export const notifyHooks = (async ({ client, directory }, _options?: unknown, de
         outcome,
         detail,
         sawMessage: active.has(sessionID),
-        awaitingResponse: pending.has(sessionID),
+        // Either kind of block suppresses the idle event's "finished": a session
+        // parked on a permission prompt has not finished, it is waiting.
+        awaitingResponse: pending.has(sessionID) || permissions.has(sessionID),
       })
       if (!decision.notify) {
         void log("debug", `suppressed: ${decision.reason}`, { sessionID })
         return
       }
-      // The cooldown absorbs a burst of identical notices. Two outcomes are
+      // The cooldown absorbs a burst of identical notices. Three outcomes are
       // exempt, for the same reason: they report a session that is BLOCKED, and a
       // blocked session that is not announced is a silent stall.
-      //   error    the failure is new; the cooldown may still be holding from the
-      //            "busy" transition moments earlier
-      //   question a second question within the window is a second thing to answer,
-      //            not a repeat of the first -- gating it strands the user on a
-      //            prompt they were never told about
-      // Both record the timestamp so a follow-up is judged against what the user
-      // has actually already seen.
+      //   error      the failure is new; the cooldown may still be holding from the
+      //              "busy" transition moments earlier
+      //   question   a second question within the window is a second thing to answer,
+      //              not a repeat of the first -- gating it strands the user on a
+      //              prompt they were never told about
+      //   permission likewise: a permission prompt the user never saw is the exact
+      //              silent stall this plugin exists to prevent
+      // All three record the timestamp so a follow-up is judged against what the
+      // user has actually already seen.
       //
       // Keyed per outcome so a genuine later completion still notifies: a question
       // and the "finished" that follows it are different moments.
-      const kind = decision.urgency === "critical" ? "error" : outcome === "question" ? "question" : "done"
+      const kind = decision.urgency === "critical" ? "error" : outcome === "done" ? "done" : outcome
       const key = `${kind}:${sessionID}`
-      const blocking = kind === "error" || kind === "question"
+      const blocking = kind !== "done"
       const now = Date.now()
       if (blocking) {
         notifier.record(key, now)
@@ -289,12 +313,54 @@ export const notifyHooks = (async ({ client, directory }, _options?: unknown, de
           return
         }
 
+        // The permission gap. Everything above was about a session handing control back
+        // or asking a question; this is the other silent stall -- opencode blocks
+        // on a permission decision and says nothing, which is why a directory
+        // prompt used to look like a hung agent.
+        //
+        // The event is `permission.asked`, read off the wire deliberately, for
+        // the same reason as question.asked: the pinned SDK types describe a
+        // different thing. They offer `permission.updated` carrying a
+        // `Permission` with `type`/`pattern`; this runtime emits
+        // `permission.asked` carrying `permission`/`patterns`. `type` and
+        // `pattern` appear nowhere in the binary, and the `permission.ask` HOOK
+        // the SDK also declares is never triggered -- wiring a handler to it
+        // would be dead code that reads as live coverage. See the field-by-field
+        // derivation on PermissionRequest.
+        //
+        // This is a bus event, not that hook, which is also the security property:
+        // there is no `output.status` here to perturb, so observing a prompt
+        // cannot approve or deny it. The payload is only read.
+        if (event.type === "permission.asked") {
+          const properties = event.properties as PermissionRequest
+          const sessionID = properties?.sessionID
+          if (!sessionID) return
+          permissions.add(sessionID)
+          // A permission request is also proof of work, so it must not be
+          // suppressed by the never-went-busy rule -- and if it was never seen
+          // busy, treat it as busy.
+          active.add(sessionID)
+          void announce(sessionID, "permission", permissionHeadline(properties) || undefined)
+          return
+        }
+
+        // The prompt was answered or dismissed. This deliberately does NOT
+        // notify: the user asked to be told they are being asked, not what they
+        // or opencode decided afterwards. It only clears the block, so the idle
+        // event that follows is allowed to report real work as finished again.
+        if (event.type === "permission.replied") {
+          const sessionID = (event.properties as { sessionID?: string })?.sessionID
+          if (sessionID) permissions.delete(sessionID)
+          return
+        }
+
         if (event.type === "session.error") {
           const sessionID = event.properties.sessionID
           // An error unblocks the session: whatever question was parked is no
           // longer what the user must act on.
           if (sessionID) {
             pending.delete(sessionID)
+            permissions.delete(sessionID)
             void announce(sessionID, "error")
           }
           return
@@ -308,6 +374,7 @@ export const notifyHooks = (async ({ client, directory }, _options?: unknown, de
             active.delete(sessionID)
             titles.delete(sessionID)
             pending.delete(sessionID)
+            permissions.delete(sessionID)
           }
           return
         }

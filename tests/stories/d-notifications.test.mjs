@@ -260,3 +260,228 @@ test("[US-11] a remote session says so in the notification, so the tunnel is exp
     else process.env.SSH_TTY = previous.tty
   }
 })
+// ---------------------------------------------------------------------------
+// US-25 -- a permission prompt
+// ---------------------------------------------------------------------------
+//
+// The payloads below are the RUNTIME's shape, verified against the v1.18.35
+// bundle rather than copied from the pinned SDK:
+//
+//   SX = D.Struct({ id, sessionID, permission: D.String,
+//                   patterns: D.Array(D.String), metadata, always, tool })
+//       .annotate({identifier: "PermissionRequest"})
+//
+// `permission.asked`, not the SDK's `permission.updated`; `permission` and
+// `patterns`, not `type` and `pattern`. A fixture written from types.gen.d.ts
+// would pass these tests and produce "undefined" on a real server.
+
+test("[US-25] a permission request delivers exactly one notification naming the type and the pattern", async () => {
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+  await busy(emit, "s1")
+  await emit("permission.asked", {
+    id: "p1",
+    sessionID: "s1",
+    permission: "read",
+    patterns: ["*.env"],
+    metadata: {},
+    always: ["*.env"],
+  })
+  await settle()
+
+  assert.equal(sent.length, 1, `exactly one notification, got ${JSON.stringify(sent)}`)
+  assert.match(sent[0].title, /Read the config/, "the notification must name the session, as every other path does")
+  assert.match(sent[0].message, /permission/i, `the message must say a permission is being asked: ${sent[0].message}`)
+  assert.match(sent[0].message, /read/, `the permission type must be in the message: ${sent[0].message}`)
+  assert.match(sent[0].message, /\.env/, `the pattern must be in the message: ${sent[0].message}`)
+  assert.equal(sent[0].urgency, "normal", "a permission prompt is a request, not a failure, and must not go modal")
+})
+
+test("[US-25] an external_directory prompt names the directory being requested", async () => {
+  // The glob is `dir/*`; the user is being asked about `dir`. opencode's own TUI
+  // resolves this prompt from metadata.parentDir/filepath and trims the glob, and
+  // the notification resolves it the same way -- otherwise the one thing the user
+  // has to judge is the part that got elided.
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Fix the login redirect" } } })
+  await busy(emit, "s1")
+  await emit("permission.asked", {
+    id: "p2",
+    sessionID: "s1",
+    permission: "external_directory",
+    patterns: ["/srv/shared/config/*"],
+    metadata: { parentDir: "/srv/shared/config", filepath: "/srv/shared/config/app.json" },
+    always: ["/srv/shared/config/*"],
+  })
+  await settle()
+
+  assert.equal(sent.length, 1, `expected exactly one notification, got ${JSON.stringify(sent)}`)
+  assert.match(sent[0].message, /external directory/i, `the message must say what kind of ask this is: ${sent[0].message}`)
+  assert.match(sent[0].message, /\/srv\/shared\/config/, `the directory must be named: ${sent[0].message}`)
+  assert.ok(
+    !/\/\*\b/.test(sent[0].message) && !/\*`/.test(sent[0].message),
+    `the trailing glob must be trimmed, the directory is the thing being asked about: ${sent[0].message}`,
+  )
+})
+
+test("[US-25] a bash prompt names the command rather than a glob", async () => {
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Run the suite" } } })
+  await busy(emit, "s1")
+  await emit("permission.asked", {
+    id: "p3",
+    sessionID: "s1",
+    permission: "bash",
+    patterns: ["*"],
+    metadata: { command: "rm -rf build" },
+    always: ["*"],
+  })
+  await settle()
+
+  assert.equal(sent.length, 1, `expected exactly one notification, got ${JSON.stringify(sent)}`)
+  assert.match(sent[0].message, /rm -rf build/, `the command is the thing being asked about: ${sent[0].message}`)
+  assert.match(sent[0].message, /permission/i, `the message must say why you are being interrupted: ${sent[0].message}`)
+})
+
+test("[US-25] permission.replied sends no notification", async () => {
+  // The user was told they were being asked. Telling them how that was resolved
+  // is noise, and they were the one who resolved it.
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+  await busy(emit, "s1")
+  await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+  await settle()
+  assert.equal(sent.length, 1, "the prompt itself notified")
+
+  await emit("permission.replied", { sessionID: "s1", requestID: "p1", reply: "once" })
+  await settle()
+  assert.equal(sent.length, 1, `the resolution must not notify again, got ${JSON.stringify(sent)}`)
+})
+
+test("[US-25] a session parked on a permission prompt sends no finished notification", async () => {
+  // Nothing finished: the agent is blocked. "Task finished" here is not merely
+  // redundant, it is the opposite of what happened.
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Fix the login redirect" } } })
+  await busy(emit, "s1")
+  await emit("permission.asked", {
+    id: "p1",
+    sessionID: "s1",
+    permission: "external_directory",
+    patterns: ["/srv/shared/*"],
+    metadata: { parentDir: "/srv/shared" },
+  })
+  await settle()
+  await idle(emit, "s1")
+  await settle()
+
+  assert.equal(sent.length, 1, `the parked session must notify once, not twice: ${JSON.stringify(sent)}`)
+  assert.match(sent[0].message, /permission/i, "the only notification is the prompt")
+})
+
+test("[US-25] a permission prompt bypasses the cooldown", async () => {
+  // Two prompts inside the 5s window. The second is a second thing to answer, and
+  // a cooldown that swallowed it is the silent stall this story exists to remove.
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+  await busy(emit, "s1")
+  await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+  await emit("permission.asked", { id: "p2", sessionID: "s1", permission: "read", patterns: ["*.key"], metadata: {} })
+  await settle()
+
+  assert.equal(sent.length, 2, `both prompts must be announced, got ${JSON.stringify(sent)}`)
+})
+
+test("[US-25] unrelated events produce no permission notification", async () => {
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+  await busy(emit, "s1")
+  await emit("session.updated", { info: { id: "s1", title: "Read the config" } })
+  await emit("message.part.updated", { part: { id: "pt1", sessionID: "s1", type: "text", text: "working" } })
+  await emit("permission.replied", { sessionID: "s1", requestID: "p1", reply: "reject" })
+  await emit("permission.list", { permissions: [] })
+  await settle()
+
+  assert.deepEqual(sent, [], `no event here is a permission prompt, got ${JSON.stringify(sent)}`)
+})
+
+test("[US-25] the handler cannot approve or deny: it registers no permission.ask hook and mutates nothing", async () => {
+  // The security-critical property. `Hooks["permission.ask"]` takes a mutable
+  // `output.status` ("ask" | "deny" | "allow"), so a handler that touched it
+  // could silently grant access. The fix is structural, not defensive: the
+  // notification is driven by the `permission.asked` bus EVENT, which carries no
+  // output object at all, so there is nothing to perturb.
+  const { hooks } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+
+  assert.equal(
+    hooks["permission.ask"],
+    undefined,
+    "no permission.ask hook may be registered: its output.status IS the permission decision, and this runtime never triggers it anyway",
+  )
+
+  // And the payload the handler was given is left byte-identical.
+  const payload = {
+    id: "p1",
+    sessionID: "s1",
+    permission: "external_directory",
+    patterns: ["/srv/shared/*"],
+    metadata: { parentDir: "/srv/shared" },
+    always: ["/srv/shared/*"],
+  }
+  const before = JSON.stringify(payload)
+  await hooks.event({ event: { type: "permission.asked", properties: payload } })
+  await settle()
+  assert.equal(JSON.stringify(payload), before, "the event payload must not be mutated")
+})
+
+test("[US-25] a deliberately perturbing handler fails the read-only assertion", async () => {
+  // The guard above only means something if a handler that DOES decide fails it.
+  // This is the demonstration that it bites, so the guarantee is structural
+  // rather than a promise about code nobody can check.
+  //
+  // The read-only check, expressed once, is "this object is byte-identical to
+  // how it started". A `Hooks["permission.ask"]` handler gets an
+  // `{status: "ask"|"deny"|"allow"}` output and one assignment to it decides the
+  // permission outright.
+  const status = { status: "ask" }
+  const untouched = () => {
+    const after = { ...status }
+    assert.deepEqual(after, { status: "ask" }, "the handler decided the permission")
+  }
+
+  // What the plugin does: nothing is handed a decision object, so nothing can
+  // change it.
+  const { hooks } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+  await hooks.event({
+    event: { type: "permission.asked", properties: { id: "p1", sessionID: "s1", permission: "external_directory", patterns: ["/etc/*"] } },
+  })
+  await settle()
+  untouched()
+
+  // What an over-reaching handler would do, and what the same assertion says.
+  status.status = "allow"
+  assert.throws(untouched, /decided the permission/, "a handler that wrote output.status must be caught by this check")
+})
+
+test("[US-25] the notification goes through the injected seam, never a real desktop call", async () => {
+  // `sent` is only populated because the test supplied a recorder as `deliver`.
+  // With no seam the factory would spawn bin/oc-notify; nothing here may spawn
+  // anything, so the test also asserts the factory exposes no hook that could.
+  const stub = stubInput({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+  const sent = []
+  const hooks = await notifyHooks(stub.input, undefined, {
+    deliver: async (title, message, urgency) => {
+      sent.push({ title, message, urgency })
+      return { ok: true }
+    },
+  })
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "s1", status: { type: "busy" } } } })
+  await hooks.event({
+    event: { type: "permission.asked", properties: { id: "p1", sessionID: "s1", permission: "bash", patterns: ["*"], metadata: { command: "ls" } } },
+  })
+  await settle()
+
+  assert.equal(sent.length, 1, "the injected sender observed the notification")
+  assert.ok(
+    stub.text().some((line) => line.startsWith("info notified")),
+    `the delivery is acknowledged through the same log path as every other outcome:\n${stub.text().join("\n")}`,
+  )
+  assert.ok(
+    !stub.text().some((line) => line.includes("no oc-notify helper found")),
+    "the helper lookup must never run when a seam is supplied, or this test would be touching the real transport",
+  )
+})

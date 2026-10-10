@@ -198,6 +198,18 @@ does not.
 - [ ] Given a parked question is replied to, rejected, or the session errors, When that event fires, Then the pending entry is cleared and the next real completion notifies again.
 - [ ] Given a question and a completion occur inside the same cooldown window, When both are evaluated, Then they are not deduplicated against each other.
 
+### US-25: Notification when opencode asks for permission
+**As a** user, **I want** to be notified when opencode is blocked asking me for permission — including permission to reach a directory outside the worktree — **so that** a silent permission prompt is never mistaken for a hung agent.
+
+**Story ID(s) for tests:** US-25
+**Acceptance criteria:**
+- [ ] Given a permission is requested, When the `permission.asked` event fires, Then exactly one notification is delivered naming the permission type and the path or pattern being requested.
+- [ ] Given opencode asks to reach a directory outside the worktree, When the prompt fires, Then the notification names that directory, resolved from `metadata.parentDir`/`metadata.filepath` and with the trailing glob trimmed, because a glob is not something the user can judge.
+- [ ] Given the permission is granted, denied, or dismissed, When `permission.replied` fires, Then no notification is sent — the prompt was the thing worth interrupting for, not the answer — and only the parked-session block is cleared.
+- [ ] Given a session is parked on a permission prompt, When the idle event fires, Then no "finished" notification is sent, because nothing finished.
+- [ ] Given the plugin observes a permission prompt, When it handles the event, Then it is a read-only observer: the payload is not mutated and no `permission.ask` hook is registered, because that hook's `output.status` is the permission decision itself.
+- [ ] Given a `permission` notification is raised, When it is evaluated against the cooldown, Then it bypasses it, since an unannounced block is the failure this story exists to remove.
+
 ---
 
 ## Epic E — Remote hosts over SSH
@@ -362,6 +374,7 @@ table was filled in.
 | US-10 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs`, `tests/pool-timer-test.mjs` |
 | US-11 | D | `tests/stories/d-notifications.test.mjs`, `tests/notify-test.mjs` |
 | US-12 | D | `tests/stories/d-notifications.test.mjs`, `tests/notify-test.mjs` |
+| US-25 | D | `tests/stories/d-notifications.test.mjs` |
 | US-13 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/notify-test.mjs`, `tests/oc-test.mjs` |
 | US-14 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |
 | US-18 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |
