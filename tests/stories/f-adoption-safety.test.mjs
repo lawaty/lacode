@@ -241,6 +241,93 @@ test("[US-15] the published package loads and runs from inside node_modules, whe
 })
 
 // ---------------------------------------------------------------------------
+// US-15 -- the manifest the loader resolves, and the loader that does not
+//
+// opencode 1.18.35 installs an npm plugin correctly and then resolves its entry
+// point through a path that only honours `exports["./server"]` or a top-level
+// `main`. LaCode publishes `exports["."]`, so the bare specifier installs the
+// package and then drops it: zero agents injected, no error, no log line. A
+// `file://<installed>/dist/index.js` entry loads the full agent set.
+//
+// So `main` and `exports["./server"]` are published as well. They are the shapes
+// a resolver following the documented convention consults, and on versions that
+// honour them they make the bare specifier work -- which is worth having for a
+// package whose whole pitch is a one-line install. They are NOT a fix for
+// 1.18.35: adding either of them to the INSTALLED cache copy was tested there and
+// the bare specifier still loaded nothing. These tests therefore pin the fields
+// and pin the README's honesty about what they do and do not buy.
+// ---------------------------------------------------------------------------
+
+test("[US-15] the manifest publishes every entry-point shape a plugin loader may resolve", async () => {
+  await ensureBuilt()
+  const pkg = manifest()
+
+  // The two shapes the loader is known to consult, both pointing at the built
+  // plugin rather than at a source file or a bare directory.
+  assert.equal(pkg.main, "./dist/index.js", "a resolver that reads only `main` must still find the plugin")
+  assert.equal(pkg.exports["./server"], "./dist/index.js", "a resolver that reads only `exports[\"./server\"]` must still find the plugin")
+
+  // Forward-compatibility additions only: the subpath this package has always
+  // published is still the plugin, and every pre-existing subpath still points
+  // exactly where it did.
+  assert.equal(pkg.exports["."], "./dist/index.js", "`exports[\".\"]` must survive the forward-compat additions")
+  assert.equal(pkg.exports["./pool"], "./dist/pool.js")
+  assert.equal(pkg.exports["./agents"], "./dist/agents.js")
+  assert.equal(pkg.exports["./commands"], "./dist/commands.js")
+  assert.equal(pkg.exports["./tunnel"], "./dist/tunnel.js")
+  assert.equal(pkg.exports["./package.json"], "./package.json")
+
+  // A declared entry point that does not exist is a dangling specifier, which is
+  // exactly the silent no-op the reader is being sent here to avoid.
+  for (const target of [pkg.main, pkg.exports["./server"], pkg.exports["."]]) {
+    assert.ok(existsSync(join(ROOT, target)), `${target} must exist, or the loader resolves to nothing; run \`npm run build\``)
+  }
+})
+
+test("[US-15] the README documents the 1.18.35 loader failure and the `file://` config that actually loads", () => {
+  const readme = readFileSync(join(ROOT, "README.md"), "utf8")
+  const heading = "### If the plugin does not load on opencode 1.18.35"
+  const anchor = "#if-the-plugin-does-not-load-on-opencode-11835"
+  const at = readme.indexOf(heading)
+  assert.ok(at !== -1, `README must carry the "${heading}" section; found none`)
+
+  // Scoped to THIS section, so the checks below are about the workaround and
+  // cannot be satisfied by a `file://` mentioned somewhere else in the document.
+  const nextHeading = readme.indexOf("\n### ", at + heading.length)
+  const section = readme.slice(at, nextHeading === -1 ? readme.length : nextHeading)
+
+  // The one-liner stays the documented install; the workaround is a fallback,
+  // not a replacement, and the README must say which one it is.
+  assert.ok(readme.includes('{ "plugin": ["@lawaty/lacode"] }'), "the bare one-liner must remain the documented install")
+  assert.ok(readme.slice(0, at).includes(anchor), "the install section must forward-pointer to the workaround")
+
+  // The working configuration: the bare specifier AND a file:// entry into the
+  // cached build. Parsed, not grepped, so a half-written example fails here.
+  const example = section.match(/```json\n([\s\S]*?)```/)
+  assert.ok(example, "the section must show a copy-pasteable config")
+  const entries = JSON.parse(example[1]).plugin
+  assert.ok(Array.isArray(entries) && entries.length === 2, `both entries are required: ${JSON.stringify(entries)}`)
+  assert.equal(entries[0], "@lawaty/lacode", "the bare specifier must stay: it is what creates the cache the file:// entry points into")
+  assert.match(entries[1], /^file:\/\/\S*\/@lawaty\/lacode@latest\/node_modules\/@lawaty\/lacode\/dist\/index\.js$/, `the second entry must be a file:// URL into the cached build: ${entries[1]}`)
+
+  // The failure is silent, and saying so is the only way a reader knows to look
+  // at the cache instead of waiting for an error that never comes.
+  assert.match(section, /silent/i, "the section must say the failure is silent")
+  assert.match(section, /1\.18\.35/, "the section must name the version it applies to")
+
+  // No double-injection, and the version that is NOT fixed by the manifest
+  // fields — the two claims a reader would otherwise have to guess at. Both are
+  // matched whitespace-tolerantly: the README hard-wraps its prose, and a test
+  // that broke on a line break would be a test about wrapping, not about the doc.
+  assert.match(section, /does not\s+double-inject/, "the section must say the two-entry config cannot double-inject")
+  assert.match(section, /not\*\*?\s+fix 1\.18\.35|do not\s+fix 1\.18\.35/, "the section must say `main`/`exports[\"./server\"]` do NOT fix 1.18.35")
+
+  // And the silent-failure text above agrees with it: a populated cache is an
+  // installed-but-dropped plugin, not a failed install.
+  assert.match(readme.slice(0, at), /populated/, "the install sections must distinguish a populated cache from an empty one")
+})
+
+// ---------------------------------------------------------------------------
 // US-15 -- the injected set is COMPLETE, not merely present
 //
 // Both of these were found by diffing the injected agent set against the

@@ -27,8 +27,10 @@
   "engines": {
     "node": ">=22.18"
   },
-"exports": {
+  "main": "./dist/index.js",
+  "exports": {
     ".": "./dist/index.js",
+    "./server": "./dist/index.js",
     "./pool": "./dist/pool.js",
     "./agents": "./dist/agents.js",
     "./commands": "./dist/commands.js",

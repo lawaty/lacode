@@ -258,6 +258,9 @@ does not.
 - [ ] Given a fresh machine with no LaCode config, When the install runs, Then one config line is sufficient and no further manual step is required.
 - [ ] Given no configuration is present at all, When LaCode boots, Then it falls back to shipped defaults and still functions.
 - [ ] Given the plugin package is installed, When its peer dependency is unmet, Then the requirement is declared rather than silently duplicated inside the package.
+- [ ] Given the published manifest, When a plugin loader looks for an entry point, Then it finds one in both shapes a resolver may consult — a top-level `main` and `exports["./server"]` — while `exports["."]` keeps pointing at the same built plugin, and the documentation states plainly that these are forward-compatibility metadata and **not** a fix for opencode 1.18.35, where adding them to the installed copy was tested and the bare specifier still loaded nothing.
+- [ ] Given opencode 1.18.35, When `{"plugin": ["@lawaty/lacode"]}` is the whole config, Then the README states that this version installs the package and then silently injects nothing from it — no error, no log line, no agents — and shows the config that does load: the bare specifier plus a `file://` entry pointing at the cached `dist/index.js`, because the bare specifier's only remaining job is to create the `file://` target and the two cannot double-inject.
+- [ ] Given a user whose cache holds an installed package, When the plugin's agents are nevertheless absent, Then the README distinguishes that from a failed install (an empty cache directory) and points at the loader workaround, so "installed" and "loaded" are never reported as the same fact.
 
 ### US-16: Merges, never clobbers
 **As a** user with an existing opencode config, **I want** LaCode to add its agents/commands only where absent and never overwrite my own definitions, **so that** installing it cannot break my setup.

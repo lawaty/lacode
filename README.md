@@ -39,6 +39,10 @@ directory to create. Do not run `npm i -g @lawaty/lacode`: a global npm install
 is never consulted by opencode, so it changes nothing about whether the plugin
 loads.
 
+It is also the form to keep as your default. On opencode 1.18.35 this one line
+installs the package but does not load it — see
+[If the plugin does not load on opencode 1.18.35](#if-the-plugin-does-not-load-on-opencode-11835).
+
 To install it explicitly instead — or to install it once for every project on
 the machine rather than per config — use the CLI, which does the same thing:
 
@@ -66,7 +70,10 @@ $XDG_CACHE_HOME/opencode/packages/<specifier>/node_modules/
 To inspect what a specifier actually resolved to, list its directory under
 `~/.cache/opencode/packages/`. An empty directory with no `node_modules` inside
 it means the install failed — almost always an unpublished or misspelled package
-— and opencode starts normally **without** the plugin.
+— and opencode starts normally **without** the plugin. A *populated* directory
+there means the install succeeded and tells you nothing about whether the plugin
+was loaded; see
+[the next section](#if-the-plugin-does-not-load-on-opencode-11835).
 
 ### Verifying the install
 
@@ -81,9 +88,51 @@ A working install prints `explore-fast`, `implement-fast`, `explore-deep` and
 `implement-deep`, each with the hidden `-1`..`-4` pool variants alongside. If the
 grep returns nothing but opencode's built-ins, the plugin did not load: check the
 cache directory above, and check that `plugin` is in the config file opencode
-actually reads. Run this in the same shell environment opencode runs in — an
+actually reads. A cache directory that is **populated** and still yields no
+agents is a different failure from an empty one — the install worked and the
+loader dropped the plugin, which is what
+[the next section](#if-the-plugin-does-not-load-on-opencode-11835) describes. Run
+this in the same shell environment opencode runs in — an
 `agent list` under a different `HOME` or `XDG_CONFIG_HOME` tests a different
 machine.
+
+### If the plugin does not load on opencode 1.18.35
+
+On opencode **1.18.35** the bare npm specifier installs the package into the
+cache and then silently drops it: opencode starts normally, nothing is printed
+and nothing is logged, and none of the LaCode agents exist. That was measured
+there — a cache directory populated by a successful install, zero agents
+injected, no error anywhere.
+
+The install is not what fails. On that version the plugin's entry point is
+resolved through `exports["./server"]` or a top-level `main`; this package
+publishes `exports["."]`, which that lookup does not see. Point the loader at the
+built file directly:
+
+```json
+{
+  "plugin": [
+    "@lawaty/lacode",
+    "file:///home/you/.cache/opencode/packages/@lawaty/lacode@latest/node_modules/@lawaty/lacode/dist/index.js"
+  ]
+}
+```
+
+- The bare name is what makes opencode install the package into its cache. It
+  contributes nothing to the loaded plugin on 1.18.35, so this pair does not
+  double-inject.
+- The `file://` entry is the one that loads. With it, the agent list is
+  complete.
+
+The path is the default cache layout described above, with `$HOME` expanded —
+substitute your own. Re-check it after a cache wipe or a reinstall: the cache
+directory is keyed by specifier, so it moves when the version does.
+
+This package also publishes `main` and an `exports["./server"]` entry pointing at
+the same file, which are the two shapes the documented convention uses. They are
+correct metadata and they cost nothing — but they do **not** fix 1.18.35: adding
+either one to the *installed* cache copy was tested there and the bare
+specifier still loaded nothing. Use the `file://` entry.
 
 ### The `lacode` CLI
 
