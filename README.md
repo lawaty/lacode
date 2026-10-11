@@ -128,6 +128,12 @@ The path is the default cache layout described above, with `$HOME` expanded —
 substitute your own. Re-check it after a cache wipe or a reinstall: the cache
 directory is keyed by specifier, so it moves when the version does.
 
+After a cache wipe, expect to restart opencode twice before the agents appear.
+The first start installs the package and creates the path the `file://` entry
+points at, but a path that does not exist at startup is a path that cannot be
+loaded in that same run. The second start finds it and loads the plugin. After
+that it is steady state.
+
 This package also publishes `main` and an `exports["./server"]` entry pointing at
 the same file, which are the two shapes the documented convention uses. They are
 correct metadata and they cost nothing — but they do **not** fix 1.18.35: adding
