@@ -79,7 +79,7 @@ test("[US-8] a claim past its TTL with no activity is aborted when the reaper sw
 
 test("[US-8] the reaper sweeps on its own interval, not only when work arrives", async () => {
   // The one real timer in the suite. reapMs=40 keeps it at 40ms and the wait is
-  // 150ms: long enough for three ticks on any CI box, short enough that the
+  // 150ms: long enough for three ticks on a loaded machine, short enough that the
   // suite stays fast. Nothing here waits 30 seconds to prove a 30s interval.
   const clock = fakeClock()
   const net = stubFetch()

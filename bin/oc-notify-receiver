@@ -34,10 +34,24 @@
 
 set -uo pipefail
 
-# mapfile -t splits on newlines only: no word splitting, so a message full of
-# spaces survives intact, and no globbing, so a message full of `*` does too.
-# Fields past the fourth are ignored -- not merged, not executed.
-mapfile -t fields <<<"${SSH_ORIGINAL_COMMAND-}"
+# Split on newlines only: no word splitting, so a message full of spaces survives
+# intact, and no globbing, so a message full of `*` does too. Fields past the
+# fourth are ignored -- not merged, not executed.
+#
+# A `while read` loop rather than `mapfile -t`, and the two are equivalent here:
+# checked against empty input, a trailing newline, blank lines and a field full
+# of spaces, the resulting arrays are identical. That matters because mapfile is
+# bash 4.0+. On the bash 3.2 macOS ships -- and on a few minimal Linux images --
+# `mapfile` was simply "command not found", `fields` stayed unset, and EVERY
+# field fell back to its default: a popup titled "LaCode" with an empty body,
+# raised with no error and no log line anywhere. That is the same silent blank
+# notification the argv bug in the header comment already caused once, reached
+# again through a different door, so the loop below is the fix rather than a
+# portability nicety.
+fields=()
+while IFS= read -r field; do
+  fields+=("$field")
+done <<<"${SSH_ORIGINAL_COMMAND-}"
 
 TITLE="${fields[0]:-LaCode}"
 MSG="${fields[1]:-}"
@@ -66,17 +80,35 @@ case "$ICON" in
   *) ICON=utilities-terminal ;;
 esac
 
-# This runs as your desktop user on your desktop machine, so the session bus is
-# whatever the session actually uses. Fall back to the common X11 layouts only
-# when the inherited environment has neither.
+# This is the LINUX end of the hop: notify-send (libnotify) is the channel, and
+# libnotify is a Linux thing. A machine with no notify-send is told so plainly
+# and exits non-zero, rather than being handed a payload nothing will ever show.
+#
+# macOS has no notify-send, and a Mac cannot be this end of the tunnel: the
+# persistent forward that reaches it is a systemd --user unit installed by
+# oc-sync, so the whole desktop half of this hop is Linux-only by design. A Mac
+# that wants notifications does not run this script at all.
+#
+# Both branches name the way out, because the failure is otherwise invisible:
+# this runs as an authorized_keys forced command, so its stderr goes to whoever
+# happened to open the ssh connection and to nobody else. A bare "command not
+# found" read as a desktop that silently stopped notifying.
+if ! command -v notify-send >/dev/null 2>&1; then
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    echo "oc-notify: this receiver delivers through notify-send, which macOS does not have." >&2
+  else
+    echo "oc-notify: notify-send is not installed on this machine (it ships with libnotify-bin / libnotify)." >&2
+  fi
+  echo "oc-notify: use the portable path instead -- 'lacode notify' picks the right channel for this platform and needs no receiver." >&2
+  exit 127
+fi
+
+# notify-send exists, so this is a Linux session bus whatever it looks like.
+# Fall back to the common X11 layouts only when the inherited environment has
+# neither.
 export DISPLAY="${DISPLAY:-:0}"
 if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
-fi
-
-if ! command -v notify-send >/dev/null 2>&1; then
-  echo "oc-notify: notify-send is not installed on this machine" >&2
-  exit 127
 fi
 
 exec notify-send "$TITLE" "$MSG" --urgency="$URGENCY" --icon="$ICON"

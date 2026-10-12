@@ -20,7 +20,7 @@
 //              Run the actual scenario twice — subagents vs the main model —
 //              and read token counts back from the run's own message metadata.
 //              If credentials are missing this EXITS 0 with a "skipped" line.
-//              It never fails CI and never invents a token count.
+//              It never fails the run and never invents a token count.
 //
 //   --simulate (default when no credentials)
 //              Compute a projected cost from a task profile (calls x

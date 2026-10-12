@@ -9,7 +9,7 @@
 // US-3's behavioural contract is exercised here by driving the real harness in
 // tests/benchmark/run.mjs as a subprocess; the harness itself is not imported,
 // because the thing under test is the process a maintainer runs by hand and the
-// exit code it returns to CI.
+// exit code it returns to the caller.
 
 import { test } from "node:test"
 import assert from "node:assert/strict"

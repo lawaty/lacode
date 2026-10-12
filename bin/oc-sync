@@ -133,6 +133,74 @@ ok()   { printf '  \xe2\x9c\x93 %s\n' "$*"; }
 bad()  { printf '  \xe2\x9c\x97 %s\n' "$*"; }
 warn() { printf '  \xe2\x9a\xa0 %s\n' "$*"; }
 
+# ---------------------------------------------------------------------------
+# Refuse to run at all on a machine that cannot do the job, and say why.
+#
+# This script is LINUX-ONLY BY DESIGN, not by accident, and that has to be
+# visible before anything is touched. The persistent tunnel it installs is a
+# systemd --user unit with `Restart=always` plus `loginctl enable-linger` -- the
+# desktop half of the notification hop IS a supervised Linux service -- and the
+# deploy half leans on GNU coreutils. There is no macOS reading of any of that,
+# so the honest answer is to stop and name the way out, not to half-deploy.
+#
+# Why this has to come before the host list is parsed: on bash 3.2 the host list
+# is read with `mapfile`, which does not exist there, so the array comes back
+# empty and the run dies at "Error: no hosts configured." -- a confident,
+# completely wrong account of the failure that sends the reader to edit .env
+# while the actual cause is the interpreter in front of them. A tool that cannot
+# run must say so, not pick the nearest plausible excuse.
+#
+# `timeout` is checked separately because it is the one dependency that is
+# genuinely absent on macOS with no equivalent to reach for: it is GNU
+# coreutils, and macOS ships BSD userland. (macOS users needing to push config
+# to Linux hosts do not need this script -- rsync over ssh does that, and the
+# package ships `lacode forward` for exactly that.)
+# ---------------------------------------------------------------------------
+
+check_prereqs() {
+  local missing=()
+
+  # mapfile/readarray (bash 4.0) reads the host list; `declare -A` (bash 4.0)
+  # holds the per-host tunnel port in assert_ports_unique. Without either, both
+  # steps quietly degrade: an empty host list, then an indexed array used as if
+  # it were associative.
+  if (( BASH_VERSINFO[0] < 4 )); then
+    missing+=("bash 4.0 or newer (this is bash ${BASH_VERSION}: mapfile and declare -A do not exist below 4.0)")
+  fi
+
+  command -v timeout >/dev/null 2>&1 || missing+=("GNU coreutils' timeout (absent from macOS, which ships BSD userland)")
+
+  if (( ${#missing[@]} > 0 )); then
+    echo "oc-sync cannot run here -- it is a Linux-only deploy script." >&2
+    echo >&2
+    for item in "${missing[@]}"; do echo "  missing: $item" >&2; done
+    echo >&2
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+      # The one case where the missing things are not a mistake to fix.
+      echo "Why it is Linux-only: the desktop half of the notification tunnel is a" >&2
+      echo "systemd --user unit installed here, with 'loginctl enable-linger' so it" >&2
+      echo "survives logout. There is no macOS equivalent of that to install, so" >&2
+      echo "this is not something to work around." >&2
+      echo >&2
+      echo "On macOS, use the portable paths instead:" >&2
+      echo "  lacode notify TITLE [MESSAGE]   -- osascript/terminal-notifier, no tunnel" >&2
+      echo "  lacode forward HOST -- CMD      -- run a command on a host over ssh" >&2
+      echo "  lacode doctor                   -- show what the tunnel resolves to" >&2
+    else
+      # Otherwise the machine is a Linux box that is simply short of something,
+      # and saying "this is a Mac" would send the reader somewhere pointless.
+      echo "This looks like a Linux machine that is short of the tools above rather" >&2
+      echo "than a Mac: install GNU coreutils (for 'timeout') and make sure the" >&2
+      echo "script is run by bash 4.0 or newer." >&2
+    fi
+    exit 1
+  fi
+}
+
+# After argument parsing, so `--help` still prints and an unknown flag still
+# exits 2, and before anything is read or written.
+check_prereqs
+
 # rsync with the same ssh options, and --dry-run folded in. rsync's progress
 # lines are noise here, but the transfer's exit status is the whole point: a
 # filtered pipe reports success for a transfer that never happened, so the

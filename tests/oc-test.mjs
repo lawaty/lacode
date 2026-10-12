@@ -9,7 +9,7 @@
 // host list.
 
 import { execFileSync, spawnSync } from "node:child_process"
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs"
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, chmodSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import * as path from "node:path"
 
@@ -17,9 +17,23 @@ const REPO = path.resolve(import.meta.dirname, "..")
 const BIN = path.join(REPO, "bin")
 
 let passed = 0
+let skipped = 0
 const failures = []
 
-const check = (name, fn) => {
+/**
+ * `check(name, fn)` runs the body; `check(name, fn, { skip })` records a skip
+ * with a reason instead.
+ *
+ * A skip is only ever correct when the thing under test cannot exist on this
+ * machine -- not when it is inconvenient. Every skip below names a specific,
+ * checkable cause, so "it was skipped" is never mistaken for "it passed".
+ */
+const check = (name, fn, options = {}) => {
+  if (typeof options.skip === "string" && options.skip) {
+    skipped++
+    console.log(`SKIP: ${name} -- ${options.skip}`)
+    return
+  }
   try {
     fn()
     passed++
@@ -33,6 +47,76 @@ const assert = (condition, message) => {
 }
 
 const read = (name) => readFileSync(path.join(BIN, name), "utf8")
+
+// ---------------------------------------------------------------------------
+// Platform capability, probed rather than assumed.
+//
+// These scripts drive a Linux SERVER over ssh and a Linux DESKTOP tunnel, so
+// several checks below are Linux-only by design. Whether a check can run is a
+// question about THIS machine's bash and its PATH, not about its OS label: a
+// macOS box with a Homebrew bash 5 on PATH can run the same things a Linux box
+// can, and a Debian container on an old base image cannot. Probing means the
+// skips land where the real cause is.
+// ---------------------------------------------------------------------------
+
+const bashVersion = (() => {
+  const result = spawnSync("bash", ["-c", 'printf "%s" "$BASH_VERSION"'], { encoding: "utf8" })
+  return (result.stdout || "").trim()
+})()
+
+const bashMajor = Number(bashVersion.split(".")[0]) || 0
+
+/**
+ * True when `timeout` -- GNU coreutils, absent from macOS -- is on the PATH the
+ * child will see. bin/oc-sync wraps every ssh and rsync in it, so without it
+ * the run cannot work; the preflight is what now says so.
+ */
+const hasTimeout = () => spawnSync("sh", ["-c", "command -v timeout"], { encoding: "utf8" }).status === 0
+
+/**
+ * A PATH with one binary removed, rather than a PATH that merely happens to
+ * lack something.
+ *
+ * Two properties make this the right instrument for "what happens on a machine
+ * without X". It REPLACES rather than prepends, so nothing leaks in from the
+ * real PATH and the absence is real; and it keeps everything else -- bash, awk,
+ * ssh -- so the child dies of the cause under test and not of a missing
+ * interpreter, which would make a check pass for the wrong reason.
+ *
+ * A command that is not installed anywhere on the PATH is left alone: the
+ * condition under test already holds.
+ */
+const pathWithout = (command) => {
+  const dirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean)
+  const created = [mkdtempSync(path.join(tmpdir(), "ocsync-path-"))]
+  const kept = dirs
+    .map((dir) => {
+      if (!existsSync(path.join(dir, command))) return dir
+      const next = mkdtempSync(path.join(tmpdir(), "ocsync-passthrough-"))
+      created.push(next)
+      for (const entry of readdirSync(dir)) {
+        if (entry === command) continue
+        try { symlinkSync(path.join(dir, entry), path.join(next, entry)) } catch { /* not a symlink target */ }
+      }
+      return next
+    })
+    .filter(Boolean)
+  // `scratch` is every directory this made, including the pass-through ones:
+  // a helper that made a temp directory per PATH entry and returned only one of
+  // them would leave the rest behind on every call.
+  return { PATH: [created[0], ...kept].join(path.delimiter), scratch: () => created.forEach((d) => rmSync(d, { recursive: true, force: true })) }
+}
+
+/** Why a check that runs bin/oc-sync cannot run here, or "" if it can. */
+const NO_OC_SYNC = [
+  bashMajor < 4
+    ? `bin/oc-sync needs bash 4.0+ (mapfile, declare -A) and this PATH's bash is ${bashVersion || "unknown"}`
+    : "",
+  // `timeout` is GNU coreutils and macOS ships BSD userland. bin/oc-sync's own
+  // preflight refuses to run without it, so a check that expects the run to
+  // proceed would be asserting the failure instead of the behaviour.
+  !hasTimeout() ? "bin/oc-sync needs GNU coreutils' timeout, which this PATH does not have" : "",
+].filter(Boolean).join("; ")
 
 // Every run of oc-sync from this file must be hermetic.
 //
@@ -52,6 +136,11 @@ const hermeticEnv = (extra = {}) => ({
 
 // ---------------------------------------------------------------------------
 // Syntax
+//
+// `bash -n` only PARSES, so this passes under bash 3.2 -- macOS's version --
+// for every script here, including the ones whose bodies use bash 4 builtins.
+// That is worth knowing rather than assuming: this check is a syntax gate, not a
+// runtime one, and the runtime gate is the preflight check further down.
 // ---------------------------------------------------------------------------
 
 for (const script of ["oc", "oc-notify", "oc-sync", "oc-notify-receiver"]) {
@@ -96,7 +185,7 @@ check("oc-sync scripts-only actually disables config", () => {
   assert(!/unknown option/.test(output), `--scripts-only/--no-config rejected: ${output.trim()}`)
   assert(/no hosts configured/.test(output),
     `an empty host list must stop the run before any ssh or rsync: ${output.trim()}`)
-})
+}, { skip: NO_OC_SYNC })
 
 check("oc-sync rejects an unknown flag", () => {
   const result = spawnSync("bash", [path.join(BIN, "oc-sync"), "--bogus-flag"], {
@@ -134,16 +223,20 @@ check("the config dir defaults to the personal config, not to the repo", () => {
 })
 
 check("OC_SYNC_CONFIG_DIR still overrides the config dir", () => {
+  // A path that exists on every platform this suite runs on: tmpdir() rather
+  // than a literal /tmp, which on macOS is a symlink to /private/tmp and would
+  // still compare equal here but is not the temp root the rest of the suite uses.
+  const elsewhere = path.join(tmpdir(), "somewhere-else")
   const out = execFileSync("bash", ["-c",
     'eval "$(grep -E \'^CONFIG_DIR=\' "$1")"; printf "%s" "$CONFIG_DIR"', "_", path.join(BIN, "oc-sync"),
-  ], { encoding: "utf8", env: { ...process.env, OC_SYNC_CONFIG_DIR: "/tmp/somewhere-else" } })
-  assert(out === "/tmp/somewhere-else", `the override must win, got ${out}`)
+  ], { encoding: "utf8", env: { ...process.env, OC_SYNC_CONFIG_DIR: elsewhere } })
+  assert(out === elsewhere, `the override must win, got ${out}`)
 })
 
 check("every synced item is read from the tree that owns it", () => {
-  // Static, because the two trees do not exist together in CI. A path pointed
-  // at the wrong one is silent: rsync reports the failure, but only after the
-  // host has been reached and the earlier items have already landed.
+  // Static, because the personal config tree is not part of this repository. A
+  // path pointed at the wrong one is silent: rsync reports the failure, but only
+  // after the host has been reached and the earlier items have already landed.
   const src = read("oc-sync")
   const fromRepo = ['$REPO_DIR/bin/$SCRIPT', '$REPO_DIR/src/', '$REPO_DIR/presets/', '$REPO_DIR/plugins/']
   const fromConfig = [
@@ -351,10 +444,66 @@ check("receiver reads the payload from SSH_ORIGINAL_COMMAND, never from $1..$4",
   // The bug this pins: an authorized_keys forced command is started with no
   // arguments of its own, so "$1" is always empty and every field fell back to
   // its default -- an empty popup on the desktop with nothing in the logs.
+  //
+  // Deliberately NOT pinned to `mapfile`. This used to assert the literal text
+  // "mapfile -t fields", which made it a test about one implementation of
+  // "split on newlines" rather than about the split. That is how the script
+  // could sit on a bash-4 builtin while every desktop it was installed on ran
+  // bash 3.2 -- macOS ships 3.2, and there `mapfile` is "command not found",
+  // `fields` stays unset, and all four fields silently fall back to their
+  // defaults. The assertion below is the property that actually matters: the
+  // payload is read from the environment, and split on newlines only.
   const src = read("oc-notify-receiver")
   assert(/SSH_ORIGINAL_COMMAND/.test(src), "the receiver should read the payload from the environment")
-  assert(/mapfile -t fields/.test(src), "it should split on newlines with mapfile, not word splitting")
   assert(!/\$\{1:-/.test(src) && !/\$\{2:-/.test(src), "it must not read positional parameters: ssh passes none")
+  // Newline-only splitting, whichever way it is spelled. `readarray` is bash's
+  // other name for `mapfile` and has the same floor.
+  assert(
+    /mapfile\s+-t/.test(src) || /readarray\s+-t/.test(src) || /while\s+IFS=\s*read\s+-r/.test(src),
+    "it must split the payload on newlines only -- never on whitespace, or a message with spaces is shredded",
+  )
+})
+
+check("receiver actually splits the payload, on this machine's bash", () => {
+  // The behavioural counterpart to the assertion above, and the one that would
+  // have caught the bash-3.2 failure: it EXECUTES the receiver with a payload
+  // that defeats word splitting (spaces, a glob character, a shell metacharacter)
+  // and reads back what notify-send was handed.
+  //
+  // This is a source-shape test's blind spot. Every assertion above passed with
+  // `mapfile` in the file while the script raised a blank "LaCode" popup on
+  // every macOS desktop, because "the file mentions mapfile" is not "mapfile
+  // ran". Stubbing notify-send keeps it offline and deterministic; the split
+  // logic is plain bash, so it behaves identically wherever it runs.
+  const home = mkdtempSync(path.join(tmpdir(), "ocsync-recv-"))
+  const stub = path.join(home, "notify-send")
+  const log = path.join(home, "argv.log")
+  writeFileSync(stub, `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a" >> ${JSON.stringify(log)}; done\nexit 0\n`)
+  chmodSync(stub, 0o755)
+
+  const body = "Step 3 of 7 failed: tests/*.spec.ts > 'should retry'"
+  try {
+    const result = spawnSync("bash", [path.join(BIN, "oc-notify-receiver")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${home}${path.delimiter}${process.env.PATH}`,
+        HOME: home,
+        SSH_ORIGINAL_COMMAND: `A Title\n${body}\ncritical\ndialog-error`,
+      },
+    })
+    assert(result.status === 0, `the receiver must exit 0 with a stub notifier: ${result.stderr}`)
+    assert(!/command not found/.test(result.stderr), `a builtin was missing: ${result.stderr.trim()}`)
+    const argv = readFileSync(log, "utf8").split("\n").filter((line) => line.length > 0)
+    assert(argv[0] === "A Title", `title must survive verbatim, got ${JSON.stringify(argv)}`)
+    // The whole point: word splitting would turn this into six arguments, and
+    // globbing would have eaten the `*` even if it had not.
+    assert(argv[1] === body, `the body must arrive as ONE argument, got ${JSON.stringify(argv)}`)
+    assert(argv[2] === "--urgency=critical", `urgency must survive, got ${JSON.stringify(argv)}`)
+    assert(argv[3] === "--icon=dialog-error", `icon must survive, got ${JSON.stringify(argv)}`)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
 })
 
 check("receiver never evaluates the payload, and says why", () => {
@@ -386,6 +535,43 @@ check("receiver validates the icon against a whitelist", () => {
 check("receiver uses notify-send with quoted arguments", () => {
   const src = read("oc-notify-receiver")
   assert(/exec notify-send "\$TITLE" "\$MSG"/.test(src), "title and message must be quoted")
+})
+
+check("receiver fails cleanly, with a way out, where notify-send does not exist", () => {
+  // The macOS case, and the reason the receiver is Linux-only BY DESIGN rather
+  // than by accident. A Mac has no notify-send, and this script is the desktop
+  // half of a tunnel whose persistence is a systemd --user unit, so there is no
+  // macOS reading of the hop to port.
+  //
+  // What is testable, and what this pins, is that the refusal is HONEST: a
+  // non-zero exit and a message that names both what is missing and what to use
+  // instead. A bare "command not found" from a forced command over ssh reaches
+  // nobody, which is how a broken desktop half presents as a working one.
+  //
+  // Hermetic rather than platform-gated: `pathWithout` removes notify-send
+  // from the PATH this child sees, which is exactly the state a Mac is in, on
+  // any machine. On a machine that never had one the PATH is simply returned
+  // unchanged and the same assertion holds.
+  const stripped = pathWithout("notify-send")
+  const home = mkdtempSync(path.join(tmpdir(), "ocsync-nonotify-"))
+  try {
+    const result = spawnSync("bash", [path.join(BIN, "oc-notify-receiver")], {
+      encoding: "utf8",
+      env: {
+        PATH: stripped.PATH,
+        HOME: home,
+        SSH_ORIGINAL_COMMAND: "A Title\nA body\ncritical\ndialog-error",
+      },
+    })
+    const output = (result.stdout || "") + (result.stderr || "")
+    assert(result.status === 127, `expected the conventional "not found" status 127, got ${result.status}: ${output.trim()}`)
+    assert(/notify-send/.test(output), `the missing channel must be named: ${output.trim()}`)
+    // The way out, not just the wall.
+    assert(/lacode notify/.test(output), `the message must point at the portable path: ${output.trim()}`)
+  } finally {
+    stripped.scratch()
+    rmSync(home, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -492,7 +678,7 @@ exit 0
   assert(/collide=stopped/.test(out), `a real collision must stop the run: ${out}`)
   assert(/claimed by both/.test(out), `and must say which two hosts: ${out}`)
   assert(/distinct=passed/.test(out), `distinct hosts must pass: ${out}`)
-})
+}, { skip: NO_OC_SYNC })
 
 check("oc-sync removes the RemoteForward that used to race the unit", () => {
   // Left in place, the config line wins the port on every login and then drops
@@ -587,7 +773,7 @@ check("dry run writes nothing and reports no failure", () => {
   } finally {
     rmSync(home, { recursive: true, force: true })
   }
-})
+}, { skip: NO_OC_SYNC })
 
 check("--help exits 0 and prints usage", () => {
   const result = spawnSync("bash", [path.join(BIN, "oc-sync"), "--help"], {
@@ -599,8 +785,71 @@ check("--help exits 0 and prints usage", () => {
 })
 
 // ---------------------------------------------------------------------------
+// The preflight: bin/oc-sync is Linux-only, and says so instead of guessing
+//
+// These run EVERYWHERE, on macOS and Linux alike, and deliberately so: the
+// condition being tested is a missing dependency, and one can be produced
+// hermetically by taking `timeout` off the PATH. That makes them the checks
+// that actually hold the portable-skip honest -- if the preflight regressed to
+// running anyway, these would fail on the machine that most needs them.
+// ---------------------------------------------------------------------------
 
-console.log(`${passed} checks passed`)
+check("oc-sync refuses to run without GNU timeout, and names what is missing", () => {
+  // The failure this replaces. Under bash 3.2 the host list is read with
+  // `mapfile`; that builtin does not exist, the array comes back empty, and the
+  // script reported "Error: no hosts configured." -- a confident wrong answer
+  // that sends the reader to edit .env while the real cause is the interpreter
+  // in front of them.
+  const stripped = pathWithout("timeout")
+  const home = mkdtempSync(path.join(tmpdir(), "ocsync-preflight-"))
+  try {
+    const result = spawnSync("bash", [path.join(BIN, "oc-sync"), "--dry-run"], {
+      encoding: "utf8",
+      env: hermeticEnv({ PATH: stripped.PATH, HOME: home, OC_HOSTS: "a-host", OC_HOSTS_FILE: "/nonexistent" }),
+    })
+    const output = (result.stdout || "") + (result.stderr || "")
+    assert(result.status === 1, `expected exit 1 from the preflight, got ${result.status}: ${output.trim()}`)
+    assert(/timeout/.test(output), `the missing dependency must be named: ${output.trim()}`)
+    assert(!/no hosts configured/.test(output),
+      `the misleading "no hosts configured" diagnosis must not come back: ${output.trim()}`)
+    // A way forward, not just a wall. Which way depends on the machine: on a Mac
+    // there is nothing to install and the answer is a different command, while on
+    // a Linux box that is merely short of coreutils the answer is `apt install`.
+    // Pinning either one would have made this check fail on the platform whose
+    // case it was written for.
+    assert(/coreutils|lacode notify/.test(output), `the message must offer a way forward: ${output.trim()}`)
+  } finally {
+    stripped.scratch()
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+check("oc-sync's preflight runs AFTER argument parsing, so --help and bad flags still behave", () => {
+  // Otherwise the preflight would swallow the two answers a user needs most on
+  // the machine where it fires: what does this do, and is my flag right.
+  const stripped = pathWithout("timeout")
+  try {
+    const help = spawnSync("bash", [path.join(BIN, "oc-sync"), "--help"], {
+      encoding: "utf8",
+      env: hermeticEnv({ PATH: stripped.PATH }),
+    })
+    assert(help.status === 0, `--help must still exit 0, got ${help.status}: ${help.stderr}`)
+    assert(/--scripts-only/.test(help.stdout), "help must still print usage")
+
+    const bogus = spawnSync("bash", [path.join(BIN, "oc-sync"), "--bogus-flag"], {
+      encoding: "utf8",
+      env: hermeticEnv({ PATH: stripped.PATH }),
+    })
+    assert(bogus.status === 2, `an unknown flag must still exit 2, got ${bogus.status}`)
+    assert(/unknown option/.test(bogus.stderr), `and must still say so: ${bogus.stderr.trim()}`)
+  } finally {
+    stripped.scratch()
+  }
+})
+
+// ---------------------------------------------------------------------------
+
+console.log(`${passed} checks passed${skipped ? `, ${skipped} skipped` : ""}`)
 if (failures.length > 0) {
   console.error(`\n${failures.length} FAILED:`)
   for (const failure of failures) console.error(`  - ${failure}`)

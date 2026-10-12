@@ -28,43 +28,73 @@ test.after(cleanupAll)
 const exec = promisify(execFile)
 const CLI = join(ROOT, "bin", "lacode")
 
+const onDarwin = process.platform === "darwin"
+
+/**
+ * Why a check that can only hold on the Linux notification channel is skipped
+ * rather than run: the channel is chosen by platform, and `osascript`'s argv
+ * carries neither `--urgency=` nor `--icon=`. The property behind those flags --
+ * that an unwhitelisted urgency or icon never reaches a notifier -- is asserted
+ * on every platform by the tests that read ALL channels.
+ */
+const SKIP_LINUX_CHANNEL = "the local notification channel here is osascript, whose argv has no --urgency=/--icon=; the whitelist itself is covered on darwin by the test that reads every channel"
+
+
 /**
  * A stub transport that records its argv, one NUL-terminated record per argument.
  *
- * `notify-send` and `ssh` are the only two external binaries the hop uses, so
- * replacing exactly those turns "did it reach the desktop" and "how did it get
- * there" into file reads.
+ * `ssh` plus EVERY local notification channel -- `notify-send`, `osascript` and
+ * `terminal-notifier` -- are stubbed, so "did it reach the desktop" and "how did
+ * it get there" become file reads on every platform.
+ *
+ * All three, not just notify-send, and that is load-bearing rather than
+ * thoroughness. `localChannel()` picks by `process.platform` FIRST and by what
+ * is installed second, so on a real Mac `osascript` is chosen and `notify-send`
+ * is never invoked at all. A suite that stubbed only notify-send would therefore
+ * pass on Linux and read an empty log -- and worse, would invoke the runner's
+ * REAL osascript against a GUI session that is not there. The platform then
+ * decides which stub fires, and `desktopArgv()` below reads whichever it was.
  *
  * NUL, not newline, is the record separator: the notification payload is ONE
  * argument containing embedded newlines, and a newline-delimited log would split
  * it back into four records and hide exactly the defect these tests exist to
  * catch. Nothing here runs a shell, evaluates an argument, or reaches a network.
  */
+const CHANNELS = ["notify-send", "osascript", "terminal-notifier"]
+
 const stubTransport = () => {
   const bin = scratch("stub-bin-")
-  const notifyLog = join(bin, "notify-send.log")
   const sshLog = join(bin, "ssh.log")
+  const channelLogs = Object.fromEntries(CHANNELS.map((name) => [name, join(bin, `${name}.log`)]))
 
-  writeFileSync(
-    join(bin, "notify-send"),
-    `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(notifyLog)}; done\nexit 0\n`,
-  )
-  writeFileSync(
-    join(bin, "ssh"),
-    `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(sshLog)}; done\nexit 0\n`,
-  )
-for (const name of ["notify-send", "ssh"]) chmodSync(join(bin, name), 0o755)
+  const recorder = (log) => `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done\nexit 0\n`
+  writeFileSync(join(bin, "ssh"), recorder(sshLog))
+  for (const name of CHANNELS) writeFileSync(join(bin, name), recorder(channelLogs[name]))
+  for (const name of ["ssh", ...CHANNELS]) chmodSync(join(bin, name), 0o755)
 
   // NUL records, dropped only at the trailing terminator: an empty notification
   // body is a real argument, and `filter(Boolean)` would silently delete
-  // exactly the field under test.
   const argv = (log) => {
     if (!existsSync(log)) return []
     const parts = readFileSync(log, "utf8").split("\0")
     if (parts[parts.length - 1] === "") parts.pop()
     return parts
   }
-  return { bin, notifyArgv: () => argv(notifyLog), sshArgv: () => argv(sshLog) }
+  return {
+    bin,
+    /** Per-channel argv, for the assertions that are about one channel's shape. */
+    channelArgv: (name) => argv(channelLogs[name]),
+    /**
+     * Every argument handed to ANY desktop channel, in a fixed order.
+     *
+     * This is the platform-independent accessor, and it is a stronger assertion
+     * than reading one log: a notification that leaked unvalidated text into a
+     * channel this machine did not pick still shows up here.
+     */
+    desktopArgv: () => CHANNELS.flatMap((name) => argv(channelLogs[name])),
+    notifyArgv: () => argv(channelLogs["notify-send"]),
+    sshArgv: () => argv(sshLog),
+  }
 }
 
 /**
@@ -98,6 +128,12 @@ const lacode = async (args, { transports, env = {} } = {}) => {
  * variable. This helper supplies exactly that, with `notify-send` stubbed on
  * PATH and read back afterwards, so "the popup on the desktop" is a file read
  * rather than an assumption.
+ *
+ * The receiver is LINUX-ONLY by design (it delivers through notify-send, and
+ * the forward that reaches it is a systemd user unit), but stubbing the notifier
+ * makes it runnable -- and assertable -- from any platform, which is why this
+ * helper stubs rather than skipping on darwin. What it pins here is the parse,
+ * and the parse is portable.
  */
 const runReceiver = async ({ command, args = [] } = {}) => {
   const transports = stubTransport()
@@ -163,11 +199,15 @@ test("[US-13] a notification raised on a remote host is delivered to the local d
   assert.ok(landed.notifyArgv.includes("--urgency=normal"), "the urgency must arrive too")
   assert.ok(landed.notifyArgv.includes("--icon=utilities-terminal"), "the icon must arrive too")
 
-  // And with the tunnel down, the SAME title reaches notify-send locally, which
-  // is what "the local desktop shows it" means in the end.
+  // And with the tunnel down, the SAME title reaches a desktop channel locally,
+  // which is what "the local desktop shows it" means in the end.
+  //
+  // `desktopArgv()`, not `notifyArgv()`: the local channel is chosen by platform,
+  // so on a Mac this is osascript rather than notify-send, and reading one
+  // channel's log would assert against a binary that machine never runs.
   const local = stubTransport()
   await lacode(["notify", "opencode — Fix the login", "Task finished", "normal", "utilities-terminal"], { transports: local })
-  assert.ok(local.notifyArgv().includes("opencode — Fix the login"), `the desktop must receive it: ${JSON.stringify(local.notifyArgv())}`)
+  assert.ok(local.desktopArgv().includes("opencode — Fix the login"), `the desktop must receive it: ${JSON.stringify(local.desktopArgv())}`)
 })
 
 test("[US-13] the desktop user and port come from configuration, never from the remote's id -u / id -un", async () => {
@@ -195,28 +235,48 @@ test("[US-13] the desktop user and port come from configuration, never from the 
   assert.match(result.stderr, /OC_LOCAL_USER is unset/, `the refusal must be explained: ${result.stderr}`)
 })
 
-test("[US-13] urgency and icon are validated against a whitelist before notify-send is invoked", async () => {
+test("[US-13] unvalidated urgency and icon never reach a notifier, on any platform", async () => {
+  // The security half, and it is the half that must hold everywhere. The local
+  // channel differs by platform, so the assertion is made against EVERY stubbed
+  // channel rather than the one this machine happens to pick: a hostile value
+  // that leaked into a channel we did not expect is still a leak.
   const transports = stubTransport()
   await lacode(["notify", "T", "M", "not-a-urgency; rm -rf /", "../../etc/passwd"], { transports })
 
-  const argv = transports.notifyArgv()
-  assert.ok(argv.includes("--urgency=normal"), `an unknown urgency must collapse to the default: ${JSON.stringify(argv)}`)
-  assert.ok(argv.includes("--icon=utilities-terminal"), `an unknown icon must collapse to the default: ${JSON.stringify(argv)}`)
+  const argv = transports.desktopArgv()
+  assert.ok(argv.length > 0, `something must have reached a notifier: ${JSON.stringify(argv)}`)
   for (const arg of argv) {
-    assert.doesNotMatch(arg, /rm -rf|passwd/, `an unvalidated argument reached notify-send: ${arg}`)
-  }
-  // Every whitelisted icon and urgency is passed through unchanged.
-  for (const [urgency, icon] of [
-    ["low", "dialog-error"],
-    ["critical", "dialog-warning"],
-    ["normal", "emblem-default"],
-  ]) {
-    const pass = stubTransport()
-    await lacode(["notify", "T", "M", urgency, icon], { transports: pass })
-    assert.ok(pass.notifyArgv().includes(`--urgency=${urgency}`), `${urgency} must pass through`)
-    assert.ok(pass.notifyArgv().includes(`--icon=${icon}`), `${icon} must pass through`)
+    assert.doesNotMatch(arg, /rm -rf|passwd|\.\.\//, `an unvalidated argument reached a notifier: ${arg}`)
   }
 })
+
+test(
+  "[US-13] urgency and icon are validated against a whitelist before notify-send is invoked",
+  { skip: onDarwin ? SKIP_LINUX_CHANNEL : false },
+  async () => {
+    // The notify-send argument SHAPE, which is Linux-only: on macOS the local
+    // channel is osascript, whose argv is `-e <script> <marker> <title> <body>`
+    // and carries neither `--urgency=` nor `--icon=`. The whitelist itself is
+    // platform-independent and is asserted just above, against every channel.
+    const transports = stubTransport()
+    await lacode(["notify", "T", "M", "not-a-urgency; rm -rf /", "../../etc/passwd"], { transports })
+
+    const argv = transports.notifyArgv()
+    assert.ok(argv.includes("--urgency=normal"), `an unknown urgency must collapse to the default: ${JSON.stringify(argv)}`)
+    assert.ok(argv.includes("--icon=utilities-terminal"), `an unknown icon must collapse to the default: ${JSON.stringify(argv)}`)
+    // Every whitelisted icon and urgency is passed through unchanged.
+    for (const [urgency, icon] of [
+      ["low", "dialog-error"],
+      ["critical", "dialog-warning"],
+      ["normal", "emblem-default"],
+    ]) {
+      const pass = stubTransport()
+      await lacode(["notify", "T", "M", urgency, icon], { transports: pass })
+      assert.ok(pass.notifyArgv().includes(`--urgency=${urgency}`), `${urgency} must pass through`)
+      assert.ok(pass.notifyArgv().includes(`--icon=${icon}`), `${icon} must pass through`)
+    }
+  },
+)
 
 test("[US-13] the notification crosses the hop as ONE delimited argument, never as a shell string", async () => {
   const transports = stubTransport()
@@ -244,11 +304,11 @@ test("[US-13] the notification crosses the hop as ONE delimited argument, never 
   // evaluates.
   assert.ok(!existsSync(marker), "the payload must never be evaluated by a shell")
 
-  // The same on the receiving side: notify-send gets args, not a command line.
+  // The same on the receiving side: the notifier gets args, not a command line.
   const local = stubTransport()
   await lacode(["notify", `Title ${payload}`, "M", "normal", "utilities-terminal"], { transports: local })
   assert.ok(!existsSync(marker), "the local send must not evaluate the payload either")
-  assert.ok(local.notifyArgv().includes(`Title ${payload}`), "the title must reach the desktop intact")
+  assert.ok(local.desktopArgv().includes(`Title ${payload}`), "the title must reach the desktop intact")
 })
 
 test("[US-13] the hop is resolved from configuration alone, so it survives the session that started it", async () => {
@@ -409,7 +469,7 @@ test("[US-14] a failing hop never produces a desktop notification on the remote 
       OC_CONNECT_TIMEOUT_MS: "1000",
     },
   })
-  assert.deepEqual(transports.notifyArgv(), [], "a remote hop must never fall back to the remote desktop")
+  assert.deepEqual(transports.desktopArgv(), [], "a remote hop must never fall back to the remote host's own desktop, on any channel")
   assert.equal(result.code, 0, "a failed hop is still a successful fire-and-forget call")
   assert.match(result.stderr, /Connection refused/, `ssh's own diagnostic must reach the operator: ${result.stderr}`)
 })
@@ -482,13 +542,16 @@ test("[US-14] every ssh call clears its forwardings so it cannot compete for the
 })
 
 test("[US-14] an argument that is not whitelisted is rejected rather than forwarded", async () => {
+  // Platform-independent, and asserted against every channel: whether this
+  // machine picks notify-send, osascript or terminal-notifier, the unvalidated
+  // urgency and icon are replaced rather than forwarded, and `$(id)` never
+  // becomes an argument a notifier will act on.
   const transports = stubTransport()
   const hostile = "--hint=ignore;$(id)"
   await lacode(["notify", "T", "M", hostile, hostile], { transports })
-  const argv = transports.notifyArgv()
-  assert.deepEqual(argv.filter((a) => a.includes("id)")), [], `nothing unvalidated may reach notify-send: ${JSON.stringify(argv)}`)
-  assert.ok(argv.includes("--urgency=normal"), "an unknown urgency is replaced, not passed through")
-  assert.ok(argv.includes("--icon=utilities-terminal"), "an unknown icon is replaced, not passed through")
+  const argv = transports.desktopArgv()
+  assert.ok(argv.length > 0, `the notification must still be delivered: ${JSON.stringify(argv)}`)
+  assert.deepEqual(argv.filter((a) => a.includes("id)") || a.includes("hint=ignore")), [], `nothing unvalidated may reach a notifier: ${JSON.stringify(argv)}`)
 })
 
 test("[US-14] doctor reports what the environment resolves to without failing when nothing is configured", async () => {
@@ -571,7 +634,6 @@ const withStubs = (names, fn) => {
  * These two cases need a Mac that is missing a binary the OS ships, which a
  * machine that IS that Mac cannot fake by editing PATH.
  */
-const notOnDarwin = process.platform === "darwin"
 const REASON = "cannot simulate a Mac without osascript by editing the PATH of a Mac"
 
 const REQUEST = {
@@ -634,7 +696,7 @@ test("[US-26] a title and body full of quotes and shell metacharacters reach osa
   })
 })
 
-test("[US-26] macOS falls back to terminal-notifier only when osascript is absent", { skip: notOnDarwin ? REASON : false }, () => {
+test("[US-26] macOS falls back to terminal-notifier only when osascript is absent", { skip: onDarwin ? REASON : false }, () => {
   withStubs(["terminal-notifier"], ({ argv }) => {
     const result = sendLocal(REQUEST, "darwin")
     assert.equal(result.ok, true, `the send must succeed: ${result.detail}`)
@@ -655,7 +717,7 @@ test("[US-26] macOS falls back to terminal-notifier only when osascript is absen
   })
 })
 
-test("[US-26] a Mac with no notifier degrades to a reported failure, and never hangs", { skip: notOnDarwin ? REASON : false }, () => {
+test("[US-26] a Mac with no notifier degrades to a reported failure, and never hangs", { skip: onDarwin ? REASON : false }, () => {
   withStubs([], () => {
     const started = Date.now()
     const result = sendLocal(REQUEST, "darwin")
@@ -700,9 +762,25 @@ test("[US-26] Linux still delivers through notify-send, argument for argument un
   })
 
   // ...and the default, with no platform argument, is still this machine's.
-  withStubs(["notify-send"], ({ argv }) => {
+  //
+  // Written against `localChannel()` rather than against notify-send's argv,
+  // because the claim here is "the default is whatever THIS machine picks" and
+  // that is not notify-send on a Mac. Pinning the literal Linux call here would
+  // have made this test fail on a Mac for being on a Mac -- the
+  // exact shape of bug this whole change exists to remove. The byte-exact Linux
+  // call is pinned above and in the `sendLocal(REQUEST, "linux")` case, where it
+  // belongs.
+  withStubs(["notify-send", "osascript", "terminal-notifier"], ({ argv }) => {
     sendLocal(REQUEST)
-    assert.deepEqual(argv("notify-send"), ["opencode — Fix the login", "Task finished", "--urgency=critical", "--icon=dialog-error"])
+    const expected = localChannel()
+    assert.notEqual(expected, "none", `this machine must resolve to a channel; a test runner with no notifier proves nothing`)
+    for (const channel of ["notify-send", "osascript", "terminal-notifier"]) {
+      if (channel === expected) continue
+      assert.deepEqual(argv(channel), [], `only ${expected} may run here, but ${channel} did: ${JSON.stringify(argv(channel))}`)
+    }
+    // Whatever the channel is, the title is an argument to it -- never spliced
+    // into a command line.
+    assert.ok(argv(expected).includes(REQUEST.title), `${expected} must have received the title as an argument: ${JSON.stringify(argv(expected))}`)
   })
 })
 

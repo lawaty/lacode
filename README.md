@@ -39,9 +39,11 @@ directory to create. Do not run `npm i -g @lawaty/lacode`: a global npm install
 is never consulted by opencode, so it changes nothing about whether the plugin
 loads.
 
-It is also the form to keep as your default. On opencode 1.18.35 this one line
-installs the package but does not load it — see
-[If the plugin does not load on opencode 1.18.35](#if-the-plugin-does-not-load-on-opencode-11835).
+It is also the form to keep as your default: if your opencode does not load the
+bare specifier, add to this line rather than replacing it. The
+[procedure below](#if-the-agents-are-missing) says when that is, and
+[which versions this is known on](#which-opencode-versions-this-is-known-on)
+says what is actually verified.
 
 To install it explicitly instead — or to install it once for every project on
 the machine rather than per config — use the CLI, which does the same thing:
@@ -57,28 +59,53 @@ agent set will look stale for no visible reason.
 
 ### Where it is installed
 
-opencode installs npm plugins itself, into one directory per specifier under
-its cache — not into your project's `node_modules`, and not from anywhere a
-global npm install put them:
+opencode installs npm plugins itself, into one directory per specifier under its
+cache — not into your project's `node_modules`, and not from anywhere a global
+npm install put them. Ask opencode where that cache is instead of assuming,
+because where it lives differs by platform:
+
+```bash
+opencode debug paths
+```
+
+It prints the directories opencode is using on this machine — config, data, log
+and the rest. Find the **cache** line and append
+`/packages/<specifier>/node_modules/` to the path it reports. On Linux with no
+`XDG_CACHE_HOME` set, that comes out as, for example:
 
 ```
-$XDG_CACHE_HOME/opencode/packages/<specifier>/node_modules/
-# ~/.cache/opencode/packages/@lawaty/lacode@latest/node_modules/ by default
+~/.cache/opencode/packages/@lawaty/lacode@latest/node_modules/
 ```
 
-`$XDG_CACHE_HOME` defaults to `~/.cache`; set it if you keep a cache elsewhere.
-To inspect what a specifier actually resolved to, list its directory under
-`~/.cache/opencode/packages/`. An empty directory with no `node_modules` inside
-it means the install failed — almost always an unpublished or misspelled package
-— and opencode starts normally **without** the plugin. A *populated* directory
-there means the install succeeded and tells you nothing about whether the plugin
-was loaded; see
-[the next section](#if-the-plugin-does-not-load-on-opencode-11835).
+**That last line is an illustration of one platform's layout, not a path to
+copy.** Where the same cache root sits on another operating system is not
+something this document should guess at — read it from `opencode debug paths`
+and use what it prints.
 
-### Verifying the install
+To inspect what a specifier actually resolved to, list its directory under that
+cache root. An **empty** directory with no `node_modules` inside it means the
+install failed — almost always an unpublished or misspelled package — and
+opencode starts normally **without** the plugin. A **populated** directory there
+means the install succeeded and tells you nothing at all about whether the
+plugin was loaded; that is the next section, and telling those two apart is the
+whole reason for reading it.
 
-A plugin that fails to install is silent: there is no error, opencode starts,
-and it simply does not have the agents. Check for them:
+### If the agents are missing
+
+A plugin that fails to load is silent: opencode starts normally, prints nothing,
+logs nothing, and the agents are simply not there. Work down this. Every step
+below is written to hold whichever opencode version you are running — none of
+them depends on knowing the answer in advance.
+
+**1 — Write the bare specifier and restart.**
+
+```json
+{ "plugin": ["@lawaty/lacode"] }
+```
+
+Nothing here hot-reloads, so the restart is part of the step, not a footnote.
+
+**2 — Check whether the plugin loaded.**
 
 ```bash
 opencode agent list | grep -E '^(explore-fast|implement-fast|explore-deep|implement-deep)'
@@ -86,59 +113,123 @@ opencode agent list | grep -E '^(explore-fast|implement-fast|explore-deep|implem
 
 A working install prints `explore-fast`, `implement-fast`, `explore-deep` and
 `implement-deep`, each with the hidden `-1`..`-4` pool variants alongside. If the
-grep returns nothing but opencode's built-ins, the plugin did not load: check the
-cache directory above, and check that `plugin` is in the config file opencode
-actually reads. A cache directory that is **populated** and still yields no
-agents is a different failure from an empty one — the install worked and the
-loader dropped the plugin, which is what
-[the next section](#if-the-plugin-does-not-load-on-opencode-11835) describes. Run
-this in the same shell environment opencode runs in — an
+grep returns nothing and the list holds only opencode's own built-ins, the plugin
+did not load. Run it in the same shell environment opencode runs in — an
 `agent list` under a different `HOME` or `XDG_CONFIG_HOME` tests a different
-machine.
+machine. **If the agents are listed, stop here: the one line above is the whole
+install**, and nothing further in this section applies to you.
 
-### If the plugin does not load on opencode 1.18.35
+**3 — Decide which failure you are looking at.** Inspect the package directory
+under the cache root from
+[Where it is installed](#where-it-is-installed), and also check that `plugin`
+really is in the config file opencode reads.
 
-On opencode **1.18.35** the bare npm specifier installs the package into the
-cache and then silently drops it: opencode starts normally, nothing is printed
-and nothing is logged, and none of the LaCode agents exist. That was measured
-there — a cache directory populated by a successful install, zero agents
-injected, no error anywhere.
+- **Empty** (no `node_modules` inside): the install failed — check the package
+  name, and that it is published. There is nothing to load yet.
+- **Populated**: the install worked and the loader dropped the plugin. Go to
+  step 4. These two look identical from the outside, which is why this step
+  exists.
 
-The install is not what fails. On that version the plugin's entry point is
-resolved through `exports["./server"]` or a top-level `main`; this package
-publishes `exports["."]`, which that lookup does not see. Point the loader at the
-built file directly:
+**4 — If the install worked and the agents are still missing, point the loader
+at the built file.** Add a second entry; leave the bare name in place:
 
 ```json
 {
   "plugin": [
     "@lawaty/lacode",
-    "file:///home/you/.cache/opencode/packages/@lawaty/lacode@latest/node_modules/@lawaty/lacode/dist/index.js"
+    "file:///ABSOLUTE-PATH-FROM-debug-paths/packages/@lawaty/lacode@latest/node_modules/@lawaty/lacode/dist/index.js"
   ]
 }
 ```
 
-- The bare name is what makes opencode install the package into its cache. It
-  contributes nothing to the loaded plugin on 1.18.35, so this pair does not
-  double-inject.
-- The `file://` entry is the one that loads. With it, the agent list is
-  complete.
+`ABSOLUTE-PATH-FROM-debug-paths` is a placeholder to be replaced, not a
+directory: take the cache path `opencode debug paths` reports for **your**
+machine and put it in front of `/packages/…`. It must be an absolute path with
+`$HOME` already expanded and no `~` left in it. Re-derive it after a cache wipe
+or a reinstall — the directory is keyed by specifier, so it moves when the
+version does.
 
-The path is the default cache layout described above, with `$HOME` expanded —
-substitute your own. Re-check it after a cache wipe or a reinstall: the cache
-directory is keyed by specifier, so it moves when the version does.
+Why keep both entries instead of swapping the bare name out:
 
-After a cache wipe, expect to restart opencode twice before the agents appear.
-The first start installs the package and creates the path the `file://` entry
-points at, but a path that does not exist at startup is a path that cannot be
-loaded in that same run. The second start finds it and loads the plugin. After
-that it is steady state.
+- The bare name is what makes opencode install the package into its cache, and
+  therefore what creates the path the `file://` entry points at.
+- The `file://` entry is what actually loads the plugin.
+- They **cannot double-inject** on opencode 1.18.35, where the bare name
+  contributes nothing at all: the pair loads the plugin exactly once. On any
+  other version this is untested, which is precisely why step 4 is something you
+  take *because* step 2 showed the agents missing, and never on the expectation
+  that it would help.
+
+**5 — Restart, and expect two restarts after a cache wipe.** The first start
+installs the package and creates the path the `file://` entry points at, but a
+path that does not exist at startup is a path that cannot be loaded in that same
+run. The second start finds it and loads the plugin. After that it is steady
+state.
 
 This package also publishes `main` and an `exports["./server"]` entry pointing at
-the same file, which are the two shapes the documented convention uses. They are
-correct metadata and they cost nothing — but they do **not** fix 1.18.35: adding
-either one to the *installed* cache copy was tested there and the bare
-specifier still loaded nothing. Use the `file://` entry.
+the same built file, because those are two of the shapes a plugin loader
+resolving an entry point consults. They are forward-compatibility metadata and
+they cost nothing — but they do **not** fix this on 1.18.35: adding either one to
+the *installed* cache copy was tested there and the bare specifier still loaded
+nothing. No other version has been observed where they help either. Use the
+`file://` entry.
+
+### Which opencode versions this is known on
+
+Exactly one version has been measured, and the procedure above is deliberately
+not built around that fact. Treat this table as the evidence it is, which is one
+row wide.
+
+| opencode version | bare spec loads? | `file://` needed? | evidence |
+| --- | --- | --- | --- |
+| 1.18.35 | No — installs the package, then silently drops it | Yes | **Verified** on 1.18.35: a populated cache directory, zero agents injected, no error and no log line; the `file://` entry loads the full agent set. |
+| Any other version | **Unknown** | **Unknown** | **Untested.** No other opencode version has been run against this package in either direction. |
+
+Every command quoted on this page was run against 1.18.35. **If your version is
+not the one measured here, follow the procedure above rather than reading this
+table as coverage of your build**: each step stands on its own, and step 2 tells
+you which situation you are in before any version-specific advice is relevant.
+
+### macOS
+
+The plugin runs on macOS. It is plain JavaScript with no native dependency, and
+what the package publishes is the built JavaScript rather than TypeScript
+sources, so nothing about loading it is Linux-only. Use the procedure above
+unchanged.
+
+Three things differ, and all three are worth reading rather than assuming:
+
+- **Paths.** Do not copy a cache path out of this document — the example under
+  [Where it is installed](#where-it-is-installed) is one platform's layout. Run
+  `opencode debug paths` and build the `file://` entry from what it reports.
+  This page deliberately does not name a macOS cache root: where opencode keeps
+  it on a Mac has not been established here, and a plausible-looking guess is
+  worse than an instruction to look.
+- **Notifications** are delivered through `osascript`, or through
+  `terminal-notifier` when `osascript` is not installed, rather than through the
+  Linux `notify-send` (US-26). `lacode doctor` reports which channel your machine
+  would actually use.
+- **The repository's shell scripts are Linux-only by design**, and are not in the
+  published package. They drive one person's SSH topology, so each is on the side
+  it belongs to:
+
+  | Script | Runs on | Why it is Linux-only |
+  | --- | --- | --- |
+  | `bin/oc`, `bin/oc-notify` | the **remote host** that runs opencode | Server-side. They are pushed to `~/bin/` on each host by `bin/oc-sync` and notify *your desktop* over the tunnel. |
+  | `bin/oc-notify-receiver` | your **desktop** | Delivers through `notify-send` (libnotify), and the persistent forward that reaches it is a systemd user unit. |
+  | `bin/oc-sync` | your **desktop** | Installs those systemd user units and runs `loginctl enable-linger`. |
+
+  None of this is a limitation of the package: a macOS client installs the plugin
+  and uses the `lacode` CLI, and both are portable. The scripts above are the
+  author's personal remote-tunnel tooling. `bin/oc-sync` refuses to run where it
+  cannot work and says which `lacode` subcommand to use instead, rather than
+  failing somewhere less obvious.
+
+**The test suite runs on macOS.** It is written to pass on a Mac as well as on
+Linux, so "it works on a Mac" is a supported claim rather than an intention. The
+few checks that exercise the Linux-only shell scripts above skip themselves on a
+machine that cannot run them, naming the reason — a bash 3.2 with no `mapfile`,
+or no GNU `timeout` — rather than passing silently or failing confusingly.
 
 ### The `lacode` CLI
 
@@ -462,7 +553,8 @@ they call the same `scripts/build.mjs` the tarball does.
 is the guard: it reads the `### US-N:` headings out of `docs/USER-STORIES.md`
 and the `[US-N]` markers out of the test names and fails if they disagree, in
 either direction. **A test that covers a story must have the id at the start of
-its name** — `test("[US-7] a paid model is accepted")` — or CI's guard fails it.
+its name** — `test("[US-7] a paid model is accepted")` — or the coverage guard
+fails it.
 A story with no test is as much a failure as a test naming a story that does not
 exist.
 

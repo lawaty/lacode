@@ -251,11 +251,17 @@ test("[US-15] the published package loads and runs from inside node_modules, whe
 //
 // So `main` and `exports["./server"]` are published as well. They are the shapes
 // a resolver following the documented convention consults, and on versions that
-// honour them they make the bare specifier work -- which is worth having for a
-// package whose whole pitch is a one-line install. They are NOT a fix for
+// honour them they may make the bare specifier work -- which is worth having for
+// a package whose whole pitch is a one-line install. They are NOT a fix for
 // 1.18.35: adding either of them to the INSTALLED cache copy was tested there and
-// the bare specifier still loaded nothing. These tests therefore pin the fields
-// and pin the README's honesty about what they do and do not buy.
+// the bare specifier still loaded nothing.
+//
+// No other version has been tested in either direction, so the README's version
+// table records 1.18.35 as verified and every other version as unknown, and the
+// install guidance is written as a procedure (add, verify, fall back to a
+// `file://` entry) rather than as instructions for one version. These tests pin
+// the manifest fields, pin the README's honesty about what they do and do not
+// buy, and pin that no version is claimed without evidence.
 // ---------------------------------------------------------------------------
 
 test("[US-15] the manifest publishes every entry-point shape a plugin loader may resolve", async () => {
@@ -284,47 +290,225 @@ test("[US-15] the manifest publishes every entry-point shape a plugin loader may
   }
 })
 
-test("[US-15] the README documents the 1.18.35 loader failure and the `file://` config that actually loads", () => {
+/**
+ * The `## Install` chapter, as text.
+ *
+ * Deliberately NOT anchored to a `###` heading. The old assertion pinned the
+ * exact string "### If the plugin does not load on opencode 1.18.35" and its
+ * GitHub anchor, so rewording a heading — which is exactly what a restructure
+ * does — failed a test that had nothing to say about wording. These assertions
+ * are about the substance a reader needs, so they locate the chapter by its
+ * stable top-level heading and then require the concepts to be present.
+ *
+ * The chapter is still a meaningful scope: nothing outside `## Install`
+ * discusses the cache, the `file://` fallback or which versions are verified, so
+ * a claim satisfied from some unrelated section cannot satisfy these.
+ */
+const installChapter = () => {
   const readme = readFileSync(join(ROOT, "README.md"), "utf8")
-  const heading = "### If the plugin does not load on opencode 1.18.35"
-  const anchor = "#if-the-plugin-does-not-load-on-opencode-11835"
-  const at = readme.indexOf(heading)
-  assert.ok(at !== -1, `README must carry the "${heading}" section; found none`)
+  const start = readme.search(/^## Install\b/m)
+  assert.ok(start !== -1, "README must have a `## Install` chapter")
+  const rest = readme.slice(start)
+  const next = rest.slice(1).search(/^## /m)
+  return next === -1 ? rest : rest.slice(0, next + 1)
+}
 
-  // Scoped to THIS section, so the checks below are about the workaround and
-  // cannot be satisfied by a `file://` mentioned somewhere else in the document.
-  const nextHeading = readme.indexOf("\n### ", at + heading.length)
-  const section = readme.slice(at, nextHeading === -1 ? readme.length : nextHeading)
+/** Every markdown table row in the install chapter, separator rows dropped. */
+const tableRows = (text) =>
+  text.split("\n")
+    .filter((line) => /^\s*\|.*\|\s*$/.test(line) && !/^\s*\|[\s:|-]+\|\s*$/.test(line))
+    .map((line) => line.trim())
 
-  // The one-liner stays the documented install; the workaround is a fallback,
-  // not a replacement, and the README must say which one it is.
-  assert.ok(readme.includes('{ "plugin": ["@lawaty/lacode"] }'), "the bare one-liner must remain the documented install")
-  assert.ok(readme.slice(0, at).includes(anchor), "the install section must forward-pointer to the workaround")
+/**
+ * The rows of the table whose HEADER is about versions, and only that table.
+ *
+ * Scoping to the table rather than to every row in the chapter is what keeps
+ * this honest: the install chapter legitimately carries more than one table (a
+ * macOS subsection naming the Linux-only scripts adds one), and a row-by-row
+ * rule applied to all of them would either demand "untested" of an unrelated
+ * table or -- worse -- be loosened until it stopped biting.
+ *
+ * Returns { header, rows } so a caller can assert the header is really about
+ * versions before trusting anything downstream.
+ */
+const versionTable = (chapter) => {
+  const lines = chapter.split("\n")
+  const tables = []
+  let current = []
+  for (const line of lines) {
+    if (/^\s*\|.*\|\s*$/.test(line)) current.push(line.trim())
+    else if (current.length) { tables.push(current); current = [] }
+  }
+  if (current.length) tables.push(current)
 
-  // The working configuration: the bare specifier AND a file:// entry into the
-  // cached build. Parsed, not grepped, so a half-written example fails here.
-  const example = section.match(/```json\n([\s\S]*?)```/)
-  assert.ok(example, "the section must show a copy-pasteable config")
-  const entries = JSON.parse(example[1]).plugin
+  const found = tables.find((rows) => /version/i.test(rows[0] ?? ""))
+  assert.ok(found, `the install chapter must carry a table about opencode versions; found headers: ${tables.map((t) => t[0]).join(" / ")}`)
+  return { header: found[0], rows: found.slice(1).filter((row) => !/^\s*\|[\s:|-]+\|\s*$/.test(row)) }
+}
+
+/**
+ * One `###` section of a chapter, located by matching its HEADING against a
+ * pattern rather than by exact text. Rewording a heading therefore does not
+ * fail a test, but deleting the section does.
+ */
+const sectionOf = (chapter, headingRe) => {
+  const headings = [...chapter.matchAll(/^#{1,3} (.+)$/gm)].map((m) => ({ text: m[1], at: m.index }))
+  const found = headings.find((h) => headingRe.test(h.text))
+  assert.ok(found, `the install chapter must have a section matching ${headingRe}; found: ${headings.map((h) => h.text).join(" | ")}`)
+  const after = chapter.slice(found.at + found.text.length)
+  const next = after.search(/^#{1,3} /m)
+  return next === -1 ? after : after.slice(0, next)
+}
+
+/**
+ * "does not fix" / "do **not** fix" / "not a fix", emphasis and line-wrapping
+ * tolerant. The README hard-wraps and bolds the negation, so a stricter pattern
+ * would be a test about formatting rather than about the claim.
+ */
+const DENIES_A_FIX = /do(?:es)?\s+[*_]*not[*_]*\s+fix|not[*_]*\s+a\s+fix/i
+
+test("[US-15] the README gives a version-agnostic install procedure: verify with `agent list`, find paths with `debug paths`, fall back to `file://`", () => {
+  const chapter = installChapter()
+  // `assert.ok(regex.test(...))` rather than `assert.match`: the chapter is
+  // thousands of characters, and node prints the whole "actual" value on a
+  // failed assert.match, which buries the message that explains the failure.
+  const has = (re, message) => assert.ok(re.test(chapter), message)
+
+  // The two commands the procedure is built on. Failure mode if either goes:
+  // without `agent list` the reader has no way to tell "installed" from
+  // "loaded", which is the exact conflation this section exists to stop;
+  // without `debug paths` they are back to copying an OS-specific cache path
+  // that is wrong on every platform but one.
+  has(/opencode agent list/, "the procedure must verify the load with `opencode agent list`")
+
+  // Scoped to the section that introduces the cache location rather than to the
+  // whole chapter. The string appears in several places, and a chapter-wide
+  // check stays green if the instruction is replaced by a hardcoded path right
+  // where the reader first looks for one -- which is the mutation that matters.
+  const where = sectionOf(chapter, /where it is installed|cache/i)
+  assert.ok(
+    /opencode debug paths/.test(where),
+    "the section that names the cache location must tell the reader to read it from `opencode debug paths`, not to assume a root",
+  )
+  assert.ok(
+    /illustration|for example|not a path to copy/i.test(where),
+    "any literal cache path shown must be marked as an illustration of one platform's layout",
+  )
+
+  // The one-line install stays the documented install; the fallback is an
+  // addition to it, not a replacement.
+  assert.ok(chapter.includes('{ "plugin": ["@lawaty/lacode"] }'), "the bare one-liner must remain the documented install")
+  has(/restart/i, "the procedure must tell the reader to restart: nothing here hot-reloads")
+
+  // Two restarts after a cache wipe is a measured behaviour that is easy to
+  // lose in a rewrite, and its absence sends people looking for a bug.
+  has(/\btwice\b|two restarts/i, "the two-restarts-after-a-cache-wipe behaviour must survive the restructure")
+
+  // Installed-but-dropped and never-installed look identical from outside; the
+  // README has to name both or the reader cannot choose a next step.
+  has(/populated/i, "the chapter must distinguish a populated cache from an empty one")
+  has(/\bempty\b/i, "the failed-install case must be named too, not only the populated one")
+  has(/silent/i, "the chapter must say the failure mode is silent")
+
+  // The working configuration, parsed rather than grepped, so a half-written
+  // example fails here instead of in a user's config file.
+  const block = chapter.match(/```json\n([\s\S]*?)```/g)?.find((fence) => fence.includes("file://"))
+  assert.ok(block, "the chapter must show a copy-pasteable config containing the file:// entry")
+  const entries = JSON.parse(block.replace(/```json\n|```/g, "")).plugin
   assert.ok(Array.isArray(entries) && entries.length === 2, `both entries are required: ${JSON.stringify(entries)}`)
   assert.equal(entries[0], "@lawaty/lacode", "the bare specifier must stay: it is what creates the cache the file:// entry points into")
   assert.match(entries[1], /^file:\/\/\S*\/@lawaty\/lacode@latest\/node_modules\/@lawaty\/lacode\/dist\/index\.js$/, `the second entry must be a file:// URL into the cached build: ${entries[1]}`)
 
-  // The failure is silent, and saying so is the only way a reader knows to look
-  // at the cache instead of waiting for an error that never comes.
-  assert.match(section, /silent/i, "the section must say the failure is silent")
-  assert.match(section, /1\.18\.35/, "the section must name the version it applies to")
+  // Why the pair is safe. Tolerates emphasis and line wrapping because the
+  // README hard-wraps and bolds: a pattern stricter than that would be a test
+  // about formatting rather than about the claim.
+  has(/(?:cannot|does not|do not)\s+\*{0,2}double-inject/i, "the chapter must say the two-entry config cannot double-inject")
 
-  // No double-injection, and the version that is NOT fixed by the manifest
-  // fields — the two claims a reader would otherwise have to guess at. Both are
-  // matched whitespace-tolerantly: the README hard-wraps its prose, and a test
-  // that broke on a line break would be a test about wrapping, not about the doc.
-  assert.match(section, /does not\s+double-inject/, "the section must say the two-entry config cannot double-inject")
-  assert.match(section, /not\*\*?\s+fix 1\.18\.35|do not\s+fix 1\.18\.35/, "the section must say `main`/`exports[\"./server\"]` do NOT fix 1.18.35")
+  // And the path must be told to be re-derived, not copied: the example above is
+  // one machine's layout and the directory is keyed by specifier version.
+  has(/illustration|for example/i, "the example path must be marked as an illustration, not a path to copy")
+})
 
-  // And the silent-failure text above agrees with it: a populated cache is an
-  // installed-but-dropped plugin, not a failed install.
-  assert.match(readme.slice(0, at), /populated/, "the install sections must distinguish a populated cache from an empty one")
+test("[US-15] the README claims nothing about opencode versions it has not measured", () => {
+  const chapter = installChapter()
+  const { header, rows } = versionTable(chapter)
+  const has = (re, message) => assert.ok(re.test(chapter), message)
+
+  // A version table is the secondary path; its absence is what lets an
+  // unverified version quietly acquire a row later.
+  assert.match(header, /version/i, "the table must be about versions")
+  assert.ok(rows.length >= 2, `the version table must have a row per version, found ${rows.length}`)
+
+  // The real invariant, row by row: a row naming a measured version says so,
+  // and EVERY other row says it is unknown. The failure mode is the specific
+  // lie this restructure exists to prevent -- a row reading "1.18.36 | Yes |
+  // No" would pass a naive "does the README mention a version table" check and
+  // is exactly the claim being banned.
+  const measured = []
+  for (const row of rows) {
+    if (/\b1\.18\.35\b/.test(row)) {
+      measured.push(row)
+      assert.match(row, /verified|measured/i, `the 1.18.35 row must record that it was measured, got: ${row}`)
+      continue
+    }
+    assert.match(row, /untested|unknown/i, `no row may claim behaviour for an unmeasured version, got: ${row}`)
+  }
+  assert.ok(measured.length > 0, "the measured version must still have a row of its own")
+
+  // The evidence cell has to stay honest about what "verified" means there:
+  // installs-then-drops, not "does not work" in general.
+  const verified = measured.join(" ")
+  assert.ok(/install[^|]*silently|silently[^|]*drop/i.test(verified), `the 1.18.35 row must say it installs then drops, got: ${verified}`)
+
+  // And the table must not stand in for the procedure: an unlisted version is
+  // the common case, so the document has to route the reader onward.
+  has(/not the one measured|not listed|not in the table|follow the procedure/i, "the chapter must tell an unlisted-version reader to follow the procedure instead of the table")
+})
+
+test("[US-15] the README documents macOS support, and keeps the Linux-only tooling marked Linux-only", () => {
+  const chapter = installChapter()
+
+  // Located by a heading MATCHING /macos/i rather than by exact text: any
+  // wording of the heading counts, but deleting the section does not.
+  const section = sectionOf(chapter, /macos/i)
+
+  // How notifications get delivered on a Mac, which is the thing that used to
+  // be silently dropped.
+  assert.match(section, /osascript/, "the macOS section must name the notification channel it uses")
+  assert.match(section, /terminal-notifier/, "the macOS section must name the fallback channel")
+
+  // No asserted cache path. This is the assertion that matters most here: the
+  // macOS cache root is genuinely unknown, so a doc that "helpfully" writes
+  // ~/Library/Caches is asserting something unmeasured, and the failure mode is
+  // a reader building a file:// entry from a guess.
+  assert.ok(!/\/Library\/Caches/.test(section), "the macOS section must not assert a cache path: where macOS keeps it is not known, it is read from `opencode debug paths`")
+  assert.ok(!/~?\/?\.cache\//.test(section), "the macOS section must not assert a Linux-style cache path either")
+  assert.match(section, /opencode debug paths/, "the macOS section must point at `opencode debug paths` for paths")
+
+  // The tunnel tooling is Linux-server-only, and implying otherwise sends a Mac
+  // user debugging an ssh script that was never meant to run there.
+  assert.match(section, /Linux-only|Linux only/i, "the macOS section must mark the remote/tunnel tooling as Linux-only")
+  for (const script of ["oc-sync", "oc-notify-receiver"]) {
+    assert.ok(section.includes(script), `the macOS section must name ${script} so the exclusion is concrete`)
+  }
+})
+
+test("[US-15] the README still says `main`/`exports[\"./server\"]` are forward-compat metadata and not a 1.18.35 fix", () => {
+  const chapter = installChapter()
+
+  assert.match(chapter, /exports\["\.\/server"\]|exports\[\"\.\/server\"\]/, "the README must still discuss the `./server` entry point")
+  assert.match(chapter, /forward[- ]compat/i, "the README must still frame those fields as forward-compatibility metadata")
+
+  // Scoped to the paragraph that names them, so a disclaimer elsewhere cannot
+  // cover an affirmative claim here. Failure mode if dropped: someone reads the
+  // manifest fields as a supported fix for the one version we measured broken,
+  // which is the specific belief US-15 records as tested-and-false.
+  const paragraphs = chapter.split(/\n{2,}/).filter((p) => /exports\["\.\/server"\]/.test(p))
+  assert.ok(paragraphs.length > 0, "no paragraph in the install chapter discusses `exports[\"./server\"]`")
+  for (const p of paragraphs) {
+    assert.match(p, DENIES_A_FIX, `the paragraph naming exports["./server"] must deny that it fixes 1.18.35: ${p.slice(0, 120)}`)
+    assert.match(p, /1\.18\.35/, `the denial must name the version it does not fix: ${p.slice(0, 120)}`)
+  }
 })
 
 // ---------------------------------------------------------------------------

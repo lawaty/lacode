@@ -87,10 +87,12 @@ nobody's desktop. Guessing the desktop user is worse than failing.
 ## Setting the tunnel up on the desktop
 
 The receiver runs on the machine with the desktop, as an `authorized_keys`
-forced command restricted to that one script:
+forced command restricted to that one script. `$HOME` must be the expanded
+absolute path — a `~` is not expanded there, and an unexpanded one produces an
+`authorized_keys` entry that names a file that does not exist:
 
 ```
-restrict,command="/home/you/.local/bin/lacode-notify-receiver" ssh-ed25519 AAAA… oc-notify tunnel auth
+restrict,command="/home/yourname/.local/bin/lacode-notify-receiver" ssh-ed25519 AAAA… oc-notify tunnel auth
 ```
 
 `restrict` is doing the security work: no shell, no PTY, no agent forwarding, no
@@ -103,11 +105,35 @@ The receiver must satisfy this contract:
    argument list — it is attacker-controlled, because it is whatever the remote
    user typed;
 3. split it on newlines into title / message / urgency / icon, each with a
-   default;
+   default — **using only constructs bash 3.2 has**, not just bash 4+;
 4. whitelist `urgency` against `low|normal|critical` and `icon` against the six
    supported names, both of which become command-line flags;
 5. resolve `DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the session it is running
    in, then `exec notify-send "$TITLE" "$MSG" --urgency=… --icon=…`.
+
+Point 3 is not a detail. `mapfile`/`readarray` are bash 4.0+, and where they are
+missing — macOS ships bash 3.2, as do some minimal Linux images — the array is
+simply never built, every field falls back to its default, and the desktop gets
+a notification titled "LaCode" with an empty body. No error is printed anywhere
+that anyone will read, because the receiver's stderr goes to whoever happened to
+open the ssh connection. A `while IFS= read -r` loop is equivalent and works
+everywhere; `bin/oc-notify-receiver` uses one.
+
+### This half of the hop is Linux
+
+The receiver delivers through `notify-send`, and the forward that reaches it is
+a systemd `--user` unit (below). Both are Linux, so **the desktop half of this
+tunnel does not exist on macOS**, and that is by design rather than a gap.
+
+On a Mac you do not need it: `lacode notify` run locally picks `osascript` (or
+`terminal-notifier`) and shows the notification itself, with no tunnel, no
+`authorized_keys` entry and no systemd unit involved. The tunnel exists for the
+case opencode runs *somewhere else*, and a Mac is not going to be running it.
+
+If you point the receiver at a machine with no `notify-send` anyway, it exits
+non-zero and says so, naming `lacode notify` as the path that does work there.
+`bin/oc-sync` refuses the same machine for the same reason, and names each
+missing prerequisite instead of failing somewhere less obvious.
 
 > **Note.** The published package ships the built CLI (`dist/lacode.js`, linked
 > as `lacode`) and the tunnel behind it (`dist/tunnel.js`, importable as

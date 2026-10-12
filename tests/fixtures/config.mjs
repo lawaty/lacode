@@ -4,7 +4,7 @@
 // live in this repo, and the pool tests read it directly. When the package moved
 // out of `~/.config/opencode`, that file stayed behind with the author, so the
 // tests read a path that only exists on one machine and broke for every consumer
-// and for CI.
+// and on every fresh checkout.
 //
 // The package no longer ships an `opencode.jsonc` at all: `src/index.ts` injects
 // its agent set (`src/agents.ts` `buildAgentSet()`) into whatever config the user
