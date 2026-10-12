@@ -213,17 +213,15 @@ Three things differ, and all three are worth reading rather than assuming:
   published package. They drive one person's SSH topology, so each is on the side
   it belongs to:
 
-  | Script | Runs on | Why it is Linux-only |
-  | --- | --- | --- |
-  | `bin/oc`, `bin/oc-notify` | the **remote host** that runs opencode | Server-side. They are pushed to `~/bin/` on each host by `bin/oc-sync` and notify *your desktop* over the tunnel. |
-  | `bin/oc-notify-receiver` | your **desktop** | Delivers through `notify-send` (libnotify), and the persistent forward that reaches it is a systemd user unit. |
-  | `bin/oc-sync` | your **desktop** | Installs those systemd user units and runs `loginctl enable-linger`. |
-
-  None of this is a limitation of the package: a macOS client installs the plugin
-  and uses the `lacode` CLI, and both are portable. The scripts above are the
-  author's personal remote-tunnel tooling. `bin/oc-sync` refuses to run where it
-  cannot work and says which `lacode` subcommand to use instead, rather than
-  failing somewhere less obvious.
+- **Remote hosts are plain npm clients.** A remote host installs the plugin the
+  same way (`opencode plugin @lawaty/lacode -g`); there is nothing to rsync. The
+  notification hop is a direct ssh (`ControlMaster` + `ControlPersist`) set up
+  once with `lacode tunnel setup` — no reverse forward, no listening port, no
+  systemd unit. See [Remote hosts](#remote-hosts) and docs/TUNNEL.md.
+- The repo still carries the author's personal, Linux-only tooling from the older
+  reverse-forward setup (`bin/oc`, `bin/oc-notify`, `bin/oc-notify-receiver`,
+  `bin/oc-sync`). None of it is in the published package, and none of it is needed
+  for the npm-client path above.
 
 **The test suite runs on macOS.** It is written to pass on a Mac as well as on
 Linux, so "it works on a Mac" is a supported claim rather than an intention. The
@@ -233,7 +231,7 @@ or no GNU `timeout` — rather than passing silently or failing confusingly.
 
 ### The `lacode` CLI
 
-The package also ships the `lacode` CLI (`notify`, `forward`, `doctor`) — see
+The package also ships the `lacode` CLI (`notify`, `forward`, `doctor`, `receive`, `tunnel setup`) — see
 [Remote hosts](#remote-hosts). The plugin install does **not** put it on your
 `PATH`; run it from the package's `node_modules/.bin`, or install just the CLI
 globally with `npm i -g @lawaty/lacode` if you want the bare command. (That

@@ -9,31 +9,23 @@ gets it back.
 
 ```
   remote host                                   your desktop
-  ┌──────────────────┐                          ┌────────────────────────┐
-  │ opencode session │                          │ oc-notify-receiver     │
-  │      │           │  ssh (reverse forward)   │  (forced command,      │
-  │      ▼           │ ───────────────────────► │   restrict)            │
-  │ bin/lacode      │  ONE argument:            │      │                 │
-  │   notify         │  title\nmessage\n         │      ▼                 │
-  │                  │  urgency\nicon            │  notify-send           │
+  ┌──────────────────┐   direct ssh             ┌────────────────────────┐
+  │ opencode session │   (ControlPersist)       │  lacode receive        │
+  │      │           │ ───────────────────────► │  (authorized_keys      │
+  │      ▼           │   ONE argument:          │   forced command)      │
+  │ lacode notify    │   title\nmessage\n       │      │                 │
+  │                  │   urgency\nicon          │      ▼                 │
+  │                  │                          │  notify-send /         │
+  │                  │                          │  osascript             │
   └──────────────────┘                          └────────────────────────┘
 ```
 
-**Direct ssh (the default).** Set `OC_LOCAL_HOST` and the hop is a plain `ssh`
-to the desktop with `ControlMaster=auto` + `ControlPersist`, so one warm
-connection carries every notification. There is no reverse forward, no listening
-port, no systemd unit and nothing to sync: the plugin owns the transport. The
-desktop needs one `authorized_keys` line, which `lacode tunnel setup` prints. The
-reverse-forward description below is the legacy path, used only when
-`OC_LOCAL_HOST` is unset.
-
-**Reverse forward (legacy).** Two things are load-bearing here.
-
-**The reverse forward.** The remote opens an SSH connection to *your* machine
-and asks sshd on the desktop to listen on a port. A notification is then an ssh
-call to `localhost:<port>` with a dedicated key that is authorized to run
-exactly one command. It is not a login, it is not a shell, and it does not
-depend on which terminal connected first.
+**Direct ssh, one warm connection.** The hop is a plain `ssh` to the desktop with
+`ControlMaster=auto` + `ControlPersist`, so the first notification opens the
+connection and every later one rides it. There is no reverse forward, no
+listening port, no systemd unit and nothing to sync: the plugin owns the
+transport, and it exists only while opencode runs — which is the only time a
+notification matters.
 
 **One argument, not four.** ssh concatenates everything after the host into a
 single command string, and a forced command starts with *no* positional
@@ -51,17 +43,46 @@ the free-text fields before assembling or reading it, and `urgency` and `icon`
 come from whitelists. No field can contain the delimiter, so a message full of
 spaces, quotes or `*` survives intact.
 
+## Setting it up
+
+Once, on the **remote host** (where opencode runs):
+
+```bash
+lacode tunnel setup
+```
+
+It generates the dedicated key (`~/.ssh/lacode_notify` by default) and prints the
+environment to export there, and the single `authorized_keys` line to add on the
+desktop:
+
+```
+OC_LOCAL_USER=<desktop user>
+OC_LOCAL_HOST=<desktop hostname>
+OC_NOTIFY_KEY=~/.ssh/lacode_notify
+```
+
+On the **desktop**, add the printed line to `~/.ssh/authorized_keys`:
+
+```
+restrict,command="lacode receive" ssh-ed25519 AAAA… lacode-notify
+```
+
+`restrict` does the security work: no shell, no PTY, no agent forwarding, no port
+forwarding. The key can do exactly one thing — hand one notification to
+`lacode receive` — and nothing else. Use the absolute path to `lacode` if it is
+not on the forced command's `PATH`.
+
 ## Sending
 
 The CLI picks the transport by where it is running — `SSH_CLIENT` or `SSH_TTY`
 means remote, so it forwards; otherwise it delivers locally through whichever
-desktop notifier this platform has: `notify-send` everywhere else, `osascript` on
-macOS, with `terminal-notifier` as the macOS fallback when `osascript` is missing.
+desktop notifier this platform has: `notify-send` on Linux, `osascript` on macOS,
+with `terminal-notifier` as the macOS fallback when `osascript` is missing.
 
 ```bash
-lacode notify "build finished" "lapode: 4 files changed" normal dialog-information
+lacode notify "build finished" "4 files changed" normal dialog-information
 lacode notify "question" "which database should I use?" critical dialog-warning
-lacode forward web-01 -- systemctl --user status oc-tunnel
+lacode forward web-01 -- systemctl --user status something
 lacode doctor
 ```
 
@@ -76,108 +97,38 @@ handler, never spliced into the script source — a session title is not trusted
 input. `lacode doctor` prints the channel that would actually run, so it is
 useful on a Mac rather than reporting only whether a Linux binary is installed.
 
-`lacode doctor` prints what the environment resolves to and never gates on it.
+## The desktop side: `lacode receive`
+
+`lacode receive` is the forced command. It reads the newline payload from
+`$SSH_ORIGINAL_COMMAND`, sanitizes each field again at the trust boundary, and
+delivers locally through the platform channel — `notify-send` on Linux,
+`osascript`/`terminal-notifier` on macOS. Because it delegates to the same local
+channel as a local send, **the desktop half is not Linux-only**: a Mac desktop
+receives notifications too.
+
+It never forwards: `SSH_CLIENT` is set for a forced command as well, so it calls
+the local channel directly rather than `notify()` (which would loop back).
 
 ## Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `OC_LOCAL_USER` | *(unset)* | The desktop user the hop authenticates as. **Required for the remote hop.** |
-| `OC_LOCAL_HOST` | *(unset)* | Desktop hostname for the **direct ssh** hop. Set it and the reverse forward/port/systemd unit are not used at all. |
-| `OC_TUNNEL_PORT` | `10022` | Reverse-forward listener port on the desktop. Give each remote host its own. |
+| `OC_LOCAL_HOST` | *(unset)* | Desktop hostname for the direct ssh hop. The default; set it and no reverse forward or port is used. |
 | `OC_NOTIFY_KEY` | `~/.ssh/lacode_notify` | The dedicated key. Never a personal key. |
 | `OC_CONNECT_TIMEOUT_MS` | `5000` | Ceiling on the hop. |
 | `OC_SSH_TIMEOUT_MS` | `30000` | Ceiling on `forward`. |
+| `OC_TUNNEL_PORT` | `10022` | **Legacy** reverse-forward listener port. Used only when `OC_LOCAL_HOST` is unset. |
 
 `OC_LOCAL_USER` is read rather than probed on purpose. `id -un` on a remote
 account frequently returns `root`, and a dbus path built from that reaches
 nobody's desktop. Guessing the desktop user is worse than failing.
 
-## Setting the tunnel up on the desktop
+## Legacy: the reverse forward
 
-The receiver runs on the machine with the desktop, as an `authorized_keys`
-forced command restricted to that one script. `$HOME` must be the expanded
-absolute path — a `~` is not expanded there, and an unexpanded one produces an
-`authorized_keys` entry that names a file that does not exist:
-
-```
-restrict,command="/home/yourname/.local/bin/lacode-notify-receiver" ssh-ed25519 AAAA… oc-notify tunnel auth
-```
-
-`restrict` is doing the security work: no shell, no PTY, no agent forwarding, no
-port forwarding. The key can do exactly one thing and nothing else.
-
-The receiver must satisfy this contract:
-
-1. read the payload from **`$SSH_ORIGINAL_COMMAND`**, never from `$1`..`$4`;
-2. **never** `eval` it, never hand it to `sh -c`, never splice it into an
-   argument list — it is attacker-controlled, because it is whatever the remote
-   user typed;
-3. split it on newlines into title / message / urgency / icon, each with a
-   default — **using only constructs bash 3.2 has**, not just bash 4+;
-4. whitelist `urgency` against `low|normal|critical` and `icon` against the six
-   supported names, both of which become command-line flags;
-5. resolve `DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the session it is running
-   in, then `exec notify-send "$TITLE" "$MSG" --urgency=… --icon=…`.
-
-Point 3 is not a detail. `mapfile`/`readarray` are bash 4.0+, and where they are
-missing — macOS ships bash 3.2, as do some minimal Linux images — the array is
-simply never built, every field falls back to its default, and the desktop gets
-a notification titled "LaCode" with an empty body. No error is printed anywhere
-that anyone will read, because the receiver's stderr goes to whoever happened to
-open the ssh connection. A `while IFS= read -r` loop is equivalent and works
-everywhere; `bin/oc-notify-receiver` uses one.
-
-### This half of the hop is Linux
-
-The receiver delivers through `notify-send`, and the forward that reaches it is
-a systemd `--user` unit (below). Both are Linux, so **the desktop half of this
-tunnel does not exist on macOS**, and that is by design rather than a gap.
-
-On a Mac you do not need it: `lacode notify` run locally picks `osascript` (or
-`terminal-notifier`) and shows the notification itself, with no tunnel, no
-`authorized_keys` entry and no systemd unit involved. The tunnel exists for the
-case opencode runs *somewhere else*, and a Mac is not going to be running it.
-
-If you point the receiver at a machine with no `notify-send` anyway, it exits
-non-zero and says so, naming `lacode notify` as the path that does work there.
-`bin/oc-sync` refuses the same machine for the same reason, and names each
-missing prerequisite instead of failing somewhere less obvious.
-
-> **Note.** The published package ships the built CLI (`dist/lacode.js`, linked
-> as `lacode`) and the tunnel behind it (`dist/tunnel.js`, importable as
-> `@lawaty/lacode/tunnel`), not a receiver script. The receiver is the
-> desktop-side half and is yours to install — keep it out of your shell's
-> `$PATH` reach and pinned in `authorized_keys`.
-
-If the two halves disagree you get a blank popup, which points nowhere. A
-receiver that sees a payload with no newline in it should say so on stderr
-rather than silently defaulting everything.
-
-## Holding the forward open
-
-The tunnel has to exist whenever a notification is sent. Anything that survives
-your logout works: a `--user` systemd unit is the usual choice, one per remote
-host, each with its own port.
-
-```ini
-# ~/.config/systemd/user/oc-tunnel@<host>.service
-[Service]
-ExecStart=/usr/bin/ssh -NT -R 10022:localhost -o ClearAllForwardings=yes -o ExitOnForwardFailure=yes \
-          -i %h/.ssh/lacode_notify you@localhost
-```
-
-Then `systemctl --user enable --now oc-tunnel@web-01`.
-
-Two details that matter:
-
-- **`-o ExitOnForwardFailure=yes`** — without it, ssh stays up with no forward
-  and the notifications fail silently.
-- **`-o ClearAllForwardings=yes`** on every *other* ssh call that touches that
-  host, including rsync's `-e`. A `RemoteForward` in `~/.ssh/config` competes
-  for the same port, and a half-claimed listener starves the one session that
-  needed it.
-
-Do not hold the forward open with a `RemoteForward` line in `~/.ssh/config`. It
-is per-connection: the port exists only while some terminal is open, and it is
-claimed by whichever terminal connects first.
+The original design opened a reverse forward (`ssh -R`) held by a `systemd --user`
+unit on the desktop, and delivered to a `notify-send`-only bash receiver
+(`bin/oc-notify-receiver`). It is kept only for hosts that still set
+`OC_TUNNEL_PORT` and leave `OC_LOCAL_HOST` unset: `sendRemote` falls back to an
+ssh call to `localhost:<port>`. New setups should use the direct ssh above. See
+the git history for the old systemd unit shape.
