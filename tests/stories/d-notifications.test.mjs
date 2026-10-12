@@ -15,7 +15,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { chmodSync, writeFileSync } from "node:fs"
+import { chmodSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { ROOT, cleanupAll, scratch, settle, stubInput } from "./_harness.mjs"
 
@@ -70,8 +70,10 @@ test("[US-11] an error is delivered and bypasses the duplicate-suppression coold
   await busy(emit, "s1")
   // Two errors inside the 5s cooldown window. A cooldown would swallow the
   // second, and a user who never learns the run failed is the exact harm.
-  await emit("session.error", { sessionID: "s1" })
-  await emit("session.error", { sessionID: "s1" })
+  // The error payload is unrecognized, so each one notifies; a recognized rate
+  // limit or an abort would stay silent by design.
+  await emit("session.error", { sessionID: "s1", error: { message: "boom" } })
+  await emit("session.error", { sessionID: "s1", error: { message: "boom" } })
   await settle()
 
   assert.equal(sent.length, 2, `both errors must be announced, got ${JSON.stringify(sent)}`)
@@ -79,6 +81,53 @@ test("[US-11] an error is delivered and bypasses the duplicate-suppression coold
     assert.match(notice.message, /Failed/i, `an error notification must say so: ${notice.message}`)
     assert.equal(notice.urgency, "critical", "a failure is the one thing worth interrupting for")
   }
+})
+
+test("[US-11] an unrecognized terminal error notifies and carries the error's own message", async () => {
+  // The error's text is the difference between a notification that names the
+  // failure and one that only says something went wrong.
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Deploy the API" } } })
+  await busy(emit, "s1")
+  await emit("session.error", { sessionID: "s1", error: { message: "socket hang up after 30s" } })
+  await settle()
+
+  assert.equal(sent.length, 1, `exactly one notification, got ${JSON.stringify(sent)}`)
+  assert.match(sent[0].message, /Failed/i, `an error notification must say so: ${sent[0].message}`)
+  assert.match(sent[0].message, /socket hang up after 30s/, `the error's own text must be carried: ${sent[0].message}`)
+  assert.equal(sent[0].urgency, "critical", "a failure is the one thing worth interrupting for")
+})
+
+test("[US-11] a recognized rate-limit error does not notify", async () => {
+  // The pool owns rate limits: it cools the model and the request retries. A
+  // second notification would report something already handled.
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Deploy the API" } } })
+  await busy(emit, "s1")
+  await emit("session.error", { sessionID: "s1", error: { message: "Rate limit exceeded, retry in 30s" } })
+  await settle()
+
+  assert.deepEqual(sent, [], `a recognized rate limit must not notify, got ${JSON.stringify(sent)}`)
+})
+
+test("[US-11] a user abort does not notify", async () => {
+  // The user pressed escape; they already know. Telling them what they did is
+  // noise, and a failure popup for it would train them to dismiss popups.
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Deploy the API" } } })
+  await busy(emit, "s1")
+  await emit("session.error", { sessionID: "s1", error: { name: "MessageAbortedError", message: "The message was aborted" } })
+  await settle()
+
+  assert.deepEqual(sent, [], `an abort is the user's own action, got ${JSON.stringify(sent)}`)
+})
+
+test("[US-11] a session error carrying no error payload stays silent", async () => {
+  // The event without an error object is not a failure this plugin can
+  // describe; announcing "Failed" with no reason would be noise.
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Deploy the API" } } })
+  await busy(emit, "s1")
+  await emit("session.error", { sessionID: "s1" })
+  await settle()
+
+  assert.deepEqual(sent, [], `an error with no payload must not notify, got ${JSON.stringify(sent)}`)
 })
 
 test("[US-11] a session that never went busy delivers nothing when it idles", async () => {
@@ -91,7 +140,7 @@ test("[US-11] a session that never went busy delivers nothing when it idles", as
 })
 
 test("[US-11] a subagent session and a cartographer session are both suppressed", async () => {
-  const child = await notifier({ sessions: { c1: { id: "c1", parentID: "root", title: "explore-fast" } } })
+  const child = await notifier({ sessions: { c1: { id: "c1", parentID: "root", title: "explore" } } })
   await busy(child.emit, "c1")
   await idle(child.emit, "c1")
   await settle()
@@ -99,7 +148,7 @@ test("[US-11] a subagent session and a cartographer session are both suppressed"
 
   // The cartographer is spawned with no parentID, so structure alone cannot
   // exclude it; it is identified by its title prefix.
-  const cartographer = await notifier({ sessions: { m1: { id: "m1", title: "context-manager (auto update)" } } })
+  const cartographer = await notifier({ sessions: { m1: { id: "m1", title: "context (auto update)" } } })
   await busy(cartographer.emit, "m1")
   await idle(cartographer.emit, "m1")
   await settle()
@@ -126,6 +175,31 @@ test("[US-11] a helper that exits non-zero is reported as a failed delivery, not
     const text = stub.text()
     assert.ok(text.some((line) => line.startsWith("error notification failed")), `a failed send must not be logged as sent:\n${text.join("\n")}`)
     assert.ok(!text.some((line) => line.startsWith("info notified")), `claiming "notified" on a failed send is the bug:\n${text.join("\n")}`)
+  } finally {
+    if (previous === undefined) delete process.env.OC_NOTIFY_HELPER
+    else process.env.OC_NOTIFY_HELPER = previous
+  }
+})
+
+test("[US-11] a lacode-shaped helper is invoked with the notify subcommand", async () => {
+  // The helper's argv is not universal. The shipped bug handed dist/lacode.js
+  // the oc-notify shape and the CLI answered "unknown command" -- a notifier
+  // that existed, was spawned, and delivered nothing.
+  const bin = scratch("lacode-helper-")
+  const argsFile = join(bin, "args.log")
+  const helper = join(bin, "lacode")
+  writeFileSync(helper, `#!/bin/sh\nfor a in "$@"; do echo "$a"; done > ${argsFile}\n`)
+  chmodSync(helper, 0o755)
+  const previous = process.env.OC_NOTIFY_HELPER
+  process.env.OC_NOTIFY_HELPER = helper
+  try {
+    const stub = stubInput({ sessions: { s1: { id: "s1", title: "Something" } } })
+    const hooks = await notifyHooks(stub.input)
+    await hooks.event({ event: { type: "session.status", properties: { sessionID: "s1", status: { type: "busy" } } } })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "s1" } } })
+    await settle(120)
+    const args = readFileSync(argsFile, "utf8").split("\n").filter(Boolean)
+    assert.equal(args[0], "notify", `a lacode helper must be called as 'lacode notify ...', got ${JSON.stringify(args)}`)
   } finally {
     if (previous === undefined) delete process.env.OC_NOTIFY_HELPER
     else process.env.OC_NOTIFY_HELPER = previous
@@ -195,7 +269,10 @@ test("[US-12] a parked question is cleared by a reply, a rejection, or an error"
     await settle()
     sent.length = 0
 
-    await emit(event, { sessionID: "s1" })
+    // Only the error iteration carries a payload, and it must be an
+    // unrecognized one: a recognized error would stay silent by design, and
+    // the assertion below is that THIS error is announced.
+    await emit(event, event === "session.error" ? { sessionID: "s1", error: { message: "boom" } } : { sessionID: "s1" })
     await settle()
     await idle(emit, "s1")
     await settle()

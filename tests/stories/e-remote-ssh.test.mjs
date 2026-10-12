@@ -210,6 +210,24 @@ test("[US-13] a notification raised on a remote host is delivered to the local d
   assert.ok(local.desktopArgv().includes("opencode — Fix the login"), `the desktop must receive it: ${JSON.stringify(local.desktopArgv())}`)
 })
 
+test("[US-13] with OC_LOCAL_HOST set the hop is a direct ssh with ControlPersist, not a reverse-forward port", async () => {
+  // The caller-owned transport: one warm connection and no machinery to manage.
+  const transports = stubTransport()
+  const { stdout } = await lacode(["notify", "opencode — Fix the login", "Task finished", "normal", "utilities-terminal"], {
+    transports,
+    env: { SSH_CLIENT: "10.0.0.1 51000 10.0.0.2 22", OC_LOCAL_USER: "desktop-user", OC_LOCAL_HOST: "desktop.example" },
+  })
+  const hop = transports.sshArgv()
+  assert.ok(hop.length > 0, "the notification must cross the hop")
+  assert.equal(hop.find((a) => a.includes("@")), "desktop-user@desktop.example", `the hop must target the configured host, got ${JSON.stringify(hop)}`)
+  assert.ok(hop.includes("ControlMaster=auto"), "the direct hop must multiplex through a control master")
+  assert.ok(hop.some((a) => a.startsWith("ControlPersist=")), "the master must stay warm between notifications")
+  assert.ok(!hop.includes("-p") && !hop.includes("localhost"), `no reverse-forward port may be used, got ${JSON.stringify(hop)}`)
+  // Still exactly one argument, still newline-delimited, still readable by a receiver.
+  assert.equal(hop[hop.length - 1].split("\n")[0], "opencode — Fix the login", `the payload stays one argument, got ${JSON.stringify(hop[hop.length - 1])}`)
+  assert.match(stdout, /^$/, "a successful send is silent")
+})
+
 test("[US-13] the desktop user and port come from configuration, never from the remote's id -u / id -un", async () => {
   const transports = stubTransport()
   await lacode(["notify", "T", "M"], {

@@ -4,6 +4,9 @@ import * as path from "node:path"
 import type { Hooks } from "@opencode-ai/plugin"
 import {
   Notifier,
+  errorDetail,
+  helperArgv,
+  isUnrecognizedError,
   permissionHeadline,
   questionHeadline,
   shouldNotify,
@@ -19,7 +22,7 @@ import { PACKAGE_ROOT } from "../lib/pool.ts"
 // Two design points that are load-bearing rather than cosmetic:
 //
 //   * Subagents are suppressed. A root session that dispatched ten
-//     explore-fast children would otherwise raise ten "ready" notifications.
+//     explore children would otherwise raise ten "ready" notifications.
 //     The whole value of this plugin is one notification per thing you asked
 //     for, and a subagent going idle is not a thing you asked for.
 //   * The cartographer is suppressed too. context-autoupdate creates it through
@@ -62,7 +65,8 @@ const COOLDOWN_MS = 5_000
 //      the package's bin/lacode there would hand a broken helper to every
 //      consumer: found, spawned, and dead on arrival with node refusing to strip
 //      types under node_modules. The built CLI is the same program with the
-//      types already gone.
+//      types already gone -- but a different ENTRY: it takes a `notify`
+//      subcommand, so its argv is built differently (see helperArgv below).
 // Candidates are anchored on PACKAGE_ROOT rather than on this module's own
 // directory, because bundling moves this file from src/plugins/ to dist/ and a
 // relative hop would resolve outside the package.
@@ -151,7 +155,7 @@ export const notifyHooks = (async ({ client, directory }, _options?: unknown, de
       // stdio pipes (not ignore) because the helper's own diagnostics are the only
       // way a remote tunnel failure is ever visible -- oc-notify prints to stderr
       // and exits 0, so its output is the entire signal.
-      const child = spawn(helper, [title, message, urgency, "utilities-terminal"], {
+      const child = spawn(helper, helperArgv(helper, title, message, urgency, "utilities-terminal"), {
         stdio: ["ignore", "ignore", "pipe"],
         detached: true,
       })
@@ -361,7 +365,18 @@ export const notifyHooks = (async ({ client, directory }, _options?: unknown, de
           if (sessionID) {
             pending.delete(sessionID)
             permissions.delete(sessionID)
-            void announce(sessionID, "error")
+            // Only an unrecognized failure interrupts. Rate limits and quota
+            // errors are the pool's to handle -- it cools the model and the
+            // request retries -- and an abort is the user's own action, so
+            // notifying for either would report something already handled.
+            // The error field is not in the pinned SDK's event types, so it is
+            // read off the wire with a narrow cast, like question.asked.
+            const error = (event.properties as { error?: unknown }).error
+            if (isUnrecognizedError(error)) {
+              void announce(sessionID, "error", errorDetail(error))
+            } else {
+              void log("debug", "suppressed: recognized error", { sessionID })
+            }
           }
           return
         }

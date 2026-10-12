@@ -28,42 +28,23 @@ understand them and find the surrounding code, never as a reason to skip them.
 
 If the map conflicts with the source, trust the source, say so in your report,
 and never repeat the stale claim. Never edit `.opencode/context/` files — the
-context-manager agent owns those (`/context-update` or its automatic post-work
+context agent owns those (`/context-update` or its automatic post-work
 runs). Report what should be updated there instead.
 
 <!-- MERGE POINT: paste any project-specific exploration conventions from
      your current plan.txt / explore instructions here (e.g. which
      directories to ignore, naming conventions, where docs live). -->
 
-# Escalation
+# When to report back
 
-If you hit any of the following, STOP and delegate to @explore-deep via the
-task tool instead of continuing to search:
+There is no deeper tier to hand off to. If after genuinely trying — one
+alternative search strategy first — you still cannot answer:
 
-- You've made more than ~8 tool calls (read/glob/grep/bash) without
-  converging on an answer
-- The same search strategy (same query pattern, same directory) has failed
-  twice in a row
-- The code you need to understand involves genuinely complex logic you're
-  not confident you're reading correctly (e.g. dense concurrency, generated
-  code, deep inheritance/dependency chains, obscure build tooling)
-- You cannot locate a symbol, config value, or file the task clearly
-  requires, after searching from at least two different angles (e.g. by
-  name and by usage)
+- STOP. Do not loop or guess.
+- Report the exact question, every search you already tried and what each
+  one returned, and your best hypothesis even if unconfirmed.
+- Never guess or fabricate a file path, line number, or code behavior. An
+  honest "I couldn't find this, here's why" is the correct output.
 
-Do not escalate on the first dead end — try at least one alternative search
-strategy yourself first (different keywords, different tool, broader or
-narrower scope).
-
-When escalating, pass full context to @explore-deep:
-- The exact question you were asked to answer
-- Every search strategy you already tried and what each one returned
-- Your best current hypothesis, even if unconfirmed
-
-Never guess or fabricate a file path, line number, or code behavior to avoid
-escalating. A wrong answer is worse than an escalation.
-
-# No further escalation beyond deep
-
-You may only escalate to @explore-deep. Do not attempt to call @implement-fast,
-@implement-deep, or any other agent — exploration agents only explore.
+You may only explore. Do not attempt to call @implement or any other agent —
+exploration agents only explore.

@@ -47,7 +47,7 @@ const bootConfig = async (slots, cfg, id, options = {}) => {
 }
 
 /** Route `n` spawns concurrently and report the variant each one was sent to. */
-const burst = async (hooks, cfg, n, base = "explore-fast") => {
+const burst = async (hooks, cfg, n, base = "explore") => {
   const out = []
   for (let i = 0; i < n; i++) out.push((await spawn(hooks, cfg, { subagent: base, callID: `c${i}`, sessionID: `s${i}` })).routed)
   return out
@@ -104,12 +104,12 @@ test("[US-4] with model A cooling, the next spawn goes elsewhere and is never re
 
   const routed = await burst(hooks, cfg, 2)
   for (const variant of routed) {
-    assert.notEqual(variant, "explore-fast-1", "a cooling model must not be picked again")
-    assert.match(variant, /^explore-fast-[1-9]$/, `every spawn must still route somewhere, got ${variant}`)
+    assert.notEqual(variant, "explore-1", "a cooling model must not be picked again")
+    assert.match(variant, /^explore-[1-9]$/, `every spawn must still route somewhere, got ${variant}`)
   }
   // And specifically: it fell through to the slot that is NOT cooling.
-  assert.deepEqual(routed, ["explore-fast-2", "explore-fast-2"], `expected failover to the healthy slot, got ${routed}`)
-  assert.ok(!routed.includes("explore-fast-3"), "the last resort should not be burned while a healthy slot is free")
+  assert.deepEqual(routed, ["explore-2", "explore-2"], `expected failover to the healthy slot, got ${routed}`)
+  assert.ok(!routed.includes("explore-3"), "the last resort should not be burned while a healthy slot is free")
   await hooks.dispose()
 })
 
@@ -132,7 +132,7 @@ test("[US-4] when every model is cooling, routing degrades to the least-loaded s
   // The whole point: a refused spawn would fail the task. A degraded one does not.
   const routed = await burst(hooks, cfg, 2)
   for (const variant of routed) {
-    assert.match(variant, /^explore-fast-[1-9]$/, `the pool must degrade, not refuse: got ${variant}`)
+    assert.match(variant, /^explore-[1-9]$/, `the pool must degrade, not refuse: got ${variant}`)
   }
   await hooks.dispose()
 })
@@ -191,7 +191,7 @@ test("[US-5] the heavier slot is filled to its ceiling before the lighter one is
     "us5-heavy-first",
   )
   const routed = await burst(hooks, cfg, 4)
-  assert.deepEqual(routed, ["explore-fast-1", "explore-fast-1", "explore-fast-1", "explore-fast-2"], `got ${routed}`)
+  assert.deepEqual(routed, ["explore-1", "explore-1", "explore-1", "explore-2"], `got ${routed}`)
   await hooks.dispose()
 })
 
@@ -204,7 +204,7 @@ test("[US-5] a slot at its ceiling passes the next spawn to the next slot under 
     "us5-ceiling",
   )
   const routed = await burst(hooks, cfg, 3)
-  assert.deepEqual(routed, ["explore-fast-2", "explore-fast-2", "explore-fast-1"], `got ${routed}`)
+  assert.deepEqual(routed, ["explore-2", "explore-2", "explore-1"], `got ${routed}`)
   await hooks.dispose()
 })
 
@@ -217,9 +217,9 @@ test("[US-5] past every ceiling, the spawn overflows to the least-loaded slot", 
     "us5-overflow",
   )
   const routed = await burst(hooks, cfg, 3)
-  assert.deepEqual(routed.slice(0, 2), ["explore-fast-1", "explore-fast-2"], `weighted phase first, got ${routed}`)
+  assert.deepEqual(routed.slice(0, 2), ["explore-1", "explore-2"], `weighted phase first, got ${routed}`)
   // Third: both are full, so it must spread rather than pile on slot 1.
-  assert.match(routed[2], /^explore-fast-[12]$/, `overflow must still route, got ${routed[2]}`)
+  assert.match(routed[2], /^explore-[12]$/, `overflow must still route, got ${routed[2]}`)
   assert.notEqual(routed[2], routed[1], "overflow must go to the OTHER slot so load stays even")
   await hooks.dispose()
 })
@@ -228,7 +228,7 @@ test("[US-5] equal weights round-robin in declaration order", async () => {
   const slots = ["prov/a", "prov/b", "prov/c"].map((model) => ({ model, weight: 1 }))
   const { hooks, cfg } = await bootPool(slots, "us5-roundrobin")
   const routed = await burst(hooks, cfg, 6)
-  assert.deepEqual(routed, ["explore-fast-1", "explore-fast-2", "explore-fast-3", "explore-fast-1", "explore-fast-2", "explore-fast-3"], `got ${routed}`)
+  assert.deepEqual(routed, ["explore-1", "explore-2", "explore-3", "explore-1", "explore-2", "explore-3"], `got ${routed}`)
   await hooks.dispose()
 })
 
@@ -267,7 +267,7 @@ test("[US-5] no slot exceeds its weight ceiling except through overflow", async 
   )
 
   // One past capacity is overflow, which is allowed -- and must be visible.
-  await burst(hooks, cfg, 1, "implement-fast")
+  await burst(hooks, cfg, 1, "implement")
   const after = await loadsOf()
   assert.ok(
     after.some((s) => s.load > s.weight),
@@ -294,17 +294,17 @@ test("[US-6] the status view shows every process's claims and the aggregate load
   writeFileSync(
     join(dir, "claims.sibling.json"),
     JSON.stringify({
-      "peer:1": { v: "implement-fast", k: 1, m: "prov/shared", t: Date.now() },
-      "peer:2": { v: "explore-fast", k: 1, m: "prov/shared", t: Date.now() },
+      "peer:1": { v: "implement", k: 1, m: "prov/shared", t: Date.now() },
+      "peer:2": { v: "explore", k: 1, m: "prov/shared", t: Date.now() },
     }),
   )
 
   const status = await hooks.tool.pool_status.execute({}, {})
   const slot = status.output.split("\n").find((l) => l.includes("prov/shared"))
   assert.match(slot, /load=4\/4/, `per-slot load must aggregate across processes:\n${status.output}`)
-  // Mine contributed 2 explore-fast, the sibling 1 explore-fast + 1 implement-fast.
-  assert.match(slot, /explore-fastx3/, `the per-base breakdown must aggregate both processes: ${slot}`)
-  assert.match(slot, /implement-fastx1/, `the per-base breakdown must aggregate both processes: ${slot}`)
+  // Mine contributed 2 explore, the sibling 1 explore + 1 implement.
+  assert.match(slot, /explorex3/, `the per-base breakdown must aggregate both processes: ${slot}`)
+  assert.match(slot, /implementx1/, `the per-base breakdown must aggregate both processes: ${slot}`)
   assert.match(status.output, /us6-mine \(this process\): 2 claim\(s\)/, `this process must be listed:\n${status.output}`)
   assert.match(status.output, /sibling: 2 claim\(s\)/, `every sibling must be listed:\n${status.output}`)
   assert.match(status.output, /4 claim\(s\) in flight across 2 process\(es\)/)
@@ -342,7 +342,7 @@ test("[US-6] a claim file older than the dead-file threshold is pruned, not coun
 
   // A dead process's file: fresh content, ancient mtime.
   const stale = join(dir, "claims.ghost.json")
-  writeFileSync(stale, JSON.stringify({ g: { v: "explore-fast", k: 1, m: "prov/shared", t: Date.now() } }))
+  writeFileSync(stale, JSON.stringify({ g: { v: "explore", k: 1, m: "prov/shared", t: Date.now() } }))
   const ancient = new Date(Date.now() - 3 * 60 * 60 * 1000)
   utimesSync(stale, ancient, ancient)
 
@@ -370,7 +370,7 @@ test("[US-6] the slot the next spawn would take is marked, including when it is 
   // And the mark is not decoration: the next real spawn lands on that slot.
   const markedIndex = Number(/slot (\d)/.exec(marked[0])[1])
   const { routed } = await spawn(hooks, cfg, { callID: "next", sessionID: "next" })
-  assert.equal(routed, `explore-fast-${markedIndex}`, `the mark must predict the routing: marked slot ${markedIndex}, routed ${routed}`)
+  assert.equal(routed, `explore-${markedIndex}`, `the mark must predict the routing: marked slot ${markedIndex}, routed ${routed}`)
 
   // With room again, the mark moves to the slot that actually has capacity.
   const { hooks: fresh, cfg: freshCfg } = await bootPool(slots, "us6-next-open")
@@ -404,10 +404,10 @@ test("[US-7] a paid model is accepted as a slot and routed to, with no free-tier
   ]
   const { hooks, cfg } = await bootPool(slots, "us7-paid")
   const routed = await burst(hooks, cfg, 3)
-  assert.equal(routed[0], "explore-fast-1")
-  assert.equal(cfg.agent["explore-fast-1"].model, "anthropic/claude-opus-4-1", "the paid model must be bound verbatim")
-  assert.equal(cfg.agent["explore-fast-2"].model, "openai/gpt-5")
-  assert.match(routed.join(","), /explore-fast-[12]/, `paid slots must still route: ${routed}`)
+  assert.equal(routed[0], "explore-1")
+  assert.equal(cfg.agent["explore-1"].model, "anthropic/claude-opus-4-1", "the paid model must be bound verbatim")
+  assert.equal(cfg.agent["explore-2"].model, "openai/gpt-5")
+  assert.match(routed.join(","), /explore-[12]/, `paid slots must still route: ${routed}`)
   await hooks.dispose()
 })
 
@@ -420,7 +420,7 @@ test("[US-7] a vendor-prefixed id splits on the first slash only, tail preserved
   // vendor segment included. A plain split("/") would whitelist "nvidia" alone
   // and opencode would resolve the slot to no model at all.
   assert.deepEqual(cfg.provider.openrouter.whitelist, ["nvidia/nemotron-3-ultra-550b-a55b:free"], `whitelist: ${JSON.stringify(cfg.provider)}`)
-  assert.equal(cfg.agent["explore-fast-1"].model, model)
+  assert.equal(cfg.agent["explore-1"].model, model)
   await hooks.dispose()
 })
 
@@ -438,12 +438,12 @@ test("[US-7] more slots than the pool allows are dropped with a warning naming t
   const capWarning = warnings.find((line) => line.includes("capped at") && /4/.test(line))
   assert.ok(capWarning, `the surplus must be dropped with a warning naming the cap:\n${warnings.join("\n")}`)
   assert.match(capWarning, /cap\/five|cap\/six/, "the dropped entry must be named")
-  assert.ok(!cfg.agent["explore-fast-5"], "no fifth variant exists, so routing to it would fail")
-  assert.ok(cfg.agent["explore-fast-4"], "the first four slots must survive")
+  assert.ok(!cfg.agent["explore-5"], "no fifth variant exists, so routing to it would fail")
+  assert.ok(cfg.agent["explore-4"], "the first four slots must survive")
 
   // And routing never reaches for the dropped ones.
   const routed = await burst(hooks, cfg, 4)
-  for (const variant of routed) assert.match(variant, /^explore-fast-[1-4]$/, `got ${variant}`)
+  for (const variant of routed) assert.match(variant, /^explore-[1-4]$/, `got ${variant}`)
   await hooks.dispose()
 })
 
@@ -475,7 +475,7 @@ test("[US-7] a provider configured with no whitelist is left with none: creating
   assert.equal(entry.whitelist, undefined, `nothing may stand in for the key either, got ${JSON.stringify(entry)}`)
   // Not a failure mode: an absent whitelist is precisely what makes the slot
   // resolvable, so the pool still works over the provider it did not restrict.
-  assert.equal(cfg.agent["explore-fast-1"].model, "someprovider/slot-model", "the slot must still bind over an open provider")
+  assert.equal(cfg.agent["explore-1"].model, "someprovider/slot-model", "the slot must still bind over an open provider")
   await hooks.dispose()
 })
 
@@ -515,30 +515,27 @@ test("[US-7] a whitelist the user did write is extended, never replaced: the slo
 test("[US-7] no provider is ever left holding an empty whitelist, which opencode reads as delete this provider", async () => {
   // An empty allowlist matches no model at all, so opencode drops the provider
   // whole. This is the invariant over every provider in the config, asserted
-  // from one boot that covers all four shapes at once: open, restricted, a
-  // deepModel provider, and one the pool never names.
+  // from one boot that covers every shape at once: open, restricted, and one
+  // the pool never names.
   const cfg = {
     provider: {
       opened: {},
       restricted: { whitelist: ["theirs"] },
-      deep: {},
       unrelated: {},
     },
     agent: {},
     command: {},
   }
-  const { hooks } = await bootConfig([{ model: "opened/slot-model", weight: 1 }], cfg, "us7-no-empty", { deepModel: "deep/deep-tier" })
+  const { hooks } = await bootConfig([{ model: "opened/slot-model", weight: 1 }], cfg, "us7-no-empty")
 
   for (const [name, entry] of Object.entries(cfg.provider)) {
     assert.ok(entry.whitelist === undefined || entry.whitelist.length > 0, `provider ${name} must not end up with an empty whitelist: ${JSON.stringify(entry)}`)
   }
   // And every provider ends up exactly as its shape dictates: the restricted one
-  // is never named by a slot, so it is not touched; the slot's own provider and
-  // the deepModel's stay open, and both models still bind.
+  // is never named by a slot, so it is not touched; the slot's own provider stays
+  // open, and the model still binds.
   assert.deepEqual(cfg.provider.restricted.whitelist, ["theirs"], "a whitelist on an untouched provider must be left alone")
   assert.ok(!("whitelist" in cfg.provider.opened), `the slot's own provider stays open, got ${JSON.stringify(cfg.provider.opened)}`)
-  assert.equal(cfg.agent["explore-fast-1"].model, "opened/slot-model")
-  assert.equal(cfg.agent["explore-deep"].model, "deep/deep-tier", "the deep pin still binds")
-  assert.ok(!("whitelist" in cfg.provider.deep), `the deepModel provider stays open too, got ${JSON.stringify(cfg.provider.deep)}`)
+  assert.equal(cfg.agent["explore-1"].model, "opened/slot-model")
   await hooks.dispose()
 })

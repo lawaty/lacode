@@ -69,7 +69,7 @@ const calls = []
 // Deep enough to exhaust every ceiling and then overflow, whatever the shipped
 // weights are.
 const CONCURRENCY = CAPACITY + SLOT_MODELS.length
-for (let i = 1; i <= CONCURRENCY; i++) calls.push(await a.spawn(`c${i}`, "explore-fast"))
+for (let i = 1; i <= CONCURRENCY; i++) calls.push(await a.spawn(`c${i}`, "explore"))
 // A release only means anything on a live claim, and the tests below release claims out
 // of the middle of that run, so track which spawns still hold one.
 const live = new Set(calls.map((_, i) => `c${i + 1}`))
@@ -132,7 +132,7 @@ assert(
 const heaviestSlot = slotNum(calls[0])
 const heaviestCall = calls.map((v, i) => [slotNum(v), `c${i + 1}`]).filter(([n, id]) => n === heaviestSlot && live.has(id)).pop()[1]
 await releaseCall(heaviestCall)
-const afterRelease = slotNum(await a.spawn("r1", "explore-fast"))
+const afterRelease = slotNum(await a.spawn("r1", "explore"))
 assert(
   afterRelease === heaviestSlot,
   `releasing a claim on slot ${heaviestSlot} (weight ${SHIPPED[heaviestSlot - 1].weight}) must hand routing back to it, got slot ${afterRelease}`,
@@ -156,14 +156,14 @@ const busiestCall = calls
   .filter(([n, id]) => n === busiestSlot && live.has(id))
   .pop()[1]
 await releaseCall(busiestCall)
-const afterFree = slotNum(await a.spawn("r2", "explore-fast"))
+const afterFree = slotNum(await a.spawn("r2", "explore"))
 assert(
   afterFree === busiestSlot,
   `the slot whose claim was released should be refilled first, got slot ${afterFree} instead of the freed ${busiestSlot}`,
 )
-const back = [await a.spawn("r3", "explore-fast"), await a.spawn("r4", "explore-fast"), await a.spawn("r5", "explore-fast")]
+const back = [await a.spawn("r3", "explore"), await a.spawn("r4", "explore"), await a.spawn("r5", "explore")]
 assert(
-  back.every((v) => new RegExp(`^explore-fast-[1-${SLOT_MODELS.length}]$`).test(v)),
+  back.every((v) => new RegExp(`^explore-[1-${SLOT_MODELS.length}]$`).test(v)),
   `released slots must still route, got ${back.join(",")}`,
 )
 for (const v of ["r3", "r4", "r5"]) live.add(v)
@@ -184,19 +184,19 @@ const y = await make("proc-y", dir3)
 // ones, so the first process reaches every slot before the second one starts.
 // Scales with the slot count: a fixed literal only covered the four-slot pool.
 const xCalls = []
-for (let i = 1; i <= CONCURRENCY; i++) xCalls.push(await x.spawn(`x${i}`, "explore-fast"))
+for (let i = 1; i <= CONCURRENCY; i++) xCalls.push(await x.spawn(`x${i}`, "explore"))
 const xNums = xCalls.map(slotNum)
 assert(
   new Set(xNums).size === SLOT_MODELS.length,
   `first process should reach all ${SLOT_MODELS.length} slots, got ${seq(xCalls)}`,
 )
 const yCalls = []
-for (let i = 1; i <= CONCURRENCY; i++) yCalls.push(await y.spawn(`y${i}`, "explore-fast"))
+for (let i = 1; i <= CONCURRENCY; i++) yCalls.push(await y.spawn(`y${i}`, "explore"))
 // Both processes route over one shared cycle. Which slot y starts on depends on
 // x's residual load, so the load check below is what proves sharing; here only
 // that every pick is a declared slot.
 assert(
-  [...xCalls, ...yCalls].every((c) => /^explore-fast-\d+$/.test(c)),
+  [...xCalls, ...yCalls].every((c) => /^explore-\d+$/.test(c)),
   `routing must stay in the pool, got ${[...xCalls, ...yCalls].join(",")}`,
 )
 const crossStatus = await x.status()
@@ -252,26 +252,26 @@ assert(
 const blocked = join(dir1, "not-a-dir")
 writeFileSync(blocked, "x")
 const c = await make("degraded", blocked)
-const degradedPick = await c.spawn("d1", "explore-fast")
-assert(/^explore-fast-\d+$/.test(degradedPick), `degraded mode should still route, got ${degradedPick}`)
+const degradedPick = await c.spawn("d1", "explore")
+assert(/^explore-\d+$/.test(degradedPick), `degraded mode should still route, got ${degradedPick}`)
 assert(logs.some((l) => l.startsWith("warn") && l.includes("claim dir")), "degraded mode should warn once")
 
 // 7. stale claim files and orphan tmp files are pruned
 const stale = join(dir3, "claims.99999.json")
 const orphan = join(dir3, "claims.99998.json.tmp")
-writeFileSync(stale, JSON.stringify({ k: { v: "explore-fast-1", t: Date.now() } }))
+writeFileSync(stale, JSON.stringify({ k: { v: "explore-1", t: Date.now() } }))
 writeFileSync(orphan, "{}")
 const old = Date.now() / 1000 - 3600
 utimesSync(stale, old, old)
 utimesSync(orphan, old, old)
-await x.spawn("x2", "explore-fast")
+await x.spawn("x2", "explore")
 assert(!existsSync(stale), "stale claim file should be pruned")
 assert(!existsSync(orphan), "orphan tmp file should be pruned")
 
 // 8. TTL: claims older than 10 min stop counting
 const realNow = Date.now
 Date.now = () => realNow() + 11 * 60 * 1000
-const afterTtl = await a.spawn("t1", "explore-fast")
+const afterTtl = await a.spawn("t1", "explore")
 Date.now = realNow
 // Everything has aged out, so the pool is idle again and hands out a heavy slot
 assert(
@@ -283,8 +283,8 @@ assert(
 const other = { args: { filePath: "/etc" } }
 await a.hooks["tool.execute.before"]({ tool: "read", sessionID: "s1", callID: "x1" }, other)
 assert(other.args.filePath === "/etc", "non-task tool must not be touched")
-assert((await a.spawn("x2", "explore-deep")) === "explore-deep", "non-pool spawn must not be rewritten")
-assert((await a.spawn("x3", "explore-fast-2")) === "explore-fast-2", "direct variant must not be rewritten")
+assert((await a.spawn("x2", "build")) === "build", "non-pool spawn must not be rewritten")
+assert((await a.spawn("x3", "explore-2")) === "explore-2", "direct variant must not be rewritten")
 await a.hooks["tool.execute.before"]({ tool: "task", sessionID: "s1", callID: "x5" }, {})
 await a.finish("nonexistent")
 
@@ -292,7 +292,7 @@ await a.finish("nonexistent")
 //     presets/free-tier.json, each running that slot's model -- and none of them
 //     hard-codes one, so the file really is the only place a pool model lives
 const rawCfg = shippedConfig()
-const BASES = ["explore-fast", "implement-fast", "context-manager"]
+const BASES = ["explore", "implement", "context"]
 for (const base of BASES) {
   SLOT_MODELS.forEach((_, i) => {
     const v = `${base}-${i + 1}`
@@ -325,7 +325,7 @@ for (const [name, def] of Object.entries(cfg.agent)) {
   assert(cfg.provider[provider]?.whitelist.includes(id), `agent ${name} runs unwhitelisted ${def.model}`)
 }
 // opencode compiles a permission pattern to an anchored regex (* -> .*) and lets
-// the longest match win, so "explore-fast*" covers the base and every variant.
+// the longest match win, so "explore*" covers the base and every variant.
 // What must hold is not that each name is listed, but that a base and its variants
 // resolve the same way -- otherwise the pool routes a spawn to a variant the
 // caller is not allowed to run.
@@ -357,26 +357,21 @@ for (const [name, def] of Object.entries(cfg.agent)) {
 //      every one of those rules in a single call.
 const INTERPRETERS = new Set(["node", "python", "python3", "sh", "bash", "zsh", "perl", "ruby", "php", "env"])
 for (const [name, def] of Object.entries(rawCfg.agent)) {
-  if (!name.startsWith("context-manager")) continue
+  if (!name.startsWith("context")) continue
   for (const [pattern, action] of Object.entries(def.permission?.bash ?? {})) {
     if (action !== "allow" || pattern === "*") continue
     assert(!INTERPRETERS.has(pattern.split(/\s+/)[0]), `${name} may run \`${pattern}\`, which is arbitrary code execution`)
   }
 }
 
-// 10c. the generic built-in subagents must stay disabled. "explore" and "general"
-//      shadow the pool: always spawnable, full-price, and a bypass around
-//      explore-fast*/implement-fast*. Pinned so an opencode upgrade that
-//      reintroduces (or adds) one fails here rather than quietly doubling the
-//      delegation paths.
-for (const builtin of ["explore", "general", "implement"]) {
-  assert(rawCfg.agent[builtin]?.disable === true, `${builtin} must be disabled in the fixture config`)
-}
-// Only the pool's implement variants may be real agents; a bare "implement" must
-// stay disabled, so it must not be declared with anything but disable.
-for (const [name, def] of Object.entries(rawCfg.agent)) {
-  if (!/^implement(-|$)/.test(name) || name.startsWith("implement-")) continue
-  assert(def.disable === true, `${name} must not be a usable agent`)
+// 10c. only the built-in the plugin does NOT own stays disabled. The plugin's
+//      bases are named explore/implement/context, so those built-in keys must
+//      NOT be disabled: merge-without-clobber would keep the disable entry and
+//      the real base would never be injected. "general" still shadows the pool
+//      (always spawnable, full-price), so it stays disabled.
+assert(rawCfg.agent["general"]?.disable === true, "general must stay disabled in the fixture config")
+for (const base of ["explore", "implement", "context"]) {
+  assert(rawCfg.agent[base]?.disable !== true, `${base} must not be disabled: the plugin owns that name and would otherwise never inject its base`)
 }
 
 // 11. every pool model is free (0/0 cost) per the vendored models.dev snapshot.

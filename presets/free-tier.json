@@ -4,7 +4,7 @@
     "plugin options -> ~/.config/lacode/pool.json -> this file -> a built-in fallback.",
     "",
     "src/lib/pool.ts reads it at config time and rewrites every pooled variant agent",
-    "(explore-fast-N, implement-fast-N, context-manager-N) plus the provider whitelists",
+    "(explore-N, implement-N, context-N) plus the provider whitelists",
     "to match, so no model is written down next to an agent anywhere.",
     "Slot N is the same model for every base agent, which is what makes load shared.",
     "",

@@ -16,7 +16,7 @@ document; everything here is testable offline with a stub client and a
 `mkdtempSync` state directory.
 
 **Terminology.** A *slot* is one entry in `presets/free-tier.json`, carrying a
-model and a `weight`. A *base* is a pooled agent type (`explore-fast`), and its slot
+model and a `weight`. A *base* is a pooled agent type (`explore`), and its slot
 holders are `<base>-<slot>`, hidden in `opencode.jsonc`. A *claim* is a running
 spawn recorded in `claims.<pid>.json`. A *context map* is the five-file
 `.opencode/context/` codemap described in Epic G.
@@ -45,7 +45,7 @@ spawn recorded in `claims.<pid>.json`. A *context map* is the five-file
 **Story ID(s) for tests:** US-1
 **Acceptance criteria:**
 - [ ] Given the root agent `build` with read/glob/grep denied, When a read-family tool is invoked, Then the call is denied and the agent is pointed at an exploration base rather than executing inline.
-- [ ] Given a pooled base such as `explore-fast` is spawned, When the plugin rewrites the spawn, Then the concrete model selected is a slot declared in `presets/free-tier.json`.
+- [ ] Given a pooled base such as `explore` is spawned, When the plugin rewrites the spawn, Then the concrete model selected is a slot declared in `presets/free-tier.json`.
 - [ ] Given a pool whose slots are all zero-cost, When N exploration spawns run, Then none of them is dispatched to a paid model.
 
 ### US-2: One knob selects the exploration/implementation model
@@ -125,9 +125,9 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given a slot names a paid model, When the pool loads, Then the slot is accepted and routed to without a free-tier filter rejecting it.
 - [ ] Given a model id contains a vendor prefix with slashes (e.g. `openrouter/nvidia/model:free`), When it is split into provider and model id, Then the split is on the first slash only and the id tail is preserved.
 - [ ] Given more slots are declared than the pool allows, When the pool loads, Then the surplus entries are dropped with a warning naming the cap.
-- [ ] Given a provider configured with **no** `whitelist` key, When the config hook binds a slot or a `deepModel` on that provider, Then no `whitelist` is written for it, because an absent whitelist already allows every model the provider offers.
-- [ ] Given a provider the pool never names a slot or a `deepModel` on, When the config hook runs, Then that provider entry is left exactly as it was, with no `whitelist` key added.
-- [ ] Given a provider that already carries a `whitelist`, When the config hook binds a slot model or a `deepModel` on it, Then the model id is appended and every entry the user wrote is preserved in order.
+- [ ] Given a provider configured with **no** `whitelist` key, When the config hook binds a slot on that provider, Then no `whitelist` is written for it, because an absent whitelist already allows every model the provider offers.
+- [ ] Given a provider the pool never names a slot on, When the config hook runs, Then that provider entry is left exactly as it was, with no `whitelist` key added.
+- [ ] Given a provider that already carries a `whitelist`, When the config hook binds a slot model on it, Then the model id is appended and every entry the user wrote is preserved in order.
 - [ ] Given any provider after the config hook has run, When its whitelist is inspected, Then it is either absent or non-empty, because an empty allowlist names no model at all and opencode deletes the provider outright.
 
 `provider.<name>.whitelist` is an **allowlist**, not a to-do list: opencode
@@ -183,7 +183,8 @@ does not.
 **Story ID(s) for tests:** US-11
 **Acceptance criteria:**
 - [ ] Given a session went busy and is now idle, When the idle event fires, Then a `done` notification is delivered.
-- [ ] Given a session errors, When the error event fires, Then an `error` notification is delivered and it bypasses the duplicate-suppression cooldown.
+- [ ] Given a session ends with an unrecognized error, When the error event fires, Then an `error` notification is delivered, it bypasses the duplicate-suppression cooldown, and it carries the error's own message.
+- [ ] Given a recognized rate-limit or quota error, or a user abort, When a session error event fires, Then no failure notification is raised — the pool already handles the former and the user already knows the latter.
 - [ ] Given a session that never went busy, When it goes idle, Then no notification is sent.
 - [ ] Given a subagent session or a cartographer session, When it goes idle, Then it is suppressed.
 - [ ] Given the notify helper exits non-zero or writes to stderr, When the result is evaluated, Then the delivery is reported as failed rather than sent.
@@ -329,17 +330,17 @@ makes agents read it before they explore, then keeps it current on its own.
 
 **Story ID(s) for tests:** US-19
 **Acceptance criteria:**
-- [ ] Given a config that defines none of LaCode's agents, When the config hook runs, Then a `context-manager` subagent is injected, and it carries no model of its own, because the pool is the only thing that decides which model runs it.
-- [ ] Given the injected agent set, When the slot variants are built, Then a hidden `context-manager-<slot>` variant exists for every slot the pool can hand out, so a cartography run borrows shared capacity instead of a dedicated model.
+- [ ] Given a config that defines none of LaCode's agents, When the config hook runs, Then a `context` subagent is injected, and it carries no model of its own, because the pool is the only thing that decides which model runs it.
+- [ ] Given the injected agent set, When the slot variants are built, Then a hidden `context-<slot>` variant exists for every slot the pool can hand out, so a cartography run borrows shared capacity instead of a dedicated model.
 - [ ] Given a user config with no `instructions` array, When the config hook runs, Then the standing context-map rule is injected, naming all five map files, telling the agent to check with `ls` and never the `glob` tool, to read only the file relevant to the task, and to start from the canonical entry points the map lists.
-- [ ] Given the injected `context-manager`, When its prompt is inspected, Then it names the five files it owns, requires a short "Start here" list of canonical files per significant subsystem, and forbids file inventories — the map answers "what should I look at first?", never "tell me everything".
+- [ ] Given the injected `context`, When its prompt is inspected, Then it names the five files it owns, requires a short "Start here" list of canonical files per significant subsystem, and forbids file inventories — the map answers "what should I look at first?", never "tell me everything".
 
 ### US-20: The map stays current without being asked
 **As a** user, **I want** the map refreshed automatically after a session that edited code, **so that** agents are never misled by stale documentation.
 
 **Story ID(s) for tests:** US-20
 **Acceptance criteria:**
-- [ ] Given a file inside the project was edited, When the root session next goes idle, Then a `context-manager` session is created and prompted with the edited paths listed, rather than nothing happening.
+- [ ] Given a file inside the project was edited, When the root session next goes idle, Then a `context` session is created and prompted with the edited paths listed, rather than nothing happening.
 - [ ] Given `.opencode/context/` does not exist, When the automatic run fires, Then it is told to bootstrap the map; given that the directory exists, Then it is told to make an incremental update.
 - [ ] Given an idle event with no pending edit, or one from a subagent session, or one following an edit inside the map itself or inside a build directory, Then no cartographer is spawned.
 - [ ] Given an automatic run borrowed a pool slot, When it completes, Then the slot is released and the cartographer session going idle does not spawn a second run.
@@ -351,15 +352,15 @@ makes agents read it before they explore, then keeps it current on its own.
 
 **Story ID(s) for tests:** US-21
 
-Enforcement is split deliberately, and the split matters: **what the permission table enforces** is that `context-manager` can write the map and that *no other agent can*; **what the prompt enforces** is that every other agent knows to report map-relevant findings instead of making them. The permission half is the load-bearing one — it holds regardless of what the model decides to do — but it cannot tell an agent what it *should* have done, so the instruction is not redundant and is not going away.
+Enforcement is split deliberately, and the split matters: **what the permission table enforces** is that `context` can write the map and that *no other agent can*; **what the prompt enforces** is that every other agent knows to report map-relevant findings instead of making them. The permission half is the load-bearing one — it holds regardless of what the model decides to do — but it cannot tell an agent what it *should* have done, so the instruction is not redundant and is not going away.
 
 **Acceptance criteria:**
-- [ ] Given the injected agent set, When every agent's `edit` permission is evaluated against a path inside `.opencode/context/`, Then `context-manager` is the only agent whose winning rule for that path is `allow`, and every agent that may otherwise write files carries a `deny` on both spellings of the map path — so the map is closed to non-cartographers by permission, not only by instruction.
+- [ ] Given the injected agent set, When every agent's `edit` permission is evaluated against a path inside `.opencode/context/`, Then `context` is the only agent whose winning rule for that path is `allow`, and every agent that may otherwise write files carries a `deny` on both spellings of the map path — so the map is closed to non-cartographers by permission, not only by instruction.
 - [ ] Given an agent's `edit` rules are evaluated the way opencode evaluates them, When the narrow map `deny` is declared before a broad `"*": "allow"`, Then the broad rule wins and the agent is reported as a second writer; so the deny is required to be the LAST entry, and the shipped table must be declared in that order.
-- [ ] Given the `context-manager` permission rule, When it is evaluated for a normally-rooted project and for a project rooted at `/`, Then both spellings of the map path are allowed, because opencode evaluates file permissions relative to the project root.
+- [ ] Given the `context` permission rule, When it is evaluated for a normally-rooted project and for a project rooted at `/`, Then both spellings of the map path are allowed, because opencode evaluates file permissions relative to the project root.
 - [ ] Given a config whose one-writer rule allows neither spelling, When the writer rule is verified, Then it reports which rules it saw, that the map is not writable, and that both forms are required — instead of leaving a map that silently never updates.
 - [ ] Given a config in which a non-cartographer agent would be granted the map, When the writer rule is verified, Then it reports that agent by name together with the rule that wins for it, and the report is silent once the deny is narrowed and placed last.
-- [ ] Given an agent other than `context-manager` finishes work, When the standing rule reaches it, Then it is told never to edit the map itself and to report what belongs in it instead, so that a denied agent knows what to do rather than only that it was refused.
+- [ ] Given an agent other than `context` finishes work, When the standing rule reaches it, Then it is told never to edit the map itself and to report what belongs in it instead, so that a denied agent knows what to do rather than only that it was refused.
 - [ ] Given `edit` is denied for the map, When the same agents read the map, Then reading is unaffected: the rule narrows the `edit` tool only, so the map stays readable by exactly the agents that are told to check it.
 
 ### US-22: On-demand map operations
@@ -367,7 +368,7 @@ Enforcement is split deliberately, and the split matters: **what the permission 
 
 **Story ID(s) for tests:** US-22
 **Acceptance criteria:**
-- [ ] Given a config that defines none of LaCode's commands, When the config hook runs, Then `/context-init`, `/context-update` and `/context-review` are injected, each targeting `context-manager` as a subtask.
+- [ ] Given a config that defines none of LaCode's commands, When the config hook runs, Then `/context-init`, `/context-update` and `/context-review` are injected, each targeting `context` as a subtask.
 - [ ] Given an injected command template, When opencode substitutes `$ARGUMENTS`, Then `/context-update` carries the user's focus text in the placeholder's place and the procedure around it is unchanged.
 - [ ] Given the three commands have been injected, When their templates are inspected, Then each names the procedure it delegates to (bootstrap, incremental update, or review) and none carries an unsubstituted placeholder other than `/context-update`'s single `$ARGUMENTS`.
 - [ ] Given the user's config already defines one of the three commands, When the config hook runs, Then that command is left byte-identical while the other two are still added.

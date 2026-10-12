@@ -63,7 +63,7 @@ writeFileSync(
 // declaring one here would assert a rule opencode would ignore.
 const config = (rules) => {
   const file = join(dir, "opencode.jsonc")
-  writeFileSync(file, `{"agent":{"context-manager-1":{"permission":{"edit":{"*":"deny",${rules}}}}}}`)
+  writeFileSync(file, `{"agent":{"context-1":{"permission":{"edit":{"*":"deny",${rules}}}}}}`)
   return file
 }
 
@@ -135,7 +135,7 @@ try {
   const writeOnly = join(dir, "write-only.jsonc")
   writeFileSync(
     writeOnly,
-    `{"agent":{"context-manager-1":{"permission":{`
+    `{"agent":{"context-1":{"permission":{`
       + `"edit":{"*":"deny","src/*.ts":"allow"},`
       + `"write":{"*":"deny",${REL},${ABS}}}}}}`,
   )

@@ -61,9 +61,11 @@ export type NotifyRequest = {
 export type Result = { ok: boolean; detail?: string; transport: "local" | "remote" | "none" }
 
 export type TunnelConfig = {
-  /** The desktop user the reverse forward authenticates as. */
+  /** The desktop user the direct ssh hop authenticates as. */
   user: string
-  /** Port the reverse forward is listening on, local side. */
+  /** The desktop host a direct ssh reaches. Empty selects the legacy reverse-forward port path. */
+  host: string
+  /** Port the legacy reverse forward is listening on, local side. Unused when `host` is set. */
   port: number
   /** Dedicated key. Never a personal key: this one is restricted to notifying. */
   key: string
@@ -81,6 +83,7 @@ export function resolveTunnel(env: NodeJS.ProcessEnv = process.env): TunnelConfi
   const port = Number(env.OC_TUNNEL_PORT)
   return {
     user: env.OC_LOCAL_USER ?? "",
+    host: env.OC_LOCAL_HOST ?? "",
     port: Number.isFinite(port) && port > 0 ? port : 10022,
     key: env.OC_NOTIFY_KEY ?? join(homedir(), ".ssh", "lacode_notify"),
     connectTimeoutMs: Number(env.OC_CONNECT_TIMEOUT_MS) || 5000,
@@ -134,6 +137,21 @@ export const FIELD_SEPARATOR = "\n"
  * are whitelisted values. No field can contain the delimiter, so the split is
  * lossless for a body containing spaces, quotes or glob characters.
  */
+/**
+ * The inverse of `encodePayload`: the newline-delimited payload a forced command
+ * reads from $SSH_ORIGINAL_COMMAND. Fields are sanitized again here, at the trust
+ * boundary, rather than assumed from the sender.
+ */
+export function parsePayload(raw: string): NotifyRequest {
+  const [title, message, urgency, icon] = raw.split(FIELD_SEPARATOR)
+  return {
+    title: safeTitle(title),
+    message: safeMessage(message),
+    urgency: normalizeUrgency(urgency),
+    icon: normalizeIcon(icon),
+  }
+}
+
 export const encodePayload = (request: NotifyRequest): string =>
   [
     safeTitle(request.title),
@@ -153,6 +171,20 @@ const SSH_OPTS = [
   "-o", "ClearAllForwardings=yes",
   "-o", "LogLevel=ERROR",
   "-o", "StrictHostKeyChecking=accept-new",
+]
+
+/**
+ * The direct transport's multiplexing options. `ControlMaster=auto` makes the
+ * first send the master and later ones cheap channels on it, and `ControlPersist`
+ * keeps that master warm between notifications -- one long-lived ssh connection
+ * instead of one per popup, with no reverse forward, no listening port and no
+ * systemd unit to keep alive. `%C` is ssh's own hash of user/host/port, so two
+ * desktops never share a socket.
+ */
+const CONTROL_OPTS = [
+  "-o", "ControlMaster=auto",
+  "-o", "ControlPersist=300",
+  "-o", `ControlPath=${join(homedir(), ".ssh", "lacode-cm-%C")}`,
 ]
 
 const run = (command: string, args: string[], timeout: number) => {
@@ -294,16 +326,24 @@ export function sendLocal(request: NotifyRequest, platform: string = process.pla
  */
 export function sendRemote(request: NotifyRequest, tunnel: TunnelConfig): Result {
   if (!tunnel.user) return { ok: false, detail: "OC_LOCAL_USER is unset; the desktop user for the tunnel is unknown", transport: "remote" }
-  const args = [
-    ...SSH_OPTS,
-    "-o", `ConnectTimeout=${Math.max(1, Math.round(tunnel.connectTimeoutMs / 1000))}`,
-    "-i", tunnel.key,
-    "-p", String(tunnel.port),
-    `${tunnel.user}@localhost`,
-    "--",
-    encodePayload(request),
-  ]
-  const result = run("ssh", args, tunnel.connectTimeoutMs + 2000)
+  const connect = ["-o", `ConnectTimeout=${Math.max(1, Math.round(tunnel.connectTimeoutMs / 1000))}`]
+  // Direct ssh (default when OC_LOCAL_HOST is set): the caller owns the transport
+  // and ControlPersist keeps one connection warm. There is no reverse forward, no
+  // listening port and no systemd unit -- nothing to sync and nothing to manage.
+  if (tunnel.host) {
+    const result = run(
+      "ssh",
+      [...SSH_OPTS, ...CONTROL_OPTS, ...connect, "-i", tunnel.key, `${tunnel.user}@${tunnel.host}`, "--", encodePayload(request)],
+      tunnel.connectTimeoutMs + 2000,
+    )
+    return { ok: result.ok, detail: result.ok ? undefined : result.stderr || result.detail, transport: "remote" }
+  }
+  // Legacy reverse-forward fallback, kept until every host sets OC_LOCAL_HOST.
+  const result = run(
+    "ssh",
+    [...SSH_OPTS, ...connect, "-i", tunnel.key, "-p", String(tunnel.port), `${tunnel.user}@localhost`, "--", encodePayload(request)],
+    tunnel.connectTimeoutMs + 2000,
+  )
   return { ok: result.ok, detail: result.ok ? undefined : result.stderr || result.detail, transport: "remote" }
 }
 
@@ -358,6 +398,7 @@ export function describe(env: NodeJS.ProcessEnv = process.env, platform: string 
   return {
     running: isRemote(env) ? "remote (over ssh)" : "local",
     user: tunnel.user || "(unset)",
+    host: tunnel.host || "(unset)",
     port: tunnel.port,
     key: tunnel.key,
     channel: localChannel(platform),

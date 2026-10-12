@@ -199,23 +199,23 @@ export const contextAutoUpdateHooks = (async ({ client, directory }): Promise<Ho
         pool.init(state, (m) => void log("warn", m))
         const snap = pool.snapshot(state)
         const slot = pool.pickSlot(state, snap)
-        const agent = pool.agentFor("context-manager", slot.index)
+        const agent = pool.agentFor("context", slot.index)
 
         const created = await client.session.create({
-          body: { title: `context-manager (auto ${mode})` },
+          body: { title: `context (auto ${mode})` },
           query: { directory },
         })
         const target = created.data?.id
         if (!target) {
           requeue()
-          await log("warn", "could not create context-manager session")
+          await log("warn", "could not create context session")
           return
         }
 
         // Claim the slot against the session that does the work, so pool_status
         // counts it and the pool's hang reaper can abort this session directly.
         const claimKey = pool.claimKey(target, "context-autoupdate")
-        pool.acquire(state, "context-manager", slot, target, claimKey, target)
+        pool.acquire(state, "context", slot, target, claimKey, target)
         await log("info", `borrowed pool slot ${slot.index} (${slot.model}, w${slot.weight}) for auto ${mode}`, {
           slot: slot.index,
           weight: slot.weight,

@@ -56,11 +56,11 @@ test("[US-1] the root agent cannot read, grep or glob, and is pointed at an expl
   }
   // The call is denied AND redirected: build may spawn only the pooled bases.
   assert.equal(build.permission.task["*"], "deny", "build must not spawn arbitrary agents")
-  assert.equal(build.permission.task["explore-fast*"], "allow", "build must be able to delegate exploration")
-  assert.equal(build.permission.task["implement-fast*"], "allow", "build must be able to delegate implementation")
+  assert.equal(build.permission.task["explore*"], "allow", "build must be able to delegate exploration")
+  assert.equal(build.permission.task["implement*"], "allow", "build must be able to delegate implementation")
   // And it is pointed at that base in prose too, so a model that ignores the
   // permission table still gets the instruction.
-  assert.match(build.prompt, /@explore-fast/, "build's prompt must name the exploration base")
+  assert.match(build.prompt, /@explore/, "build's prompt must name the exploration base")
   await hooks.dispose()
 })
 
@@ -71,9 +71,9 @@ test("[US-1] a pooled spawn is rewritten to a variant whose model is a declared 
   const cfg = configFor(models)
   await hooks.config(cfg)
 
-  const { routed, model } = await spawn(hooks, cfg, { subagent: "explore-fast" })
-  assert.notEqual(routed, "explore-fast", "the bare base must be rewritten to a slot variant")
-  assert.match(routed, /^explore-fast-[1-9]$/, `routed to ${routed}, expected explore-fast-N`)
+  const { routed, model } = await spawn(hooks, cfg, { subagent: "explore" })
+  assert.notEqual(routed, "explore", "the bare base must be rewritten to a slot variant")
+  assert.match(routed, /^explore-[1-9]$/, `routed to ${routed}, expected explore-N`)
   assert.ok(models.includes(model), `variant model ${model} is not a slot declared in presets/free-tier.json`)
   await hooks.dispose()
 })
@@ -98,7 +98,7 @@ test("[US-1] N exploration spawns over an all-zero-cost preset are never dispatc
   const dispatched = []
   const N = 12
   for (let i = 0; i < N; i++) {
-    const base = i % 2 === 0 ? "explore-fast" : "implement-fast"
+    const base = i % 2 === 0 ? "explore" : "implement"
     const { model } = await spawn(hooks, cfg, { subagent: base, callID: `c${i}`, sessionID: `s${i}` })
     dispatched.push(model)
   }
@@ -144,15 +144,15 @@ test("[US-2] a model hard-coded on a pooled variant is reported as overridden an
   // The author's own opencode.jsonc used to carry a model here; the pool preset
   // must win, and the stale line must be named rather than silently ignored.
   const cfg = configFor([PAID])
-  cfg.agent["explore-fast-1"] = { model: "stale/leftover-model", prompt: "x", permission: {} }
+  cfg.agent["explore-1"] = { model: "stale/leftover-model", prompt: "x", permission: {} }
   await hooks.config(cfg)
 
   const warnings = stub.text().filter((line) => line.startsWith("warn"))
   assert.ok(
-    warnings.some((line) => line.includes("explore-fast-1") && line.includes("stale/leftover-model") && line.includes("pool preset wins")),
+    warnings.some((line) => line.includes("explore-1") && line.includes("stale/leftover-model") && line.includes("pool preset wins")),
     `expected a warning naming the hard-coded model and saying the preset wins, got:\n${warnings.join("\n")}`,
   )
-  assert.equal(cfg.agent["explore-fast-1"].model, PAID, "the resolved slot model must overwrite the hard-coded one")
+  assert.equal(cfg.agent["explore-1"].model, PAID, "the resolved slot model must overwrite the hard-coded one")
   await hooks.dispose()
 })
 
@@ -176,8 +176,8 @@ test("[US-2] an invalid weight falls back to 1 with a warning, and the slot surv
 
   // The slots were not dropped: all three variants exist and all report w1.
   for (let index = 1; index <= slots.length; index++) {
-    assert.ok(cfg.agent[`explore-fast-${index}`], `slot ${index} must survive a bad weight`)
-    assert.equal(cfg.agent[`explore-fast-${index}`].model, slots[index - 1].model)
+    assert.ok(cfg.agent[`explore-${index}`], `slot ${index} must survive a bad weight`)
+    assert.equal(cfg.agent[`explore-${index}`].model, slots[index - 1].model)
   }
   const status = await hooks.tool.pool_status.execute({}, {})
   assert.match(status.output, /slot 1 w1\s+weighty\/zero/, `pool_status must show the fallback weight:\n${status.output}`)
@@ -187,7 +187,7 @@ test("[US-2] an invalid weight falls back to 1 with a warning, and the slot surv
   // spawns before any of them is reused.
   const seen = []
   for (let i = 0; i < 3; i++) seen.push((await spawn(hooks, cfg, { callID: `w${i}`, sessionID: `ws${i}` })).routed)
-  assert.deepEqual(seen, ["explore-fast-1", "explore-fast-2", "explore-fast-3"], `weight 1 each must round-robin, got ${seen}`)
+  assert.deepEqual(seen, ["explore-1", "explore-2", "explore-3"], `weight 1 each must round-robin, got ${seen}`)
   await hooks.dispose()
 })
 
@@ -395,7 +395,7 @@ test("[US-23] the pool has no model whitelist: an arbitrary exotic model binds v
     await hooks.config(cfg)
 
     // Bound verbatim — not normalised, not swapped for a preset model, not dropped.
-    assert.equal(cfg.agent["explore-fast-1"].model, model, `${model} must bind verbatim`)
+    assert.equal(cfg.agent["explore-1"].model, model, `${model} must bind verbatim`)
 
     // No warning of any kind, and in particular nothing about cost or price:
     // the pool does not inspect prices, so it has no basis to comment on one.
@@ -452,7 +452,7 @@ test("[US-23] removing the advisory changed nothing: resolution, routing and the
   for (const model of routed) {
     assert.ok(slots.some((s) => s.model === model), `spawn went to ${model}, which is not a configured slot`)
   }
-  assert.equal(cfg.agent["explore-fast-1"].model, PAID, "the configured (priced) model must be bound, not replaced")
+  assert.equal(cfg.agent["explore-1"].model, PAID, "the configured (priced) model must be bound, not replaced")
 
   // 3. And the pool is still silent about cost — with no advisory left in the
   //    codebase, that silence is now the whole policy rather than a happy accident.

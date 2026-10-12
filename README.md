@@ -108,11 +108,11 @@ Nothing here hot-reloads, so the restart is part of the step, not a footnote.
 **2 — Check whether the plugin loaded.**
 
 ```bash
-opencode agent list | grep -E '^(explore-fast|implement-fast|explore-deep|implement-deep)'
+opencode agent list | grep -E '^(explore|implement|context)'
 ```
 
-A working install prints `explore-fast`, `implement-fast`, `explore-deep` and
-`implement-deep`, each with the hidden `-1`..`-4` pool variants alongside. If the
+A working install prints `explore`, `implement` and `context`, each with the
+hidden `-1`..`-4` pool variants alongside. If the
 grep returns nothing and the list holds only opencode's own built-ins, the plugin
 did not load. Run it in the same shell environment opencode runs in — an
 `agent list` under a different `HOME` or `XDG_CONFIG_HOME` tests a different
@@ -284,7 +284,6 @@ option is optional:
 | `enabled` | `true` | The single off switch. `false` injects nothing at all and does no writes. |
 | `models` | — | An inline slot list. Highest-priority source. |
 | `modelsFile` | — | An explicit slot file; short-circuits the chain below. |
-| `deepModel` | — | A `provider/model-id` pinned onto `explore-deep` and `implement-deep`. |
 | `reapMs` | `30000` | Hang-reaper interval. |
 
 ### Pool preset resolution
@@ -308,46 +307,26 @@ that is a sensible default, not because the pool requires it.
 ### Which models run which agent
 
 Only the **pool** writes a model onto a pooled agent, from whichever source wins
-above. The pooled bases (`explore-fast`, `implement-fast`, `context-manager`)
+above. The pooled bases (`explore`, `implement`, `context`)
 and their hidden `-1`..`-4` variants therefore carry no model of their own: a
 model written next to an agent would be a second source of truth that silently
 wins whenever routing falls through. Spawn a base and let the pool route it.
-
-`explore-deep` and `implement-deep` are **not** pooled — they are the deliberate
-escalation above a pooled tier — so nothing routes them and nothing writes their
-model. Left alone they fall through to your default model, which turns "I am
-stuck, escalate" into an unannounced jump to the most expensive model in your
-setup. Set `deepModel` to pin them:
-
-```jsonc
-"plugin": [["@lawaty/lacode", { "deepModel": "your-provider/your-deep-model" }]]
-```
-
-It is an option and not a literal in the package because which model to escalate
-onto is a property of your providers, not of LaCode. If you keep a `whitelist`
-on that provider, LaCode appends the pinned model to it for you: the whitelist is
-an allowlist, so opencode drops any model a provider offers that it does not
-name, and an unlisted pin would resolve to nothing at all. If you have no
-whitelist there, none is written — an absent one already allows every model. With
-`deepModel` unset, no model is written and the deep tiers use your
-default model — the behaviour of earlier versions.
 
 ### ⚠️ Per-agent tool grants must be in your own config
 
 **LaCode cannot grant tools to its agents, and this is not an oversight you can
 work around by configuring it.** If you keep a global `"tools"` block in your
-config — for example `"tools": { "playwright_*": false }` — then the four
-exploration and implementation tiers (`explore-fast`, `explore-deep`,
-`implement-fast`, `implement-deep`, plus their hidden `-1`..`-4` pool variants)
-lose browser access, and **nothing tells them why**: the tool call is simply
-refused mid-task. `context-manager` gets no grant either, which is correct — it
+config — for example `"tools": { "playwright_*": false }` — then the pooled
+exploration and implementation bases (`explore` and `implement`, plus their
+hidden `-1`..`-4` pool variants) lose browser access, and **nothing tells them why**: the tool call is simply
+refused mid-task. `context` gets no grant either, which is correct — it
 writes the context map and has no business in a browser.
 
 opencode folds an agent's `tools` into its permission list **at config-load
 time**, while decoding the config — before any plugin runs. A plugin's `config`
 hook mutates the already-decoded config, so the fold never re-runs and anything
 it puts in `agent.tools` is inert. (Verified on opencode 1.18.34/1.18.35 with
-`opencode debug agent explore-fast`: a grant written in your own config shows two
+`opencode debug agent explore`: a grant written in your own config shows two
 `playwright_*` entries — `deny` then `allow`, last one winning — while the same
 grant injected by the plugin shows only the `deny`.) LaCode's other injected
 fields are not affected; `permission`, `prompt`, `model`, `description`,
@@ -359,15 +338,13 @@ fields are not affected; `permission`, `prompt`, `model`, `description`,
 {
   "tools": { "playwright_*": false },
   "agent": {
-    "explore-fast": { "tools": { "playwright_*": true } },
-    "explore-deep": { "tools": { "playwright_*": true } },
-    "implement-fast": { "tools": { "playwright_*": true } },
-    "implement-deep": { "tools": { "playwright_*": true } }
+    "explore": { "tools": { "playwright_*": true } },
+    "implement": { "tools": { "playwright_*": true } }
   }
 }
 ```
 
-The hidden pool variants (`explore-fast-1`, `implement-fast-2`, …) inherit
+The hidden pool variants (`explore-1`, `implement-2`, …) inherit
 nothing here — add a line per variant you actually spawn, or drop the global
 deny and scope it to the agents that should not have browser access instead.
 
@@ -376,8 +353,8 @@ process.
 
 ### What gets injected
 
-**19 agent keys**: the 7 bases `build`, `plan`, `explore-fast`, `explore-deep`,
-`implement-fast`, `implement-deep`, `context-manager`, plus one hidden
+**17 agent keys**: the 5 bases `build`, `plan`, `explore`, `implement`,
+`context`, plus one hidden
 `<base>-1`..`-4` pool variant for each of the 3 pooled bases.
 
 `build` and `plan` exist in opencode as built-ins, so on a stock config those
@@ -424,7 +401,7 @@ inventories: it answers "what should I look at first?" and nothing else, which
 is what makes reading it cheaper than the exploration it replaces.
 
 It keeps itself current. When a session that edited code goes idle, LaCode
-starts a `context-manager` run that borrows a slot from the same pool every
+starts a `context` run that borrows a slot from the same pool every
 other subagent uses and updates the map from the changed paths and their
 architectural neighbourhood — defaulting to *no edit*, since a changed file is
 not a changed fact. Only that one agent ever writes the map; everything else

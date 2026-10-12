@@ -64,7 +64,7 @@ const apply = async (modelsFile, id) => {
   await hooks.config(cfg)
   return {
     cfg,
-    spawn: async (callID, requested = "explore-fast", sessionID = "s1") => {
+    spawn: async (callID, requested = "explore", sessionID = "s1") => {
       const out = { args: { subagent_type: requested, prompt: "x" } }
       await hooks["tool.execute.before"]({ tool: "task", sessionID, callID }, out)
       return out.args.subagent_type
@@ -74,7 +74,7 @@ const apply = async (modelsFile, id) => {
   }
 }
 
-const BASES = ["explore-fast", "implement-fast", "context-manager"]
+const BASES = ["explore", "implement", "context"]
 
 // 1. the shipped file is well formed
 const shipped = JSON.parse(readFileSync(MODELS, "utf8"))
@@ -135,7 +135,7 @@ for (const slot of swapped) {
 
 // 4. a three-slot file routes only 1,2,3 -- the slot count is data, not code
 const picks = []
-for (let i = 0; i < 6; i++) picks.push((await a.spawn(`s${i}`)).replace("explore-fast-", ""))
+for (let i = 0; i < 6; i++) picks.push((await a.spawn(`s${i}`)).replace("explore-", ""))
 assert(new Set(picks).size === 3, `only three slots exist, got ${[...new Set(picks)].join(",")}`)
 assert(!picks.includes("4"), "slot 4 does not exist in a three-slot file")
 
@@ -143,7 +143,7 @@ assert(!picks.includes("4"), "slot 4 does not exist in a three-slot file")
 const missing = await apply(join(dir, "does-not-exist.json"), "missing")
 assert(missing.warned().some((l) => l.includes("unreadable")), "a missing file should warn")
 const fallbackPick = await missing.spawn("f1")
-assert(fallbackPick === "explore-fast-1", `defaults should still route, got ${fallbackPick}`)
+assert(fallbackPick === "explore-1", `defaults should still route, got ${fallbackPick}`)
 
 // 6. individual bad entries are dropped with a warning; the good slots still route
 // A bad weight is NOT in that set: it is preference only, so it warns and keeps the
@@ -170,8 +170,8 @@ assert(warns.length === 3, `each bad entry should warn once, got ${warns.length}
 assert(warns.some((l) => l.includes("weight must be a number")), `a bad weight should warn, got ${warns.join(" | ")}`)
 // the model behind the bad weight survives, only its preference is lost
 assert(
-  broken.cfg.agent["explore-fast-2"].model === GOOD_2,
-  `a slot with a bad weight must still route, got ${broken.cfg.agent["explore-fast-2"].model}`,
+  broken.cfg.agent["explore-2"].model === GOOD_2,
+  `a slot with a bad weight must still route, got ${broken.cfg.agent["explore-2"].model}`,
 )
 for (const base of BASES) {
   assert(broken.cfg.agent[`${base}-1`].model === GOOD_1, `slot 1 must run the first valid entry, got ${broken.cfg.agent[`${base}-1`].model}`)
@@ -189,7 +189,7 @@ const weighted = await apply(file("weighted.json", { slots: [{ model: HEAVY, wei
 const HEAVY_CEILING = 3
 const tally = { [HEAVY]: 0, [LIGHT]: 0 }
 const tallyPick = async (callID) => {
-  const slot = (await weighted.spawn(callID)).replace("explore-fast-", "")
+  const slot = (await weighted.spawn(callID)).replace("explore-", "")
   tally[slot === "1" ? HEAVY : LIGHT]++
   return slot
 }
@@ -244,7 +244,7 @@ const overCap = await apply(
 const capWarns = overCap.warned().filter((l) => l.includes("capped"))
 assert(capWarns.length === 2, `each ignored entry past the cap should warn, got ${capWarns.length}: ${capWarns.join(" | ")}`)
 const capPicks = []
-for (let i = 0; i < pool.MAX_SLOTS * 2; i++) capPicks.push((await overCap.spawn(`c${i}`)).replace("explore-fast-", ""))
+for (let i = 0; i < pool.MAX_SLOTS * 2; i++) capPicks.push((await overCap.spawn(`c${i}`)).replace("explore-", ""))
 assert(
   new Set(capPicks).size === pool.MAX_SLOTS && !capPicks.includes(String(pool.MAX_SLOTS + 1)),
   `only the first ${pool.MAX_SLOTS} slots may route, got ${[...new Set(capPicks)].join(",")}`,

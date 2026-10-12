@@ -110,7 +110,7 @@ test("[US-15] one config line is enough: a bare config boots and delivers the wh
   const cfg = { plugin: ["@lawaty/lacode"] }
   await hooks.config(cfg)
 
-  for (const agent of ["build", "plan", "explore-fast", "implement-fast", "explore-deep", "implement-deep", "context-manager"]) {
+  for (const agent of ["build", "plan", "explore", "implement", "context"]) {
     assert.ok(cfg.agent[agent], `${agent} must be injected by the single config line`)
   }
   for (const command of ["context-init", "context-update", "context-review"]) {
@@ -120,7 +120,7 @@ test("[US-15] one config line is enough: a bare config boots and delivers the wh
 
   // And the injected set actually routes work, so this is value, not decoration.
   const { routed } = await spawn(hooks, cfg, {})
-  assert.match(routed, /^explore-fast-[1-9]$/, `delegated work must route to a pool slot, got ${routed}`)
+  assert.match(routed, /^explore-[1-9]$/, `delegated work must route to a pool slot, got ${routed}`)
   await hooks.dispose()
 })
 
@@ -138,9 +138,9 @@ test("[US-15] with no configuration at all, the installed package falls back to 
     const booted = await bootFrom(dir, { id: "us15-fresh", dir: scratch() })
     const cfg = {}
     await booted.hooks.config(cfg)
-    assert.ok(cfg.agent["explore-fast"], "shipped defaults must supply the agents with no user config")
+    assert.ok(cfg.agent["explore"], "shipped defaults must supply the agents with no user config")
     const { routed, model } = await spawn(booted.hooks, cfg, {})
-    assert.match(routed, /^explore-fast-[1-9]$/, "routing must work out of the box")
+    assert.match(routed, /^explore-[1-9]$/, "routing must work out of the box")
     await booted.hooks.dispose()
     return booted
   })
@@ -520,80 +520,19 @@ test("[US-15] the README still says `main`/`exports[\"./server\"]` are forward-c
 //
 // ---------------------------------------------------------------------------
 
-test("[US-15] the deep tiers are not left on the main model: deepModel pins them, and nothing is pinned without it", async () => {
-  const stub = stubInput()
-  const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
-
-  // Unset: unchanged behaviour, no model written, so the tiers fall through to
-  // whatever the user's default is. A package must not ship a provider.
-  const bare = await LaCode(stub.input)
-  const bareCfg = {}
-  await bare.config(bareCfg)
-  for (const name of ["explore-deep", "implement-deep"]) {
-    assert.equal(bareCfg.agent[name].model, undefined, `${name} must carry no model when deepModel is unset`)
-  }
-  // The pooled bases are unaffected by the option: the pool owns those models.
-  assert.equal(bareCfg.agent["explore-fast"].model, undefined, "a pooled base is still model-less")
-  await bare.dispose()
-
-  // Set: both unpooled tiers are pinned, and only they are.
-  const pinned = await LaCode(stub.input, { deepModel: "example/deep-tier" })
-  const pinnedCfg = { provider: { example: {} } }
-  await pinned.config(pinnedCfg)
-  for (const name of ["explore-deep", "implement-deep"]) {
-    assert.equal(pinnedCfg.agent[name].model, "example/deep-tier", `${name} must be pinned to the configured model`)
-  }
-  assert.equal(pinnedCfg.agent["explore-fast"].model, undefined, "deepModel must not touch a pooled base")
-
-  // This provider has NO whitelist, which opencode already reads as "every model
-  // the provider offers is allowed". Writing one to hold a single id would turn
-  // it into an allowlist naming nothing else, so opencode would delete every
-  // other model the user runs there -- the pin is the plugin's business, their
-  // provider list is not.
-  assert.ok(!("whitelist" in pinnedCfg.provider.example), `an absent whitelist must stay absent, got ${JSON.stringify(pinnedCfg.provider.example)}`)
-  await pinned.dispose()
-
-  // A provider the user HAS restricted still needs the pin listed: opencode drops
-  // every model an allowlist does not name, so without it the deep tiers resolve
-  // to nothing and silently fall back to the session's model.
-  const restricted = await LaCode(stub.input, { deepModel: "example/deep-tier" })
-  const restrictedCfg = { provider: { example: { whitelist: ["their-own"] } } }
-  await restricted.config(restrictedCfg)
-  assert.deepEqual(restrictedCfg.provider.example.whitelist, ["their-own", "deep-tier"], "an existing whitelist must gain the pin without losing its own entries")
-  await restricted.dispose()
-})
-
-test("[US-16] a deepModel never overwrites a deep tier the user defined themselves", async () => {
-  const stub = stubInput()
-  const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
-  const hooks = await LaCode(stub.input, { deepModel: "example/deep-tier" })
-  const mine = { description: "MY deep explorer", mode: "subagent", model: "mine/own-choice" }
-  const cfg = { agent: { "explore-deep": { ...mine } } }
-  await hooks.config(cfg)
-
-  assert.deepEqual(cfg.agent["explore-deep"], mine, "merge-without-clobber outranks the deepModel option")
-  // The sibling tier LaCode DID inject is still pinned, so the option is not inert.
-  assert.equal(cfg.agent["implement-deep"].model, "example/deep-tier")
-  await hooks.dispose()
-})
-
-// ---------------------------------------------------------------------------
-// US-16 -- merge, never clobber
-// ---------------------------------------------------------------------------
-
 test("[US-16] a user-defined agent of the same name is left byte-identical", async () => {
   const mine = { description: "MY explorer", mode: "subagent", prompt: "MY PROMPT", permission: { read: "allow" }, temperature: 0.9 }
   const stub = stubInput()
   const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
   const hooks = await LaCode(stub.input)
-  const cfg = { agent: { "explore-fast": { ...mine } } }
+  const cfg = { agent: { "explore": { ...mine } } }
   await hooks.config(cfg)
 
-  assert.deepEqual(cfg.agent["explore-fast"], mine, "a user's agent must survive injection untouched")
-  assert.equal(cfg.agent["explore-fast"].prompt, "MY PROMPT", "not even a prompt may be patched")
+  assert.deepEqual(cfg.agent["explore"], mine, "a user's agent must survive injection untouched")
+  assert.equal(cfg.agent["explore"].prompt, "MY PROMPT", "not even a prompt may be patched")
 
   // Every other agent was still added, so a merge never means "give up".
-  assert.ok(cfg.agent["implement-fast"], "the rest of the set must still be injected")
+  assert.ok(cfg.agent["implement"], "the rest of the set must still be injected")
   assert.ok(stub.text().some((line) => line.includes("kept")), "the skip must be reported once")
   await hooks.dispose()
 })
@@ -748,7 +687,7 @@ test("[US-17] with the off switch unset, behaviour is otherwise identical to ena
 // list while DECODING the config, before any plugin runs; a plugin's `config`
 // hook mutates the already-decoded object, so the fold never re-runs and the
 // injected value is read by nothing. Verified on opencode 1.18.34/1.18.35 with
-// `opencode debug agent explore-fast`: the same grant written in the USER's own
+// `opencode debug agent explore`: the same grant written in the USER's own
 // config produces two `playwright_*` entries (deny, then allow -- last wins),
 // while the plugin-injected one produces only the deny.
 //
@@ -772,11 +711,11 @@ test("[US-24] no injected agent carries a `tools` grant: the host folds agent.to
 
   // The tiers the dead grant used to sit on are named explicitly, so removing
   // the test above cannot quietly remove the check along with the field.
-  for (const name of ["explore-fast", "explore-deep", "implement-fast", "implement-deep"]) {
+  for (const name of ["explore", "implement"]) {
     assert.equal(cfg.agent[name]?.tools, undefined, `${name} is the tier the phantom grant targeted`)
   }
   // ...and so is every hidden pool variant, which inherited it from its base.
-  for (const name of ["explore-fast-1", "explore-fast-4", "implement-fast-1", "implement-fast-4"]) {
+  for (const name of ["explore-1", "explore-4", "implement-1", "implement-4"]) {
     assert.equal(cfg.agent[name]?.tools, undefined, `${name} inherited the phantom grant from its base`)
   }
   await hooks.dispose()
@@ -800,7 +739,7 @@ test("[US-24] removing the tools field removed nothing else: every agent field t
   }
   // `hidden` is the one field only some agents carry, so it is checked on the
   // pool variants specifically rather than on every agent.
-  for (const name of ["explore-fast-1", "implement-fast-4", "context-manager-2"]) {
+  for (const name of ["explore-1", "implement-4", "context-2"]) {
     assert.equal(cfg.agent[name]?.hidden, true, `${name} must stay hidden`)
   }
   await hooks.dispose()
@@ -840,7 +779,7 @@ test("[US-24] the limitation is documented for users: README states it above the
   const example = section.match(/```jsonc\n([\s\S]*?)```/)
   assert.ok(example, "the warning section must show a copy-pasteable example next to the reason")
   assert.match(example[1], /"playwright_\*": false/, "the example must show the global deny being worked around")
-  for (const tier of ["explore-fast", "explore-deep", "implement-fast", "implement-deep"]) {
+  for (const tier of ["explore", "implement"]) {
     assert.ok(example[1].includes(`"${tier}"`), `the example must grant the browser tools to ${tier}`)
   }
 })

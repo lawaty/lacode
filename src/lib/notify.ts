@@ -9,11 +9,13 @@
 //
 // Everything here is pure so the policy can be tested without a running server.
 
+import { isLimitText } from "./pool.ts"
+
 const INTERNAL_TITLE_PREFIXES = [
   // context-autoupdate spawns the cartographer through the session API, with no
   // parentID, so it looks exactly like a root session going idle. Notifying for
   // it would announce the cartographer's own bookkeeping as a finished task.
-  "context-manager (auto",
+  "context (auto",
 ]
 
 // The four things worth interrupting someone for. Wording is deliberately about
@@ -39,6 +41,108 @@ export const notifyMessage = (outcome: Outcome, detail?: string) => {
   if (outcome === "question") return detail ? `Awaiting your response — ${detail}` : "Awaiting your response"
   if (outcome === "permission") return detail ? `Awaiting your permission — ${detail}` : "Awaiting your permission"
   return "Task finished, waiting for your review"
+}
+
+/**
+ * The argv the notification helper expects.
+ *
+ * The two helper CLIs do not share a shape: `oc-notify` takes TITLE first, the
+ * `lacode` CLI takes a `notify` subcommand before it. Passing one shape to the
+ * other is an immediate "unknown command" -- the helper is found, spawned, and
+ * delivers nothing, which is the worst failure mode for a notification.
+ *
+ * Lives in lib/, not plugins/: opencode calls every export of a plugins/ file as
+ * a plugin, so a second binding there poisons the hook registry (see the header).
+ */
+export const helperArgv = (helper: string, title: string, message: string, urgency: string, icon: string): string[] => {
+  const name = helper.split(/[\\/]/).pop() ?? ""
+  return name === "lacode" || name === "lacode.js" ? ["notify", title, message, urgency, icon] : [title, message, urgency, icon]
+}
+
+// ---------------------------------------------------------------------------
+// Terminal errors: what the notification says, and whether it says anything
+// ---------------------------------------------------------------------------
+
+// JSON.stringify throws on circular structures and answers `undefined` for
+// values with no JSON form. Both are ordinary here, so serializing is
+// best-effort too: an unserializable error simply has no text to match against.
+const safeStringify = (value: unknown): string | undefined => {
+  try {
+    return JSON.stringify(value) ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+// A message read out of a serialized object is a JSON string literal's body
+// (`{"message":"a \"b\""}`), so it is decoded rather than unescaped by hand.
+const decodeJsonString = (escaped: string): string => {
+  try {
+    const decoded = JSON.parse(`"${escaped}"`)
+    return typeof decoded === "string" ? decoded : ""
+  } catch {
+    return ""
+  }
+}
+
+// Control characters and runs of whitespace make a one-line desktop summary
+// unreadable, so they are collapsed exactly as a session title's are.
+const cleanDetail = (raw: string): string | undefined => {
+  // eslint-disable-next-line no-control-regex
+  const clean = raw.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim()
+  if (!clean) return undefined
+  return clean.length > 160 ? `${clean.slice(0, 159)}…` : clean
+}
+
+/**
+ * The short human message of an arbitrary error, or `undefined` when it carries
+ * none. Shape-agnostic on purpose: providers wrap failures as
+ * `{ data: { message } }`, `{ message }`, or `{ error: "..." }`, and an object
+ * whose fields are all non-enumerable still has its `"message":"..."` in the
+ * serialized JSON. The first readable text wins.
+ */
+export const errorDetail = (error: unknown): string | undefined => {
+  const candidates = [
+    (error as { data?: { message?: unknown } } | null | undefined)?.data?.message,
+    (error as { message?: unknown } | null | undefined)?.message,
+    (error as { error?: unknown } | null | undefined)?.error,
+  ]
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue
+    const detail = cleanDetail(candidate)
+    if (detail) return detail
+  }
+  const serialized = safeStringify(error)
+  const match = serialized ? /"message"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(serialized) : undefined
+  if (match?.[1] !== undefined) {
+    const detail = cleanDetail(decodeJsonString(match[1]))
+    if (detail) return detail
+  }
+  return undefined
+}
+
+/**
+ * Whether a TERMINAL session error is one the user must hear about.
+ *
+ * Two classes are recognized and handled elsewhere, so notifying for them
+ * would double-report something the user already has:
+ *   * rate limits / quota -- the pool cools the model and the request retries
+ *     (matched textually, the way pool.ts matches, because providers word
+ *     these differently every quarter)
+ *   * user aborts -- they pressed escape; reporting their own action back is
+ *     noise
+ *
+ * A null error -- a session.error event with no payload -- is not a failure
+ * this plugin can describe, so it stays silent too.
+ */
+export const isUnrecognizedError = (error: unknown): boolean => {
+  if (error == null) return false
+  const name = (error as { name?: unknown } | null | undefined)?.name
+  if (typeof name === "string" && /abort/i.test(name)) return false
+  const serialized = safeStringify(error) ?? ""
+  if (/MessageAbortedError|aborted/i.test(serialized)) return false
+  if (isLimitText(serialized)) return false
+  return true
 }
 
 export type SessionInfo = {
@@ -76,7 +180,7 @@ export const shouldNotify = (input: {
   if (!info?.id) return { notify: false, reason: "no session info" }
 
   // Subagents. This is the suppression the whole design turns on: every
-  // explore-fast/implement-fast child session idles when it finishes, and a
+  // explore/implement child session idles when it finishes, and a
   // session that dispatched ten of them would otherwise announce ten "ready"
   // notifications for work the user never asked about individually.
   if (info.parentID) return { notify: false, reason: "subagent" }

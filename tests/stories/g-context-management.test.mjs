@@ -175,18 +175,18 @@ test("[US-19] the cartographer is injected as a pooled subagent, with no model o
   await hooks.config(cfg)
   await hooks.dispose()
 
-  const cm = cfg.agent["context-manager"]
-  assert.ok(cm, "context-manager must be injected for anyone who has not defined one")
+  const cm = cfg.agent["context"]
+  assert.ok(cm, "context must be injected for anyone who has not defined one")
   assert.equal(cm.mode, "subagent", "the cartographer is a subagent, never a root agent")
-  assert.ok(POOLED_BASES.includes("context-manager"), `context-manager must be a pooled base: ${POOLED_BASES.join(", ")}`)
+  assert.ok(POOLED_BASES.includes("context"), `context must be a pooled base: ${POOLED_BASES.join(", ")}`)
   // The pool is the only thing that decides which model runs a pooled agent, so
   // a model written next to the agent would be a second source of truth that
   // silently wins whenever routing falls through.
-  assert.equal(AGENTS["context-manager"].model, undefined, "the definition must not carry a model")
+  assert.equal(AGENTS["context"].model, undefined, "the definition must not carry a model")
   // And the model the pool bound is a real slot, not something invented here.
   const models = presetModels()
-  assert.ok(cfg.agent["context-manager-1"], "a slot variant must exist for slot 1")
-  assert.ok(models.includes(cfg.agent["context-manager-1"].model), `variant model ${cfg.agent["context-manager-1"].model} is not a declared slot`)
+  assert.ok(cfg.agent["context-1"], "a slot variant must exist for slot 1")
+  assert.ok(models.includes(cfg.agent["context-1"].model), `variant model ${cfg.agent["context-1"].model} is not a declared slot`)
 })
 
 test("[US-19] every slot the pool can hand out has a hidden cartographer variant", async () => {
@@ -200,19 +200,19 @@ test("[US-19] every slot the pool can hand out has a hidden cartographer variant
   // if there were no variant for a slot, the automatic run would have nowhere
   // to land and would either fail or escape the pool's accounting.
   for (let slot = 1; slot <= MAX_SLOTS; slot++) {
-    const variant = cfg.agent[`context-manager-${slot}`]
-    assert.ok(variant, `hidden variant context-manager-${slot} must exist for slot ${slot}`)
-    assert.equal(variant.hidden, true, `context-manager-${slot} must be hidden`)
+    const variant = cfg.agent[`context-${slot}`]
+    assert.ok(variant, `hidden variant context-${slot} must exist for slot ${slot}`)
+    assert.equal(variant.hidden, true, `context-${slot} must be hidden`)
   }
-  assert.equal(cfg.agent[`context-manager-${MAX_SLOTS + 1}`], undefined, "no variant may exist beyond the pool's slot cap")
+  assert.equal(cfg.agent[`context-${MAX_SLOTS + 1}`], undefined, "no variant may exist beyond the pool's slot cap")
 
   // A hidden variant is the same agent as its base, so routing through a slot
   // cannot escape the base's instructions or its permissions.
   for (let slot = 1; slot <= MAX_SLOTS; slot++) {
     assert.deepEqual(
-      cfg.agent[`context-manager-${slot}`].permission,
-      cfg.agent["context-manager"].permission,
-      `context-manager-${slot} must carry the base agent's permissions unchanged`,
+      cfg.agent[`context-${slot}`].permission,
+      cfg.agent["context"].permission,
+      `context-${slot} must carry the base agent's permissions unchanged`,
     )
   }
 })
@@ -237,7 +237,7 @@ test("[US-19] the map protocol reaches every agent as a standing rule", async ()
 })
 
 test("[US-19] the cartographer is told to write an index, not an inventory", async () => {
-  const prompt = AGENTS["context-manager"].prompt
+  const prompt = AGENTS["context"].prompt
 
   // The map has one job: answer "what should I look at first?". A cartographer
   // that writes a directory listing has produced something more expensive than
@@ -263,12 +263,12 @@ test("[US-20] a tracked edit followed by the root session going idle spawns the 
   await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
 
   assert.equal(stub.created.length, 1, `expected one cartographer session, got ${JSON.stringify(stub.created)}`)
-  assert.match(stub.created[0].title, /^context-manager \(auto (bootstrap|update)\)$/, "the run must be labelled so a log reader can tell what it was")
+  assert.match(stub.created[0].title, /^context \(auto (bootstrap|update)\)$/, "the run must be labelled so a log reader can tell what it was")
   assert.equal(stub.prompts.length, 1, "the session must be prompted, not merely created")
 
   // It borrows a pool slot rather than pinning a model: cartography is bulk work.
   const agent = stub.prompts[0].body.agent
-  assert.match(agent, /^context-manager-[1-9]$/, `the run must use a slot variant, got ${agent}`)
+  assert.match(agent, /^context-[1-9]$/, `the run must use a slot variant, got ${agent}`)
   const borrowed = stub.text().find((line) => line.includes("borrowed pool slot"))
   assert.ok(borrowed, `borrowing a slot must be reported:\n${stub.text().join("\n")}`)
   assert.ok(presetModels().some((model) => borrowed.includes(model)), `the borrowed slot must be a declared slot: ${borrowed}`)
@@ -436,20 +436,20 @@ test("[US-21] only the cartographer is granted the map by permission, and it may
   //
   // "Granted by rule" is the exact claim, and it is narrower than it looks — an
   // agent holding a blanket `"edit": "allow"` is also granted the map, just not
-  // BY a rule. So the claim is checked two ways below: only context-manager has a
+  // BY a rule. So the claim is checked two ways below: only context has a
   // grant rule, AND no other agent can reach the map at all.
   const granted = Object.entries(cfg.agent)
     .filter(([, def]) => !def.hidden)
     .filter(([, def]) => grantsMapByRule(def.permission))
     .map(([name]) => name)
-  assert.deepEqual(granted, ["context-manager"], `only the cartographer may be granted the map by rule; these others are: ${granted.join(", ")}`)
+  assert.deepEqual(granted, ["context"], `only the cartographer may be granted the map by rule; these others are: ${granted.join(", ")}`)
 
   // The stronger half, and the one this story exists for: the agents that CAN
-  // write files elsewhere cannot write the map. This used to fail for build,
-  // implement-fast and implement-deep, which all held a blanket "edit": "allow"
-  // and relied on the prompt alone to keep them out of the map.
+  // write files elsewhere cannot write the map. This used to fail for build
+  // and implement, which both held a blanket "edit": "allow" and relied on
+  // the prompt alone to keep them out of the map.
   for (const name of Object.keys(cfg.agent)) {
-    if (name.startsWith("context-manager")) continue
+    if (name.startsWith("context")) continue
     assert.equal(canWriteMap(cfg.agent[name].permission), false, `${name} must not be able to write the map`)
   }
 
@@ -459,7 +459,7 @@ test("[US-21] only the cartographer is granted the map by permission, and it may
   // injected config carries. Asserting the absence of `write` is what keeps
   // the claim honest: a `write` block would look identical here while being
   // dead config, because opencode folds write/apply_patch onto `edit`.
-  const cm = cfg.agent["context-manager"]
+  const cm = cfg.agent["context"]
   assert.equal(
     Object.prototype.hasOwnProperty.call(cm.permission, "write"),
     false,
@@ -486,14 +486,14 @@ test("[US-21] every agent that can write files carries a narrow-last deny on bot
   await hooks.config(cfg)
   await hooks.dispose()
 
-  // The exact pattern strings context-manager's own allow uses. Whatever makes
+  // The exact pattern strings context's own allow uses. Whatever makes
   // the allow match makes the deny match, so a typo cannot creep into one side.
   const SPELLINGS = ["*/.opencode/context/**", ".opencode/context/**"]
 
   // Every agent that can write anything is a potential second writer, and the
   // three that used to be gaps are named explicitly so a regression names itself.
-  const writers = ["build", "implement-fast", "implement-deep"]
-  for (const [slot, w] of [1, 2, 3, 4].map((n) => [`implement-fast-${n}`, cfg.agent[`implement-fast-${n}`]])) {
+  const writers = ["build", "implement"]
+  for (const [slot, w] of [1, 2, 3, 4].map((n) => [`implement-${n}`, cfg.agent[`implement-${n}`]])) {
     assert.ok(w, `${slot} must exist`)
     writers.push(slot)
   }
@@ -532,16 +532,16 @@ test("[US-21] denying the map does not deny reading it", async () => {
   // Closing the map to writes must not close it to the agents the standing rule
   // tells to check it — that would turn "read one map file" into a permission
   // error and make the whole context system unusable.
-  for (const name of ["implement-fast", "implement-deep", "explore-fast", "explore-deep", "context-manager"]) {
+  for (const name of ["implement", "explore", "context"]) {
     const perm = cfg.agent[name].permission
     assert.equal(verdict(perm.read, MAP_FILE), "allow", `${name} must still be able to READ the map`)
     assert.equal(verdict(perm.glob, MAP_FILE), "allow", `${name} must still be able to GLOB the map`)
   }
   // The cartographer keeps its own write grant.
-  assert.equal(verdict(cfg.agent["context-manager"].permission.edit, MAP_FILE), "allow", "the cartographer still writes the map")
+  assert.equal(verdict(cfg.agent["context"].permission.edit, MAP_FILE), "allow", "the cartographer still writes the map")
 
   // `build` is the one agent that cannot read at all — a deliberate, pre-existing
-  // decision (it delegates every question to @explore-fast), NOT a consequence of
+  // decision (it delegates every question to @explore), NOT a consequence of
   // the map deny. Asserting the shape rather than the absence is what keeps the
   // two confusable: a bare tool denial is the standing design, a map-scoped one
   // would mean this change had leaked into reading.
@@ -556,7 +556,7 @@ test("[US-21] the writer rule covers both path spellings opencode actually evalu
   await hooks.config(cfg)
   await hooks.dispose()
 
-  const edit = cfg.agent["context-manager"].permission.edit
+  const edit = cfg.agent["context"].permission.edit
   // Normally-rooted project: the evaluated path is relative to the project root.
   assert.equal(verdict(edit, ".opencode/context/architecture.md"), "allow", "the relative spelling must be allowed")
   // Project root "/": the same file is evaluated as home/<you>/.opencode/context/...
@@ -610,7 +610,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
   const blanket = verifyWriterRule(
     configFile({
       build: { permission: { edit: "allow" } },
-      "context-manager": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
+      "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
     }),
     MAP_UNDER_TEST,
     ROOT_UNDER_TEST,
@@ -633,7 +633,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
   // difference between this check working and crying wolf on a correct config.
   const denying = configFile({
     build: { permission: { edit: { "*": "allow", "*/.opencode/context/**": "deny", ".opencode/context/**": "deny" } } },
-    "context-manager": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
+    "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
   })
   assert.equal(verifyWriterRule(denying, MAP_UNDER_TEST, ROOT_UNDER_TEST), undefined, "a correctly-ordered narrow deny is not a violation")
 
@@ -641,7 +641,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
   // loses in opencode, and must be reported as the hole it actually is.
   const misordered = configFile({
     build: { permission: { edit: { ".opencode/context/**": "deny", "*": "allow" } } },
-    "context-manager": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
+    "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
   })
   const report = verifyWriterRule(misordered, MAP_UNDER_TEST, ROOT_UNDER_TEST)
   assert.ok(report, "a deny that loses to a later blanket allow is a real hole")
@@ -649,9 +649,9 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
 
   // The cartographer's own variants are exempt — including hidden slot variants.
   assert.equal(
-    verifyWriterRule(configFile({ "context-manager-3": { permission: { edit: { "*": "deny", ".opencode/context/**": "allow" } } } }), MAP_UNDER_TEST, ROOT_UNDER_TEST),
+    verifyWriterRule(configFile({ "context-3": { permission: { edit: { "*": "deny", ".opencode/context/**": "allow" } } } }), MAP_UNDER_TEST, ROOT_UNDER_TEST),
     undefined,
-    "context-manager-N is the same writer and must not be flagged",
+    "context-N is the same writer and must not be flagged",
   )
 
   // An agent with no `edit` rule at all is not a second writer: opencode's
@@ -675,15 +675,15 @@ test("[US-21] non-cartographer agents are told to report map changes rather than
   // the second half an agent that tries, fails, and reports "permission denied"
   // has told the user nothing.
   assert.match(STANDING_INSTRUCTION, /Never edit `\.opencode\/context\/`/, "the standing rule must forbid editing the map")
-  assert.match(STANDING_INSTRUCTION, /context-manager agent owns it/, "the standing rule must name the owner")
+  assert.match(STANDING_INSTRUCTION, /context agent owns it/, "the standing rule must name the owner")
   assert.match(STANDING_INSTRUCTION, /final report/, "the standing rule must say where to report instead")
   assert.match(STANDING_INSTRUCTION, /Source code is authoritative/, "the map must never outrank the code")
 
   // Every other tier carries the same rule inline, so an agent that was given a
   // narrow prompt and never read the standing rule still cannot go rogue.
-  for (const name of ["build", "plan", "explore-fast", "explore-deep", "implement-fast", "implement-deep"]) {
+  for (const name of ["build", "plan", "explore", "implement"]) {
     assert.match(cfg.agent[name].prompt, /\.opencode\/context\//, `${name}'s prompt must mention the map`)
-    assert.match(cfg.agent[name].prompt, /context-manager|context-update/, `${name}'s prompt must say who owns it`)
+    assert.match(cfg.agent[name].prompt, /context|context-update/, `${name}'s prompt must say who owns it`)
   }
 })
 
@@ -701,7 +701,7 @@ test("[US-22] the three context commands are injected, each targeting the cartog
   for (const name of ["context-init", "context-update", "context-review"]) {
     const def = cfg.command[name]
     assert.ok(def, `/${name} must be injected`)
-    assert.equal(def.agent, "context-manager", `/${name} must delegate to the cartographer`)
+    assert.equal(def.agent, "context", `/${name} must delegate to the cartographer`)
     assert.equal(def.subtask, true, `/${name} must run as a subtask so it cannot become a root session`)
     assert.ok(def.description && def.description.length > 0, `/${name} must describe itself in the command list`)
     assert.ok(def.template.length > 100, `/${name} must carry a real template, not a one-line stub`)

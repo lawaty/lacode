@@ -14,7 +14,7 @@ import * as pool from "../lib/pool.ts"
 // The pool's models are not written here. They come from the preset resolution
 // chain in ../lib/pool.ts (plugin options > ~/.config/lacode/pool.json >
 // presets/free-tier.json), and the config hook rewrites the variant agents
-// (explore-fast-N, ...) plus the provider whitelists from that source, so
+// (explore-N, ...) plus the provider whitelists from that source, so
 // changing the pool is a one-file edit instead of twelve agent definitions.
 //
 // No model in the pool is required to be free. A paid or proprietary model is
@@ -24,13 +24,13 @@ import * as pool from "../lib/pool.ts"
 //
 // A spawn of a pooled base type is rewritten to <base>-<slot>, where the slot is
 // chosen by live in-flight load counted per MODEL across every agent type. So
-// explore-fast and implement-fast compete for the same capacity instead of each
+// explore and implement compete for the same capacity instead of each
 // protecting its own, and total pressure per model stays balanced. Load is
 // shared across processes too: each process publishes only its own claims to
 // ~/.local/share/opencode/agent-pool/claims.<id>.json, so no locking is needed.
 //
-// Two agent types reach the pool differently. explore-fast and implement-fast
-// arrive as task tool calls, so they are rewritten here. context-manager is
+// Two agent types reach the pool differently. explore and implement
+// arrive as task tool calls, so they are rewritten here. context is
 // spawned by context-autoupdate through the session API and never passes through
 // the task hook, so that factory borrows a slot from this module directly.
 //
@@ -69,8 +69,6 @@ export type AgentPoolOptions = {
   modelsFile?: string
   /** Inline `{ slots: [...] }`, highest priority in the resolution chain. */
   models?: unknown
-  /** `provider/model-id` pinned onto explore-deep / implement-deep; see src/agents.ts. */
-  deepModel?: string
 }
 
 // Typed as a factory returning hooks, NOT as a Plugin: only src/index.ts may
@@ -198,30 +196,6 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
         }
       }
 
-      // The deep tiers are unpooled, so nothing above whitelists the model the
-      // user pinned for them via `deepModel`. When the user HAS a whitelist on
-      // that provider, an unlisted deep model resolves to NOTHING at all and the
-      // tier silently falls back -- the same silent failure the slot loop exists
-      // to prevent, one layer out. An absent whitelist is left absent, for the
-      // same reason as above: it already resolves.
-      const deepModel = typeof opts.deepModel === "string" ? opts.deepModel.trim() : ""
-      const deepSlash = deepModel.indexOf("/")
-      if (deepModel && deepSlash > 0) {
-        const provider = deepModel.slice(0, deepSlash)
-        const id = deepModel.slice(deepSlash + 1)
-        const entry = providers?.[provider]
-        if (!entry) {
-          await warnOnce(`deepModel ${deepModel} names provider ${provider}, which is not configured in opencode.jsonc; explore-deep and implement-deep cannot resolve it`)
-        } else {
-          const list = entry.whitelist
-          if (list && !list.includes(id)) {
-            list.push(id)
-            await log("info", `whitelisted ${id} on ${provider} (deepModel)`)
-          }
-        }
-      } else if (deepModel) {
-        await warnOnce(`deepModel ${deepModel} is not in provider/model-id form and was ignored`)
-      }
       s.known = known
       await log(
         "info",
@@ -285,6 +259,14 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
           : undefined
         if (!pool.isLimitText(haystack) && status !== 429) return
         const model = `${info.providerID ?? "?"}/${info.modelID ?? "?"}`
+        // A transient upstream outage is not a limit: it lifts on its own, so it
+        // gets a short, flat cooldown and is never counted as a strike (which
+        // would escalate the cooldown past the outage -- see pool.coolUnavailable).
+        if (pool.isUnavailableText(haystack)) {
+          const transient = pool.coolUnavailable(s, model)
+          if (transient) await log("warn", `cooling ${model} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason})`)
+          return
+        }
         const stated = pool.statedCooldown(haystack) ?? pool.retryAfterMs((info.error as { data?: { responseHeaders?: Record<string, string> } }).data?.responseHeaders)
         const reason = haystack.match(/rate[\s_-]?limit|usage limit|too many requests|quota|freelimiterror|overloaded/i)?.[0]
           ?.toLowerCase()

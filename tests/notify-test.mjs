@@ -28,7 +28,7 @@ const assert = (condition, message) => {
   if (!condition) throw new Error(message)
 }
 
-const { Notifier, notifyMessage, questionHeadline, safeTitle, shouldNotify } = await import(LIB)
+const { Notifier, helperArgv, notifyMessage, questionHeadline, safeTitle, shouldNotify } = await import(LIB)
 const { notifyHooks: Notify } = await import(PLUGIN)
 
 // ---------------------------------------------------------------------------
@@ -50,7 +50,7 @@ await check("subagents are suppressed", () => {
   // The requirement the whole plugin exists to satisfy: one notification per
   // thing the user asked for, not one per delegated child.
   const decision = shouldNotify({
-    info: { id: "child", parentID: "root", title: "explore-fast" },
+    info: { id: "child", parentID: "root", title: "explore" },
     outcome: "done",
     sawMessage: true,
   })
@@ -62,7 +62,7 @@ await check("the cartographer session is suppressed", () => {
   // context-autoupdate creates it with no parentID, so structure alone cannot
   // exclude it. Without this, every file edit would announce the map update.
   const decision = shouldNotify({
-    info: { id: "cm", title: "context-manager (auto update)" },
+    info: { id: "cm", title: "context (auto update)" },
     outcome: "done",
     sawMessage: true,
   })
@@ -104,7 +104,7 @@ await check("a critical notification bypasses the cooldown", async () => {
   await hooks.event({ event: { type: "session.status", properties: { sessionID: "r", status: { type: "busy" } } } })
   await hooks.event({ event: { type: "session.idle", properties: { sessionID: "r" } } })
   await new Promise((resolve) => setTimeout(resolve, 500))
-  await hooks.event({ event: { type: "session.error", properties: { sessionID: "r" } } })
+  await hooks.event({ event: { type: "session.error", properties: { sessionID: "r", error: { message: "boom" } } } })
   await new Promise((resolve) => setTimeout(resolve, 700))
 
   const lines = (existsSync(sent) ? readFileSync(sent, "utf8") : "").trim().split("\n").filter(Boolean)
@@ -265,8 +265,18 @@ await check("the plugin defers to the tested tunnel helper", () => {
 })
 
 await check("the plugin passes argv, not a shell string", () => {
-  assert(/spawn\(helper, \[/.test(pluginSrc), "should spawn the helper with an argv array")
+  assert(/spawn\(helper, helperArgv\(/.test(pluginSrc), "should spawn the helper with an argv array built for its shape")
   assert(!/exec\(/.test(pluginSrc), "should not build a shell command string")
+})
+
+await check("the helper's argv matches the CLI that was found", () => {
+  // oc-notify takes TITLE first; the lacode CLI takes `notify TITLE ...`. The
+  // shipped bug passed the oc-notify shape to dist/lacode.js and got
+  // "unknown command" -- found, spawned, and useless.
+  const argv = (helper) => JSON.stringify(helperArgv(helper, "T", "M", "normal", "icon"))
+  assert(argv("/x/oc-notify") === JSON.stringify(["T", "M", "normal", "icon"]), `oc-notify keeps TITLE first, got ${argv("/x/oc-notify")}`)
+  assert(argv("/x/lacode") === JSON.stringify(["notify", "T", "M", "normal", "icon"]), `the lacode CLI takes the notify subcommand, got ${argv("/x/lacode")}`)
+  assert(argv("/pkg/dist/lacode.js") === JSON.stringify(["notify", "T", "M", "normal", "icon"]), `dist/lacode.js is the lacode CLI, got ${argv("/pkg/dist/lacode.js")}`)
 })
 
 await check("the notification helper is detached", () => {
@@ -314,7 +324,7 @@ await check("the handler notifies for a root session and ignores a child", async
 
   const sessions = {
     root: { id: "root", title: "Fix the login redirect" },
-    child: { id: "child", parentID: "root", title: "explore-fast" },
+    child: { id: "child", parentID: "root", title: "explore" },
   }
   const client = makeClient(sessions)
   const hooks = await Notify({ client, directory: dir })
@@ -331,7 +341,7 @@ await check("the handler notifies for a root session and ignores a child", async
   const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
   assert(lines.length === 1, `expected exactly one notification, got ${lines.length}: ${JSON.stringify(lines)}`)
   assert(lines[0].includes("Fix the login redirect"), `notification should name the session: ${lines[0]}`)
-  assert(!lines[0].includes("explore-fast"), "the subagent must not appear")
+  assert(!lines[0].includes("explore"), "the subagent must not appear")
 
   delete process.env.OC_NOTIFY_HELPER
   rmSync(dir, { recursive: true, force: true })
@@ -430,7 +440,7 @@ await check("a question clears when the session errors instead", async () => {
   await hooks.event({
     event: { type: "question.asked", properties: { sessionID: "root", questions: [{ question: "A or B?" }] } },
   })
-  await hooks.event({ event: { type: "session.error", properties: { sessionID: "root" } } })
+  await hooks.event({ event: { type: "session.error", properties: { sessionID: "root", error: { message: "boom" } } } })
   await new Promise((resolve) => setTimeout(resolve, 5_200))
   await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
   await new Promise((resolve) => setTimeout(resolve, 600))

@@ -17,13 +17,15 @@
 // topology and systemd units. This is the generic subset, published on its own.
 
 import { fileURLToPath } from "node:url"
+import { existsSync, readFileSync } from "node:fs"
+import { spawnSync } from "node:child_process"
 // A STATIC import, not a computed one: this file is an esbuild entry point
 // (scripts/build.mjs -> dist/lacode.js), and a bundler can only follow a
 // specifier it can read at build time. The old `import(join(here, "..", "src",
 // "tunnel", "index.ts"))` survived type stripping but was opaque to esbuild, so
 // the shipped CLI would have reached back into a `src/` the tarball no longer
 // carries. It still runs unbundled straight from a git checkout.
-import { describe, forward, notify, safeTitle } from "../src/tunnel/index.ts"
+import { describe, forward, notify, parsePayload, resolveTunnel, safeTitle, sendLocal } from "../src/tunnel/index.ts"
 
 // Two forms of this file exist and both must work. Run from a checkout it IS
 // TypeScript-in-Node, exactly like the opencode plugins: node strips the types on
@@ -118,6 +120,46 @@ switch (command) {
       // nothing will ever pop up here either.
       console.log("\nNo local notification channel: `lacode notify` on this machine has nothing to deliver with, and every send will be reported as failed rather than shown.")
     }
+    process.exit(0)
+    break
+  }
+
+  case "receive": {
+    // The desktop end of a DIRECT hop: an authorized_keys forced command
+    // (`restrict,command="lacode receive"`). It delivers locally and never
+    // forwards -- SSH_CLIENT is set here too, so `notify()` would loop back.
+    const request = parsePayload(process.env.SSH_ORIGINAL_COMMAND ?? "")
+    const result = sendLocal(request)
+    if (!result.ok) console.error(`lacode receive: ${result.detail ?? "not delivered"}`)
+    process.exit(result.ok ? 0 : 1)
+    break
+  }
+
+  case "tunnel": {
+    const sub = argv.shift()
+    if (sub !== "setup") {
+      console.error("lacode tunnel: usage: lacode tunnel setup")
+      process.exit(2)
+    }
+    const { user, host, key } = resolveTunnel()
+    const pub = `${key}.pub`
+    if (!existsSync(key)) {
+      const gen = spawnSync("ssh-keygen", ["-t", "ed25519", "-N", "", "-C", "lacode-notify", "-f", key], { stdio: ["ignore", "ignore", "inherit"] })
+      if (gen.status !== 0) {
+        console.error("lacode tunnel setup: ssh-keygen failed; create the key by hand and re-run.")
+        process.exit(1)
+      }
+      console.log(`Generated ${key}`)
+    }
+    const pubkey = existsSync(pub) ? readFileSync(pub, "utf8").trim() : "(public key missing)"
+    const self = process.argv[1] ?? "lacode"
+    console.log("\nOn the REMOTE host (where opencode runs), export:")
+    console.log(`  OC_LOCAL_USER=${user || "<desktop-user>"}`)
+    console.log(`  OC_LOCAL_HOST=${host || "<desktop-host>"}`)
+    console.log(`  OC_NOTIFY_KEY=${key}`)
+    console.log("\nAdd ONE line to the DESKTOP's ~/.ssh/authorized_keys (this is the trust boundary):")
+    console.log(`  restrict,command="${self} receive" ${pubkey}`)
+    console.log("\nDirect ssh + ControlPersist: no reverse forward, no systemd unit, no port, nothing to sync.")
     process.exit(0)
     break
   }

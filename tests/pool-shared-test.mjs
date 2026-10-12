@@ -1,5 +1,5 @@
-// Verifies the pool is genuinely shared across agent types: explore-fast,
-// implement-fast and context-manager compete for the same four models, so a
+// Verifies the pool is genuinely shared across agent types: explore,
+// implement and context compete for the same four models, so a
 // busy agent type cannot protect its own capacity. Also checks that the
 // context-autoupdate plugin borrows a slot correctly.
 // Run: node tests/pool-shared-test.mjs
@@ -53,7 +53,7 @@ const mk = async (id, dir) => {
   }
 }
 
-const BASES = ["explore-fast", "implement-fast", "context-manager"]
+const BASES = ["explore", "implement", "context"]
 // A spawn the pool could not rewrite (because the injected config declares no variant
 // for that slot) comes back unrouted, so return -1 rather than throwing.
 const slotOf = (variant) => (variant === null || variant === undefined ? -1 : Number(/-(\d+)$/.exec(variant)?.[1] ?? -1))
@@ -118,30 +118,30 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
   assert(new Set(picks).size === ALL_SLOTS.length, "every slot must be used when base types alternate")
 }
 
-// 3. load from one base displaces the other: a saturated explore-fast pushes
-//    implement-fast onto the same shared slots instead of its own
+// 3. load from one base displaces the other: a saturated explore pushes
+//    implement onto the same shared slots instead of its own
 {
   const t = await mk("shared-2", scratch())
-  for (let i = 0; i < CAPACITY; i++) await t.spawn(`x${i}`, "explore-fast") // deep enough to exhaust every ceiling
-  const afterExplore = slotOf(await t.spawn("x4", "implement-fast"))
+  for (let i = 0; i < CAPACITY; i++) await t.spawn(`x${i}`, "explore") // deep enough to exhaust every ceiling
+  const afterExplore = slotOf(await t.spawn("x4", "implement"))
   assert(
     afterExplore === firstOf(LIGHT_SLOTS),
-    `implement-fast must land on the lightest slot, got ${afterExplore}`,
+    `implement must land on the lightest slot, got ${afterExplore}`,
   )
-  assert(!HEAVY_SLOTS.includes(afterExplore), `implement-fast must not be handed an explore-fast-loaded heavy slot`)
+  assert(!HEAVY_SLOTS.includes(afterExplore), `implement must not be handed an explore-loaded heavy slot`)
 }
 
 // 4. pool_status attributes load per model and names the agent types using it
 {
   const t = await mk("shared-3", scratch())
-  await t.spawn("s1", "explore-fast")
-  await t.spawn("s2", "implement-fast")
-  await t.spawn("s3", "context-manager")
+  await t.spawn("s1", "explore")
+  await t.spawn("s2", "implement")
+  await t.spawn("s3", "context")
   const status = await t.status()
-  assert(/explore-fastx1/.test(status), `status should attribute explore-fast load, got:\n${status}`)
-  assert(/implement-fastx1/.test(status), `status should attribute implement-fast load, got:\n${status}`)
+  assert(/explorex1/.test(status), `status should attribute explore load, got:\n${status}`)
+  assert(/implementx1/.test(status), `status should attribute implement load, got:\n${status}`)
   assert(status.includes(SLOT_MODELS[0]), "status should name the model")
-  assert(/bases: explore-fast, implement-fast, context-manager/.test(status), "status should list the pooled bases")
+  assert(/bases: explore, implement, context/.test(status), "status should list the pooled bases")
 }
 
 // 5. context-autoupdate-style acquisition: borrow a slot, claim it, then release
@@ -153,11 +153,11 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
   const slot = pool.pickSlot(state, snap)
   // an idle pool hands out its heaviest slot, whichever one the file put first
   assert(HEAVY_SLOTS.includes(slot.index), `an idle pool should hand out a heaviest slot, got ${slot.index}`)
-  const agent = pool.agentFor("context-manager", slot.index)
-  assert(agent === `context-manager-${slot.index}`, `borrowed agent name wrong: ${agent}`)
+  const agent = pool.agentFor("context", slot.index)
+  assert(agent === `context-${slot.index}`, `borrowed agent name wrong: ${agent}`)
   assert(cfg.agent[agent] !== undefined, `${agent} must exist in config`)
   const key = pool.claimKey("ses_borrow", "context-autoupdate")
-  pool.acquire(state, "context-manager", slot, "ses_borrow", key, "ses_borrow")
+  pool.acquire(state, "context", slot, "ses_borrow", key, "ses_borrow")
   let busy = pool.snapshot(state)
   assert(busy.counts.get(slot.model) === 1, "the borrowed slot must show as loaded")
   assert(busy.own.get(key).g === "ses_borrow", "the claim must target the working session for the reaper")
@@ -175,7 +175,7 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
   assert(busy.counts.get(slot.model) === undefined, "release must clear the borrowed slot")
 }
 
-// 6. a cooled model is skipped by every base type, not just explore-fast
+// 6. a cooled model is skipped by every base type, not just explore
 {
   const t = await mk("shared-4", scratch())
   // cool the first slot's model through the shared lib for this instance's dir

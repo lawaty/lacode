@@ -22,7 +22,7 @@ const SLOTS = JSON.parse(readFileSync(join(HERE, "..", "presets", "free-tier.jso
   return { model: s.model, provider, modelID, weight: s.weight, index: i + 1 }
 })
 const SLOT_MODELS = SLOTS.map((s) => s.model)
-const variantOf = (slot) => `explore-fast-${slot.index}`
+const variantOf = (slot) => `explore-${slot.index}`
 const MAX_WEIGHT = Math.max(...SLOTS.map((s) => s.weight))
 const MIN_WEIGHT = Math.min(...SLOTS.map((s) => s.weight))
 const heaviest = () => SLOTS.find((s) => s.weight === MAX_WEIGHT)
@@ -65,7 +65,7 @@ const mk = async (id, dir) => {
   await hooks.config(cfg)
   return {
     hooks,
-    spawn: async (callID, requested = "explore-fast", sessionID = "s1") => {
+    spawn: async (callID, requested = "explore", sessionID = "s1") => {
       const out = { args: { subagent_type: requested, prompt: "x" } }
       await hooks["tool.execute.before"]({ tool: "task", sessionID, callID }, out)
       return out.args.subagent_type
@@ -193,7 +193,7 @@ const dirB = scratch()
   for (const { provider, modelID } of SLOTS)
     await j.limitEvent(provider, modelID, rateError("Rate limit exceeded"))
   const pick = await j.spawn("j1")
-  assert(/^explore-fast-[1-4]$/.test(pick), `must still route when all models cool, got ${pick}`)
+  assert(/^explore-[1-4]$/.test(pick), `must still route when all models cool, got ${pick}`)
 }
 
 // 10. catalog status gates retired models (simulated by seeding serverUrl-less state)
@@ -203,6 +203,25 @@ const dirB = scratch()
     assert(new RegExp(`slot ${slot.index}\\b`).test(await k.status()), `lightest slot ${slot.index} must be listed in status`)
   }
   assert(existsSync(PLUGIN), "plugin file must exist")
+}
+
+// 11. a transient upstream outage ("Endpoint is unavailable") gets a SHORT, FLAT
+//     cooldown: it self-resolves, so repeated hits must not escalate the way a
+//     strike does -- a healthy model must be re-probed soon after recovery.
+{
+  const l = await mk("p11", scratch())
+  const slot = heaviest()
+  const err = rateError("Upstream request failed: Endpoint is unavailable.")
+  const cooldown = async () => Number(new RegExp(`${escape(slot.modelID)} for (\\d+)s`).exec(await l.status())?.[1])
+  await l.limitEvent(slot.provider, slot.modelID, err)
+  const first = await cooldown()
+  await l.limitEvent(slot.provider, slot.modelID, err)
+  const second = await cooldown()
+  assert(/COOLING/.test(await l.status()), "an unavailable upstream must cool its model")
+  assert(new RegExp(`cooling: ${escape(slot.model)}\\b`).test(await l.status()), "status must name the cooled model")
+  assert(/endpoint-unavailable/i.test(await l.status()), `the reason must name the outage, got: ${await l.status()}`)
+  assert(first <= 90, `the outage cooldown must stay short, got ${first}s`)
+  assert(second <= first + 1, `a transient outage must NOT escalate (got ${first}s then ${second}s)`)
 }
 
 globalThis.fetch = realFetch

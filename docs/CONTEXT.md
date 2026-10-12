@@ -69,14 +69,14 @@ something has gone wrong.
 
 ## How it stays current
 
-The `context-manager` agent maintains the map. It runs in two ways: on its own,
+The `context` agent maintains the map. It runs in two ways: on its own,
 after a session that changed something, and on demand through the three
 commands — both of which go through the same agent, so they behave the same way.
 
 ### Automatically
 
 After a **root** session goes idle, and only if that session edited a file
-inside the project, LaCode starts a `context-manager` run:
+inside the project, LaCode starts a `context` run:
 
 1. It collects the paths the session touched, dropping anything generated,
    vendored or outside the project (`node_modules`, `dist`, `coverage`,
@@ -123,7 +123,7 @@ as you wrote it — the same merge-without-clobber rule the agents follow.
 
 ## One writer
 
-Only `context-manager` writes the map. Every other agent is told never to edit
+Only `context` writes the map. Every other agent is told never to edit
 it, and to say in its final report if its work revealed something that belongs
 in there. The cartographer, in turn, is denied permission to write anything
 outside the map — not by convention, but by an `edit` rule that allows
@@ -199,7 +199,7 @@ thing to check is that permission rule, not the map's content.
 | `auto update finished without changing the map` | Nothing landed. Either nothing needed saying, or the cartographer could not write. |
 | `auto update failed: …` | The run errored. The paths it was given are queued again for the next window, so the work is not lost. |
 | `context map is not writable: …` | Your config's one-writer rule does not match the path opencode evaluates. Nothing will update until you fix it. |
-| `context map has more than one writer: …` | An agent other than `context-manager` would be granted the map. The offending agent and the winning rule are named. |
+| `context map has more than one writer: …` | An agent other than `context` would be granted the map. The offending agent and the winning rule are named. |
 
 ## Reference
 

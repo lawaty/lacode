@@ -5,7 +5,7 @@
 // node_modules directory the package does not control, and `$ARGUMENTS` is
 // substituted by opencode, not by us.
 //
-// All three delegate to `context-manager`, which is a pooled agent: spawning it
+// All three delegate to `context`, which is a pooled agent: spawning it
 // borrows a slot and the pool's own load balancing applies.
 //
 // ---------------------------------------------------------------------------
@@ -27,8 +27,8 @@ export type CommandDef = {
 export const COMMANDS: Record<string, CommandDef> = {
   "context-init": {
     description:
-      "Bootstrap the repository context map (.opencode/context/) via the context-manager agent.",
-    agent: "context-manager",
+      "Bootstrap the repository context map (.opencode/context/) via the context agent.",
+    agent: "context",
     subtask: true,
     template: `Bootstrap the repository context map.
 
@@ -50,8 +50,8 @@ anything that contradicts the code or existing docs.`,
 
   "context-update": {
     description:
-      "Incrementally update .opencode/context/ after recent work via the context-manager agent.",
-    agent: "context-manager",
+      "Incrementally update .opencode/context/ after recent work via the context agent.",
+    agent: "context",
     subtask: true,
     template: `Incremental context update.
 
@@ -76,7 +76,7 @@ timestamp-only edits. If nothing material changed, make no edits and report
   "context-review": {
     description:
       "Audit .opencode/context/ for staleness, contradictions, excess size, duplication, and missing entry points.",
-    agent: "context-manager",
+    agent: "context",
     subtask: true,
     template: `Context review.
 
@@ -139,7 +139,7 @@ decisions.md — then start from the canonical entry points it lists.
 
 Source code is authoritative: if the map disagrees with the code, trust the code,
 say so, and never edit source to match the map. Never edit \`.opencode/context/\`
-yourself — the context-manager agent owns it. Say in your final report if your
+yourself — the context agent owns it. Say in your final report if your
 work revealed something that belongs in the map.`
 
 /** Inject the standing instruction only when the user has none (US-16). */

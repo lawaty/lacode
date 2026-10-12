@@ -149,7 +149,7 @@ export const configFor = (models) => {
  * plugin decided, both as the rewritten agent name and as the model that agent
  * was bound to.
  */
-export const spawn = async (hooks, cfg, { subagent = "explore-fast", callID = "c1", sessionID = "s1" } = {}) => {
+export const spawn = async (hooks, cfg, { subagent = "explore", callID = "c1", sessionID = "s1" } = {}) => {
   const out = { args: { subagent_type: subagent, prompt: "read src/index.ts" } }
   await hooks["tool.execute.before"]({ tool: "task", sessionID, callID }, out)
   const routed = out.args.subagent_type

@@ -52,7 +52,7 @@ const stubFetch = () => {
  * Without the bind, the claim has no target and can never be judged idle.
  */
 const spawnChild = async (hooks, cfg, { callID, sessionID = "parent", childID }) => {
-  await spawn(hooks, cfg, { subagent: "explore-fast", callID, sessionID })
+  await spawn(hooks, cfg, { subagent: "explore", callID, sessionID })
   await emit(hooks, "session.created", { info: { id: childID, parentID: sessionID } })
 }
 
@@ -70,7 +70,7 @@ test("[US-8] a claim past its TTL with no activity is aborted when the reaper sw
 
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
   // Any pooled spawn sweeps before it routes, so the reaper needs no timer.
-  await spawn(hooks, { agent: {} }, { subagent: "explore-fast", callID: "trigger", sessionID: "trigger" })
+  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
 
   assert.deepEqual(net.aborted, ["child-wedged"], `the wedged session must be aborted, got ${JSON.stringify(net.aborted)}`)
   net.restore()
@@ -103,7 +103,7 @@ test("[US-8] a young and active claim is left alone", async () => {
   clock.advance(STUCK_IDLE * 2)
   // Still producing output: message traffic is proof of life.
   await emit(hooks, "message.part.updated", { part: { sessionID: "child-busy", type: "text" } })
-  await spawn(hooks, { agent: {} }, { subagent: "explore-fast", callID: "trigger", sessionID: "trigger" })
+  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
 
   assert.deepEqual(net.aborted, [], "a working subagent must never be killed")
   net.restore()
@@ -117,7 +117,7 @@ test("[US-8] a claim too young to be hung is left alone even when silent", async
 
   await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "child-new" })
   clock.advance(STUCK_MIN_AGE - MIN) // silent, but not old enough to be a hang
-  await spawn(hooks, { agent: {} }, { subagent: "explore-fast", callID: "trigger", sessionID: "trigger" })
+  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
 
   assert.deepEqual(net.aborted, [], "age alone must not condemn a young claim")
   net.restore()
@@ -134,7 +134,7 @@ test("[US-8] a swept claim raises the reaped total and is named in a greppable l
 
   await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "child-gone" })
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
-  await spawn(hooks, { agent: {} }, { subagent: "explore-fast", callID: "trigger", sessionID: "trigger" })
+  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
 
   const after = await hooks.tool.pool_status.execute({}, {})
   assert.match(after.output, /reaped total: 1/, `the reaped count must increase:\n${after.output}`)
@@ -162,7 +162,7 @@ test("[US-9] a reaped claim's capacity is available to the next routing decision
   assert.match(full.output, /load=2\/2/, `control: the slot is full:\n${full.output}`)
 
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
-  await spawn(hooks, cfg, { subagent: "explore-fast", callID: "trigger", sessionID: "trigger" })
+  await spawn(hooks, cfg, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
   // Release the sweep trigger itself, so what remains on the slot is only
   // whatever failed to be reaped.
   await hooks["tool.execute.after"]({ tool: "task", sessionID: "trigger", callID: "trigger" }, {})
@@ -175,7 +175,7 @@ test("[US-9] a reaped claim's capacity is available to the next routing decision
   // And routing still works with no restart, no manual step. The model is
   // cooled by the hang, and the pool must degrade to routing anyway.
   const { routed } = await spawn(hooks, cfg, { callID: "next", sessionID: "next" })
-  assert.equal(routed, "explore-fast-1", "routing must resume immediately after a sweep")
+  assert.equal(routed, "explore-1", "routing must resume immediately after a sweep")
   net.restore()
   await hooks.dispose()
 })
@@ -185,7 +185,7 @@ test("[US-9] a claim file whose process is gone is pruned as dead and its capaci
   const dead = join(dir, "claims.dead-process.json")
   writeFileSync(
     dead,
-    JSON.stringify({ x: { v: "explore-fast", k: 1, m: "hang/model", t: Date.now() } }),
+    JSON.stringify({ x: { v: "explore", k: 1, m: "hang/model", t: Date.now() } }),
   )
   const ancient = new Date(Date.now() - 3 * 60 * 60 * 1000)
   utimesSync(dead, ancient, ancient)
@@ -224,14 +224,14 @@ test("[US-9] routing resumes after a sweep with no restart and no manual interve
 
   await spawnChild(hooks, cfg, { callID: "a", childID: "stuck" })
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
-  await spawn(hooks, cfg, { subagent: "explore-fast", callID: "trigger", sessionID: "trigger" })
+  await spawn(hooks, cfg, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
 
   // No dispose, no re-boot: the same hooks object keeps routing.
   const routed = []
   for (let i = 0; i < 3; i++) {
-    routed.push((await spawn(hooks, cfg, { subagent: "implement-fast", callID: `r${i}`, sessionID: `r${i}` })).routed)
+    routed.push((await spawn(hooks, cfg, { subagent: "implement", callID: `r${i}`, sessionID: `r${i}` })).routed)
   }
-  for (const variant of routed) assert.match(variant, /^implement-fast-1$/, `routing must resume: ${routed}`)
+  for (const variant of routed) assert.match(variant, /^implement-1$/, `routing must resume: ${routed}`)
   net.restore()
   await hooks.dispose()
 })
@@ -246,7 +246,7 @@ test("[US-10] the reaper log names the reaped session and why it was reaped", as
   const { hooks, stub } = await bootPool("us10-log")
   await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "victim" })
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
-  await spawn(hooks, { agent: {} }, { subagent: "explore-fast", callID: "trigger", sessionID: "trigger" })
+  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
 
   const line = stub.text().find((l) => l.startsWith("warn hung"))
   assert.ok(line, `the hang must be logged, not silent:\n${stub.text().join("\n")}`)
@@ -284,7 +284,7 @@ test("[US-10] a failure inside the sweep is reported through the app log and nev
     return real()
   }
   try {
-    const out = { args: { subagent_type: "explore-fast", prompt: "x" } }
+    const out = { args: { subagent_type: "explore", prompt: "x" } }
     // The hook must RESOLVE. A rejection here would take down opencode's hook
     // dispatch, which is the failure mode the criterion forbids.
     await hooks["tool.execute.before"]({ tool: "task", sessionID: "s", callID: "c" }, out)
@@ -310,7 +310,7 @@ test("[US-10] a failure before the sweep's try block still never escapes the hoo
     throw new Error("clock exploded early")
   }
   try {
-    const out = { args: { subagent_type: "explore-fast", prompt: "x" } }
+    const out = { args: { subagent_type: "explore", prompt: "x" } }
     await hooks["tool.execute.before"]({ tool: "task", sessionID: "s", callID: "c" }, out)
   } finally {
     Date.now = real

@@ -13,7 +13,7 @@ import * as path from "node:path"
 const CONTEXT_DIR = path.join(".opencode", "context")
 
 /** The agent family allowed to write the map, including every hidden slot variant. */
-const WRITER = "context-manager"
+const WRITER = "context"
 
 const toPosix = (value: string) => value.split(path.sep).join("/")
 

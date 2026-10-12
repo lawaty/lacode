@@ -62,7 +62,7 @@ const mk = async (id, dir) => {
   return {
     hooks: h,
     logs,
-    spawn: async (callID, requested = "explore-fast", sessionID = "parent") => {
+    spawn: async (callID, requested = "explore", sessionID = "parent") => {
       const out = { args: { subagent_type: requested, prompt: "x" } }
       await h["tool.execute.before"]({ tool: "task", sessionID, callID }, out)
       return out.args.subagent_type

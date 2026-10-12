@@ -1,8 +1,6 @@
 {
   "agent": {
-    "explore": { "disable": true },
-    "general": { "disable": true },
-    "implement": { "disable": true }
+    "general": { "disable": true }
   },
   "provider": {
     "opencode": { "whitelist": [] },

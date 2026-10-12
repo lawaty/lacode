@@ -19,7 +19,15 @@ gets it back.
   └──────────────────┘                          └────────────────────────┘
 ```
 
-Two things are load-bearing here.
+**Direct ssh (the default).** Set `OC_LOCAL_HOST` and the hop is a plain `ssh`
+to the desktop with `ControlMaster=auto` + `ControlPersist`, so one warm
+connection carries every notification. There is no reverse forward, no listening
+port, no systemd unit and nothing to sync: the plugin owns the transport. The
+desktop needs one `authorized_keys` line, which `lacode tunnel setup` prints. The
+reverse-forward description below is the legacy path, used only when
+`OC_LOCAL_HOST` is unset.
+
+**Reverse forward (legacy).** Two things are load-bearing here.
 
 **The reverse forward.** The remote opens an SSH connection to *your* machine
 and asks sshd on the desktop to listen on a port. A notification is then an ssh
@@ -74,7 +82,8 @@ useful on a Mac rather than reporting only whether a Linux binary is installed.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `OC_LOCAL_USER` | *(unset)* | The desktop user the tunnel authenticates as. **Required for the remote hop.** |
+| `OC_LOCAL_USER` | *(unset)* | The desktop user the hop authenticates as. **Required for the remote hop.** |
+| `OC_LOCAL_HOST` | *(unset)* | Desktop hostname for the **direct ssh** hop. Set it and the reverse forward/port/systemd unit are not used at all. |
 | `OC_TUNNEL_PORT` | `10022` | Reverse-forward listener port on the desktop. Give each remote host its own. |
 | `OC_NOTIFY_KEY` | `~/.ssh/lacode_notify` | The dedicated key. Never a personal key. |
 | `OC_CONNECT_TIMEOUT_MS` | `5000` | Ceiling on the hop. |

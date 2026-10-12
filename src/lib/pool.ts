@@ -5,11 +5,11 @@ import { fileURLToPath } from "node:url"
 
 // Shared model pool for every free-model agent type.
 //
-// One set of slots is shared by ALL pooled agent types (explore-fast,
-// implement-fast, context-manager). A slot is a model, not an agent: load is
+// One set of slots is shared by ALL pooled agent types (explore,
+// implement, context). A slot is a model, not an agent: load is
 // counted per MODEL across every agent type, so total pressure on each model is
 // balanced no matter which kind of work is running. Slot N of any base is the
-// same model, so `explore-fast-2` and `context-manager-2` are the same model and
+// same model, so `explore-2` and `context-2` are the same model and
 // share one load counter.
 //
 // Every slot carries a `weight` (the preset), and that is the only knob. A
@@ -47,6 +47,9 @@ export const CATALOG_TTL_MS = 10 * 60 * 1000
 export const STUCK_MIN_AGE_MS = 5 * 60 * 1000
 export const STUCK_IDLE_MS = 3 * 60 * 1000
 export const HANG_COOLDOWN_MS = 10 * 60 * 1000
+// A transient upstream outage self-resolves, so it is cooled briefly and re-probed
+// rather than escalated like a strike. See coolUnavailable().
+export const UNAVAILABLE_COOLDOWN_MS = 60 * 1000
 // A weight is a count of concurrent sessions, so this bounds both the ceiling and
 // the total pool capacity (4 slots at MAX_WEIGHT each). Past it the number stops
 // describing concurrency and becomes a way to silence load balancing entirely, which
@@ -75,7 +78,7 @@ export type Snapshot = {
   dirReady: boolean
 }
 
-export const BASES = ["explore-fast", "implement-fast", "context-manager"]
+export const BASES = ["explore", "implement", "context"]
 
 // ---------------------------------------------------------------------------
 // Preset resolution chain
@@ -294,6 +297,11 @@ function readWeight(entry: unknown, at: string, model: string, problems: string[
   return weight
 }
 
+// A transient upstream outage ("Endpoint is unavailable"). Recognized as
+// limit-shaped so it is not reported as an unrecognized failure, but handled by
+// its own path: it lifts on its own, so it must not accumulate strikes.
+const UNAVAILABLE_PATTERN = /endpoint\s+is\s+unavailable/i
+
 const LIMIT_PATTERNS = [
   /rate[\s_-]?limit/i,
   /usage limit/i,
@@ -302,9 +310,12 @@ const LIMIT_PATTERNS = [
   /quota/i,
   /freelimiterror/i,
   /overloaded/i,
+  UNAVAILABLE_PATTERN,
 ]
 
 export const isLimitText = (text: string) => LIMIT_PATTERNS.some((re) => re.test(text))
+
+export const isUnavailableText = (text: string) => UNAVAILABLE_PATTERN.test(text)
 
 // Providers sometimes state exactly when the window reopens; prefer that over a
 // guessed backoff. Handles "Resets in 35min", "Resets in 2hr 17min", "retry in 90s".
@@ -509,6 +520,32 @@ export function recordStrike(s: State, model: string, reason: string, stated?: n
   const strikes = prior && now - prior.last < STRIKE_DECAY_MS ? prior.strikes + 1 : 1
   const backoff = Math.min(COOLDOWN_MAX_MS, COOLDOWN_BASE_MS * 2 ** (strikes - 1))
   const strike: Strike = { model, until: now + (stated ?? backoff), strikes, reason, last: now }
+  s.cooling.set(model, strike)
+  const path = join(s.dir, limitFile(model))
+  try {
+    writeFileSync(`${path}.tmp`, JSON.stringify(strike))
+    renameSync(`${path}.tmp`, path)
+  } catch {
+    /* cooldown stays local to this process */
+  }
+  return strike
+}
+
+/**
+ * A transient upstream outage ("Endpoint is unavailable") self-resolves, so it is
+ * deliberately NOT recorded as a strike: accumulating strikes would escalate the
+ * cooldown and leave a healthy model benched long after the endpoint is back. It
+ * gets one short, flat window instead -- enough to route new work to a slot that
+ * answers, short enough to re-probe soon. A longer cooldown already in force (a
+ * real rate limit) still wins.
+ */
+export function coolUnavailable(s: State, model: string) {
+  if (!s.dirReady) return
+  const now = Date.now()
+  const prior = s.cooling.get(model)
+  const until = now + UNAVAILABLE_COOLDOWN_MS
+  if (prior && prior.until > until) return prior
+  const strike: Strike = { model, until, strikes: 1, reason: "endpoint-unavailable", last: now }
   s.cooling.set(model, strike)
   const path = join(s.dir, limitFile(model))
   try {

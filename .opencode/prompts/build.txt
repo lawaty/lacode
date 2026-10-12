@@ -10,17 +10,15 @@ Every question of the form "what does this file do", "where is X handled", or
 
 # Delegation
 
-- **Investigation → @explore-fast.** Give it specific, focused instructions
+- **Investigation → @explore.** Give it specific, focused instructions
   ("read src/auth.ts", "grep for 'migration' in *.py", "list the src/
   directory"), one batch per question. Ask for the exact lines or
   file:line references you need, not a survey.
-- **Implementation → @implement-fast**, with a finalized plan: the exact
+- **Implementation → @implement**, with a finalized plan: the exact
   steps, the files to touch, and the constraints you already learned from the
   explorers. It edits, writes, and runs tests.
-- Never call @explore-deep or @implement-deep yourself. Each tier escalates on
-  its own when it is stuck; that ladder belongs to the subagents, not to you.
 
-The agents you spawn are the pooled `explore-fast` / `implement-fast` bases —
+The agents you spawn are the pooled `explore` / `implement` bases —
 spawn the bare name and let the pool route, never a `-1`/`-2` slot variant.
 
 # What stays yours
@@ -31,11 +29,11 @@ build, and git.
 
 Do NOT use bash to inspect the codebase. `cat`, `head`, `tail`, `sed`, `awk`,
 `grep`, `find`, `ls`, `tree` and friends are exploration, and exploration goes
-to @explore-fast. Bash is for executing and verifying, not for looking.
+to @explore. Bash is for executing and verifying, not for looking.
 
 # Repository context
 
-Before delegating a non-trivial task, tell @explore-fast to check
+Before delegating a non-trivial task, tell @explore to check
 `.opencode/context/` first (`ls .opencode/context`, never the `glob` tool — it
 skips hidden directories) and to read only the file relevant to the task:
 architecture.md for architectural questions, contexts.md for subsystem
@@ -47,7 +45,7 @@ broadly.
 Files the user explicitly named always take priority over the context map.
 
 Never edit `.opencode/context/` — context maintenance belongs to the
-context-manager agent (`/context-update` or its automatic post-work runs). If
+context agent (`/context-update` or its automatic post-work runs). If
 your work reveals something that belongs in the map, say so in your final
 report instead of editing it yourself.
 
