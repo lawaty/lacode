@@ -281,5 +281,30 @@ for (let i = 1; i <= shipped.slots.length; i++) {
   for (const base of BASES) assert(live.cfg.agent[`${base}-${i}`], `${base}-${i} must exist for slot ${i} of ${shipped.slots.length}`)
 }
 
+// 8. the flat pool.txt format: `model [weight]` per line, comments/blanks ignored
+{
+  const parsed = pool.parseTextSlots(
+    "# my pool\nopencode-go/longcat-2.5-preview-free 3\n\nopencode/space-bunny-free 2   # the fast one\nopencode/big-pickle\n",
+    "pool.txt",
+  )
+  assert(parsed.slots.length === 3, `flat file: expected 3 slots, got ${parsed.slots.length}`)
+  assert(parsed.slots[0].model === "opencode-go/longcat-2.5-preview-free" && parsed.slots[0].weight === 3, `slot 1: ${JSON.stringify(parsed.slots[0])}`)
+  assert(parsed.slots[1].weight === 2, `a trailing comment must not break the weight: ${JSON.stringify(parsed.slots[1])}`)
+  assert(parsed.slots[2].weight === 1, `an absent weight must default to 1: ${JSON.stringify(parsed.slots[2])}`)
+  assert(parsed.slots.every((s, i) => s.index === i + 1), "indices are array position")
+}
+
+// ...and any slot file the loader reads accepts flat OR JSON (auto-detected by a leading "{")
+{
+  const flat = file("flat-pool.txt", "opencode-go/a 2\nopencode/b\n")
+  const resolved = pool.resolveModels({ modelsFile: flat })
+  assert(resolved.slots.length === 2 && resolved.slots[0].model === "opencode-go/a" && resolved.slots[0].weight === 2, `flat modelsFile: ${JSON.stringify(resolved.slots)}`)
+  assert(resolved.origin === flat, "origin must be the file")
+
+  const json = file("obj-pool.json", { slots: [{ model: "opencode-go/a", weight: 2 }] })
+  const resolvedJson = pool.resolveModels({ modelsFile: json })
+  assert(resolvedJson.slots.length === 1 && resolvedJson.slots[0].model === "opencode-go/a", `JSON still works: ${JSON.stringify(resolvedJson.slots)}`)
+}
+
 rmSync(dir, { recursive: true, force: true })
 console.log("\nALL POOL-MODEL CHECKS PASSED")

@@ -10,7 +10,7 @@ LaCode reads the first source that yields usable slots, in this order:
 | # | Source | Where |
 |---|--------|-------|
 | 1 | plugin options | `["@lawaty/lacode", { "models": { "slots": [...] } }]` |
-| 2 | user config | `~/.config/lacode/pool.json` |
+| 2 | user config | `~/.config/lacode/pool.txt` (flat, preferred) or `~/.config/lacode/pool.json` (JSON) |
 | 3 | bundled preset | `presets/free-tier.json` |
 | 4 | built-in fallback | hardcoded in `src/lib/pool.ts`, so routing always works |
 
@@ -28,6 +28,25 @@ Source 3 is a default, not a floor.
 
 Nothing is hot-reloaded. Change a preset, then restart every running opencode
 process.
+
+## The flat pool file (recommended)
+
+`~/.config/lacode/pool.txt` is one model per line — edit a model id or a weight
+in place, no JSON and no objects:
+
+```text
+# provider/model-id                       weight
+opencode-go/longcat-2.5-preview-free      3
+opencode/space-bunny-free                 2
+opencode/big-pickle                       1
+opencode/longcat-2.5-preview-free         1
+```
+
+`#` starts a comment (whole-line or trailing), blank lines are ignored, and the
+weight is optional (default 1). The rules are exactly the same as the JSON form
+below: up to 4 slots, distinct models, split on the first slash only. The loader
+accepts either shape in the same file, so a leading `{` means JSON and anything
+else means the flat form.
 
 ## Schema
 
@@ -89,8 +108,8 @@ provider-wide rate limit takes out every slot on that provider at once.
 
 ## Writing your own
 
-Copy `free-tier.json`, change the slots, and put it at
-`~/.config/lacode/pool.json` — or skip the file entirely and pass `models`
+Write `~/.config/lacode/pool.txt` (the flat form above) — that is the whole job.
+Or put the same slots in a JSON `~/.config/lacode/pool.json`, or pass `models`
 inline from `opencode.jsonc` when you want the list version-controlled beside
 the rest of your config:
 

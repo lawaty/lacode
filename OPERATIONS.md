@@ -15,7 +15,7 @@ is what `bin/oc-sync` regressed on.
 
 | Path | Tree | Role |
 |---|---|---|
-| `presets/free-tier.json` | repo | the bundled default pool: models and weights. Resolution chain: plugin `models` option > `~/.config/lacode/pool.json` > this file. See `presets/README.md` |
+| `presets/free-tier.json` | repo | the bundled default pool: models and weights. Resolution chain: plugin `models` option > `~/.config/lacode/pool.txt` (flat; `pool.json` also accepted) > this file. See `presets/README.md` |
 | `src/agents.ts` | repo | the **17 agent keys the plugin injects** when the config lacks them: 5 bases (`build`, `plan`, `explore`, `implement`, `context`) plus 12 hidden `<base>-1..4` variants, one per slot. Injection is merge-without-clobber, so a config that declares a name keeps its own. The variants declare **no model**: it is written from `presets/free-tier.json` |
 | `src/commands.ts` | repo | the three `/context-init`, `/context-update`, `/context-review` commands, injected as inline templates the same way |
 | `src/lib/pool.ts` | repo | shared state and the slot decision; imported by both plugins, exports no plugin |
@@ -55,7 +55,7 @@ Log lines worth knowing: `routed <base> -> <variant>` on every pooled spawn,
 
 ## Changing the pool models
 
-Edit `presets/free-tier.json` (or drop a `pool.json` in `~/.config/lacode/`, or pass `models` in the plugin tuple — the chain is documented in `presets/README.md`) — one entry per slot, array position is the slot number:
+Edit `presets/free-tier.json` (or drop a `pool.txt` — `model [weight]` per line, the flat form — or a `pool.json` in `~/.config/lacode/`, or pass `models` in the plugin tuple — the chain is documented in `presets/README.md`) — one entry per slot, array position is the slot number:
 
 ```json
 { "slots": [

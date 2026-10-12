@@ -133,6 +133,8 @@ export const DEFAULT_PRESET = join(PRESETS_DIR, "free-tier.json")
 /** The user's own pool file. Absent is normal and never an error. */
 export const USER_CONFIG_DIR = join(homedir(), ".config", "lacode")
 export const USER_MODELS_PATH = join(USER_CONFIG_DIR, "pool.json")
+/** The flat, hand-edited pool file: `model [weight]` per line. Preferred over pool.json. */
+export const USER_MODELS_TXT = join(USER_CONFIG_DIR, "pool.txt")
 
 export const FALLBACK_SLOTS: Slot[] = [
   { index: 1, model: "opencode/space-bunny-free", weight: 3 },
@@ -183,6 +185,39 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
   return { slots, problems }
 }
 
+/**
+ * Parse the flat, hand-edited pool file: one `<provider>/<model-id> [weight]` per
+ * line. `#` starts a comment (whole-line or trailing); blank lines are ignored; a
+ * missing weight is 1. Entries go through the SAME `parseSlots` validation as every
+ * other source, so the rules (<= MAX_SLOTS, distinct, first-slash split, weight in
+ * range) are identical everywhere.
+ */
+export function parseTextSlots(text: string, origin: string): SlotFile {
+  const entries: Array<{ model: string; weight?: string }> = []
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.split("#")[0].trim()
+    if (!line) continue
+    const [model, weight] = line.split(/\s+/)
+    entries.push(weight === undefined ? { model } : { model, weight })
+  }
+  return parseSlots({ slots: entries }, origin)
+}
+
+/**
+ * Parse a slot file that may be JSON (a leading `{`) or the flat line format, so a
+ * user can keep either shape in the same file without the loader caring which.
+ */
+export function parseSlotText(text: string, origin: string): SlotFile {
+  if (text.trimStart().startsWith("{")) {
+    try {
+      return parseSlots(JSON.parse(text), origin)
+    } catch (error) {
+      return { slots: FALLBACK_SLOTS, problems: [`${origin} is not valid JSON (${String(error)}); using built-in defaults`] }
+    }
+  }
+  return parseTextSlots(text, origin)
+}
+
 const readJSON = (path: string): { ok: true; value: unknown } | { ok: false; error: string } => {
   try {
     return { ok: true, value: JSON.parse(readFileSync(path, "utf8")) }
@@ -201,6 +236,17 @@ function readOptional(path: string, origin: string, problems: string[]) {
     return undefined
   }
   return result.value
+}
+
+/** Read a file as text; absent is undefined, unreadable warns once and is undefined. */
+function readTextOptional(path: string, origin: string, problems: string[]): string | undefined {
+  if (!existsSync(path)) return undefined
+  try {
+    return readFileSync(path, "utf8")
+  } catch (error) {
+    problems.push(`${origin} unreadable (${String(error)}); trying the next source`)
+    return undefined
+  }
 }
 
 /**
@@ -222,13 +268,19 @@ export function resolveModels(input: { models?: unknown; modelsFile?: string } =
   }
 
   if (input.modelsFile) {
-    const result = readJSON(input.modelsFile)
-    if (!result.ok) return { slots: FALLBACK_SLOTS, problems: [`${input.modelsFile} unreadable (${result.error}); using built-in defaults`], origin: input.modelsFile }
-    const parsed = parseSlots(result.value, input.modelsFile)
+    const parsed = readSlotFile(input.modelsFile)
     return { slots: parsed.slots, problems: parsed.problems, origin: input.modelsFile }
   }
 
-  // 2. the user's own file, then 3. the bundled preset.
+  // 2. the user's own file — the flat pool.txt first, then the JSON pool.json —
+  //    then 3. the bundled preset.
+  const text = readTextOptional(USER_MODELS_TXT, USER_MODELS_TXT, problems)
+  if (text !== undefined) {
+    const parsed = parseSlotText(text, USER_MODELS_TXT)
+    if (parsed.slots !== FALLBACK_SLOTS) return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin: USER_MODELS_TXT }
+    problems.push(...parsed.problems)
+  }
+
   const user = readOptional(USER_MODELS_PATH, USER_MODELS_PATH, problems)
   if (user !== undefined) {
     const parsed = parseSlots(user, USER_MODELS_PATH)
@@ -246,17 +298,21 @@ export function resolveModels(input: { models?: unknown; modelsFile?: string } =
     return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin: "presets/free-tier.json" }
   }
 
-  return { slots: FALLBACK_SLOTS, problems: [...problems, `no pool source found (${USER_MODELS_PATH}, ${DEFAULT_PRESET}); using built-in defaults`], origin: "built-in defaults" }
+  return { slots: FALLBACK_SLOTS, problems: [...problems, `no pool source found (${USER_MODELS_TXT}, ${USER_MODELS_PATH}, ${DEFAULT_PRESET}); using built-in defaults`], origin: "built-in defaults" }
 }
 
 export function readSlotFile(path: string): SlotFile {
-  const result = readJSON(path)
-  if (!result.ok) return { slots: FALLBACK_SLOTS, problems: [`${path} unreadable (${result.error}); using built-in defaults`] }
-  return parseSlots(result.value, path)
+  let text: string
+  try {
+    text = readFileSync(path, "utf8")
+  } catch (error) {
+    return { slots: FALLBACK_SLOTS, problems: [`${path} unreadable (${String(error)}); using built-in defaults`] }
+  }
+  return parseSlotText(text, path)
 }
 
 /**
- * Make `~/.config/lacode/` exist so a user can drop a `pool.json` into it without
+ * Make `~/.config/lacode/` exist so a user can drop a `pool.txt` (or `pool.json`) into it without
  * first having to `mkdir`. Called once at plugin startup, never during a read:
  * a library that creates directories as a side effect of being asked a question
  * is a library nobody trusts. Never throws -- an unwritable HOME just means the
