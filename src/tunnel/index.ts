@@ -14,8 +14,11 @@
 //     arguments cannot survive the hop and one delimited blob can,
 //   * the only value interpolated into a notify-send call is the icon, and that
 //     is checked against a whitelist,
+//   * the LOCAL channel is chosen by process.platform and by what is installed,
+//     never by guessing, and the text is handed to it as arguments rather than
+//     spliced into a command (US-26),
 //   * everything degrades. An unreachable remote, a missing key, a missing
-//     notify-send: all of them return a result, none of them throw, and the
+//     notifier: all of them return a result, none of them throw, and the
 //     fire-and-forget path exits 0 regardless (US-14). A notification that
 //     cannot be delivered must never be able to fail the thing that tried to
 //     deliver it -- an agent must not go down because a laptop went to sleep.
@@ -176,16 +179,105 @@ const have = (command: string) => {
   }
 }
 
-/** Deliver straight to the local desktop session. Never throws. */
-export function sendLocal(request: NotifyRequest): Result {
-  if (!have("notify-send")) return { ok: false, detail: "notify-send is not installed", transport: "local" }
-  const args = [
-    safeTitle(request.title),
-    safeMessage(request.message),
-    `--urgency=${normalizeUrgency(request.urgency)}`,
-    `--icon=${normalizeIcon(request.icon)}`,
-  ]
-  const result = run("notify-send", args, 5000)
+/**
+ * The desktop channel a local send goes through, or `"none"` when this platform
+ * has none.
+ *
+ * `"none"` is a real, reachable state rather than a bug: it is what a headless
+ * box reports, and `sendLocal` turns it into a non-throwing failure with an
+ * explanation, exactly as it already did for a missing `notify-send`.
+ */
+export type LocalChannel = "notify-send" | "osascript" | "terminal-notifier" | "none"
+
+/** The binary each channel names. One entry, so the channel IS the command. */
+const CHANNEL_BINARY: Record<Exclude<LocalChannel, "none">, string> = {
+  "notify-send": "notify-send",
+  osascript: "osascript",
+  "terminal-notifier": "terminal-notifier",
+}
+
+/**
+ * The AppleScript a macOS send runs.
+ *
+ * The title and the body are NOT written into this text. They arrive as `argv`
+ * and reach `display notification` as AppleScript *values*, so a body carrying
+ * quotes, `;`, `$(…)`, backticks or a newline is data and never source. Building
+ * the script by concatenation -- the obvious way, and the way every
+ * `osascript -e 'display notification "…" with title "…"'` snippet on the
+ * internet is written -- turns a session title into arbitrary AppleScript
+ * execution on the developer's own machine, which is exactly the class of bug
+ * this file already refuses to have on the SSH side.
+ */
+const DARWIN_SCRIPT = [
+  "on run argv",
+  "  display notification (item 3 of argv) with title (item 2 of argv)",
+  "end run",
+].join("\n")
+
+/**
+ * The constant first `argv` entry, and the reason the text starts at `item 2`.
+ *
+ * osascript reads its own options from the same argument list the script reads,
+ * so option parsing ends at the first argument that is not an option. Handing it
+ * the notification text first would make the user's own title the argument that
+ * ends parsing: a title beginning `-e` would be swallowed as an option and the
+ * body consumed as its value. A fixed marker first means no notification text can
+ * ever be that argument.
+ */
+const DARWIN_ARGV_MARKER = "lacode"
+
+/**
+ * Which channel a local send would use here.
+ *
+ * Platform first, installed binaries second, never a guess: macOS gets the
+ * `osascript` that ships with the OS, falling back to `terminal-notifier` when
+ * the machine has been stripped of it, and every other platform keeps the
+ * `notify-send` path it has always had -- including the ones where notify-send
+ * comes from a non-libnotify package. macOS is *added*, not substituted, so
+ * nothing that worked before can stop working.
+ *
+ * This is the single source of truth for the channel: `sendLocal` runs it and
+ * `describe` reports it, which is what stops `lacode doctor` from claiming a
+ * `notify-send` that does not exist on a Mac.
+ */
+export function localChannel(platform: string = process.platform): LocalChannel {
+  if (platform === "darwin") {
+    if (have(CHANNEL_BINARY.osascript)) return "osascript"
+    if (have(CHANNEL_BINARY["terminal-notifier"])) return "terminal-notifier"
+    return "none"
+  }
+  return have(CHANNEL_BINARY["notify-send"]) ? "notify-send" : "none"
+}
+
+/** Why there is no channel, said in the words of the platform that has none. */
+const NO_CHANNEL: Record<string, string> = {
+  linux: "notify-send is not installed",
+  darwin: "neither osascript nor terminal-notifier is installed",
+}
+
+/**
+ * Deliver straight to the local desktop session. Never throws, never blocks
+ * longer than the notifier timeout.
+ *
+ * `platform` is a parameter rather than a bare `process.platform` read so the
+ * channel a machine WOULD pick is observable from a test on any machine -- the
+ * same reason `notifyHooks` takes a `deliver` seam.
+ */
+export function sendLocal(request: NotifyRequest, platform: string = process.platform): Result {
+  const channel = localChannel(platform)
+  if (channel === "none") {
+    return { ok: false, detail: NO_CHANNEL[platform] ?? `no local notification channel on ${platform}`, transport: "local" }
+  }
+  const title = safeTitle(request.title)
+  const body = safeMessage(request.message)
+  const args =
+    channel === "osascript"
+      ? ["-e", DARWIN_SCRIPT, DARWIN_ARGV_MARKER, title, body]
+      : channel === "terminal-notifier"
+        ? ["-title", title, "-message", body, "-appName", "LaCode", "-priority", normalizeUrgency(request.urgency)]
+        : // Byte-identical to the notify-send call this package has always made.
+          [title, body, `--urgency=${normalizeUrgency(request.urgency)}`, `--icon=${normalizeIcon(request.icon)}`]
+  const result = run(CHANNEL_BINARY[channel], args, 5000)
   return { ok: result.ok, detail: result.ok ? undefined : result.stderr || result.detail, transport: "local" }
 }
 
@@ -221,9 +313,9 @@ export function sendRemote(request: NotifyRequest, tunnel: TunnelConfig): Result
  * Never throws (US-14). The caller decides what a failure means; the CLI's
  * fire-and-forget path treats every result as exit 0.
  */
-export function notify(request: NotifyRequest, env: NodeJS.ProcessEnv = process.env): Result {
+export function notify(request: NotifyRequest, env: NodeJS.ProcessEnv = process.env, platform: string = process.platform): Result {
   try {
-    return isRemote(env) ? sendRemote(request, resolveTunnel(env)) : sendLocal(request)
+    return isRemote(env) ? sendRemote(request, resolveTunnel(env)) : sendLocal(request, platform)
   } catch (error) {
     return { ok: false, detail: String(error), transport: "none" }
   }
@@ -253,14 +345,24 @@ export function forward(
   }
 }
 
-/** Print what the current environment resolves to. Diagnostics, never a gate. */
-export function describe(env: NodeJS.ProcessEnv = process.env) {
+/**
+ * Print what the current environment resolves to. Diagnostics, never a gate.
+ *
+ * `channel` is the field that has to be true: `lacode doctor` used to report
+ * only whether `notify-send` was installed, which on a Mac is a fact about a
+ * binary that has nothing to do with whether a notification appears, and
+ * therefore answered the wrong question while looking like an answer.
+ */
+export function describe(env: NodeJS.ProcessEnv = process.env, platform: string = process.platform) {
   const tunnel = resolveTunnel(env)
   return {
     running: isRemote(env) ? "remote (over ssh)" : "local",
     user: tunnel.user || "(unset)",
     port: tunnel.port,
     key: tunnel.key,
+    channel: localChannel(platform),
+    // Still exactly what it always meant -- is the notify-send binary present --
+    // rather than a second opinion about which channel runs.
     notifySend: have("notify-send"),
   }
 }

@@ -7,10 +7,10 @@
 //   lacode doctor
 //
 // Everything is best-effort by design (US-14). `notify` is fire-and-forget: an
-// unreachable desktop, a missing tunnel key, a missing notify-send -- all of them
-// exit 0 with a warning on stderr, because a notification must never be able to
-// fail the process that tried to send one. `forward` exits with the remote's
-// status, because its caller actually wants to know.
+// unreachable desktop, a missing tunnel key, no notifier installed at all -- all
+// of them exit 0 with a warning on stderr, because a notification must never be
+// able to fail the process that tried to send one. `forward` exits with the
+// remote's status, because its caller actually wants to know.
 //
 // The author's own bin/oc, oc-notify, oc-notify-receiver and oc-sync are NOT
 // replaced by this and keep working unchanged; they are wired to one person's SSH
@@ -113,6 +113,10 @@ switch (command) {
     if (info.running.startsWith("remote")) {
       if (info.user === "(unset)") console.log("\nOC_LOCAL_USER is unset: the hop cannot name the desktop user, and guessing with `id -un` is wrong on most remote accounts.")
       console.log("Set OC_LOCAL_USER, OC_TUNNEL_PORT and OC_NOTIFY_KEY, or point OC_NOTIFY_HELPER at a helper that knows them.")
+    } else if (info.channel === "none") {
+      // The silent case this report exists to rule out: nothing is wrong, and
+      // nothing will ever pop up here either.
+      console.log("\nNo local notification channel: `lacode notify` on this machine has nothing to deliver with, and every send will be reported as failed rather than shown.")
     }
     process.exit(0)
     break

@@ -2,6 +2,8 @@
 //
 //   US-13  a notification raised on a remote host reaches the local desktop
 //   US-14  the tunnel degrades safely and never blocks or throws
+//   US-18  the notification content survives the hop intact
+//   US-26  a local notification is delivered on macOS, not only on Linux
 //
 // These drive the REAL `bin/lacode` CLI as a subprocess, because the thing
 // under test is a process a remote shell runs: its argv, its exit status, and
@@ -16,7 +18,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { execFile } from "node:child_process"
-import { chmodSync, cpSync, existsSync, readFileSync, writeFileSync } from "node:fs"
+import { chmodSync, cpSync, existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { promisify } from "node:util"
 import { ROOT, cleanupAll, scratch, settle } from "./_harness.mjs"
@@ -504,4 +506,237 @@ test("[US-14] doctor reports what the environment resolves to without failing wh
   assert.equal(remote.code, 0, "doctor must never fail")
   assert.match(remote.stdout, /running\s+remote/)
   assert.match(remote.stdout, /OC_LOCAL_USER is unset/, "doctor must say what is missing")
+})
+
+// ---------------------------------------------------------------------------
+// US-26 -- the local channel is chosen per platform
+// ---------------------------------------------------------------------------
+
+const { describe: describeEnv, localChannel, safeMessage, safeTitle, sendLocal } =
+  await import(join(ROOT, "src", "tunnel", "index.ts"))
+
+/**
+ * Stub notifiers on the PATH of THIS process, for the duration of one callback.
+ *
+ * The CLI-driven tests above shell out to `bin/lacode`, which means they can only
+ * ever exercise the channel the machine running them would pick -- so on a Linux
+ * box they can never reach the macOS path at all. `sendLocal` and `describe` take
+ * the platform as an argument precisely so that is not a dead end: the other
+ * platform becomes a parameter instead of a different computer.
+ *
+ * It is the same seam as above, one process nearer: real binaries on a real PATH,
+ * recording a real argv. Nothing here reaches a desktop, a network, or AppleScript.
+ *
+ * The PATH is REPLACED, not prepended, and carries only the stubs plus `sh` and
+ * `sleep`. That matters: this machine has a real `notify-send` in /usr/bin, so a
+ * prepended temp directory cannot express "no notifier is installed" at all, and
+ * "the channel degrades when nothing is there" would quietly test nothing.
+ */
+const withStubs = (names, fn) => {
+  const bin = scratch("stub-bin-")
+  const logs = {}
+  for (const name of names) {
+    const log = join(bin, `${name}.log`)
+    logs[name] = log
+    writeFileSync(
+      join(bin, name),
+      `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done\nexit 0\n`,
+    )
+    chmodSync(join(bin, name), 0o755)
+  }
+  // `command -v` is a shell builtin, so these two are all the PATH needs beyond
+  // the stubs themselves: one to run the probe, one to stand in for a wedged
+  // notifier that never returns.
+  symlinkSync("/bin/sh", join(bin, "sh"))
+  symlinkSync("/bin/sleep", join(bin, "sleep"))
+
+  const previous = process.env.PATH
+  process.env.PATH = bin
+  const argvOf = (name) => {
+    const log = logs[name]
+    if (!log || !existsSync(log)) return []
+    const parts = readFileSync(log, "utf8").split("\0")
+    if (parts[parts.length - 1] === "") parts.pop()
+    return parts
+  }
+  try {
+    return fn({ bin, argv: argvOf })
+  } finally {
+    if (previous === undefined) delete process.env.PATH
+    else process.env.PATH = previous
+  }
+}
+
+/**
+ * These two cases need a Mac that is missing a binary the OS ships, which a
+ * machine that IS that Mac cannot fake by editing PATH.
+ */
+const notOnDarwin = process.platform === "darwin"
+const REASON = "cannot simulate a Mac without osascript by editing the PATH of a Mac"
+
+const REQUEST = {
+  title: "opencode — Fix the login",
+  message: "Task finished",
+  urgency: "critical",
+  icon: "dialog-error",
+}
+
+test("[US-26] on macOS the text is passed to osascript as arguments, never spliced into the script", () => {
+  // notify-send is stubbed too, and must stay untouched: on a Mac the old code
+  // reached for it, found nothing, and returned "not delivered" -- or, on a box
+  // that did have one, popped up through a Linux binary instead of the Mac's.
+  withStubs(["osascript", "notify-send", "terminal-notifier"], ({ argv }) => {
+    const result = sendLocal(REQUEST, "darwin")
+
+    assert.equal(result.ok, true, `the send must succeed: ${result.detail}`)
+    assert.deepEqual(argv("notify-send"), [], "notify-send must not be invoked on macOS")
+    assert.deepEqual(argv("terminal-notifier"), [], "osascript ships with macOS, so terminal-notifier is not the first choice")
+
+    const sent = argv("osascript")
+    assert.equal(sent.length, 5, `osascript gets -e, the script, and the two values: ${JSON.stringify(sent)}`)
+    assert.equal(sent[0], "-e")
+    // The script is a constant. The notification is not in it -- that is the whole
+    // of the safety claim, and asserting it here is what makes it a claim.
+    assert.ok(sent[1].includes("on run argv"), `the values must arrive through argv: ${sent[1]}`)
+    assert.ok(sent[1].includes("item 3 of argv") && sent[1].includes("item 2 of argv"), sent[1])
+    assert.ok(!sent[1].includes(REQUEST.title) && !sent[1].includes(REQUEST.message), `no notification text may be interpolated into AppleScript: ${sent[1]}`)
+    // Past a fixed marker, so the user's own text can never be the argument that
+    // ends osascript's option parsing and be eaten as a flag.
+    assert.equal(sent[2], "lacode", `argv item 1 must be the constant marker: ${JSON.stringify(sent)}`)
+    assert.deepEqual(sent.slice(3), [safeTitle(REQUEST.title), safeMessage(REQUEST.message)], `the values must arrive intact: ${JSON.stringify(sent)}`)
+  })
+})
+
+test("[US-26] a title and body full of quotes and shell metacharacters reach osascript as inert data", () => {
+  // Both fields are attacker-influenced text: a session title, a file path, a
+  // command line. The sentinel is the proof of execution, exactly as it is for
+  // the receiver in US-18 -- there is no AppleScript interpreter here to run a
+  // payload, so what matters is that nothing can reach one.
+  const marker = join(scratch("osascript-pwned-"), "should-not-exist")
+  const hostileTitle = `Title "; touch ${marker}`
+  const hostileBody = `Body "; touch ${marker}; $(touch ${marker}) ` + "`touch " + marker + "`" + ` & 'quoted' & | cat > ${marker}`
+
+  withStubs(["osascript"], ({ argv }) => {
+    const result = sendLocal({ title: hostileTitle, message: hostileBody }, "darwin")
+
+    assert.equal(result.ok, true, `the send must succeed: ${result.detail}`)
+    assert.ok(!existsSync(marker), "nothing in a notification may ever be executed")
+    // Byte-for-byte. `safeText` strips control characters and collapses
+    // whitespace, but nothing else: what the user is shown is what was sent.
+    const sent = argv("osascript")
+    assert.deepEqual(
+      sent.slice(3),
+      [safeTitle(hostileTitle), safeMessage(hostileBody)],
+      `the hostile text must reach osascript as data: ${JSON.stringify(sent)}`,
+    )
+    assert.ok(sent[3].includes(";") && sent[3].includes('"'), "the metacharacters must be present, not stripped")
+    assert.equal(sent[1].includes(hostileTitle) || sent[1].includes(hostileBody), false, "the script must not contain the payload")
+  })
+})
+
+test("[US-26] macOS falls back to terminal-notifier only when osascript is absent", { skip: notOnDarwin ? REASON : false }, () => {
+  withStubs(["terminal-notifier"], ({ argv }) => {
+    const result = sendLocal(REQUEST, "darwin")
+    assert.equal(result.ok, true, `the send must succeed: ${result.detail}`)
+    assert.deepEqual(argv("osascript"), [], "no osascript on PATH means osascript cannot be the channel")
+    assert.deepEqual(
+      argv("terminal-notifier"),
+      ["-title", safeTitle(REQUEST.title), "-message", safeMessage(REQUEST.message), "-appName", "LaCode", "-priority", "critical"],
+      `terminal-notifier gets values as its own arguments: ${JSON.stringify(argv("terminal-notifier"))}`,
+    )
+  })
+
+  // Both installed: osascript wins, because it is the one macOS ships with and
+  // asking for a brew package is not something a notification may depend on.
+  withStubs(["osascript", "terminal-notifier"], ({ argv }) => {
+    assert.equal(sendLocal(REQUEST, "darwin").ok, true)
+    assert.ok(argv("osascript").length > 0, "osascript is the primary channel")
+    assert.deepEqual(argv("terminal-notifier"), [], "the fallback is a fallback")
+  })
+})
+
+test("[US-26] a Mac with no notifier degrades to a reported failure, and never hangs", { skip: notOnDarwin ? REASON : false }, () => {
+  withStubs([], () => {
+    const started = Date.now()
+    const result = sendLocal(REQUEST, "darwin")
+    const elapsed = Date.now() - started
+
+    // The silent-failure parity: the same shape Linux already returns for a
+    // missing notify-send -- a result, not an exception -- so the fire-and-forget
+    // caller still exits 0.
+    assert.equal(result.ok, false)
+    assert.equal(result.transport, "local")
+    assert.match(result.detail, /osascript/, `the detail must name what is missing: ${result.detail}`)
+    assert.ok(elapsed < 5_000, `a missing notifier must be reported at once, took ${elapsed}ms`)
+  })
+
+  // A notifier that never returns must be killed, not waited on: an agent must
+  // not go down because a desktop notification server hung.
+  withStubs(["osascript"], ({ bin, argv }) => {
+    writeFileSync(join(bin, "osascript"), `#!/bin/sh\nsleep 120\n`)
+    chmodSync(join(bin, "osascript"), 0o755)
+
+    const started = Date.now()
+    const result = sendLocal(REQUEST, "darwin")
+    const elapsed = Date.now() - started
+    assert.equal(result.ok, false, "a wedged notifier is a failed delivery, not a thrown error")
+    assert.ok(elapsed < 15_000, `the send must be time-bounded, took ${elapsed}ms`)
+    assert.deepEqual(argv("osascript"), [], "the stub records nothing: it never got as far as running")
+  })
+})
+
+test("[US-26] Linux still delivers through notify-send, argument for argument unchanged", () => {
+  withStubs(["osascript", "notify-send", "terminal-notifier"], ({ argv }) => {
+    const result = sendLocal(REQUEST, "linux")
+
+    assert.equal(result.ok, true, `the send must succeed: ${result.detail}`)
+    assert.deepEqual(
+      argv("notify-send"),
+      ["opencode — Fix the login", "Task finished", "--urgency=critical", "--icon=dialog-error"],
+      `the Linux call must be exactly what it always was: ${JSON.stringify(argv("notify-send"))}`,
+    )
+    assert.deepEqual(argv("osascript"), [], "macOS must not change what Linux does")
+    assert.deepEqual(argv("terminal-notifier"), [], "macOS must not change what Linux does")
+  })
+
+  // ...and the default, with no platform argument, is still this machine's.
+  withStubs(["notify-send"], ({ argv }) => {
+    sendLocal(REQUEST)
+    assert.deepEqual(argv("notify-send"), ["opencode — Fix the login", "Task finished", "--urgency=critical", "--icon=dialog-error"])
+  })
+})
+
+test("[US-26] doctor names the channel this platform would use, not a binary it would not", () => {
+  withStubs(["osascript", "notify-send", "terminal-notifier"], () => {
+    const mac = describeEnv({}, "darwin")
+    assert.equal(mac.channel, "osascript", "a Mac with osascript says so")
+    assert.equal(localChannel("darwin"), "osascript")
+
+    // The old report answered a different question: it said whether the Linux
+    // binary existed, which on a Mac is true or false for no reason a caller
+    // could act on, and left "will my notification appear?" unanswered.
+    assert.equal(mac.notifySend, true, "notifySend still means what it always meant: the binary is installed")
+    assert.notEqual(mac.channel, "none")
+
+    assert.equal(describeEnv({}, "linux").channel, "notify-send")
+    assert.equal(localChannel("linux"), "notify-send")
+  })
+
+  withStubs(["notify-send"], () => {
+    // macOS is ADDED to the channels, not substituted for one. Every other
+    // platform keeps notify-send whether or not it calls itself linux, because
+    // restricting the new code to `platform === "linux"` would have silently
+    // switched off delivery for anyone running notify-send from a non-libnotify
+    // package on a FreeBSD or a WSL-less Unix.
+    assert.equal(localChannel("sunos"), "notify-send")
+    assert.equal(localChannel("win32"), "notify-send")
+  })
+
+  withStubs([], () => {
+    // No notifier for this platform at all: the honest answer is "none", and it
+    // is one doctor can print rather than a silent delivery failure.
+    assert.equal(localChannel("darwin"), "none")
+    assert.equal(describeEnv({}, "darwin").channel, "none")
+    assert.equal(localChannel("win32"), "none", "with nothing installed, any platform reports none rather than guessing")
+  })
 })

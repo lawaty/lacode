@@ -46,7 +46,9 @@ spaces, quotes or `*` survives intact.
 ## Sending
 
 The CLI picks the transport by where it is running — `SSH_CLIENT` or `SSH_TTY`
-means remote, so it forwards; otherwise it calls `notify-send` directly.
+means remote, so it forwards; otherwise it delivers locally through whichever
+desktop notifier this platform has: `notify-send` everywhere else, `osascript` on
+macOS, with `terminal-notifier` as the macOS fallback when `osascript` is missing.
 
 ```bash
 lacode notify "build finished" "lapode: 4 files changed" normal dialog-information
@@ -55,11 +57,16 @@ lacode forward web-01 -- systemctl --user status oc-tunnel
 lacode doctor
 ```
 
-`notify` is fire-and-forget by design. An unreachable desktop, a missing key, a
-missing `notify-send` — all of them print a warning on stderr and exit 0. A
+`notify` is fire-and-forget by design. An unreachable desktop, a missing key, no
+notifier installed at all — all of them print a warning on stderr and exit 0. A
 notification must never be able to fail the process that tried to send one; an
 agent must not go down because a laptop went to sleep. `forward` is the
 exception: it exits with the remote's status, because its caller wants to know.
+
+On macOS the text is passed to `osascript` as arguments to an `on run argv`
+handler, never spliced into the script source — a session title is not trusted
+input. `lacode doctor` prints the channel that would actually run, so it is
+useful on a Mac rather than reporting only whether a Linux binary is installed.
 
 `lacode doctor` prints what the environment resolves to and never gates on it.
 

@@ -246,6 +246,18 @@ does not.
 - [ ] Given a payload containing shell metacharacters (`$(…)`, backticks, `;`, `&&`) or extra fields, When the receiver handles it, Then it is parsed as data only: nothing is executed and the argument list passed to `notify-send` is unchanged.
 - [ ] Given a payload that cannot be understood at all, When it arrives, Then the receiver still exits 0 and pops up what it received, rather than failing the hop.
 
+### US-26: A local notification is delivered on macOS, not only on Linux
+**As a** user whose desktop is a Mac, **I want** a notification to actually appear when a session finishes, **so that** installing the package on macOS is not the same as getting no notifications at all.
+
+**Story ID(s) for tests:** US-26
+**Acceptance criteria:**
+- [ ] Given the notification is raised on macOS, When it is delivered locally, Then it goes to `osascript` — or to `terminal-notifier` if `osascript` is not installed — and not to `notify-send`, which does not exist there. Before this, the send exited 0, printed nothing, and popped up nothing.
+- [ ] Given the channel is chosen, When it is picked, Then it is decided by `process.platform` and by which binary is actually installed, never by guessing, and every platform other than macOS keeps the `notify-send` call it has always made.
+- [ ] Given the title and the body reach `osascript`, When the script runs, Then they are passed as arguments to an `on run argv` handler and never concatenated into the script source, because both fields are attacker-influenced text — a session title, a file path, a command.
+- [ ] Given a body containing `"`, `'`, `;`, `$(…)` or backticks, When the macOS send runs, Then it reaches `display notification` byte-for-byte as data and nothing is executed.
+- [ ] Given a machine has no notifier for its platform, When a notification is sent, Then the result is a failed delivery with a reason and no exception, and `lacode doctor` names the channel that would run — or reports that there is none — instead of reporting a binary that is not used there.
+- [ ] Given the CLI runs on macOS, When the send does not complete, Then it is still bounded by a timeout, exactly as on Linux.
+
 ---
 
 ## Epic F — Adoption and safety
@@ -381,6 +393,7 @@ table was filled in.
 | US-13 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/notify-test.mjs`, `tests/oc-test.mjs` |
 | US-14 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |
 | US-18 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |
+| US-26 | E | `tests/stories/e-remote-ssh.test.mjs` |
 | US-15 | F | `tests/stories/f-adoption-safety.test.mjs` |
 | US-16 | F | `tests/stories/f-adoption-safety.test.mjs` |
 | US-17 | F | `tests/stories/f-adoption-safety.test.mjs` |
