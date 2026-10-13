@@ -184,15 +184,32 @@ export function writeState(state: UpdateState, path = STATE_PATH): void {
 export const isDue = (state: UpdateState, now: number, interval = CHECK_INTERVAL_MS): boolean =>
   typeof state.checkedAt !== "number" || now - state.checkedAt >= interval
 
+/** Signal-0 existence probe: true if `pid` is running. EPERM means alive but not ours. */
+const isProcessAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
 /**
  * A cross-process lock so two opencode processes starting together cannot both
- * rewrite the same cache dir. Created with `wx` (exclusive); an existing lock is
- * honoured until it is older than LOCK_STALE_MS, then broken. Returns a release
- * function, or undefined when another process holds it.
+ * rewrite the same cache dir. Created with `wx` (exclusive).
+ *
+ * A lock is only broken when its holder is PROVABLY gone: the recorded pid is
+ * no longer running, or the file is older than LOCK_STALE_MS. That distinction
+ * matters because the release runs in a `finally`, and any process that exits
+ * mid-install -- a one-shot `opencode debug` command, a test, a closed session --
+ * never reaches it. Without a liveness check that orphaned file blocks every
+ * later start for the whole grace window, silently, and an updater nobody can
+ * tell is stuck is worse than one that is merely late. So a dead holder is
+ * reclaimed immediately, and the acquisition is retried so the update is not
+ * pushed back by another full cycle.
  */
 export function acquireLock(path = LOCK_PATH, now = Date.now()): (() => void) | undefined {
-  try {
-    mkdirSync(dirname(path), { recursive: true })
+  const claim = (): (() => void) => {
     const fd = openSync(path, "wx")
     writeSync(fd, String(process.pid))
     closeSync(fd)
@@ -203,13 +220,38 @@ export function acquireLock(path = LOCK_PATH, now = Date.now()): (() => void) | 
         // already gone
       }
     }
+  }
+
+  try {
+    mkdirSync(dirname(path), { recursive: true })
+    return claim()
   } catch {
+    let orphaned = false
     try {
-      if (now - statSync(path).mtimeMs > LOCK_STALE_MS) unlinkSync(path)
+      const pid = Number.parseInt(readFileSync(path, "utf8").trim(), 10)
+      orphaned = !Number.isFinite(pid) || pid <= 0 || !isProcessAlive(pid)
     } catch {
-      // vanished between check and unlink
+      orphaned = true // unreadable or vanished: treat as abandoned
     }
-    return undefined
+    if (!orphaned) {
+      try {
+        orphaned = now - statSync(path).mtimeMs > LOCK_STALE_MS
+      } catch {
+        orphaned = true
+      }
+    }
+    if (!orphaned) return undefined
+    try {
+      unlinkSync(path)
+    } catch {
+      return undefined
+    }
+    try {
+      return claim()
+    } catch {
+      // another process won the reclaimed lock; let it do the work
+      return undefined
+    }
   }
 }
 

@@ -5,9 +5,9 @@
 // here touches npm, the network, or a real opencode cache.
 
 import assert from "node:assert/strict"
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { test } from "node:test"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { PACKAGE_NAME } from "../../src/lib/package-root.ts"
 import {
   acquireLock,
@@ -81,6 +81,28 @@ const fakeSpawn = (cacheRoot, version, { exit = 0 } = {}) => {
     return child
   }
 }
+
+test("[US-27] a lock orphaned by a process that exited mid-install is reclaimed at once", () => {
+  const lockPath = join(scratch(), "lock")
+  mkdirSync(dirname(lockPath), { recursive: true })
+  // A pid that is not running: the holder died before its `finally` could unlink.
+  writeFileSync(lockPath, "999999999")
+
+  const held = acquireLock(lockPath, NOW)
+  assert.ok(held, "a provably dead holder must not block the update")
+  assert.equal(readFileSync(lockPath, "utf8"), String(process.pid), "the lock is now ours")
+  held()
+  assert.equal(existsSync(lockPath), false, "releasing removes it")
+})
+
+test("[US-27] a lock held by a live process is respected, so two starts cannot collide", () => {
+  const lockPath = join(scratch(), "lock")
+  mkdirSync(dirname(lockPath), { recursive: true })
+  writeFileSync(lockPath, String(process.pid)) // we are running
+
+  assert.equal(acquireLock(lockPath, NOW), undefined, "a live holder keeps the lock")
+  assert.equal(readFileSync(lockPath, "utf8"), String(process.pid), "and it is untouched")
+})
 
 test("[US-27] the check stands down under the test runner so the suite stays offline", async () => {
   const { packageRoot } = makeCache(OLD)
