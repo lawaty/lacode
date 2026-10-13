@@ -23,7 +23,14 @@ export async function selfUpdateHooks(input: PluginInput, options?: PluginOption
   const log = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
     input.client.app.log({ body: { service: "lacode", level, message, extra } }).catch(() => {})
 
-  void maybeSelfUpdate({ packageRoot: PACKAGE_ROOT, enabled: opts.enabled, log }).catch(() => {})
+  // Fire-and-forget, but never silent: the outcome is logged at debug level so
+  // "the updater is armed and did nothing" is distinguishable from "the updater
+  // never ran", which is otherwise impossible to tell from the outside.
+  void maybeSelfUpdate({ packageRoot: PACKAGE_ROOT, enabled: opts.enabled, log })
+    .then((result) => {
+      if (result.action !== "disabled") log("debug", `self-update check: ${JSON.stringify(result)}`)
+    })
+    .catch((error) => log("error", `self-update check threw: ${String(error)}`))
 
   return {}
 }
