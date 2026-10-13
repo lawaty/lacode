@@ -70,9 +70,10 @@
 // not warned about one by one.
 //
 // Ordering inside the config hook is load-bearing: agents go in FIRST so the pool
-// has variant agents to bind models to, OmniRoute registers its provider before
-// the pool so the pool can bind a slot to it, and the pool binds LAST because
-// binding writes into exactly the objects the agent injection just created.
+// has variant agents to bind models to; OmniRoute registers `provider.omniroute`
+// before the pool so a pool slot naming an `omniroute/...` model resolves (and the
+// pool never warns "not configured"); and the pool binds LAST because binding
+// writes into exactly the objects the agent injection just created.
 
 import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { applyAgents, buildAgentSet } from "./agents.ts"
@@ -144,11 +145,12 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       if (applyInstructions(cfg as Record<string, unknown>).added) {
         await log("info", "instructions: added the standing context-map rule (no user instructions were present)")
       }
-      // OmniRoute runs BEFORE the pool: it registers the `omniroute` provider,
-      // and when healthy marks its model as the pool's primary slot. The pool
-      // then sees that provider (so it never warns "not configured") and binds
-      // the variants to the injected slot. OmniRoute touches no agent, so the
-      // pool still binds LAST. It is a no-op when the feature is off.
+      // OmniRoute runs BEFORE the pool so it can register `provider.omniroute`
+      // first: a pool slot naming an `omniroute/...` model then resolves, and the
+      // pool never warns the provider is "not configured". OmniRoute writes the
+      // pool NOTHING -- it only makes the gateway's models addressable; the user
+      // lists whatever they want in pool.txt like any other model. It touches no
+      // agent, so the pool still binds LAST, and it is a no-op when off.
       await omniroute.config?.(cfg)
       await pool.config?.(cfg)
     } catch (error) {

@@ -352,7 +352,7 @@ as an opencode provider for you. It is **off by default**: if you do not set
 | `enabled` | `false` | Turns the integration on. |
 | `baseURL` | `http://localhost:20128/v1` | Gateway base URL, normalised to exactly one `/v1`. |
 | `apiKey` | — | Bearer key. **`OMNIROUTE_API_KEY` overrides this value.** The key is never logged. |
-| `combo` | — | An OmniRoute combo (or `auto`) used as the routing model. Always exposed first. |
+| `combo` | — | An OmniRoute combo id (or `auto`) to expose as a selectable model even though the gateway does not list it. Exposed first. |
 | `models` | — | A **hard allowlist**: only these ids are ever exposed, even if the gateway lists more. |
 | `tiers` | — | `{ "primary": [...], "backup": [...] }` preference order over models the allowlist already permits. |
 | `stickyPerSession` | `true` | Keep a session on one model while that model is healthy. |
@@ -379,18 +379,25 @@ model while it is cooling after a transient failure — 429, 408 and 5xx, honour
 `Retry-After` and otherwise using capped exponential backoff. Non-transient
 errors (400, 401, 403, 404) are surfaced to you, never failed over.
 
-**OmniRoute becomes the pool's primary slot.** This is the point of the
-integration: when the gateway is healthy, LaCode replaces the pool's **first
-slot** — the one the pool takes first — with
-`omniroute/<combo | first allowlisted model | auto>`, inheriting that slot's
-weight, so pooled mechanical work (exploration, implementation, cartography)
-drains through OmniRoute before it reaches the bundled opencode/opencode-go
-("zen") models. On the default `pool.txt` shown below, gemini's slot becomes
-OmniRoute — same slot count, same weights — and bunny / step-5 / big-pickle keep
-their places behind it. The replacement is skipped, leaving the pool exactly as
-it was, if the gateway is disabled, unreachable, returns no usable models, or if
-your own pool already routes on the `omniroute` provider (LaCode never stacks a
-second slot on a provider you already chose). See
+**Using OmniRoute in the pool.** The integration only *registers* the provider —
+it never touches your pool, and it does not place a slot for you. To route pooled
+work (exploration, implementation, cartography) through the gateway, list it in
+your pool like any other model:
+
+```
+# ~/.config/lacode/pool.txt
+omniroute/auto             3
+opencode/space-bunny-free  2
+opencode-go/step-5-preview-free 1
+opencode/big-pickle        1
+```
+
+`omniroute/auto` then takes slot 1 (weight 3) and drains pooled mechanical work
+before it reaches the bundled opencode/opencode-go ("zen") models. Any
+`omniroute/<id>` works, provided the id is exposed — by `combo`/`models`, or the
+whole catalog when neither is set. Because the plugin writes the pool nothing,
+the only thing that changes when the gateway is down is that `omniroute/<id>`
+fails; every other slot keeps working. See
 [docs/USER-STORIES.md](docs/USER-STORIES.md) US-28.
 
 **A note on mid-session switching.** opencode 1.18.34 exposes no hook to change
@@ -413,7 +420,7 @@ local instance with `REQUIRE_API_KEY=false`, the literal placeholder
 | `401` / `Invalid API key` | `REQUIRE_API_KEY=true` and the key is missing or wrong | Create a key in the dashboard, export `OMNIROUTE_API_KEY`, or set `REQUIRE_API_KEY=false` locally and use `sk_omniroute`. |
 | `404` on a URL containing `/v1/v1/` | A `baseURL` that already carried `/v1` was given twice | LaCode normalises this, so it should not come from LaCode; check a hand-written `provider.omniroute` block, which LaCode leaves untouched. |
 | Provider registered but models are missing | You already had `provider.omniroute` | Remove it and let LaCode write it, or add the models yourself — LaCode never modifies an existing provider. |
-| Pooled work still runs on the bundled models | The gateway was unhealthy/disabled at startup, or your own pool already routes on `omniroute` | Check the startup log for `omniroute health check failed` / `no usable models`; if you added your own `omniroute/…` pool slot, remove it to let LaCode place one. |
+| Pooled work still runs on the bundled models | The gateway was unhealthy/disabled at startup, or you have no `omniroute/…` slot in your pool | Check the startup log for `omniroute health check failed` / `no usable models`, then add `omniroute/<model>` to `pool.txt` (or `pool.json`) to route pooled work through the gateway. |
 
 ### Which models run which agent
 

@@ -36,7 +36,6 @@
 
 import type { Hooks, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import * as omni from "../lib/omniroute.ts"
-import * as pool from "../lib/pool.ts"
 
 const SERVICE = "omniroute"
 
@@ -106,10 +105,6 @@ export const omniRouteHooks = async (
   // this process" and a recovered gateway is picked up on the next start.
   let disabled = false
 
-  // The model this integration will prepend as the pool's PRIMARY slot, decided
-  // once the gateway has answered. Null means "do not touch the pool".
-  let poolModel: string | null = null
-
   // The probe itself: at most one per factory run, and lazy -- the factory never
   // touches the network, so a user with the block disabled pays nothing and an
   // enabled one pays exactly one probe per start.
@@ -155,11 +150,6 @@ export const omniRouteHooks = async (
     }
 
     selector.setCandidates(candidates)
-    // The pool target: the combo when one is named, else the first allowlisted
-    // model, else OmniRoute's own zero-config `auto` router -- so `enabled: true`
-    // alone is enough to make the gateway the pool's primary slot.
-    const chosen = config.combo ?? (config.models !== undefined && config.models.length > 0 ? candidates[0] : "auto")
-    poolModel = `omniroute/${chosen}`
     await log("info", `omniroute: ${candidates.length} model(s) from ${config.baseURL}: ${candidates.join(", ")}`)
   }
 
@@ -193,12 +183,8 @@ export const omniRouteHooks = async (
     // the picker; opencode 1.18.34 has no hook to force a session's model, so
     // this is presentation, not a routing decision.
     const exposed = selector.candidates()
-    // The pool target must itself be selectable, even when it is `auto` and the
-    // gateway did not advertise it.
-    const target = poolModel !== null ? poolModel.slice("omniroute/".length) : null
-    const ids = target !== null && !exposed.includes(target) ? [target, ...exposed] : exposed
     const models: Record<string, { name: string }> = {}
-    for (const id of ids) models[id] = { name: id }
+    for (const id of exposed) models[id] = { name: id }
 
     providers.omniroute = {
       name: "OmniRoute",
@@ -217,16 +203,6 @@ export const omniRouteHooks = async (
         timeout: config.timeoutMs,
       },
       models,
-    }
-
-    // Make this gateway the pool's PRIMARY slot -- slot 1, the one the pool takes
-    // first -- replacing that slot's model in place so pooled mechanical work
-    // drains here before it reaches the bundled (zen) models. Written into the
-    // shared pool state -- the same state object the pool's config hook reads on
-    // this same pass, which is why this hook runs before it (see src/index.ts).
-    if (poolModel !== null) {
-      const ps = pool.state((options ?? {}) as { id?: string; dir?: string; modelsFile?: string; models?: unknown })
-      pool.setPrimarySlot(ps, { model: poolModel })
     }
   }
 

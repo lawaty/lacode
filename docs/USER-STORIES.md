@@ -140,16 +140,16 @@ correct exactly when a whitelist exists (it is a real restriction, and the pool
 models would otherwise resolve to nothing) and is not merely unnecessary when one
 does not.
 
-### US-28: A local gateway (OmniRoute) becomes the pool's primary slot
-**As a** user running a local OpenAI-compatible gateway, **I want** LaCode to drain the pool's mechanical work through it first, **so that** the bundled opencode/opencode-go ("zen") models stop carrying that load.
+### US-28: A local gateway (OmniRoute) is registered as an ordinary provider
+**As a** user running a local OpenAI-compatible gateway, **I want** LaCode to register it so its models are selectable and I can name one in my pool, **so that** *I* decide whether pooled work drains through it instead of the bundled models.
 
 **Story ID(s) for tests:** US-28
 **Acceptance criteria:**
-- [ ] Given `omniroute.enabled` with a reachable gateway and a `combo` or `models` choice, When the config hook runs, Then slot 1 of the pool is `omniroute/<combo | first allowlisted model>` — replacing the first slot's model IN PLACE and inheriting that slot's weight — so it is the model the pool takes first.
-- [ ] Given OmniRoute is disabled, enabled with an invalid block, unhealthy, or returns no usable models, When the pool resolves, Then no slot is changed and the resolved slots are exactly what the chain produced — the behaviour before the integration existed.
-- [ ] Given the user's own pool already routes on the `omniroute` provider, When the integration is healthy, Then the first slot is left exactly as written and no second slot is stacked on that provider.
-- [ ] Given the primary slot is injected, When the pool resolves, Then the number of slots is unchanged and every slot after the first is byte-identical to what the chain produced — nothing is dropped or renumbered, because the replacement creates no extra slot.
-- [ ] Given an `omniroute` slot is injected, When the pool binds its variants, Then it does not warn that the provider is missing, because OmniRoute registers the provider before the pool's config hook runs.
+- [ ] Given `omniroute.enabled` with a reachable gateway, When the config hook runs, Then LaCode registers a `provider.omniroute` entry exposing the gateway's models (everything it lists, or filtered by `models`/`combo`), and writes NOTHING into the pool.
+- [ ] Given any pool source (bundled preset, `pool.json`, `pool.txt`, or `options.models`), When OmniRoute is enabled and healthy, Then every slot resolves exactly as it would without the integration — the slot list is unchanged, so opting in means the user lists `omniroute/<model>` themselves.
+- [ ] Given a pool slot naming an `omniroute/<model>`, When the pool resolves and binds, Then that slot routes as an ordinary slot, and the pool does not warn the provider is missing, because OmniRoute registers the provider before the pool's config hook runs.
+- [ ] Given OmniRoute is disabled, enabled with an invalid block, unhealthy, or returns no usable models, When the config hook runs, Then no provider is registered, no pool slot changes, and a failure is warned about once.
+- [ ] Given the gateway is unreachable, When pooled work runs, Then the only thing affected is a slot that names `omniroute/<model>`; every other slot keeps working, because the plugin never put an `omniroute` slot in the pool.
 
 ---
 

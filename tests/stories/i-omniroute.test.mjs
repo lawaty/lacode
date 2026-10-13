@@ -1,13 +1,13 @@
-// Epic B (provider resilience) — the local-gateway pool slot.
+// Epic B (provider resilience) — the local gateway as an ordinary provider.
 //
-//   US-28 a local OpenAI-compatible gateway (OmniRoute) becomes the pool's
-//         primary slot, so pooled mechanical work drains there before it reaches
-//         the bundled opencode/opencode-go ("zen") models.
+//   US-28 enabling OmniRoute REGISTERS a `provider.omniroute` entry so the
+//         gateway's models become selectable, and does nothing else. It never
+//         touches the pool: to route pooled work through the gateway the user
+//         lists `omniroute/<model>` in pool.txt (or pool.json / options.models)
+//         like any other provider.
 //
 // The gateway is reached over HTTP at config time, so every test swaps
 // `globalThis.fetch` for a stub and restores it afterwards. No socket is opened.
-// Each test gets a unique `id`/`dir` so the pool's per-process state is fresh:
-// the injected slot lives in that state object.
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
@@ -42,7 +42,9 @@ let n = 0
 const boot = async (stub, options = {}) =>
   bootLaCode(stub, { id: `omniroute-story-${n++}`, dir: scratch(), selfUpdate: false, ...options })
 
-test("[US-28] a healthy gateway with an allowlist becomes the pool's first slot", async () => {
+const poolModels = (cfg) => [1, 2, 3, 4].map((i) => cfg.agent[`explore-${i}`].model)
+
+test("[US-28] a healthy gateway registers provider.omniroute and leaves the pool alone", async () => {
   const gw = gateway(["model-a", "model-b"])
   const stub = stubInput()
   try {
@@ -53,17 +55,8 @@ test("[US-28] a healthy gateway with an allowlist becomes the pool's first slot"
     assert.equal(cfg.provider.omniroute.npm, "@ai-sdk/openai-compatible")
     assert.deepEqual(Object.keys(cfg.provider.omniroute.models), ["model-b"])
 
-    // The gateway REPLACES slot 1 in place: same number of slots, same weights,
-    // every other slot untouched. On the shipped preset that is gemini's slot.
-    assert.equal(cfg.agent["explore-1"].model, "omniroute/model-b")
-    assert.equal(cfg.agent["explore-2"].model, presetModels()[1])
-    assert.equal(cfg.agent["explore-3"].model, presetModels()[2])
-    assert.equal(cfg.agent["explore-4"].model, presetModels()[3])
-
-    const routed = await spawn(hooks, cfg, { subagent: "explore" })
-    assert.equal(routed.routed, "explore-1")
-    assert.equal(routed.model, "omniroute/model-b")
-
+    // The plugin WRITES THE POOL NOTHING: every slot is exactly the preset's.
+    assert.deepEqual(poolModels(cfg), presetModels())
     await hooks.dispose?.()
   } finally {
     gw.restore()
@@ -71,15 +64,15 @@ test("[US-28] a healthy gateway with an allowlist becomes the pool's first slot"
   }
 })
 
-test("[US-28] a named combo is used as the pool's first slot", async () => {
+test("[US-28] a named combo is exposed as a selectable model", async () => {
   const gw = gateway(["model-a"])
   const stub = stubInput()
   try {
     const hooks = await boot(stub, { omniroute: { enabled: true, combo: "static-best-free" } })
     const cfg = emptyConfig()
     await hooks.config(cfg)
-    assert.equal(cfg.agent["explore-1"].model, "omniroute/static-best-free")
     assert.equal(cfg.provider.omniroute.models["static-best-free"].name, "static-best-free")
+    assert.deepEqual(poolModels(cfg), presetModels())
     await hooks.dispose?.()
   } finally {
     gw.restore()
@@ -87,15 +80,14 @@ test("[US-28] a named combo is used as the pool's first slot", async () => {
   }
 })
 
-test("[US-28] enabled with no choice falls back to OmniRoute's own auto router", async () => {
+test("[US-28] enabled with no allowlist exposes the gateway's whole catalog", async () => {
   const gw = gateway(["model-a", "model-b"])
   const stub = stubInput()
   try {
     const hooks = await boot(stub, { omniroute: { enabled: true } })
     const cfg = emptyConfig()
     await hooks.config(cfg)
-    assert.equal(cfg.agent["explore-1"].model, "omniroute/auto")
-    assert.equal(cfg.provider.omniroute.models.auto.name, "auto")
+    assert.deepEqual(Object.keys(cfg.provider.omniroute.models).sort(), ["model-a", "model-b"])
     await hooks.dispose?.()
   } finally {
     gw.restore()
@@ -103,7 +95,37 @@ test("[US-28] enabled with no choice falls back to OmniRoute's own auto router",
   }
 })
 
-test("[US-28] a disabled integration adds no slot and makes no request", async () => {
+test("[US-28] an omniroute slot listed in the pool routes through the gateway", async () => {
+  const gw = gateway(["model-a"])
+  const stub = stubInput()
+  try {
+    const hooks = await boot(stub, {
+      omniroute: { enabled: true, combo: "auto" },
+      models: {
+        slots: [
+          { model: "omniroute/auto", weight: 3 },
+          { model: "opencode/space-bunny-free", weight: 2 },
+        ],
+      },
+    })
+    const cfg = emptyConfig()
+    await hooks.config(cfg)
+
+    // The user's pool decides, exactly like any other provider.
+    assert.equal(cfg.agent["explore-1"].model, "omniroute/auto")
+    assert.equal(cfg.provider.omniroute.models.auto.name, "auto")
+
+    const routed = await spawn(hooks, cfg, { subagent: "explore" })
+    assert.equal(routed.routed, "explore-1")
+    assert.equal(routed.model, "omniroute/auto")
+    await hooks.dispose?.()
+  } finally {
+    gw.restore()
+    cleanupAll()
+  }
+})
+
+test("[US-28] a disabled integration registers nothing and makes no request", async () => {
   const gw = gateway(["model-a"])
   const stub = stubInput()
   try {
@@ -112,7 +134,7 @@ test("[US-28] a disabled integration adds no slot and makes no request", async (
     await hooks.config(cfg)
 
     assert.equal(cfg.provider.omniroute, undefined)
-    assert.equal(cfg.agent["explore-1"].model, presetModels()[0])
+    assert.deepEqual(poolModels(cfg), presetModels())
     assert.equal(gw.calls.some((url) => url.includes("/models")), false)
     await hooks.dispose?.()
   } finally {
@@ -121,7 +143,7 @@ test("[US-28] a disabled integration adds no slot and makes no request", async (
   }
 })
 
-test("[US-28] an unreachable gateway falls back to the bundled slots", async () => {
+test("[US-28] an unreachable gateway registers nothing and leaves the pool alone", async () => {
   const gw = gateway([], { fail: true })
   const stub = stubInput()
   try {
@@ -130,7 +152,7 @@ test("[US-28] an unreachable gateway falls back to the bundled slots", async () 
     await hooks.config(cfg)
 
     assert.equal(cfg.provider.omniroute, undefined)
-    assert.equal(cfg.agent["explore-1"].model, presetModels()[0])
+    assert.deepEqual(poolModels(cfg), presetModels())
     assert.equal(
       stub.text().some((line) => line.includes("health check failed")),
       true,
@@ -143,87 +165,23 @@ test("[US-28] an unreachable gateway falls back to the bundled slots", async () 
   }
 })
 
-test("[US-28] a user pool already routing on omniroute is not doubled", async () => {
-  const gw = gateway(["model-a"])
+test("[US-28] registering the provider first means a pool slot naming it is not warned as unconfigured", async () => {
+  const gw = gateway(["auto"])
   const stub = stubInput()
   try {
     const hooks = await boot(stub, {
-      omniroute: { enabled: true, models: ["model-a"] },
-      models: {
-        slots: [
-          { model: "omniroute/keep-me", weight: 3 },
-          { model: "opencode/space-bunny-free", weight: 2 },
-        ],
-      },
+      omniroute: { enabled: true, combo: "auto" },
+      models: { slots: [{ model: "omniroute/auto", weight: 3 }] },
     })
-    const cfg = emptyConfig()
-    await hooks.config(cfg)
-
-    // The user's own omniroute slot stays first; the integration does not stack a
-    // second slot on the same provider.
-    assert.equal(cfg.agent["explore-1"].model, "omniroute/keep-me")
-    assert.equal(cfg.agent["explore-2"].model, "opencode/space-bunny-free")
-    assert.equal(
-      stub.text().some((line) => line.includes("provider omniroute is already in the pool")),
-      true,
-    )
-    await hooks.dispose?.()
-  } finally {
-    gw.restore()
-    cleanupAll()
-  }
-})
-
-test("[US-28] the primary slot replaces the first slot in place, keeping the slot count", async () => {
-  const gw = gateway(["model-a"])
-  const stub = stubInput()
-  try {
-    const hooks = await boot(stub, {
-      omniroute: { enabled: true, models: ["model-a"] },
-      models: {
-        slots: [
-          { model: "opencode/s1", weight: 3 },
-          { model: "opencode/s2", weight: 2 },
-          { model: "opencode-go/s3", weight: 1 },
-          { model: "opencode-go/s4", weight: 1 },
-        ],
-      },
-    })
-    const cfg = emptyConfig()
-    await hooks.config(cfg)
-
-    // Slot 1 is replaced in place; slots 2..4 are exactly as written -- nothing
-    // is dropped, because no fifth slot is created.
-    assert.equal(cfg.agent["explore-1"].model, "omniroute/model-a")
-    assert.equal(cfg.agent["explore-2"].model, "opencode/s2")
-    assert.equal(cfg.agent["explore-3"].model, "opencode-go/s3")
-    assert.equal(cfg.agent["explore-4"].model, "opencode-go/s4")
-    // It inherits the replaced slot's weight (s1's 3), so it is genuinely first.
-    assert.equal(
-      stub.text().some((line) => line.includes("1=omniroute/model-a w3")),
-      true,
-      "the primary slot keeps the weight of the slot it replaced",
-    )
-    await hooks.dispose?.()
-  } finally {
-    gw.restore()
-    cleanupAll()
-  }
-})
-
-test("[US-28] registering the provider first means the pool does not warn it is missing", async () => {
-  const gw = gateway(["model-a"])
-  const stub = stubInput()
-  try {
-    const hooks = await boot(stub, { omniroute: { enabled: true, models: ["model-a"] } })
     const cfg = emptyConfig()
     await hooks.config(cfg)
 
     assert.equal(
       stub.text().some((line) => line.includes("provider omniroute is not configured")),
       false,
-      "OmniRoute registers the provider before the pool binds its slots",
+      "OmniRoute registers the provider before the pool checks its slots",
     )
+    assert.equal(cfg.agent["explore-1"].model, "omniroute/auto")
     await hooks.dispose?.()
   } finally {
     gw.restore()

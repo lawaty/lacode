@@ -86,15 +86,6 @@ export const isQuotaReason = (reason: string) => /quota|limit|rate|too-many|over
 
 export type Slot = { index: number; model: string; weight: number }
 
-/**
- * A model a caller wants to take the pool's PRIMARY slot -- slot 1, the one the
- * pool takes first. Carries no `index`: it REPLACES the resolved first slot in
- * place, inheriting that slot's weight unless one is given. Used by the optional
- * OmniRoute integration to make a local gateway the first slot without editing
- * the user's preset or ~/.config/lacode/pool.*, and without changing the number
- * of slots or displacing any of the others.
- */
-export type PoolPrimarySlot = { model: string; weight?: number }
 export type Claim = { v: string; k: number; m: string; t: number; s?: string; g?: string }
 export type Strike = { model: string; until: number; strikes: number; reason: string; last: number }
 export type Sibling = { id: string; claims: Claim[] }
@@ -428,8 +419,6 @@ type State = {
   modelsFile?: string
   /** Inline `{ slots: [...] }` from plugin options, if the caller passed one. */
   inlineModels?: unknown
-  /** A model a feature wants to take the resolved pool's first slot. */
-  primarySlot: PoolPrimarySlot | null
   origin: string
   slots: Slot[]
 }
@@ -466,7 +455,6 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
       dir,
       modelsFile,
       inlineModels: models,
-      primarySlot: null,
       origin: "unresolved",
       slots: [],
     }
@@ -474,79 +462,15 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
   return g[key]
 }
 
-/**
- * Put `primary` in the pool's first slot, replacing its model in place.
- *
- * Used by the OmniRoute integration to make a local gateway the slot the pool
- * takes first, so pooled work drains there before the bundled models. It is a
- * REPLACEMENT, not an insertion: the number of slots is unchanged, the replaced
- * slot keeps its weight, and every other slot is left exactly as resolved. On
- * the shipped preset that hands gemini's three concurrent sessions to OmniRoute,
- * with bunny / step-5 / big-pickle untouched behind it.
- *
- * Deliberately conservative:
- *   * if the pool already routes on the SAME provider, nothing is replaced, so a
- *     user who chose their own `omniroute/...` slot is not overridden;
- *   * the base list is never mutated in place; a fresh list is returned;
- *   * the replaced slot keeps its index, so no variant agent is renamed and none
- *     routes at a variant that does not exist.
- */
-export function replacePrimarySlot(base: Slot[], primary: PoolPrimarySlot): { slots: Slot[]; problems: string[] } {
-  const problems: string[] = []
-  const model = typeof primary?.model === "string" ? primary.model.trim() : ""
-  if (!model.includes("/")) {
-    problems.push(`primary slot: model must be written provider/model-id, got "${model}"`)
-    return { slots: base, problems }
-  }
-  const provider = providerOf(model)
-  if (base.some((slot) => providerOf(slot.model) === provider)) {
-    problems.push(`primary slot ${model}: provider ${provider} is already in the pool; the primary slot is skipped`)
-    return { slots: base, problems }
-  }
-  if (base.length === 0) return { slots: [{ index: 1, model, weight: Math.max(1, primary.weight ?? 1) }], problems }
-  let weight = primary.weight
-  if (weight !== undefined && (typeof weight !== "number" || !Number.isFinite(weight) || weight <= 0)) {
-    problems.push(`primary slot ${model}: weight must be a positive number; inheriting the replaced slot's weight`)
-    weight = undefined
-  }
-  // Only slot 0 changes, and it keeps its index; its weight is inherited unless
-  // one was given, so this is "in place of" the old first slot, not a new slot.
-  const slots = base.map((slot, i) => (i === 0 ? { ...slot, model, weight: weight ?? slot.weight } : slot))
-  return { slots, problems }
-}
-
-/**
- * Register a primary slot, invalidating any list already resolved.
- *
- * The pool resolves its slots at factory start (for the cost advisory and the
- * startup log), but a feature like OmniRoute decides its slot only at config
- * time, after a health probe. Clearing the cached list is what makes the
- * replacement real instead of silently ignored: the pool's own config pass
- * re-resolves and applies it. Callers must run before the pool's `config` hook.
- */
-export function setPrimarySlot(s: State, primary: PoolPrimarySlot): void {
-  s.primarySlot = primary
-  if (s.slots.length > 0) s.slots = []
-}
-
 // Read once per process, on first use: plugins are not hot-reloaded, so editing
 // the preset means restarting opencode anyway.
 export function ensureSlots(s: State, onWarn: (m: string) => void) {
   if (s.slots.length > 0) return s.slots
   const { slots, problems, origin } = resolveModels({ models: s.inlineModels, modelsFile: s.modelsFile })
-  let resolved = slots
-  // Only replace when a caller asked for a primary slot: otherwise the resolved
-  // list (including the FALLBACK_SLOTS array identity some callers compare
-  // against) is left exactly as resolveModels returned it.
-  if (s.primarySlot !== null) {
-    const replaced = replacePrimarySlot(slots, s.primarySlot)
-    resolved = replaced.slots
-    problems.push(...replaced.problems)
-  }
-  s.slots = resolved
+  s.slots = slots
   s.origin = origin
   for (const problem of problems) onWarn(problem)
-  return resolved
+  return slots
 }
 
 export const claimKey = (sessionID: string, callID: string) => `${sessionID}:${callID}`
