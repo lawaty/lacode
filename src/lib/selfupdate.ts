@@ -37,6 +37,17 @@ export const CHILD_ENV = "LACODE_SELFUPDATE_CHILD"
 /** The user's explicit off switch for the automatic check. */
 export const OPT_OUT_ENV = "LACODE_NO_SELFUPDATE"
 
+/**
+ * True when this code is running inside node's test runner (`node --test` sets
+ * NODE_TEST_CONTEXT). Several suites boot the real plugin — including the
+ * installed-package fixture — and an unguarded check would reach the npm
+ * registry and write to the developer's real state dir, breaking the rule that
+ * the suite is offline and hermetic. Detection is by env var because the runner
+ * sets it; a missing var simply means "not a test", which is the safe default.
+ */
+export const inTestRunner = (env: Record<string, string | undefined> = process.env): boolean =>
+  typeof env.NODE_TEST_CONTEXT === "string" && env.NODE_TEST_CONTEXT.length > 0
+
 export const STATE_DIR = join(homedir(), ".local", "share", "opencode", "lacode")
 export const STATE_PATH = join(STATE_DIR, "selfupdate.json")
 export const LOCK_PATH = join(STATE_DIR, "selfupdate.lock")
@@ -324,7 +335,7 @@ export type MaybeResult = { action: "skipped" | "current" | "updated" | "failed"
  */
 export async function maybeSelfUpdate(opts: MaybeOptions): Promise<MaybeResult> {
   const env = opts.env ?? process.env
-  if (opts.enabled === false || env[CHILD_ENV] === "1" || env[OPT_OUT_ENV] === "1") {
+  if (opts.enabled === false || env[CHILD_ENV] === "1" || env[OPT_OUT_ENV] === "1" || inTestRunner(env)) {
     return { action: "disabled" }
   }
   const now = (opts.now ?? Date.now)()

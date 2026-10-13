@@ -25,6 +25,12 @@ import {
 } from "../../src/lib/selfupdate.ts"
 import { cleanupAll, scratch } from "./_harness.mjs"
 
+// `node --test` sets NODE_TEST_CONTEXT, and the updater correctly stands down
+// when it sees it so the suite never touches the registry. These tests drive the
+// check directly and need the real paths, so clear it here; the guard itself is
+// asserted explicitly further down.
+delete process.env.NODE_TEST_CONTEXT
+
 const NOW = 1_700_000_000_000
 const NEW = "0.2.0"
 const OLD = "0.1.6"
@@ -75,6 +81,26 @@ const fakeSpawn = (cacheRoot, version, { exit = 0 } = {}) => {
     return child
   }
 }
+
+test("[US-27] the check stands down under the test runner so the suite stays offline", async () => {
+  const { packageRoot } = makeCache(OLD)
+  let calls = 0
+  const result = await maybeSelfUpdate({
+    packageRoot,
+    now: () => NOW,
+    statePath: join(scratch(), "state.json"),
+    lockPath: join(scratch(), "lock"),
+    env: { NODE_TEST_CONTEXT: "child-v8" },
+    fetchImpl: async () => {
+      calls++
+      return { ok: true, json: async () => ({ version: NEW }) }
+    },
+    spawnImpl: mustNotSpawn,
+    log: () => {},
+  })
+  assert.equal(result.action, "disabled")
+  assert.equal(calls, 0, "no registry call from inside the test runner")
+})
 
 test("[US-27] version comparison orders x.y.z", () => {
   assert.equal(compareSemver("0.2.0", "0.1.6"), 1)
