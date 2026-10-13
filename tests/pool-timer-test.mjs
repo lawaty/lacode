@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url"
 import { shippedConfig } from "./fixtures/config.mjs"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
+const PRESET = join(HERE, "..", "presets", "free-tier.json")
 const cfg = shippedConfig()
 
 // presets/free-tier.json owns the pool's models. Test 4 is about a provider-wide
@@ -57,7 +58,7 @@ let clock = 0
 Date.now = () => REAL + clock
 
 const mk = async (id, dir) => {
-  const h = await AgentPool({ client, serverUrl: new URL("http://127.0.0.1:59999") }, { id, dir, reapMs: 20 })
+  const h = await AgentPool({ client, serverUrl: new URL("http://127.0.0.1:59999") }, { id, dir, reapMs: 20, modelsFile: PRESET })
   await h.config(cfg)
   return {
     hooks: h,

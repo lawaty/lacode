@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, statSync } from "node:fs"
 import * as path from "node:path"
-import type { Hooks } from "@opencode-ai/plugin"
+import type { Hooks, PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
 import { verifyWriterRule } from "../lib/writer-rule.ts"
 
@@ -94,11 +94,15 @@ const changedSince = (before: Map<string, string>, dir: string) => {
 // the process. See the note at the top of ./agent-pool.ts.
 
 // A factory returning hooks, not a Plugin -- see the note in ./agent-pool.ts.
-export const contextAutoUpdateHooks = (async ({ client, directory }): Promise<Hooks> => {
+export const contextAutoUpdateHooks = (async ({ client, directory }, options?: PluginOptions): Promise<Hooks> => {
   const pending = new Set<string>()
   const owned = new Map<string, number>()
   let lastRun = 0
-  const state = pool.state()
+  // Same state identity the agent-pool uses (id, dir, models source) so the
+  // borrow and the pool it borrows from can never disagree about the slots.
+  // Passing the options through is what lets a test pin modelsFile: PRESET and
+  // keeps the plugin honouring a user's explicit slot options.
+  const state = pool.state(options as { id?: string; dir?: string; modelsFile?: string; models?: unknown } | undefined)
 
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
     client.app.log({ body: { service: SERVICE, level, message, extra } }).catch(() => {})

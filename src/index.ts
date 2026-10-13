@@ -28,6 +28,12 @@
 //       An inline slot list, the highest-priority pool source. Any model id is
 //       accepted, free or paid (US-7); only structure is validated.
 //
+//     selfUpdate?: boolean
+//       The automatic update check (US-27). Absent or true = check at most once
+//       per ~6h and reinstall a newer release in the background (applied on the
+//       next start). `false` disables it; `LACODE_NO_SELFUPDATE=1` does the same
+//       from the environment.
+//
 //     reapMs?: number        reaper interval, default 30s
 //     id?: string            process identity for the claim files (tests)
 //     dir?: string           claim directory (tests)
@@ -67,6 +73,7 @@ import { applyCommands, applyInstructions } from "./commands.ts"
 import { agentPoolHooks } from "./plugins/agent-pool.ts"
 import { contextAutoUpdateHooks } from "./plugins/context-autoupdate.ts"
 import { notifyHooks } from "./plugins/notify.ts"
+import { selfUpdateHooks } from "./plugins/selfupdate.ts"
 
 export type LacodeOptions = {
   enabled?: boolean
@@ -75,6 +82,7 @@ export type LacodeOptions = {
   id?: string
   dir?: string
   modelsFile?: string
+  selfUpdate?: boolean
   [key: string]: unknown
 }
 
@@ -109,6 +117,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   const pool = (await settled("agent-pool", () => agentPoolHooks(input, options))) ?? inertHooks
   const autoupdate = (await settled("context-autoupdate", () => contextAutoUpdateHooks(input, options))) ?? inertHooks
   const notifier = (await settled("notify", () => notifyHooks(input, options))) ?? inertHooks
+  const selfupdate = (await settled("self-update", () => selfUpdateHooks(input, options))) ?? inertHooks
 
   // Order is the whole design: the pool must see variant agents that already
   // exist, and the agent set must exist before the pool writes models into it.
@@ -151,6 +160,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       await pool.dispose?.()
       await autoupdate.dispose?.()
       await notifier.dispose?.()
+      await selfupdate.dispose?.()
     },
   } satisfies Hooks
 }) satisfies Plugin

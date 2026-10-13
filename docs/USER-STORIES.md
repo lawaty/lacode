@@ -317,6 +317,25 @@ The pain: LaCode once shipped a `tools: { "playwright_*": true }` grant on its f
 
 ---
 
+### US-27: The package keeps itself current, without npm and without being asked
+**As a** user who installed LaCode once, **I want** each new release to reach my machine automatically, **so that** I never have to learn that opencode freezes the plugin version and hand-clear a cache to upgrade.
+
+The pain: opencode's plugin cache is **write-once**. It resolves `@lawaty/lacode` to an exact version once and never re-resolves — not on restart, not with `opencode plugin -g -f`, not with a range pin, not with a tagged config spec (all four verified against opencode 1.18.34). A published release therefore reaches a client only when something installs it into that cache again, and nothing in opencode ever does. The plugin has to do it itself, and it may assume only one tool: the opencode binary the code already runs inside.
+
+**Story ID(s) for tests:** US-27
+**Acceptance criteria:**
+- [ ] Given a client runs the plugin and the registry reports a newer version, When the check runs, Then the plugin reinstalls its own cache entry in the background and logs one line naming the old and new version, and startup is never blocked on the registry.
+- [ ] Given the check ran recently, When the plugin loads again within the interval, Then the registry is consulted at most once per interval, so a session start never waits on npm and npm is not hammered.
+- [ ] Given a machine with neither npm nor bun, When an update runs, Then it is performed by the opencode binary alone, because that is the one tool every client is guaranteed to have.
+- [ ] Given an update is installed, When the running session continues, Then it keeps its loaded code and the new version takes effect on the next start, and the log line says exactly that.
+- [ ] Given two opencode processes start together and both find an update, When they race, Then a cross-process lock ensures only one performs the install.
+- [ ] Given `selfUpdate: false` in the plugin options or `LACODE_NO_SELFUPDATE=1` in the environment, When the plugin loads, Then it performs no check at all.
+- [ ] Given the registry is unreachable, When the check runs, Then it is silent, records nothing that would suppress a later retry forever, and never throws into opencode.
+- [ ] Given a plain source checkout rather than an opencode cache install, When the check runs, Then it does not attempt to reinstall, so a development tree is never overwritten.
+- [ ] Given `lacode update` or `lacode update --check`, When it is run, Then it reports (or installs) the update for this machine and exits non-zero only on a real failure — a missing registry, no cache to update, or a failed install.
+
+---
+
 ## Epic G — Context and cost (a maintained map instead of cold exploration)
 
 The pain: every task opened by exploring the repository from scratch. The same
@@ -408,6 +427,7 @@ table was filled in.
 | US-16 | F | `tests/stories/f-adoption-safety.test.mjs` |
 | US-17 | F | `tests/stories/f-adoption-safety.test.mjs` |
 | US-24 | F | `tests/stories/f-adoption-safety.test.mjs` |
+| US-27 | F | `tests/stories/h-self-update.test.mjs` |
 | US-19 | G | `tests/stories/g-context-management.test.mjs` |
 | US-20 | G | `tests/stories/g-context-management.test.mjs` |
 | US-21 | G | `tests/stories/g-context-management.test.mjs`, `tests/permission-test.mjs` |

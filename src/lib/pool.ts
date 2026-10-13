@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
-import { fileURLToPath } from "node:url"
+import { join } from "node:path"
+import { PACKAGE_ROOT } from "./package-root.ts"
 
 // Shared model pool for every free-model agent type.
 //
@@ -100,34 +100,11 @@ export const BASES = ["explore", "implement", "context"]
 // explicitly) short-circuits the chain.
 
 /**
- * Package root: the directory holding `presets/`, `bin/` and `package.json`.
- *
- * This module is `src/lib/pool.ts` in a checkout — two levels down — but the
- * published package ships the very same code bundled into `dist/index.js`, one
- * level down. A fixed "two levels up" hop therefore resolves to the package's
- * PARENT once installed, the bundled preset is not found, and the pool falls
- * through to FALLBACK_SLOTS — still routing, still passing a test that only
- * checks that routing happened, and quietly not the preset the user installed.
- * So walk up to the manifest that names this package instead of counting
- * directories, which is correct from any depth; the old hop is the last resort
- * for a `dist/` copied somewhere with no manifest above it.
+ * Package root discovery lives in ./package-root.ts so lightweight consumers
+ * (the CLI, the self-updater) can import the path without pulling in this whole
+ * module. Re-exported here to keep the `./pool` public surface unchanged.
  */
-const findPackageRoot = (start: string): string => {
-  let dir = start
-  for (let up = 0; up < 6; up++) {
-    try {
-      if (JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).name === "@lawaty/lacode") return dir
-    } catch {
-      // No manifest, or one that is not ours: keep walking.
-    }
-    const parent = dirname(dir)
-    if (parent === dir) break
-    dir = parent
-  }
-  return join(start, "..", "..")
-}
-
-export const PACKAGE_ROOT = findPackageRoot(dirname(fileURLToPath(import.meta.url)))
+export { PACKAGE_ROOT }
 export const PRESETS_DIR = join(PACKAGE_ROOT, "presets")
 export const DEFAULT_PRESET = join(PRESETS_DIR, "free-tier.json")
 /** The user's own pool file. Absent is normal and never an error. */

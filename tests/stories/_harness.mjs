@@ -124,7 +124,12 @@ export const stubInput = ({ sessions = {}, directory = "/tmp/lacode-story", crea
 /** Build the hook object the way opencode does: default export + PluginInput. */
 export const bootLaCode = async (stub, options = {}) => {
   const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
-  const hooks = await LaCode(stub.input, options)
+  // Pin the pool to the bundled preset unless the caller overrides the source.
+  // Without this the pool falls through to the real ~/.config/lacode/pool.txt,
+  // so a developer's own slot list silently changes what these tests assert.
+  // An inline `models` (which resolveModels prefers) still wins; a caller's own
+  // `modelsFile` still wins via the spread.
+  const hooks = await LaCode(stub.input, { modelsFile: PRESET, ...options })
   return hooks
 }
 

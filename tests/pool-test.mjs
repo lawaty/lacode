@@ -12,6 +12,7 @@ import { shippedConfig } from "./fixtures/config.mjs"
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PLUGIN = join(HERE, "..", "src", "plugins", "agent-pool.ts")
 const SNAPSHOT = join(HERE, "models-snapshot.json")
+const PRESET = join(HERE, "..", "presets", "free-tier.json")
 const cfg = shippedConfig()
 
 // presets/free-tier.json is the single source of truth for the pool, so the test reads
@@ -42,7 +43,7 @@ const assert = (cond, msg) => {
 }
 
 const make = async (id, dir) => {
-  const hooks = await AgentPool({ client }, { id, dir })
+  const hooks = await AgentPool({ client }, { id, dir, modelsFile: PRESET })
   await hooks.config(cfg)
   const spawn = async (callID, requested, sessionID = "s1") => {
     const out = { args: { subagent_type: requested, prompt: "x" } }

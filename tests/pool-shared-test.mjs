@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url"
 import { shippedConfig } from "./fixtures/config.mjs"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
+const PRESET = join(HERE, "..", "presets", "free-tier.json")
 const POOL = join(HERE, "..", "src", "lib", "pool.ts")
 const cfg = shippedConfig()
 
@@ -40,7 +41,7 @@ const { agentPoolHooks: AgentPool } = await import(join(HERE, "..", "src", "plug
 const pool = await import(POOL)
 
 const mk = async (id, dir) => {
-  const hooks = await AgentPool({ client, serverUrl: undefined }, { id, dir })
+  const hooks = await AgentPool({ client, serverUrl: undefined }, { id, dir, modelsFile: PRESET })
   await hooks.config(cfg)
   return {
     hooks,
@@ -147,7 +148,7 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
 // 5. context-autoupdate-style acquisition: borrow a slot, claim it, then release
 {
   const dir = scratch()
-  const state = pool.state({ id: "borrow", dir })
+  const state = pool.state({ id: "borrow", dir, modelsFile: PRESET })
   pool.init(state, () => {})
   const snap = pool.snapshot(state)
   const slot = pool.pickSlot(state, snap)
@@ -180,7 +181,7 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
   const t = await mk("shared-4", scratch())
   // cool the first slot's model through the shared lib for this instance's dir
   const cooled = SLOT_MODELS[0]
-  const state = pool.state({ id: "shared-4", dir: made[made.length - 1] })
+  const state = pool.state({ id: "shared-4", dir: made[made.length - 1], modelsFile: PRESET })
   pool.recordStrike(state, cooled, "rate-limit", 60_000)
   const cooledSlot = SLOT_MODELS.indexOf(cooled) + 1
   const picks = []

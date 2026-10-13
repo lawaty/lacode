@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url"
 import { shippedConfig } from "./fixtures/config.mjs"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
+const PRESET = join(HERE, "..", "presets", "free-tier.json")
 const PLUGIN = join(HERE, "..", "src", "plugins", "agent-pool.ts")
 const cfg = shippedConfig()
 
@@ -61,7 +62,7 @@ const scratch = () => {
 }
 
 const mk = async (id, dir) => {
-  const hooks = await AgentPool({ client, serverUrl: new URL("http://127.0.0.1:59999") }, { id, dir })
+  const hooks = await AgentPool({ client, serverUrl: new URL("http://127.0.0.1:59999") }, { id, dir, modelsFile: PRESET })
   await hooks.config(cfg)
   return {
     hooks,

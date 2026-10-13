@@ -31,7 +31,7 @@ import { COMMANDS, STANDING_INSTRUCTION } from "../../src/commands.ts"
 import { MAX_SLOTS } from "../../src/lib/pool.ts"
 import { verifyWriterRule } from "../../src/lib/writer-rule.ts"
 import { contextAutoUpdateHooks } from "../../src/plugins/context-autoupdate.ts"
-import { ROOT, bootLaCode, cleanupAll, emptyConfig, fakeClock, presetModels, scratch, settle, stubInput } from "./_harness.mjs"
+import { ROOT, PRESET, bootLaCode, cleanupAll, emptyConfig, fakeClock, presetModels, scratch, settle, stubInput } from "./_harness.mjs"
 
 test.after(cleanupAll)
 
@@ -123,7 +123,9 @@ const bootAutoupdate = async ({ withMap = false, sessions = {} } = {}) => {
     directory: root,
   })
   const home = scratch("home-")
-  const hooks = await withHome(home, () => contextAutoUpdateHooks(stub.input))
+  // The autoupdate plugin borrows from the same pool; pin it to the preset so a
+  // developer's own ~/.config/lacode/pool.txt cannot leak into the assertion.
+  const hooks = await withHome(home, () => contextAutoUpdateHooks(stub.input, { modelsFile: PRESET }))
   return { stub, hooks, root, mapDir, home }
 }
 

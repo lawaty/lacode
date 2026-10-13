@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 // lacode — the portable CLI half of LaCode.
 //
-// Three subcommands:
+// Subcommands:
 //   lacode notify TITLE [MESSAGE] [URGENCY] [ICON]
 //   lacode forward HOST -- COMMAND [ARG...]
+//   lacode update [--check]
 //   lacode doctor
+//   lacode receive            (the forced-command end of a direct hop)
+//   lacode tunnel setup       (print the wiring for a direct hop)
 //
 // Everything is best-effort by design (US-14). `notify` is fire-and-forget: an
 // unreachable desktop, a missing tunnel key, no notifier installed at all -- all
@@ -26,6 +29,8 @@ import { spawnSync } from "node:child_process"
 // the shipped CLI would have reached back into a `src/` the tarball no longer
 // carries. It still runs unbundled straight from a git checkout.
 import { describe, forward, notify, parsePayload, resolveTunnel, safeTitle, sendLocal } from "../src/tunnel/index.ts"
+import { PACKAGE_ROOT } from "../src/lib/package-root.ts"
+import { checkForUpdate, refreshCache } from "../src/lib/selfupdate.ts"
 
 // Two forms of this file exist and both must work. Run from a checkout it IS
 // TypeScript-in-Node, exactly like the opencode plugins: node strips the types on
@@ -59,6 +64,13 @@ const USAGE = `lacode — portable notifications and remote exec for LaCode
 
   lacode doctor
       Print what the environment resolves to. Diagnostics only.
+
+  lacode update [--check]
+      Bring this machine's installed LaCode up to the latest published
+      version. opencode's plugin cache never re-resolves on its own, so
+      this is the manual half of the automatic check the plugin runs at
+      startup. --check only reports; it installs nothing. The new version
+      takes effect on the next opencode start.
 
 Environment:
   OC_LOCAL_USER        desktop user the tunnel authenticates as
@@ -120,6 +132,41 @@ switch (command) {
       // nothing will ever pop up here either.
       console.log("\nNo local notification channel: `lacode notify` on this machine has nothing to deliver with, and every send will be reported as failed rather than shown.")
     }
+    process.exit(0)
+    break
+  }
+
+  case "update": {
+    const checkOnly = argv.includes("--check")
+    const check = await checkForUpdate({ packageRoot: PACKAGE_ROOT })
+    if (!check.installed) {
+      console.error("lacode update: could not read the installed version (run from an installed package).")
+      process.exit(1)
+    }
+    if (!check.latest) {
+      console.error("lacode update: could not reach the npm registry; check your connection and retry.")
+      process.exit(1)
+    }
+    if (!check.newer) {
+      console.log(`lacode ${check.installed} is up to date (latest ${check.latest}).`)
+      process.exit(0)
+    }
+    console.log(`lacode ${check.installed} -> ${check.latest} available.`)
+    if (checkOnly) process.exit(0)
+    if (!check.cacheRoot) {
+      console.error("This is not an opencode cache install; update it with your package manager instead.")
+      process.exit(1)
+    }
+    if (!check.bin) {
+      console.error("lacode update: no opencode binary found to perform the install.")
+      process.exit(1)
+    }
+    const result = await refreshCache({ cacheRoot: check.cacheRoot, bin: check.bin, latest: check.latest })
+    if (!result.ok) {
+      console.error(`lacode update: install failed (${result.detail}).`)
+      process.exit(1)
+    }
+    console.log(`Updated to ${check.latest}. Restart opencode to apply.`)
     process.exit(0)
     break
   }

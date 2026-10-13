@@ -283,6 +283,19 @@ option is optional:
 | `models` | — | An inline slot list. Highest-priority source. |
 | `modelsFile` | — | An explicit slot file; short-circuits the chain below. |
 | `reapMs` | `30000` | Hang-reaper interval. |
+| `selfUpdate` | `true` | Check for a newer release at most once per ~6h and install it in the background; it applies on the next opencode start. `false` — or `LACODE_NO_SELFUPDATE=1` — turns the check off. |
+
+### Staying up to date
+
+opencode's plugin cache is **write-once**: it resolves `@lawaty/lacode` to an
+exact version once and never re-resolves — not on restart, not with
+`opencode plugin -g -f`, not with a range pin, not with a tagged config spec. So
+LaCode keeps itself current instead (US-27): at startup it compares its own
+version to npm's `latest` (at most once per ~6h, silent when offline) and, when
+behind, reinstalls its own cache entry in the background using the opencode
+binary — no npm or bun required. The running session keeps its loaded code; the
+new version takes effect on the next start, and the log says so. Run
+`lacode update` to do it on demand, or `lacode update --check` to just report.
 
 ### Pool preset resolution
 
