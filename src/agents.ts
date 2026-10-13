@@ -180,7 +180,9 @@ missing). Never paste context file contents into the report.`,
       "task": {
         "*": "deny",
         "explore*": "allow",
-        "implement*": "allow"
+        "implement*": "allow",
+        "basic": "allow",
+        "expert": "allow"
       }
     },
   },
@@ -250,7 +252,9 @@ Once the plan is complete, present it clearly so the caller can implement it ste
       "task": {
         "*": "deny",
         "explore*": "allow",
-        "implement*": "allow"
+        "implement*": "allow",
+        "basic": "allow",
+        "expert": "allow"
       }
     },
   },
