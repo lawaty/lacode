@@ -20,8 +20,8 @@
     "  3. once EVERY slot is at its ceiling, the overflow goes to the least loaded slot,",
     "     so a burst past the summed ceilings degrades to even spreading and never blocks",
     "",
-    "With this file: longcat (opencode-go) takes 3 sessions to itself, then space-bunny",
-    "takes 2, then big-pickle and longcat (Zen) take 1 each -- sequence 1,1,1,2,2,3,4,...",
+    "With this file: space-bunny takes 3 sessions to itself, then step-5-preview",
+    "(opencode-go) takes 2, then big-pickle and step-5-preview (Zen) take 1 each -- sequence 1,1,1,2,2,3,4,...",
     "Equal weights give a plain round robin in list order. 2,2,1,1 reproduces the old",
     "primary/overflow cycle exactly, which is why the old tier values still work.",
     "",
@@ -53,8 +53,8 @@
   ],
   "slots": [
     { "model": "opencode/space-bunny-free", "weight": 3 },
-    { "model": "opencode-go/longcat-2.5-preview-free", "weight": 2 },
+    { "model": "opencode-go/step-5-preview-free", "weight": 2 },
     { "model": "opencode/big-pickle", "weight": 1 },
-    { "model": "opencode/longcat-2.5-preview-free", "weight": 1 }
+    { "model": "opencode/step-5-preview-free", "weight": 1 }
   ]
 }
