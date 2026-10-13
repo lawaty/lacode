@@ -140,6 +140,17 @@ correct exactly when a whitelist exists (it is a real restriction, and the pool
 models would otherwise resolve to nothing) and is not merely unnecessary when one
 does not.
 
+### US-28: A local gateway (OmniRoute) becomes the pool's primary slot
+**As a** user running a local OpenAI-compatible gateway, **I want** LaCode to drain the pool's mechanical work through it first, **so that** the bundled opencode/opencode-go ("zen") models stop carrying that load.
+
+**Story ID(s) for tests:** US-28
+**Acceptance criteria:**
+- [ ] Given `omniroute.enabled` with a reachable gateway and a `combo` or `models` choice, When the config hook runs, Then slot 1 of the pool is `omniroute/<combo | first allowlisted model>` — replacing the first slot's model IN PLACE and inheriting that slot's weight — so it is the model the pool takes first.
+- [ ] Given OmniRoute is disabled, enabled with an invalid block, unhealthy, or returns no usable models, When the pool resolves, Then no slot is changed and the resolved slots are exactly what the chain produced — the behaviour before the integration existed.
+- [ ] Given the user's own pool already routes on the `omniroute` provider, When the integration is healthy, Then the first slot is left exactly as written and no second slot is stacked on that provider.
+- [ ] Given the primary slot is injected, When the pool resolves, Then the number of slots is unchanged and every slot after the first is byte-identical to what the chain produced — nothing is dropped or renumbered, because the replacement creates no extra slot.
+- [ ] Given an `omniroute` slot is injected, When the pool binds its variants, Then it does not warn that the provider is missing, because OmniRoute registers the provider before the pool's config hook runs.
+
 ---
 
 ## Epic C — Hang detection and auto-recovery
@@ -413,6 +424,7 @@ table was filled in.
 | US-5 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/pool-test.mjs`, `tests/pool-models-test.mjs` |
 | US-6 | B | `tests/stories/b-provider-resilience.test.mjs` |
 | US-7 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/pool-models-test.mjs` |
+| US-28 | B | `tests/stories/i-omniroute.test.mjs` |
 | US-8 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs` |
 | US-9 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs`, `tests/pool-shared-test.mjs` |
 | US-10 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs`, `tests/pool-timer-test.mjs` |

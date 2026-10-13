@@ -34,6 +34,12 @@
 //       next start). `false` disables it; `LACODE_NO_SELFUPDATE=1` does the same
 //       from the environment.
 //
+//     omniroute?: object
+//       Optional OmniRoute (local OpenAI-compatible gateway) integration. Absent
+//       or `{ enabled: false }` changes nothing. When `enabled: true`, lacode
+//       health-checks the gateway and registers a `provider.omniroute` entry
+//       pointing at it. See README.md § Configuring OmniRoute for the fields.
+//
 //     reapMs?: number        reaper interval, default 30s
 //     id?: string            process identity for the claim files (tests)
 //     dir?: string           claim directory (tests)
@@ -64,8 +70,9 @@
 // not warned about one by one.
 //
 // Ordering inside the config hook is load-bearing: agents go in FIRST so the pool
-// has variant agents to bind models to, and the pool binds LAST because binding
-// writes into exactly the objects the agent injection just created.
+// has variant agents to bind models to, OmniRoute registers its provider before
+// the pool so the pool can bind a slot to it, and the pool binds LAST because
+// binding writes into exactly the objects the agent injection just created.
 
 import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { applyAgents, buildAgentSet } from "./agents.ts"
@@ -73,11 +80,13 @@ import { applyCommands, applyInstructions } from "./commands.ts"
 import { agentPoolHooks } from "./plugins/agent-pool.ts"
 import { contextAutoUpdateHooks } from "./plugins/context-autoupdate.ts"
 import { notifyHooks } from "./plugins/notify.ts"
+import { omniRouteHooks } from "./plugins/omniroute.ts"
 import { selfUpdateHooks } from "./plugins/selfupdate.ts"
 
 export type LacodeOptions = {
   enabled?: boolean
   models?: unknown
+  omniroute?: unknown
   reapMs?: number
   id?: string
   dir?: string
@@ -118,6 +127,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   const autoupdate = (await settled("context-autoupdate", () => contextAutoUpdateHooks(input, options))) ?? inertHooks
   const notifier = (await settled("notify", () => notifyHooks(input, options))) ?? inertHooks
   const selfupdate = (await settled("self-update", () => selfUpdateHooks(input, options))) ?? inertHooks
+  const omniroute = (await settled("omniroute", () => omniRouteHooks(input, options))) ?? inertHooks
 
   // Order is the whole design: the pool must see variant agents that already
   // exist, and the agent set must exist before the pool writes models into it.
@@ -134,6 +144,12 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       if (applyInstructions(cfg as Record<string, unknown>).added) {
         await log("info", "instructions: added the standing context-map rule (no user instructions were present)")
       }
+      // OmniRoute runs BEFORE the pool: it registers the `omniroute` provider,
+      // and when healthy marks its model as the pool's primary slot. The pool
+      // then sees that provider (so it never warns "not configured") and binds
+      // the variants to the injected slot. OmniRoute touches no agent, so the
+      // pool still binds LAST. It is a no-op when the feature is off.
+      await omniroute.config?.(cfg)
       await pool.config?.(cfg)
     } catch (error) {
       await log("error", `config hook failed: ${String(error)}`)
@@ -161,6 +177,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       await autoupdate.dispose?.()
       await notifier.dispose?.()
       await selfupdate.dispose?.()
+      await omniroute.dispose?.()
     },
   } satisfies Hooks
 }) satisfies Plugin

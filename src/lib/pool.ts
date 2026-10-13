@@ -64,9 +64,37 @@ export const MAX_WEIGHT = 100
 export const MAX_SLOTS = 4
 const COOLDOWN_BASE_MS = 60 * 1000
 const COOLDOWN_MAX_MS = 15 * 60 * 1000
+// A provider quota/limit is not a transient blip: it reopens on the provider's
+// own schedule, so a limit-shaped failure is cooled on a far longer curve than a
+// generic rate-limit guess. Without this a daily quota produced a fresh 60s window
+// every time the previous one lapsed, so the same dead model was re-admitted (and
+// its 6 upstream retries re-burned) all day long. `stated` resets -- "Resets in
+// 35min" -- still win outright, which is the exact "until the quota restores" case.
+export const QUOTA_COOLDOWN_BASE_MS = 15 * 60 * 1000
+export const QUOTA_COOLDOWN_MAX_MS = 6 * 60 * 60 * 1000
 const STRIKE_DECAY_MS = 30 * 60 * 1000
 
+/**
+ * A failure reason that describes a provider quota/allowance rather than a
+ * transient blip. Used to pick the longer cooldown curve; the scraper in
+ * src/plugins/agent-pool.ts supplies reasons like `quota`, `usage-limit`,
+ * `rate-limit`, `too-many-requests`, `overloaded` and `free_tier_limit`.
+ * `hang` (the reaper) and `endpoint-unavailable` are deliberately NOT quota
+ * reasons: neither is the provider saying "you are out of allowance".
+ */
+export const isQuotaReason = (reason: string) => /quota|limit|rate|too-many|overloaded|429/i.test(reason)
+
 export type Slot = { index: number; model: string; weight: number }
+
+/**
+ * A model a caller wants to take the pool's PRIMARY slot -- slot 1, the one the
+ * pool takes first. Carries no `index`: it REPLACES the resolved first slot in
+ * place, inheriting that slot's weight unless one is given. Used by the optional
+ * OmniRoute integration to make a local gateway the first slot without editing
+ * the user's preset or ~/.config/lacode/pool.*, and without changing the number
+ * of slots or displacing any of the others.
+ */
+export type PoolPrimarySlot = { model: string; weight?: number }
 export type Claim = { v: string; k: number; m: string; t: number; s?: string; g?: string }
 export type Strike = { model: string; until: number; strikes: number; reason: string; last: number }
 export type Sibling = { id: string; claims: Claim[] }
@@ -384,6 +412,13 @@ type State = {
   catalog: Map<string, string>
   catalogAt: number
   cooling: Map<string, Strike>
+  /**
+   * Every strike record still inside its decay window, INCLUDING a cooldown whose
+   * `until` has already passed. `cooling` is the active subset the router excludes;
+   * this is the memory that lets a repeat failure escalate instead of restarting at
+   * strike 1. See readLimits.
+   */
+  strikes: Map<string, Strike>
   activity: Map<string, number>
   reaped: number
   reaping: boolean
@@ -393,6 +428,8 @@ type State = {
   modelsFile?: string
   /** Inline `{ slots: [...] }` from plugin options, if the caller passed one. */
   inlineModels?: unknown
+  /** A model a feature wants to take the resolved pool's first slot. */
+  primarySlot: PoolPrimarySlot | null
   origin: string
   slots: Slot[]
 }
@@ -420,6 +457,7 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
       catalog: new Map(),
       catalogAt: 0,
       cooling: new Map(),
+      strikes: new Map(),
       activity: new Map(),
       reaped: 0,
       reaping: false,
@@ -428,6 +466,7 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
       dir,
       modelsFile,
       inlineModels: models,
+      primarySlot: null,
       origin: "unresolved",
       slots: [],
     }
@@ -435,15 +474,79 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
   return g[key]
 }
 
+/**
+ * Put `primary` in the pool's first slot, replacing its model in place.
+ *
+ * Used by the OmniRoute integration to make a local gateway the slot the pool
+ * takes first, so pooled work drains there before the bundled models. It is a
+ * REPLACEMENT, not an insertion: the number of slots is unchanged, the replaced
+ * slot keeps its weight, and every other slot is left exactly as resolved. On
+ * the shipped preset that hands gemini's three concurrent sessions to OmniRoute,
+ * with bunny / step-5 / big-pickle untouched behind it.
+ *
+ * Deliberately conservative:
+ *   * if the pool already routes on the SAME provider, nothing is replaced, so a
+ *     user who chose their own `omniroute/...` slot is not overridden;
+ *   * the base list is never mutated in place; a fresh list is returned;
+ *   * the replaced slot keeps its index, so no variant agent is renamed and none
+ *     routes at a variant that does not exist.
+ */
+export function replacePrimarySlot(base: Slot[], primary: PoolPrimarySlot): { slots: Slot[]; problems: string[] } {
+  const problems: string[] = []
+  const model = typeof primary?.model === "string" ? primary.model.trim() : ""
+  if (!model.includes("/")) {
+    problems.push(`primary slot: model must be written provider/model-id, got "${model}"`)
+    return { slots: base, problems }
+  }
+  const provider = providerOf(model)
+  if (base.some((slot) => providerOf(slot.model) === provider)) {
+    problems.push(`primary slot ${model}: provider ${provider} is already in the pool; the primary slot is skipped`)
+    return { slots: base, problems }
+  }
+  if (base.length === 0) return { slots: [{ index: 1, model, weight: Math.max(1, primary.weight ?? 1) }], problems }
+  let weight = primary.weight
+  if (weight !== undefined && (typeof weight !== "number" || !Number.isFinite(weight) || weight <= 0)) {
+    problems.push(`primary slot ${model}: weight must be a positive number; inheriting the replaced slot's weight`)
+    weight = undefined
+  }
+  // Only slot 0 changes, and it keeps its index; its weight is inherited unless
+  // one was given, so this is "in place of" the old first slot, not a new slot.
+  const slots = base.map((slot, i) => (i === 0 ? { ...slot, model, weight: weight ?? slot.weight } : slot))
+  return { slots, problems }
+}
+
+/**
+ * Register a primary slot, invalidating any list already resolved.
+ *
+ * The pool resolves its slots at factory start (for the cost advisory and the
+ * startup log), but a feature like OmniRoute decides its slot only at config
+ * time, after a health probe. Clearing the cached list is what makes the
+ * replacement real instead of silently ignored: the pool's own config pass
+ * re-resolves and applies it. Callers must run before the pool's `config` hook.
+ */
+export function setPrimarySlot(s: State, primary: PoolPrimarySlot): void {
+  s.primarySlot = primary
+  if (s.slots.length > 0) s.slots = []
+}
+
 // Read once per process, on first use: plugins are not hot-reloaded, so editing
 // the preset means restarting opencode anyway.
 export function ensureSlots(s: State, onWarn: (m: string) => void) {
   if (s.slots.length > 0) return s.slots
   const { slots, problems, origin } = resolveModels({ models: s.inlineModels, modelsFile: s.modelsFile })
-  s.slots = slots
+  let resolved = slots
+  // Only replace when a caller asked for a primary slot: otherwise the resolved
+  // list (including the FALLBACK_SLOTS array identity some callers compare
+  // against) is left exactly as resolveModels returned it.
+  if (s.primarySlot !== null) {
+    const replaced = replacePrimarySlot(slots, s.primarySlot)
+    resolved = replaced.slots
+    problems.push(...replaced.problems)
+  }
+  s.slots = resolved
   s.origin = origin
   for (const problem of problems) onWarn(problem)
-  return slots
+  return resolved
 }
 
 export const claimKey = (sessionID: string, callID: string) => `${sessionID}:${callID}`
@@ -481,6 +584,16 @@ export function publish(s: State) {
   }
 }
 
+/** Signal-0 liveness probe: true if `pid` is running. EPERM means alive but not ours. */
+const isPidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
 export function readSiblings(s: State): Sibling[] {
   const siblings: Sibling[] = []
   let entries: string[]
@@ -508,6 +621,14 @@ export function readSiblings(s: State): Sibling[] {
       try { unlinkSync(path) } catch {}
       continue
     }
+    // A claim file whose owning process is gone holds no work, so it must not
+    // count as load. Reclaim it immediately rather than waiting out DEAD_FILE_MS:
+    // that window left a crashed process's slots looking busy -- and therefore
+    // unavailable -- for up to 20 minutes after it died.
+    if (/^\d+$/.test(match[1]) && !isPidAlive(Number(match[1]))) {
+      try { unlinkSync(path) } catch {}
+      continue
+    }
     try {
       const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, Claim>
       const claims = Object.values(parsed).filter(
@@ -523,10 +644,13 @@ export function readSiblings(s: State): Sibling[] {
 
 export function readLimits(s: State): Map<string, Strike> {
   const cooling = new Map<string, Strike>()
+  const memory = new Map<string, Strike>()
   let entries: string[]
   try {
     entries = readdirSync(s.dir)
   } catch {
+    s.cooling = cooling
+    s.strikes = memory
     return cooling
   }
   const now = Date.now()
@@ -536,24 +660,42 @@ export function readLimits(s: State): Map<string, Strike> {
     try {
       const strike = JSON.parse(readFileSync(path, "utf8")) as Strike
       if (typeof strike.until !== "number" || typeof strike.model !== "string") continue
-      if (strike.until > now) cooling.set(strike.model, strike)
-      else unlinkSync(path)
+      if (strike.until > now) {
+        cooling.set(strike.model, strike)
+        memory.set(strike.model, strike)
+      } else if (typeof strike.last === "number" && now - strike.last < STRIKE_DECAY_MS) {
+        // Lapsed, but recent enough that a new failure is still the same streak.
+        // Keep the record -- strikes intact -- so the NEXT failure escalates
+        // instead of restarting at strike 1. Only its absence from `cooling`
+        // re-admits the model; deleting the file here (the old behaviour) threw
+        // the strike count away and reset the backoff on every lapse.
+        memory.set(strike.model, strike)
+      } else {
+        unlinkSync(path)
+      }
     } catch {
       try { unlinkSync(path) } catch {}
     }
   }
   s.cooling = cooling
+  s.strikes = memory
   return cooling
 }
 
 export function recordStrike(s: State, model: string, reason: string, stated?: number) {
   if (!s.dirReady) return
   const now = Date.now()
-  const prior = s.cooling.get(model)
+  // Read the prior count from the whole memory map, not from `cooling`: a lapsed
+  // cooldown is no longer cooling but its strike streak still counts (readLimits).
+  const prior = s.strikes.get(model)
   const strikes = prior && now - prior.last < STRIKE_DECAY_MS ? prior.strikes + 1 : 1
-  const backoff = Math.min(COOLDOWN_MAX_MS, COOLDOWN_BASE_MS * 2 ** (strikes - 1))
+  const quota = isQuotaReason(reason)
+  const base = quota ? QUOTA_COOLDOWN_BASE_MS : COOLDOWN_BASE_MS
+  const cap = quota ? QUOTA_COOLDOWN_MAX_MS : COOLDOWN_MAX_MS
+  const backoff = Math.min(cap, base * 2 ** (strikes - 1))
   const strike: Strike = { model, until: now + (stated ?? backoff), strikes, reason, last: now }
   s.cooling.set(model, strike)
+  s.strikes.set(model, strike)
   const path = join(s.dir, limitFile(model))
   try {
     writeFileSync(`${path}.tmp`, JSON.stringify(strike))
@@ -580,6 +722,7 @@ export function coolUnavailable(s: State, model: string) {
   if (prior && prior.until > until) return prior
   const strike: Strike = { model, until, strikes: 1, reason: "endpoint-unavailable", last: now }
   s.cooling.set(model, strike)
+  s.strikes.set(model, strike)
   const path = join(s.dir, limitFile(model))
   try {
     writeFileSync(`${path}.tmp`, JSON.stringify(strike))

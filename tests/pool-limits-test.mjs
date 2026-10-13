@@ -175,17 +175,33 @@ const dirB = scratch()
   assert(!picks.includes(variantOf(slot)), `peer must avoid the cooled model, got ${picks.join(",")}`)
 }
 
-// 8. expired cooldown files are pruned, not honoured forever
+// 8. a lapsed cooldown stops cooling the model, but its STRIKE MEMORY survives
+//    the decay window so the NEXT failure escalates instead of restarting at
+//    strike 1. A fully decayed record is pruned.
 {
   const dir = scratch()
   const i = await mk("p8", dir)
   await i.limitEvent(heaviest().provider, heaviest().modelID, rateError("Rate limit exceeded"))
   assert(readdirSync(dir).some((f) => f.startsWith("limit.")), "a cooldown file should be written")
-  const realNow = Date.now
-  Date.now = () => realNow() + 16 * 60 * 1000
+  const hasLimit = () => readdirSync(dir).some((f) => f.startsWith("limit."))
+  const advance = (ms) => {
+    const real = Date.now
+    Date.now = () => real() + ms
+    return () => { Date.now = real }
+  }
+
+  // Lapsed but inside the 30-minute decay window: no longer cooling, record kept.
+  let restore = advance(16 * 60 * 1000)
+  const afterLapse = await i.status()
+  restore()
+  assert(!/COOLING/.test(afterLapse), "a lapsed cooldown must stop cooling its model")
+  assert(hasLimit(), "a lapsed-but-recent cooldown must be KEPT as strike memory")
+
+  // Fully decayed: now it is pruned.
+  restore = advance(31 * 60 * 1000)
   await i.status()
-  Date.now = realNow
-  assert(!readdirSync(dir).some((f) => f.startsWith("limit.")), "a lapsed cooldown file should be pruned on read")
+  restore()
+  assert(!hasLimit(), "a fully decayed strike record should be pruned on read")
 }
 
 // 9. routing still works when every model is cooling (must not refuse to route)
@@ -223,6 +239,83 @@ const dirB = scratch()
   assert(/endpoint-unavailable/i.test(await l.status()), `the reason must name the outage, got: ${await l.status()}`)
   assert(first <= 90, `the outage cooldown must stay short, got ${first}s`)
   assert(second <= first + 1, `a transient outage must NOT escalate (got ${first}s then ${second}s)`)
+}
+
+// 12. a quota/limit failure is cooled on a LONG window (not the 60s rate-limit
+//     guess), and a repeat failure ESCALATES instead of restarting at strike 1
+//     because the strike survives the first cooldown lapsing.
+{
+  const m = await mk("p12", scratch())
+  const slot = heaviest()
+  const line = async () => {
+    const text = await m.status()
+    return {
+      secs: Number(new RegExp(`${escape(slot.modelID)} for (\\d+)s`).exec(text)?.[1]),
+      strike: Number(/strike (\d+)/.exec(text)?.[1]),
+    }
+  }
+  await m.limitEvent(slot.provider, slot.modelID, rateError("You exceeded your current quota for this model"))
+  const first = await line()
+  assert(first.secs >= 15 * 60, `a quota strike must cool for at least 15m, got ${first.secs}s`)
+  assert(first.strike === 1, `the first quota failure is strike 1, got ${first.strike}`)
+
+  const restore = (() => {
+    const real = Date.now
+    Date.now = () => real() + (first.secs + 5) * 1000
+    return () => { Date.now = real }
+  })()
+  await m.limitEvent(slot.provider, slot.modelID, rateError("You exceeded your current quota for this model"))
+  restore()
+  const second = await line()
+  assert(second.strike === 2, `a repeat quota failure must escalate to strike 2, got ${second.strike}`)
+  assert(second.secs > first.secs, `the escalated cooldown must be longer (got ${first.secs}s then ${second.secs}s)`)
+}
+
+// 13. dispose() releases this process's claims from the shared file, so a dead
+//     process never keeps a slot looking busy for its peers.
+{
+  const dir = scratch()
+  const n = await mk("p13", dir)
+  await n.spawn("n1")
+  const file = join(dir, "claims.p13.json")
+  assert(readFileSync(file, "utf8") !== "{}", "a spawn must publish a claim")
+  await n.hooks.dispose()
+  assert(readFileSync(file, "utf8") === "{}", `dispose must release the claims, got ${readFileSync(file, "utf8")}`)
+}
+
+// 14. a claim file left behind by a DEAD process is reclaimed at once, rather
+//     than counting as load until the age-based window lapses.
+{
+  const dir = scratch()
+  const ghost = join(dir, "claims.2147483646.json")
+  writeFileSync(ghost, JSON.stringify({
+    "ghost:call": { v: "explore", k: 1, m: SLOT_MODELS[0], t: Date.now(), s: "ghost", g: "ghost" },
+  }))
+  const o = await mk("p14", dir)
+  const status = await o.status()
+  assert(!/2147483646/.test(status), `a dead process's claims must not be listed, got:\n${status}`)
+  assert(!existsSync(ghost), "a dead process's claim file must be reclaimed")
+}
+
+// 15. reaping a stuck claim must NOT re-strike a model that is already cooling.
+//     A usage limit HANGS, so the model that wedged the task is usually the one
+//     already benched; re-striking it relabelled the reason as "hang" and
+//     inflated the strike count.
+{
+  const r = await mk("p15", scratch())
+  const slot = heaviest()
+  await r.spawn("r1")
+  await r.limitEvent(slot.provider, slot.modelID, rateError("You exceeded your current quota"))
+  const before = Number(/strike (\d+)/.exec(await r.status())?.[1])
+
+  const real = Date.now
+  Date.now = () => real() + 6 * 60 * 1000
+  await r.spawn("r2") // triggers a reaper sweep on the now-aged claim
+  const after = await r.status()
+  Date.now = real
+  assert(new RegExp(`${escape(slot.modelID)} for (\\d+)s`).test(after), "the model must stay cooled across the reap")
+  assert(!/\(hang/.test(after), `an already-cooling model must not be relabelled as a hang, got: ${after}`)
+  assert(Number(/strike (\d+)/.exec(after)?.[1]) === before, "reaping must not inflate the strike count")
 }
 
 globalThis.fetch = realFetch

@@ -117,9 +117,15 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
           `hung ${claim.v} on ${claim.m} after ${Math.round((Date.now() - claim.t) / 1000)}s with ${Math.round(pool.idleFor(s, claim, Date.now()) / 1000)}s of silence; ${killed ? `aborted session ${claim.g}` : "no session to abort"}`,
           { base: claim.v, model: claim.m, slot: claim.k, session: claim.g, aborted: killed },
         )
-        const prior = s.cooling.get(claim.m)
         const now = Date.now()
-        const strike = pool.recordStrike(s, claim.m, "hang", prior && prior.until > now ? prior.until - now : HANG_FALLBACK_MS)
+        const prior = s.cooling.get(claim.m)
+        // A usage limit HANGS rather than errors, so the model that wedged this task
+        // is very often already cooling for that very limit. Re-striking it here only
+        // relabelled a provider quota window as a "hang" and inflated its strike
+        // count. Freeing the claim is the reaper's whole job; leave an active
+        // cooldown exactly as it was.
+        if (prior && prior.until > now) continue
+        const strike = pool.recordStrike(s, claim.m, "hang", HANG_FALLBACK_MS)
         if (strike) await log("warn", `cooling ${claim.m} for ${Math.round((strike.until - now) / 1000)}s (hang)`)
       }
     } catch (error) {
@@ -391,6 +397,11 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
     dispose: async () => {
       clearInterval(timer)
       s.own.clear()
+      // Publish the empty set so this process's claims stop counting as load for
+      // every sibling the moment it exits. Clearing memory alone left the claims
+      // in `claims.<id>.json`, so a dead process's "locks" outlived it until the
+      // TTL -- the pool reported slots as busy that nobody was using.
+      pool.publish(s)
     },
   }
 })

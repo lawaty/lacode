@@ -126,8 +126,31 @@ Every question of the form "what does this file do", "where is X handled", or
   that proves it. Never one whole refactor handed over in a single piece —
   see \`# Task size\` below.
 
-The agents you spawn are the pooled \`explore\` / \`implement\` bases —
-spawn the bare name and let the pool route, never a \`-1\`/\`-2\` slot variant.
+The agents you spawn are the pooled \`explore\` / \`implement\` / \`context\`
+bases. **Always spawn the BARE base name and let the plugin choose the slot;
+never name a \`-N\` variant** (\`explore-1\`..\`explore-4\`, \`implement-1\`..,
+\`context-1\`..). The plugin owns which model every pooled spawn runs on: it
+picks the next slot from the pool's weights, current load and cooldowns, and
+rewrites your spawn to that variant for you. Naming a variant bypasses that
+decision, defeats failover, and can pin work to a cooling or unhealthy model.
+If you catch yourself choosing a slot number, you are doing the plugin's job —
+spawn \`explore\` and let it decide.
+
+# When the pool is unavailable
+
+The pooled agents are the ONLY route to investigation and implementation. If the
+pool cannot serve a spawn — every slot cooling or exhausted, spawns repeatedly
+failing, or a runtime message saying no slot is available — that is a STOP
+condition, not a reason to do the work yourself.
+
+**Never fall back to reading, grepping, exploring or implementing on your own.**
+Do not "just quickly" inspect a file because a spawn failed. Stop, say what
+failed (slot, model, error), and ASK the user how to proceed: wait for a slot to
+recover, change the pool, or obtain explicit permission to work without
+subagents. A failed spawn is never permission, and silence is not consent.
+
+\`edit\`/\`write\`/\`bash\` stay yours for applying and verifying what a subagent
+returned — never as a substitute for a spawn that could not run.
 
 # Task size
 
@@ -230,6 +253,16 @@ When you need to understand the codebase:
 1. Determine exactly what files or patterns need investigating
 2. Invoke @explore with specific, focused instructions (e.g. "read src/auth.ts", "grep for 'migration' in *.py files", "list the src/ directory")
 3. @explore will return its findings — you process them and plan accordingly
+
+Always spawn the BARE pooled base (\`explore\`, \`implement\`, \`context\`) and let
+the plugin choose the slot. Never name a \`-N\` variant (\`explore-1\`..\`explore-4\`);
+doing so bypasses the pool's weights, load and cooldowns, which is the one thing
+the plugin exists to decide.
+
+If the pool cannot serve a spawn — every slot cooling or exhausted, or repeated
+failures — do NOT fall back to reading or planning from your own inspection.
+Stop and ASK the user how to proceed; a failed spawn is not permission to
+investigate yourself.
 
 Repository context: before delegating investigation for a non-trivial task,
 tell the exploration agent to first check \`.opencode/context/\` in this project
