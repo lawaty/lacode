@@ -188,3 +188,73 @@ test("[US-28] registering the provider first means a pool slot naming it is not 
     cleanupAll()
   }
 })
+
+// The whole setup story, as a user actually writes it: one block, one key, no
+// hand-picked model list. `models: []` is a hard allowlist of nothing, so the
+// combo is the only thing the gateway exposes.
+test("[US-28] the trivial client recipe exposes the combo alone and writes the pool nothing", async () => {
+  const gw = gateway(["model-a", "model-b"])
+  const stub = stubInput()
+  try {
+    const hooks = await boot(stub, {
+      omniroute: { enabled: true, apiKey: "test-key", combo: "auto", models: [] },
+    })
+    const cfg = emptyConfig()
+    await hooks.config(cfg)
+
+    assert.deepEqual(Object.keys(cfg.provider.omniroute.models), ["auto"])
+    assert.equal(cfg.provider.omniroute.models.auto.name, "auto")
+
+    // Registering a provider IS the whole feature: the pool's own slot list is
+    // untouched, so a user who wants pooled work on the gateway says so by
+    // listing omniroute/auto in it themselves.
+    assert.deepEqual(poolModels(cfg), presetModels())
+    await hooks.dispose?.()
+  } finally {
+    gw.restore()
+    cleanupAll()
+  }
+})
+
+// US-28 criterion 5, the positive half: the gateway is DOWN and the user has
+// already listed omniroute/auto as slot 1. The decided behaviour is warning-only
+// -- the slot is kept exactly as the user wrote it, so nothing here silently
+// re-routes the pool behind their back.
+test("[US-28] a down gateway with an omniroute slot warns once, keeps the slot bound and leaves the others alone", async () => {
+  const gw = gateway([], { fail: true })
+  const stub = stubInput()
+  try {
+    const hooks = await boot(stub, {
+      omniroute: { enabled: true, combo: "auto" },
+      models: {
+        slots: [
+          { model: "omniroute/auto", weight: 3 },
+          { model: "opencode/space-bunny-free", weight: 2 },
+        ],
+      },
+    })
+    const cfg = emptyConfig()
+    await hooks.config(cfg)
+
+    const UNCONFIGURED =
+      "provider omniroute is not configured in opencode.jsonc; slot 1 (omniroute/auto) cannot resolve"
+    // Exact line, exactly once: the gateway being down must not turn into a
+    // warning per config hook.
+    assert.equal(
+      stub.text().filter((line) => line === `warn ${UNCONFIGURED}`).length,
+      1,
+      "the unreachable gateway is warned about once, naming the slot it costs",
+    )
+
+    // Nothing is registered, so the pool sees the provider missing...
+    assert.equal(cfg.provider.omniroute, undefined)
+    // ...but the slot the user chose is still bound to it.
+    assert.equal(cfg.agent["explore-1"].model, "omniroute/auto")
+    // Every other slot keeps working exactly as written.
+    assert.equal(cfg.agent["explore-2"].model, "opencode/space-bunny-free")
+    await hooks.dispose?.()
+  } finally {
+    gw.restore()
+    cleanupAll()
+  }
+})

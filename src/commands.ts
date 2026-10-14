@@ -5,8 +5,10 @@
 // node_modules directory the package does not control, and `$ARGUMENTS` is
 // substituted by opencode, not by us.
 //
-// All three delegate to `context`, which is a pooled agent: spawning it
-// borrows a slot and the pool's own load balancing applies.
+// The context commands delegate to `context`, a pooled agent: spawning it
+// borrows a slot and the pool's own load balancing applies. `/lacode-doctor`
+// deliberately does not — it diagnoses the pool and the gateway, so it runs in
+// the caller's own agent instead of spending one of the slots under test.
 //
 // ---------------------------------------------------------------------------
 // MERGE-WITHOUT-CLOBBER (US-16)
@@ -97,6 +99,38 @@ Audit the five context files for:
 
 Fix what you find in \`.opencode/context/\` only, then report: findings, fixes,
 and anything you could not verify.`,
+  },
+
+  "lacode-doctor": {
+    description:
+      "Check the LaCode setup — pool slots, model resolution, and the OmniRoute gateway. Report only; changes nothing.",
+    template: `Diagnose this machine's LaCode setup. Report only; change nothing.
+
+Print one PASS/FAIL line per check below, with the exact fix for any FAIL.
+
+1. Pool status — call the \`pool_status\` tool. Report the slot list, each
+   slot's load against its weight ceiling, and which models are cooling.
+
+2. OmniRoute configured — inspect the \`@lawaty/lacode\` plugin options in the
+   user's opencode config for an \`omniroute\` block with \`enabled: true\`. If it
+   is absent or disabled, print the two OmniRoute checks below as "not
+   configured" and stop after the pool section.
+
+3. Gateway reachable — when omniroute is configured, request its model list
+   (\`GET <baseURL>/v1/models\`, default baseURL \`http://localhost:20128/v1\`)
+   and report reachable or not. On failure, say plainly: start OmniRoute BEFORE
+   opencode, then restart opencode — provider registration is per-run. To make
+   that durable, run \`omniroute autostart enable\` (OmniRoute's own autostart;
+   LaCode never starts the gateway itself).
+
+4. Slots resolve — for every pool slot whose provider is \`omniroute\`, confirm
+   the model id is one the gateway advertises AND is registered. The known
+   trap: an id that is a valid gateway route but is NOT in the plugin's
+   \`omniroute.models\` allowlist fails with
+   \`ProviderModelNotFoundError: Model not found\`; the fix is to add that id to
+   the \`models\` array, or use the always-registered \`auto\`.
+
+Change nothing. Print a final one-line summary of failures.`,
   },
 }
 

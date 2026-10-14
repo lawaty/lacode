@@ -747,6 +747,22 @@ test("[US-22] each command names the procedure it delegates and nothing is left 
   assert.match(COMMANDS["context-review"].template, /\.opencode\/context\//, "a review must name where its fixes are allowed")
 })
 
+test("[US-22] /lacode-doctor runs in the caller's agent rather than borrowing a pool slot", () => {
+  // The doctor's whole subject is the pool and the gateway, so it can neither
+  // delegate to a pooled agent nor spawn a subtask: either would route through
+  // the very thing that may be broken, and a FAIL would look like a success.
+  const def = COMMANDS["lacode-doctor"]
+  assert.ok(def, "/lacode-doctor must be injected")
+  assert.equal(def.agent, undefined, "/lacode-doctor must not target another agent")
+  assert.equal(def.subtask, undefined, "/lacode-doctor must not spawn a subagent")
+
+  const template = def.template
+  assert.match(template, /pool_status/, "the doctor must call pool_status")
+  assert.match(template, /omniroute\.models/, "the doctor must name the allowlist a slot's model has to be in")
+  assert.match(template, /ProviderModelNotFoundError/, "the doctor must name the error an unlisted model fails with")
+  assert.match(template, /report only/i, "the doctor must say it changes nothing")
+})
+
 test("[US-22] a user-defined context command is left byte-identical while the other two are still added", async () => {
   const mine = { template: "MY OWN REVIEW", description: "mine", agent: "build" }
   const stub = stubInput()

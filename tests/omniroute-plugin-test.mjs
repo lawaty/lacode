@@ -125,6 +125,66 @@ test("the combo leads the exposed models even when the allowlist is narrower", a
   assert.deepEqual(Object.keys(cfg.provider.omniroute.models), ["static-best-free", "a"])
 })
 
+test("the client recipe -- a combo with an empty allowlist -- exposes that combo and nothing else", async () => {
+  // `models: []` is a HARD allowlist, not "no allowlist", so everything the
+  // gateway advertises is filtered out and only the combo survives. This is the
+  // literal recipe a user copies when they want the gateway to pick: one entry
+  // in the picker, and the gateway's catalogue stays the gateway's business
+  // instead of being published into opencode's model list by accident.
+  const { config } = await boot({ enabled: true, combo: "auto", models: [] }, gateway(["model-a", "model-b", "model-c"]))
+  const cfg = {}
+  await config(cfg)
+
+  assert.deepEqual(Object.keys(cfg.provider.omniroute.models), ["auto"], "three advertised models, one exposed")
+  assert.deepEqual(cfg.provider.omniroute.models.auto, { name: "auto" }, "opencode's contract is `{ <id>: { name } }`")
+})
+
+test("the registered provider is exactly this object: no timeout, no whitelist, no blank key", async () => {
+  // The WHOLE provider is pinned, not a field or two of it. Every key here is
+  // one a refactor can add by accident, and each addition changes what opencode
+  // does with the block. `timeout` in particular was written to `options` until
+  // it was deliberately removed -- an @ai-sdk/openai-compatible provider never
+  // reads that key, so it was decoration that read like a promise. Only a
+  // comparison of the entire object keeps it removed.
+  const { config } = await boot({ enabled: true, combo: "auto", models: [] }, gateway(["model-a"]))
+  const cfg = {}
+  await config(cfg)
+
+  const provider = cfg.provider.omniroute
+  assert.deepEqual(provider, {
+    name: "OmniRoute",
+    npm: "@ai-sdk/openai-compatible",
+    options: { baseURL: omni.DEFAULT_BASE_URL },
+    models: { auto: { name: "auto" } },
+  })
+
+  // Named separately from the deepEqual above: the whole-object diff already
+  // fails on any of these, and these say WHICH rule broke when it does.
+  assert.equal("apiKey" in provider.options, false, "keyless is an absent key, never an empty bearer")
+  assert.equal("timeout" in provider.options, false, "the removed timeout must stay removed")
+  assert.equal("whitelist" in provider, false, "lacode is not the author of this provider's model list")
+})
+
+test("with a key the provider gains options.apiKey, and still no options.timeout", async () => {
+  // The keyed shape is the same block plus one option. Written separately from
+  // the keyless case because the two can drift apart: the key is added
+  // conditionally, and a refactor that reached for the removed `timeout` while
+  // doing it would only ever show up here.
+  const KEY = "shape-key-regression-603"
+  const { config, logs } = await boot({ enabled: true, apiKey: KEY, combo: "auto", models: [] }, gateway(["model-a"]))
+  const cfg = {}
+  await config(cfg)
+
+  const options = cfg.provider.omniroute.options
+  assert.equal(options.apiKey, KEY)
+  assert.deepEqual(options, { baseURL: omni.DEFAULT_BASE_URL, apiKey: KEY }, "one option added, none removed")
+  assert.equal("timeout" in options, false, "adding a key must not bring the removed timeout back")
+
+  for (const line of logs) {
+    assert(!line.includes(KEY), `log leaked the key: ${line}`)
+  }
+})
+
 test("the env key beats the config key, lands in options, and never in a log line", async () => {
   const CFG_KEY = "cfg-key-regression-601"
   const ENV_KEY = "env-key-regression-602"
@@ -144,6 +204,57 @@ test("the env key beats the config key, lands in options, and never in a log lin
     assert(!line.includes(ENV_KEY), `log leaked the env key: ${line}`)
     assert(!line.includes(CFG_KEY), `log leaked the config key: ${line}`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// The probe: memoised as a promise, so N config calls cost ONE boot
+// ---------------------------------------------------------------------------
+
+test("two config calls share one probe: the gateway is asked exactly twice", async () => {
+  // opencode runs the config hook more than once per process, and every call
+  // must be free after the first. Two requests in TOTAL for the whole factory
+  // run: one for the health probe (checkHealth reads the gateway directly, it
+  // does not go through the model cache) and one for the model list that fills
+  // that cache. A probe per hook would be a request nobody asked for every time
+  // the user opens a config.
+  const gate = gateway(["model-a"])
+  const { config, calls } = await boot({ enabled: true, models: ["model-a"] }, gate)
+
+  const first = {}
+  const second = {}
+  await config(first)
+  await config(second)
+
+  assert.equal(calls.length, 2, "one health probe + one model-list fetch, and no second boot")
+  assert.deepEqual(Object.keys(first.provider.omniroute.models), ["model-a"])
+  assert.deepEqual(Object.keys(second.provider.omniroute.models), ["model-a"])
+  // Two SEPARATE config objects on purpose. The same object twice would take the
+  // merge-without-clobber branch on the second call -- the first already wrote
+  // provider.omniroute -- and pass for the wrong reason; that branch has its own
+  // test above. A fresh object per call is what makes the second registration a
+  // real one rather than a short-circuit.
+})
+
+test("an unhealthy gateway stays fallen back on every config call, and warns once", async () => {
+  // The fallback is sticky for the rest of the run: a settled probe is cached,
+  // so the second call does not re-probe a gateway that was already found down.
+  // That is also the reason the probe is memoised as a PROMISE and not behind a
+  // boolean -- a boolean would let the second caller fall through while
+  // `disabled` was still false, and register a provider built from a candidate
+  // list nobody has fetched.
+  const gate = down()
+  const { config, calls, warns } = await boot({ enabled: true, models: ["model-a"] }, gate)
+
+  const first = {}
+  const second = {}
+  await config(first)
+  await config(second)
+
+  assert.equal(calls.length, 1, "the health probe failed, so the model list is never fetched at all")
+  assert.equal(first.provider, undefined, "a failed probe registers nothing, on the first call or any later one")
+  assert.equal(second.provider, undefined)
+  assert.equal(warns().length, 1, "the memoised probe settles once and warnOnce collapses the repeat")
+  assert.match(warns()[0], /health check failed/)
 })
 
 // ---------------------------------------------------------------------------

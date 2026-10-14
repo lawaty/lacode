@@ -118,7 +118,7 @@ export const omniRouteHooks = async (
       })
       if (!healthy) {
         disabled = true
-        await warnOnce(`omniroute health check failed at ${config.baseURL}; falling back to lacode's normal behaviour for this run`)
+        await warnOnce(`omniroute health check failed at ${config.baseURL}; falling back to lacode's normal behaviour for this run; pool slots naming omniroute/<id> will fail until the gateway is up`)
         return
       }
     }
@@ -200,7 +200,6 @@ export const omniRouteHooks = async (
         // Absent rather than blank: an empty bearer on a keyless gateway is a
         // 401 that looks like a configuration error.
         ...(config.apiKey ? { apiKey: config.apiKey } : {}),
-        timeout: config.timeoutMs,
       },
       models,
     }

@@ -294,6 +294,23 @@ for (let i = 1; i <= shipped.slots.length; i++) {
   assert(parsed.slots.every((s, i) => s.index === i + 1), "indices are array position")
 }
 
+// ...and omniroute gateway ids survive that parse: everything after the FIRST slash is
+// the model id, so omniroute's own prefix is never mistaken for a provider. A plain
+// gateway id ("auto") and a vendor-prefixed live id ("openrouter/google/...") split
+// the same way, and the weight still comes from the line.
+{
+  const parsed = pool.parseTextSlots("omniroute/auto 3\nomniroute/openrouter/google/gemini-4-argon 2\n", "omniroute.txt")
+  assert(parsed.slots.length === 2, `omniroute file: expected 2 slots, got ${parsed.slots.length}`)
+  const auto = pool.splitModel(parsed.slots[0].model)
+  assert(auto.provider === "omniroute" && auto.id === "auto", `omniroute/auto must split to provider omniroute, id auto, got ${JSON.stringify(auto)}`)
+  assert(parsed.slots[0].weight === 3, `omniroute/auto must carry weight 3, got ${parsed.slots[0].weight}`)
+  const live = pool.splitModel(parsed.slots[1].model)
+  assert(
+    live.provider === "omniroute" && live.id === "openrouter/google/gemini-4-argon",
+    `a multi-segment id must split on the FIRST slash only, got ${JSON.stringify(live)}`,
+  )
+}
+
 // ...and any slot file the loader reads accepts flat OR JSON (auto-detected by a leading "{")
 {
   const flat = file("flat-pool.txt", "opencode-go/a 2\nopencode/b\n")

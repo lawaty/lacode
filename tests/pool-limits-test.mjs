@@ -17,7 +17,8 @@ const cfg = shippedConfig()
 // limit event needs are split from it, so swapping a model is not a test edit.
 // Slots are also looked up by weight, since the tests care about "a heaviest slot"
 // and "a lightest slot", not about which number either happens to be.
-const { splitModel } = await import(join(HERE, "..", "src", "lib", "pool.ts"))
+const pool = await import(join(HERE, "..", "src", "lib", "pool.ts"))
+const { splitModel } = pool
 const SLOTS = JSON.parse(readFileSync(join(HERE, "..", "presets", "free-tier.json"), "utf8")).slots.map((s, i) => {
   const { provider, id: modelID } = splitModel(s.model)
   return { model: s.model, provider, modelID, weight: s.weight, index: i + 1 }
@@ -213,13 +214,32 @@ const dirB = scratch()
   assert(/^explore-[1-4]$/.test(pick), `must still route when all models cool, got ${pick}`)
 }
 
-// 10. catalog status gates retired models (simulated by seeding serverUrl-less state)
+// 10. catalog status gates retired models: a non-active/non-unknown status removes a
+//     slot from routing, and pool_status surfaces the gate. The plugin's state is the
+//     process-wide singleton keyed by id + dir + modelsFile, so seeding its catalog is
+//     exactly what an /api/model answer would have done.
 {
-  const k = await mk("p10", scratch())
+  const dir = scratch()
+  const k = await mk("p10", dir)
+  // the lightest slots are still listed whatever their status
   for (const slot of SLOTS.filter((s) => s.weight === MIN_WEIGHT)) {
     assert(new RegExp(`slot ${slot.index}\\b`).test(await k.status()), `lightest slot ${slot.index} must be listed in status`)
   }
   assert(existsSync(PLUGIN), "plugin file must exist")
+
+  const target = heaviest()
+  const state = pool.state({ id: "p10", dir, modelsFile: PRESET })
+  state.catalog.set(target.model, "deprecated")
+  const status = await k.status()
+  assert(/catalog:deprecated/.test(status), `status must surface a retired model, got:\n${status}`)
+  assert(new RegExp(`slot ${target.index}\\b`).test(status), `the retired slot must still be listed, got:\n${status}`)
+  // routing skips the retired heaviest slot and lands on the heaviest remaining one
+  const pick = await k.spawn("c1")
+  const picked = SLOTS[Number(/-(\d+)$/.exec(pick)[1]) - 1]
+  assert(picked.model !== target.model, `routing must skip a retired slot, got ${pick}`)
+  const remaining = SLOTS.filter((s) => s.model !== target.model)
+  const topRemaining = Math.max(...remaining.map((s) => s.weight))
+  assert(picked.weight === topRemaining, `the next spawn must take the heaviest remaining slot (weight ${topRemaining}), got ${pick}`)
 }
 
 // 11. a transient upstream outage ("Endpoint is unavailable") gets a SHORT, FLAT

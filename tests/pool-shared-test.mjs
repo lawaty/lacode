@@ -190,6 +190,100 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
   assert(/COOLING/.test(await t.status()), "status should report the cooling model")
 }
 
+// 7. isAvailable: the catalog gates a model ONLY when it reports a retirement
+//    (any status other than active/unknown); an absent entry is the normal state
+//    while no /api/model answer has arrived and must not gate anything. A live
+//    cooldown always wins, in both directions.
+{
+  const state = pool.state({ id: "avail", dir: scratch(), modelsFile: PRESET })
+  pool.init(state, () => {})
+  const none = new Map()
+  const absent = "omniroute/not-in-catalog"
+  assert(pool.isAvailable(state, absent, none) === true, "a model absent from the catalog must be available")
+  const matrix = [
+    ["openrouter/status-active", "active", true],
+    ["openrouter/status-unknown", "unknown", true],
+    ["openrouter/status-deprecated", "deprecated", false],
+    ["openrouter/status-disabled", "disabled", false],
+  ]
+  for (const [model, status, want] of matrix) {
+    state.catalog.set(model, status)
+    assert(
+      pool.isAvailable(state, model, none) === want,
+      `catalog status "${status}" must make the model ${want ? "available" : "unavailable"}`,
+    )
+  }
+  // cooling beats the catalog: an active (and an absent) model is unavailable while
+  // its cooldown is live.
+  const cooledActive = "openrouter/cooled-active"
+  state.catalog.set(cooledActive, "active")
+  pool.recordStrike(state, cooledActive, "rate-limit", 60_000)
+  assert(pool.isAvailable(state, cooledActive, state.cooling) === false, "a cooling model must be unavailable even with catalog status active")
+  const cooledAbsent = "omniroute/cooled-absent"
+  pool.recordStrike(state, cooledAbsent, "rate-limit", 60_000)
+  assert(pool.isAvailable(state, cooledAbsent, state.cooling) === false, "a cooling model must be unavailable even when the catalog is silent")
+}
+
+// 8. pickSlot: a catalog-gated slot leaves the candidate set, so the next-heaviest
+//    available slot takes the spawn by weight. When EVERY slot is gated the pool
+//    still returns one -- it never refuses work (src/lib/pool.ts:709-714): the usable
+//    set is empty, so the full slot list is used and the heaviest declared slot wins.
+{
+  const state = pool.state({
+    id: "gate",
+    dir: scratch(),
+    models: {
+      slots: [
+        { model: "fixture/gate-a", weight: 4 },
+        { model: "fixture/gate-b", weight: 2 },
+        { model: "fixture/gate-c", weight: 1 },
+      ],
+    },
+  })
+  pool.init(state, () => {})
+  const idle = pool.pickSlot(state, pool.snapshot(state))
+  assert(idle.model === "fixture/gate-a", `an idle pool must pick the heaviest declared slot, got ${idle.model}`)
+  // retire the heaviest: the weight-2 slot is the next heaviest available
+  state.catalog.set("fixture/gate-a", "deprecated")
+  const gated = pool.pickSlot(state, pool.snapshot(state))
+  assert(gated.model === "fixture/gate-b", `a gated heaviest slot must fall through to the next heaviest, got ${gated.model}`)
+  // every slot retired: no usable slot, so the full list is the pool and -- every
+  // slot being under its ceiling -- the heaviest declared slot (index 1) is returned.
+  state.catalog.set("fixture/gate-b", "deprecated")
+  state.catalog.set("fixture/gate-c", "disabled")
+  const fallback = pool.pickSlot(state, pool.snapshot(state))
+  assert(
+    fallback.model === "fixture/gate-a" && fallback.index === 1,
+    `when every slot is unusable pickSlot must still return a slot (heaviest declared, index 1), got ${fallback.index}:${fallback.model}`,
+  )
+}
+
+// 9. pickSlot tie-breaking: equal weights keep declaration order -- the property the
+//    pool.ts comment above pickSlot calls "a plain round robin". The earlier-declared
+//    slot wins a tie, and only once it reaches its own ceiling does the equal-weight
+//    sibling take over.
+{
+  const state = pool.state({
+    id: "tie",
+    dir: scratch(),
+    models: {
+      slots: [
+        { model: "fixture/tie-first", weight: 2 },
+        { model: "fixture/tie-second", weight: 2 },
+      ],
+    },
+  })
+  pool.init(state, () => {})
+  const first = pool.pickSlot(state, pool.snapshot(state))
+  assert(first.index === 1, `an idle tie must go to the earlier-declared slot, got slot ${first.index}`)
+  pool.acquire(state, "explore", first, "s1", "tie-1")
+  const second = pool.pickSlot(state, pool.snapshot(state))
+  assert(second.index === 1, `the earlier slot has room under its weight-2 ceiling, so it keeps the spawn, got slot ${second.index}`)
+  pool.acquire(state, "explore", second, "s1", "tie-2")
+  const third = pool.pickSlot(state, pool.snapshot(state))
+  assert(third.index === 2, `once the earlier slot hits its ceiling the equal-weight sibling takes over (round robin), got slot ${third.index}`)
+}
+
 for (const d of made) rmSync(d, { recursive: true, force: true })
 if (failures === 0) console.log("\nALL SHARED-POOL CHECKS PASSED")
 else {
