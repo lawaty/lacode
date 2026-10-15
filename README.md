@@ -337,6 +337,9 @@ as an opencode provider for you. It is **off by default**: if you do not set
    disabled for that run, and the integration is per-run.
 2. Add the plugin block to your opencode config:
    `["@lawaty/lacode", { "omniroute": { "enabled": true, "apiKey": "<your omniroute key>", "combo": "auto", "models": [] } }]`
+   `auto` is the zero-config default, but on a free tier it often resolves to a
+   slow chain. [A tested fast combo](#a-tested-fast-combo-free-mix) below is
+   ordered for latency and is worth applying on a new client.
 3. Optionally, to route pooled work through it, make `omniroute/auto 3` the
    **first** line of `~/.config/lacode/pool.txt`. `pool.txt` is optional user
    config; the bundled default preset does **not** include OmniRoute.
@@ -425,6 +428,98 @@ whole catalog when neither is set. Because the plugin writes the pool nothing,
 the only thing that changes when the gateway is down is that `omniroute/<id>`
 fails; every other slot keeps working. See
 [docs/USER-STORIES.md](docs/USER-STORIES.md) US-28.
+
+### A tested fast combo: `free-mix`
+
+`combo: "auto"` is the zero-configuration default, but `auto` inherits whatever
+the gateway chooses, and on a busy free tier that is frequently the slowest
+chain available. The combo below was **measured** against a live free-tier
+gateway and is ordered for latency rather than for breadth. Apply it during the
+"Setting it up on a client machine" steps above and pooled work is usable
+straight away, instead of starting from a gateway that queues for half a minute
+per call.
+
+```jsonc
+{
+  "name": "free-mix",
+  // Order decides. Do NOT use "weighted" here — weights let the gateway
+  // re-shuffle a model that is returning 429 into first position again.
+  "strategy": "priority",
+  "models": [
+    { "model": "gemini/gemini-3.1-flash-lite",                      "providerId": "gemini" },
+    { "model": "gemini/gemini-3.8-flash",                           "providerId": "gemini" },
+    { "model": "gemini/gemini-3.7-flash",                           "providerId": "gemini" },
+    { "model": "gemini/gemini-3-flash-preview",                     "providerId": "gemini" },
+    { "model": "openrouter/nvidia/nemotron-3-super-120b-a12b:free",  "providerId": "openrouter" },
+    { "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",  "providerId": "openrouter" },
+    { "model": "openrouter/nvidia/nemotron-3.5-lightning:free",     "providerId": "openrouter" },
+    { "model": "openrouter/cohere/north-mini-code:free",            "providerId": "openrouter" },
+    { "model": "openrouter/poolside/laguna-s-2.1:free",             "providerId": "openrouter" },
+    { "model": "openrouter/dots-studio/dots-3-note-preview:free",   "providerId": "openrouter" }
+  ]
+}
+```
+
+Why this order, from 859 calls over a single day against that gateway:
+
+| Model | Observed behaviour | Position |
+| --- | --- | --- |
+| `gemini/gemini-3.1-flash-lite` | **165/172 succeeded (96%)**, ~4.5s median | **first** |
+| `gemini-3.8-flash` / `3.7-flash` / `3-flash-preview` | succeed intermittently, but **burn exactly 30.0s** on a `503` queue-budget timeout when they do not | next |
+| `openrouter/*:free` | **~90% `429`**, but fails *fast* (~1.8s) and occasionally succeeds | last, as a cheap final fallback |
+| `gemini-2.5-flash`, `gemini-2.5-flash-lite` | **`404` on every attempt** — dead ids | **omitted entirely** |
+
+The ordering matters because a combo pays for *every* step it walks past. Put the
+96%-success model first and the common case is a single hop; the 30s models sit
+behind it where they cost nothing, and the 429s sit last where they give up in
+under two seconds.
+
+Measured on the same gateway, same day, `max_tokens: 10`:
+
+| | Before | After |
+| --- | --- | --- |
+| `free-mix` response | 42.7s / 41.8s / 34.7s | 4.1s / 3.1s / 3.2s / 4.0s / 3.2s |
+| Median | **~41.8s** | **~3.2s** |
+| Provider time burned on calls >25s | **56.9 of 102.4 min (56%)** | — |
+
+Before the change, the real call sequence was a `429` after 2.7s, then a `503`
+after 30.0s, then the actual work in 5.7s — roughly **33 seconds of dead time in
+front of every successful request**, and a p90 of 100s when three 30s steps
+chained.
+
+These free-tier endpoints change availability constantly, so treat the ordering
+as a **starting point to re-measure, not a permanent truth**. Re-check it with
+OmniRoute's own call logs before assuming it still holds:
+
+```bash
+# one timed request through the gateway
+curl -o /dev/null -w '%{http_code} %{time_starttransfer}s\n' \
+  -X POST http://localhost:20128/v1/chat/completions \
+  -H "Authorization: Bearer $OMNIROUTE_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"free-mix","messages":[{"role":"user","content":"Say OK"}],"max_tokens":10}'
+
+# per-model status + duration, straight from OmniRoute's logs
+python3 - <<'PY'
+import json, glob, collections
+d = "/home/<user>/.omniroute/call_logs/<YYYY-MM-DD>"
+g = collections.defaultdict(collections.Counter)
+for f in glob.glob(d + "/*.json"):
+    try: s = json.load(open(f))["summary"]
+    except Exception: continue
+    g[s.get("comboStepId")][s.get("status")] += 1
+for k, v in sorted(g.items(), key=lambda x: str(x[0])):
+    print(f"{str(k)[:44]:44} {dict(v)}")
+PY
+```
+
+Apply it with the bundled CLI (`PUT /api/combos/<id>` updates in place, so the
+combo is never briefly missing):
+
+```bash
+omniroute api combos get-api-combos-id- --id <combo-id> --json > free-mix.json
+# edit name/strategy/models in free-mix.json, then:
+omniroute api combos put-api-combos-id- --id <combo-id> --body @free-mix.json
+```
 
 **A note on mid-session switching.** opencode 1.18.34 exposes no hook to change
 an agent's main model mid-request, so LaCode cannot swap models inside a running
@@ -569,6 +664,28 @@ re-discovering structure; as with everything else here, no savings percentage is
 published, because none has been independently measured. The mechanism, the
 permission rule that makes one writer possible, and what the log lines mean are
 in [docs/CONTEXT.md](docs/CONTEXT.md).
+
+## Managerial directions
+
+You can optionally add `manager.md` to `.opencode/context/`. This file is owned
+by you alone and is never written, edited, pruned, or promoted by any agent. It
+outranks the five generated files on focus and settled decisions, but it is
+secondary to the source code: if the code disagrees, the code wins and the
+conflict is reported back to you.
+
+The file is per-clone, not committed, and entirely optional: if it is missing,
+agents behave exactly as before. When present, it should contain these three
+sections:
+
+- `## Stage`: A snapshot of your current work-in-progress. Rewrite this section
+  rather than appending to it to keep it concise. If this file passes roughly 150
+  lines, run `/context-review`.
+- `## Confirmed`: Facts and decisions you have personally ratified. Treat these
+  as settled, but not as permission to skip reading the code.
+- `## Instructions`: Standing managerial directions for all agents.
+
+No agent may write this file at all: the context agent's edit permission denies
+`manager.md` explicitly, so ratification can only ever come from your hand.
 
 ## Cost
 

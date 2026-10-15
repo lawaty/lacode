@@ -96,13 +96,13 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given every model is cooling, When a spawn is routed, Then the least-loaded slot is chosen anyway (degrade, never block).
 - [ ] Given a limit error names a reset time, When the cooldown is recorded, Then the stated reset is used instead of a guessed backoff.
 
-### US-5: Weighted preference drains preferred providers first
-**As a** user, **I want** to express preference between models via weights, **so that** the pool prefers the cheapest/freest provider up to its ceiling.
+### US-5: Weighted round-robin gives every slot a turn per cycle
+**As a** user, **I want** weights to say how many turns each slot takes per rotation cycle, **so that** no provider is drained to its limit while the others sit idle.
 
 **Story ID(s) for tests:** US-5
 **Acceptance criteria:**
-- [ ] Given a heavy slot and a light slot, When spawns are routed below both ceilings, Then the heavier slot is filled before the lighter one.
-- [ ] Given a slot is at its weight ceiling, When another spawn is routed, Then the pick moves to the next slot under its ceiling.
+- [ ] Given a heavy slot and a light slot, When spawns are routed below both ceilings, Then the rotation walks the list in order with each slot taking as many consecutive turns as its weight says, rather than the heavy slot being filled and refilled first.
+- [ ] Given a slot is at its weight ceiling or cooling, When its turn comes up in the rotation, Then the turn is skipped and the rotation resumes at the following turn.
 - [ ] Given every slot is at its ceiling, When another spawn is routed, Then it goes to the least-loaded slot as overflow.
 - [ ] Given all slots carry equal weight, When spawns are routed, Then the picks round-robin in declaration order.
 - [ ] Given per-slot load is read, When it is asserted, Then a slot's load never exceeds its weight ceiling except by overflow.
@@ -115,7 +115,7 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given claims are held by several processes, When the status view is requested, Then it shows every process's claims and the aggregate load per slot.
 - [ ] Given a model is cooling with a stated reason, When the status view is requested, Then the model is listed as cooling together with that reason.
 - [ ] Given a claim file is older than the dead-file threshold, When the status view is computed, Then the stale claim is pruned rather than counted.
-- [ ] Given a slot is at its ceiling, When the status view is requested, Then it is marked as the slot the next spawn would take.
+- [ ] Given a slot is at its ceiling, When the status view is requested, Then it is not marked as the slot the next spawn would take, because the rotation's turns are skipped for a full slot until it frees a claim.
 
 ### US-7: Non-free models still work
 **As a** user who wants a paid model in the pool, **I want** to supply any model list, **so that** the pool is not restricted to free tiers.

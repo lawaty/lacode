@@ -182,29 +182,35 @@ test("[US-4] a Retry-After header is honoured when the error text states no rese
 // US-5 — weighted preference
 // ---------------------------------------------------------------------------
 
-test("[US-5] the heavier slot is filled to its ceiling before the lighter one is used", async () => {
+test("[US-5] a heavy slot holds more turns in the run than a light one, which still takes its own", async () => {
+  // Not a drain order. The slots are expanded into a run -- one position per unit
+  // of weight, in declaration order -- so weights [3,1] produce [1,1,1,2] and the
+  // light slot's single position is still inside it, after the heavy one's three.
   const { hooks, cfg } = await bootPool(
     [
       { model: "prov/heavy", weight: 3 },
       { model: "prov/light", weight: 1 },
     ],
-    "us5-heavy-first",
+    "us5-run-shape",
   )
   const routed = await burst(hooks, cfg, 4)
   assert.deepEqual(routed, ["explore-1", "explore-1", "explore-1", "explore-2"], `got ${routed}`)
   await hooks.dispose()
 })
 
-test("[US-5] a slot at its ceiling passes the next spawn to the next slot under its ceiling", async () => {
+test("[US-5] the run is walked in order, so a light slot ahead of a heavier one is served first", async () => {
+  // The rule is order-first: each spawn takes the first slot in the run which is
+  // available and under its ceiling, so the run [1,2,2] gives slot 1 its turn and
+  // slot 2 the two after it. Weight-as-priority would answer 2,2,1 here instead.
   const { hooks, cfg } = await bootPool(
     [
       { model: "prov/one", weight: 1 },
       { model: "prov/two", weight: 2 },
     ],
-    "us5-ceiling",
+    "us5-run-order",
   )
   const routed = await burst(hooks, cfg, 3)
-  assert.deepEqual(routed, ["explore-2", "explore-2", "explore-1"], `got ${routed}`)
+  assert.deepEqual(routed, ["explore-1", "explore-2", "explore-2"], `got ${routed}`)
   await hooks.dispose()
 })
 

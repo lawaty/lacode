@@ -1,5 +1,6 @@
 import { tool, type Hooks, type PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
+import type { Claim } from "../lib/pool.ts"
 
 // Task routing, limit detection and hang recovery for a shared set of models.
 //
@@ -57,6 +58,12 @@ import * as pool from "../lib/pool.ts"
 const SERVICE = "agent-pool"
 const REAP_INTERVAL_MS = 30_000
 const HANG_FALLBACK_MS = 10 * 60 * 1000
+// The kill is one POST to our own local server. It gets a deadline because the
+// reaper is the thing that must never wedge: an unbounded fetch would leave
+// s.reaping true and silently disarm the watchdog for the rest of the process.
+const ABORT_TIMEOUT_MS = 10_000
+
+type LogFn = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => Promise<void>
 
 export type AgentPoolOptions = {
   /** Process identity for the claim files; defaults to the pid. Tests inject their own. */
@@ -91,14 +98,43 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
 
   pool.init(s, (m) => void warnOnce(m))
 
-  const abortSession = async (sessionID: string) => {
-    if (!serverUrl) return false
+  // A successful POST is NOT proof the session died: this endpoint answers 200 and
+  // body "true" for a session id that does not exist, and it answers 200 for a
+  // 404/500 upstream. So the response is checked, and the reason a kill failed is
+  // carried back rather than swallowed -- otherwise a failure is indistinguishable
+  // from a success and the zombie outlives its claim.
+  const abortSession = async (sessionID: string): Promise<{ ok: boolean; why: string }> => {
+    if (!serverUrl) return { ok: false, why: "no serverUrl: this process has no HTTP server to abort through" }
     try {
-      await fetch(new URL(`/session/${sessionID}/abort`, serverUrl).toString(), { method: "POST" })
-      return true
-    } catch {
-      return false
+      const res = await fetch(new URL(`/session/${sessionID}/abort`, serverUrl).toString(), {
+        method: "POST",
+        signal: AbortSignal.timeout(ABORT_TIMEOUT_MS),
+      })
+      if (!res.ok) return { ok: false, why: `gateway answered HTTP ${res.status}` }
+      const body = (await res.text()).trim()
+      if (body === "false") return { ok: false, why: "server reported the session was not aborted" }
+      return { ok: true, why: "" }
+    } catch (error) {
+      return { ok: false, why: String(error) }
     }
+  }
+
+  // How many consecutive failed kills to tolerate before giving the slot back.
+  // Holding a claim whose session we cannot kill is right for a few sweeps (the
+  // abort may just be racing the server), but not forever: the slot must not be
+  // lost to a session we can never reach. The give-up is logged loudly.
+  const MAX_ABORT_ATTEMPTS = 3
+
+  // A usage limit HANGS rather than errors, so the model that wedged this task is
+  // very often already cooling for that very limit. Re-striking it here only
+  // relabelled a provider quota window as a "hang" and inflated its strike count.
+  // Cooling is only for a model we have actually just seen wedge something.
+  const coolForHang = async (claim: Claim, log: LogFn) => {
+    const now = Date.now()
+    const prior = s.cooling.get(claim.m)
+    if (prior && prior.until > now) return
+    const strike = pool.recordStrike(s, claim.m, "hang", HANG_FALLBACK_MS)
+    if (strike) await log("warn", `cooling ${claim.m} for ${Math.round((strike.until - now) / 1000)}s (hang)`)
   }
 
   const reapStuck = async () => {
@@ -108,26 +144,65 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
     try {
       const stuck = pool.findStuck(s)
       if (stuck.length === 0) return
-      pool.releaseStuck(s, stuck.map((x) => x.key))
-      for (const { claim } of stuck) {
-        const killed = claim.g ? await abortSession(claim.g) : false
+      const released: string[] = []
+      for (const { key, claim } of stuck) {
+        // A child that bound late (or whose session.created raced the claim) has no
+        // target yet; bind it now so the abort has something to aim at.
+        if (!claim.g) pool.backfillChild(s, claim)
+        const idle = pool.idleFor(s, claim, Date.now())
+        // Infinity means "never bound to a child session", which is not evidence of
+        // a hang -- reporting it as silence is what produced "Infinitys of silence".
+        const since = Number.isFinite(idle) ? `${Math.round(idle / 1000)}s of silence` : "no child session ever bound"
+        const age = Math.round((Date.now() - claim.t) / 1000)
+
+        if (claim.g) {
+          const kill = await abortSession(claim.g)
+          if (kill.ok) {
+            released.push(key)
+            s.reaped++
+            await log(
+              "warn",
+              `hung ${claim.v} on ${claim.m} after ${age}s with ${since}; aborted session ${claim.g}`,
+              { base: claim.v, model: claim.m, slot: claim.k, session: claim.g, aborted: true },
+            )
+            await coolForHang(claim, log)
+            continue
+          }
+          // The session is still running. Freeing the claim here is what orphans it:
+          // the key is gone, so no later sweep can retry, and the pool hands the slot
+          // out while the zombie keeps streaming. Hold the claim and try again.
+          claim.n = (claim.n ?? 0) + 1
+          if (claim.n < MAX_ABORT_ATTEMPTS) {
+            await log(
+              "warn",
+              `could not abort hung ${claim.v} session ${claim.g} on ${claim.m} (${kill.why}); claim held, retry ${claim.n}/${MAX_ABORT_ATTEMPTS}`,
+              { base: claim.v, model: claim.m, slot: claim.k, session: claim.g, aborted: false },
+            )
+            continue
+          }
+          released.push(key)
+          s.reaped++
+          await log(
+            "error",
+            `GIVING UP on hung ${claim.v} session ${claim.g} on ${claim.m}: ${kill.why} after ${claim.n} attempts. The claim is released but the session is still running and must be killed by hand.`,
+            { base: claim.v, model: claim.m, slot: claim.k, session: claim.g, aborted: false },
+          )
+          continue
+        }
+
+        // Never bound: there is no session to abort and no evidence of a hang, so the
+        // slot goes back but the model is NOT cooled -- an unbindable claim says
+        // nothing about the provider being responsible.
+        released.push(key)
         s.reaped++
-        await log(
-          "warn",
-          `hung ${claim.v} on ${claim.m} after ${Math.round((Date.now() - claim.t) / 1000)}s with ${Math.round(pool.idleFor(s, claim, Date.now()) / 1000)}s of silence; ${killed ? `aborted session ${claim.g}` : "no session to abort"}`,
-          { base: claim.v, model: claim.m, slot: claim.k, session: claim.g, aborted: killed },
-        )
-        const now = Date.now()
-        const prior = s.cooling.get(claim.m)
-        // A usage limit HANGS rather than errors, so the model that wedged this task
-        // is very often already cooling for that very limit. Re-striking it here only
-        // relabelled a provider quota window as a "hang" and inflated its strike
-        // count. Freeing the claim is the reaper's whole job; leave an active
-        // cooldown exactly as it was.
-        if (prior && prior.until > now) continue
-        const strike = pool.recordStrike(s, claim.m, "hang", HANG_FALLBACK_MS)
-        if (strike) await log("warn", `cooling ${claim.m} for ${Math.round((strike.until - now) / 1000)}s (hang)`)
+        await log("warn", `released unbound ${claim.v} claim on ${claim.m} after ${age}s (${since}); model not cooled`, {
+          base: claim.v,
+          model: claim.m,
+          slot: claim.k,
+          aborted: false,
+        })
       }
+      if (released.length > 0) pool.releaseStuck(s, released)
     } catch (error) {
       await log("error", `reaper failed: ${String(error)}`)
     } finally {
@@ -350,7 +425,8 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
 
           // Which slot the next pooled spawn would actually take, so a surprising routing
           // decision can be read off the status instead of guessed at from load alone.
-          const next = pool.pickSlot(s, snap)
+          // advance:false -- looking must not consume the rotation's next turn.
+          const next = pool.pickSlot(s, snap, { advance: false })
           const line = (slot: pool.Slot) => {
             const entry = byModel.get(slot.model)
             const users = entry && entry.bases.size > 0 ? [...entry.bases].map(([b, n]) => `${b}x${n}`).join(" ") : "idle"
@@ -375,7 +451,7 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
           return {
             title: `agent-pool: ${total} task(s) in flight, ${coolingNow.length} model(s) cooling`,
             output: [
-              `shared pool over ${slots.length} model(s) from ${s.origin}; bases: ${pool.BASES.join(", ")}\npriority is weight: the heaviest slot under its ceiling takes the next spawn (FULL = at ceiling, used only when every slot is)`,
+              `shared pool over ${slots.length} model(s) from ${s.origin}; bases: ${pool.BASES.join(", ")}\nround robin in slot order, each slot taking as many turns as its weight says, so no slot is starved while another drains (FULL = at ceiling, used only when every slot is)`,
               ...slots.map(line),
               "",
               "by process:",

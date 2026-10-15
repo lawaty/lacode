@@ -60,11 +60,15 @@ const make = async (id, dir) => {
 const dir1 = mkdtempSync(join(tmpdir(), "agent-pool-solo-"))
 const seq = (calls) => calls.map((c) => c.replace(/^[a-z-]+-/, "")).join(",")
 
-// 1. routing: priority IS the weight, and it is a soft ceiling. The heaviest slot
-//    fills to its own weight before the next slot sees any work, slots fill in weight
-//    order, and only past the summed ceilings does the overflow spread evenly. Slot
-//    numbers, weights and pick order are presets/free-tier.json's business, so what is
-//    pinned here is the property, not a literal sequence.
+// 1. routing: ORDER FIRST, THEN WEIGHT. The slots are expanded into a weighted
+//    round-robin run -- one position per unit of weight, in declaration order -- and
+//    each spawn scans that run from a persisted cursor, taking the first slot which is
+//    available and still under its ceiling. So the run is walked in order rather than
+//    the heaviest slot being drained first, weight is a soft ceiling on how many
+//    concurrent claims a slot holds, and only past the summed ceilings does the
+//    overflow spread evenly. Slot numbers, weights and pick order are
+//    presets/free-tier.json's business, so what is pinned here is the property, not a
+//    literal sequence.
 const a = await make("solo", dir1)
 const calls = []
 // Deep enough to exhaust every ceiling and then overflow, whatever the shipped
@@ -88,8 +92,9 @@ assert(
   new Set(numbers).size === SLOT_MODELS.length,
   `all ${SLOT_MODELS.length} slots must be used under ${CONCURRENCY} concurrent, got ${seq(calls)}`,
 )
-// within the weighted phase, no slot is used before every heavier slot is at its own
-// ceiling: the heaviest slot gets its sessions entirely to itself first
+// inside the summed ceilings the pick is always a slot of the heaviest weight that
+// still has room: the heaviest slot holds the first positions of the run, so it is
+// chosen until it reaches its own ceiling and the next slot is the next position
 const countsByModel = (ns) => {
   const m = new Map()
   for (const n of ns) m.set(SLOT_MODELS[n - 1], (m.get(SLOT_MODELS[n - 1]) ?? 0) + 1)
@@ -103,7 +108,8 @@ for (let i = 0; i < CAPACITY; i++) {
     `spawn ${i + 1} must go to the heaviest slot with room (weight ${topWeight}), got ${SLOT_MODELS[numbers[i] - 1]}`,
   )
 }
-// and the heaviest slot really does run alone to its ceiling before slot 2 starts
+// and the heaviest slot really does hold every position at the top of the run before
+// slot 2 gets one
 const heavyLead = numbers.slice(0, MAX_WEIGHT)
 assert(
   heavyLead.every((n) => HEAVY_MODELS.includes(SLOT_MODELS[n - 1])),
@@ -126,10 +132,10 @@ assert(
   `every spawn must be accounted for, got ${seq(calls)}`,
 )
 
-// 2. releasing a claim on the heaviest slot hands routing straight back to it: it drops
-//    under its ceiling again and, being the heaviest, outranks everything else. So the
-//    pool refills what it freed rather than carrying on down the priority order. The
-//    slot is read off the run rather than assumed to be a particular number.
+// 2. releasing a claim on a slot hands routing straight back to it: it drops under
+//    its ceiling again, and the cursor is still pointing at that slot's next position
+//    in the run, so the spawn that frees the capacity is the one that gets it back.
+//    The slot is read off the run rather than assumed to be a particular number.
 const heaviestSlot = slotNum(calls[0])
 const heaviestCall = calls.map((v, i) => [slotNum(v), `c${i + 1}`]).filter(([n, id]) => n === heaviestSlot && live.has(id)).pop()[1]
 await releaseCall(heaviestCall)
@@ -139,9 +145,9 @@ assert(
   `releasing a claim on slot ${heaviestSlot} (weight ${SHIPPED[heaviestSlot - 1].weight}) must hand routing back to it, got slot ${afterRelease}`,
 )
 
-// 3. releasing the busiest claim hands that slot the next spawn: the pool refills
-//    what it freed rather than opening anything new. Read the busiest slot off
-//    pool_status rather than assuming which number the weights put on top.
+// 3. releasing the busiest claim hands that slot the next spawn: the freed position in
+//    the run is the next one the cursor reaches. Read the busiest slot off pool_status
+//    rather than assuming which slot the run put on top.
 const loads = async () => {
   const m = new Map()
   for (const line of (await a.status()).split("\n")) {
@@ -181,8 +187,8 @@ assert(/across 1 process\(es\)/.test(statusOut), "solo process should report one
 const dir3 = mkdtempSync(join(tmpdir(), "agent-pool-share-"))
 const x = await make("proc-x", dir3)
 const y = await make("proc-y", dir3)
-// Enough spawns to fill each heavy slot twice and then walk down to the light
-// ones, so the first process reaches every slot before the second one starts.
+// Enough spawns to walk every slot's positions in the run -- each heavy slot's whole
+// share -- so the first process reaches every slot before the second one starts.
 // Scales with the slot count: a fixed literal only covered the four-slot pool.
 const xCalls = []
 for (let i = 1; i <= CONCURRENCY; i++) xCalls.push(await x.spawn(`x${i}`, "explore"))
@@ -193,9 +199,10 @@ assert(
 )
 const yCalls = []
 for (let i = 1; i <= CONCURRENCY; i++) yCalls.push(await y.spawn(`y${i}`, "explore"))
-// Both processes route over one shared cycle. Which slot y starts on depends on
-// x's residual load, so the load check below is what proves sharing; here only
-// that every pick is a declared slot.
+// Both processes route over one shared run, each advancing the cursor the other one
+// reads and seeing the other's claims in the shared dir. Which slot y starts on
+// depends on x's residual load, so the load check below is what proves sharing; here
+// only that every pick is a declared slot.
 assert(
   [...xCalls, ...yCalls].every((c) => /^explore-\d+$/.test(c)),
   `routing must stay in the pool, got ${[...xCalls, ...yCalls].join(",")}`,
@@ -218,9 +225,9 @@ assert(
   loadList.reduce((a, b) => a + b, 0) === 2 * CONCURRENCY,
   `all ${2 * CONCURRENCY} claims must be shared, got ${report}`,
 )
-// Slots of the same weight have identical ratios, so routing
-// always takes the smallest: loads stay within one of each other, equal when the
-// group is an even size, off by one otherwise.
+// Slots of the same weight hold the same number of positions in the run, so they take
+// the same number of turns: loads stay within one of each other, equal when the group
+// is an even size, off by one otherwise.
 const spread = (xs) => Math.max(...xs) - Math.min(...xs)
 assert(spread(heavyLoads) <= 1, `the heaviest slots must stay load-balanced, got ${report}`)
 assert(spread(lightLoads) <= 1, `the lightest slots must stay load-balanced, got ${report}`)
@@ -274,7 +281,8 @@ const realNow = Date.now
 Date.now = () => realNow() + 11 * 60 * 1000
 const afterTtl = await a.spawn("t1", "explore")
 Date.now = realNow
-// Everything has aged out, so the pool is idle again and hands out a heavy slot
+// Everything has aged out, so the pool is idle again and the run resumes from where
+// the cursor was left, which for this preset is the heaviest slot
 assert(
   HEAVY_MODELS.includes(SLOT_MODELS[slotNum(afterTtl) - 1]),
   `TTL should empty the pool, got ${afterTtl}`,

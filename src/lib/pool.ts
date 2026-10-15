@@ -13,11 +13,16 @@ import { PACKAGE_ROOT } from "./package-root.ts"
 // share one load counter.
 //
 // Every slot carries a `weight` (the preset), and that is the only knob. A
-// slot's weight is a SOFT CEILING on how many claims it holds at once, and priority is
-// simply that weight: the highest-weight slot that is still under its ceiling takes
-// the next spawn, so the pool fills slot 1 to its number before slot 2 sees any work
-// at all. Equal weights therefore give a plain round robin in declaration order, and
-// 2 over 2 / 1 over 1 reproduces the old primary/overflow cycle exactly.
+// slot's weight is a SOFT CEILING on how many claims it holds at once, and routing is an
+// ORDER-FIRST weighted round robin: the slots are expanded into a run in which each one
+// appears once per unit of its weight ([3,2,1,1] -> [1,1,1,2,2,3,4]), the next spawn
+// takes the first slot in that run which is available and still under its ceiling, and
+// a cursor shared by every opencode process remembers where it got to. So weight says
+// how OFTEN a slot is preferred and the cursor says WHICH turn comes next: a heavy
+// slot is not drained before the others see any work, and two processes sharing the
+// pool keep rotating instead of each restarting the run. Equal weights therefore give a
+// plain round robin in declaration order, and 2 over 2 / 1 over 1 reproduces the old
+// primary/overflow cycle exactly.
 //
 // Once EVERY slot is at or over its ceiling the weight can no longer gate anything,
 // so the overflow goes to the least loaded slot -- the pool never blocks, and a burst
@@ -86,7 +91,24 @@ export const isQuotaReason = (reason: string) => /quota|limit|rate|too-many|over
 
 export type Slot = { index: number; model: string; weight: number }
 
-export type Claim = { v: string; k: number; m: string; t: number; s?: string; g?: string }
+export type Claim = {
+  v: string
+  k: number
+  m: string
+  /** When the claim was taken. Never moved, so hang-age stays anchored to the spawn. */
+  t: number
+  /**
+   * Last proof the target session is alive, refreshed by every message event.
+   * Abandonment (TTL) is measured from here, NOT from `t`: a long task that keeps
+   * working must keep occupying its slot, otherwise the shared count silently
+   * drops it mid-run and the slot oversubscribes.
+   */
+  hb?: number
+  /** Failed abort attempts. The claim is held (not freed) until this gives up. */
+  n?: number
+  s?: string
+  g?: string
+}
 export type Strike = { model: string; until: number; strikes: number; reason: string; last: number }
 export type Sibling = { id: string; claims: Claim[] }
 export type Snapshot = {
@@ -152,7 +174,7 @@ export type ModelsSource = { slots: Slot[]; problems: string[]; origin: string }
 // Weight is the slot's concurrency ceiling, so a bad one warns and falls back to 1
 // rather than dropping the slot -- losing a model because of a typo in a count would
 // cost real capacity. A slot with no weight at all is weight 1, i.e. one session at
-// a time before the next slot is considered.
+// a time and one turn in the rotation.
 export function parseSlots(parsed: unknown, origin: string): SlotFile {
   const problems: string[] = []
   const entries = (parsed as { slots?: unknown })?.slots
@@ -411,6 +433,15 @@ type State = {
    */
   strikes: Map<string, Strike>
   activity: Map<string, number>
+  /**
+   * Recently seen `session.created` children, newest last, per parent session.
+   * `bindChild` only matches a claim that already exists, so a child that is
+   * created before its claim is taken is never bound and the claim can never be
+   * aborted. This ring lets the reaper recover that binding later without
+   * guessing at unrelated sessions: only children of the claim's own parent,
+   * created at or after the claim, are eligible.
+   */
+  children: Map<string, { id: string; t: number }[]>
   reaped: number
   reaping: boolean
   lastSweep: number
@@ -448,6 +479,7 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
       cooling: new Map(),
       strikes: new Map(),
       activity: new Map(),
+      children: new Map(),
       reaped: 0,
       reaping: false,
       lastSweep: 0,
@@ -492,7 +524,7 @@ export function init(s: State, onWarn: (m: string) => void) {
 
 export function pruneOwn(s: State) {
   const now = Date.now()
-  for (const [key, claim] of s.own) if (now - claim.t > CLAIM_TTL_MS) s.own.delete(key)
+  for (const [key, claim] of s.own) if (now - (claim.hb ?? claim.t) > CLAIM_TTL_MS) s.own.delete(key)
 }
 
 export function publish(s: State) {
@@ -556,7 +588,7 @@ export function readSiblings(s: State): Sibling[] {
     try {
       const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, Claim>
       const claims = Object.values(parsed).filter(
-        (c) => c && typeof c.v === "string" && typeof c.m === "string" && now - c.t <= CLAIM_TTL_MS,
+        (c) => c && typeof c.v === "string" && typeof c.m === "string" && now - (c.hb ?? c.t) <= CLAIM_TTL_MS,
       )
       siblings.push({ id: match[1], claims })
     } catch {
@@ -697,18 +729,108 @@ const loadOf = (counts: Map<string, number>, model: string) => counts.get(model)
 // can still gate anything. A cooling slot is never picked regardless of this.
 export const underCeiling = (slot: Slot, counts: Map<string, number>) => loadOf(counts, slot.model) < slot.weight
 
-// Priority is the weight itself, NOT load divided by weight. That is the whole point
-// of a weight here: the top slot fills to its ceiling before the next one starts, so
-// a main model gets its 3 concurrent sessions to itself. Weights are dynamic and
-// deliberately unequal, so this never degenerates into a share calculation -- a slot
-// either has room or it does not. Ties (equal weights) keep declaration order, which
-// is what makes equal weights a round robin.
-export function pickSlot(s: State, snap: Snapshot): Slot {
+/**
+ * The weighted round-robin run, expanded from the slot list: every slot occupies one
+ * position per unit of its weight, in declaration order. Weights `[3,2,1,1]` become
+ * `[1,1,1,2,2,3,4]`. A heavier slot therefore holds more positions in the run, which
+ * is how it is preferred more often -- without having to be filled to its ceiling
+ * first, which is what the old highest-weight-wins rule did.
+ *
+ * Pure and exported so the shape can be unit tested without touching the disk. A
+ * fractional weight contributes its whole part: a position in the run is a whole turn,
+ * and it is the ceiling, not this expansion, that bounds how much a slot may hold.
+ */
+export function roundRobinSequence(slots: Slot[]): number[] {
+  const seq: number[] = []
+  for (const slot of slots) for (let turn = 0; turn < slot.weight; turn++) seq.push(slot.index)
+  return seq
+}
+
+// Where in the run the next spawn starts looking.
+//
+// It has to be SHARED by every opencode process, not kept per process: a private
+// cursor would restart the rotation in each one, and a pool whose processes all start
+// at the top is the starvation this run is here to remove. So the cursor lives in the
+// claim dir next to the limit files, written atomically the same way.
+//
+// Read-modify-write races between processes are deliberately NOT locked: the worst a
+// lost update can do is let two processes pick the same slot, which is exactly what
+// happened before any cursor existed. The value is an optimisation of the rotation,
+// never a correctness requirement, so an unwritable dir, a missing file, or corrupt
+// JSON all degrade to "start at the top" and nothing is ever thrown at opencode.
+const CURSOR_FILE = "cursor.json"
+
+function readCursor(s: State): number {
+  try {
+    const parsed = JSON.parse(readFileSync(join(s.dir, CURSOR_FILE), "utf8")) as { seq?: unknown }
+    if (typeof parsed.seq === "number" && Number.isInteger(parsed.seq) && parsed.seq >= 0) return parsed.seq
+  } catch {
+    /* no cursor yet, or one this process cannot make sense of: start at the top */
+  }
+  return 0
+}
+
+function writeCursor(s: State, seq: number) {
+  if (!s.dirReady) return
+  const path = join(s.dir, CURSOR_FILE)
+  try {
+    writeFileSync(`${path}.tmp`, JSON.stringify({ seq }))
+    renameSync(`${path}.tmp`, path)
+  } catch {
+    /* the run simply restarts at the top on the next spawn */
+  }
+}
+
+/**
+ * Pick the slot for the next spawn.
+ *
+ * ORDER FIRST, THEN WEIGHT. The old rule took the heaviest slot that still had room
+ * under its ceiling, which re-decided the same way on every spawn: slot 1 filled to its
+ * number while slots 2 and 3 idled, and a burst past that ceiling fell straight through
+ * to the overflow path. Here the slots are expanded into a weighted round-robin run
+ * (roundRobinSequence) and the scan walks that run from the shared cursor, taking the
+ * first slot which is available AND under its ceiling. A slot that is cooling or full
+ * is skipped rather than ending the scan, so the rotation keeps turning past a busy or
+ * benched slot instead of stalling on it.
+ *
+ * The ceiling is UNCHANGED: weight is still how many claims a slot may hold at once.
+ * Round robin changes which slot is PREFERRED next, never how many a slot may hold.
+ *
+ * Falling off the end of the run is the old overflow path, kept as it was: the least
+ * loaded usable slot, or the least loaded slot of all when every one of them is cooling.
+ * The pool never refuses work.
+ */
+/**
+ * The next slot the pool would hand a spawn.
+ *
+ * Selection walks a weighted round-robin run from a persisted cursor, so picking a
+ * slot CONSUMES its turn. `advance: false` is a pure preview: pool_status calls it
+ * to show where the next spawn would land, and observing the rotation must not be
+ * what moves it, or merely looking at the pool would shift every spawn after it.
+ */
+export function pickSlot(s: State, snap: Snapshot, options?: { advance?: boolean }): Slot {
+  const advance = options?.advance !== false
   const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
+  // Built over the FULL slot list, not the usable subset: the run must not change
+  // length every time a model goes into cooldown, or a slot appearing and
+  // disappearing would silently rewind the cursor's rotation.
+  const seq = roundRobinSequence(slots)
+  if (seq.length > 0) {
+    const byIndex = new Map(slots.map((slot) => [slot.index, slot]))
+    const start = readCursor(s) % seq.length
+    for (let step = 0; step < seq.length; step++) {
+      const at = (start + step) % seq.length
+      const slot = byIndex.get(seq[at])
+      if (slot && isAvailable(s, slot.model, snap.cooling) && underCeiling(slot, snap.counts)) {
+        // Resume AFTER the turn just taken, so a slot that holds several positions in
+        // the run is never handed two of them back to back.
+        if (advance) writeCursor(s, at + 1)
+        return slot
+      }
+    }
+  }
   const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
   const pool = usable.length > 0 ? usable : slots
-  const open = pool.filter((slot) => underCeiling(slot, snap.counts))
-  if (open.length > 0) return open.reduce((best, slot) => (slot.weight > best.weight ? slot : best), open[0])
   // Every slot is at or over its ceiling, so no weight can gate the pick: spread the
   // overflow over the least loaded slot rather than refusing the work.
   return pool.reduce((best, slot) => (loadOf(snap.counts, slot.model) < loadOf(snap.counts, best.model) ? slot : best), pool[0])
@@ -722,8 +844,9 @@ export function agentFor(base: string, slot: number) {
 // work: for a task spawn it is the child session (bound later), for a
 // plugin-spawned session it is the session itself.
 export function acquire(s: State, base: string, slot: Slot, ownerSession: string, key: string, target?: string) {
-  s.own.set(key, { v: base, k: slot.index, m: slot.model, t: Date.now(), s: ownerSession, g: target })
-  if (target) s.activity.set(target, Date.now())
+  const now = Date.now()
+  s.own.set(key, { v: base, k: slot.index, m: slot.model, t: now, hb: now, s: ownerSession, g: target })
+  if (target) s.activity.set(target, now)
   publish(s)
 }
 
@@ -731,7 +854,24 @@ export function release(s: State, key: string) {
   if (s.own.delete(key)) publish(s)
 }
 
+// How many recent children to remember per parent, and for how long.
+const CHILD_RING = 8
+const CHILD_MEMORY_MS = 30 * 60_000
+// Tolerate a little clock skew when deciding whether a child predates its claim.
+const CHILD_SLACK_MS = 1_000
+
+// Every child we are told about is remembered, so a claim that missed its own
+// session.created can still be bound later by backfillChild(). Bound to a ring so
+// a long-lived parent cannot grow this without limit.
+function noteChild(s: State, parentID: string, childID: string) {
+  const ring = s.children.get(parentID) ?? []
+  ring.push({ id: childID, t: Date.now() })
+  while (ring.length > CHILD_RING) ring.shift()
+  s.children.set(parentID, ring)
+}
+
 export function bindChild(s: State, parentID: string, childID: string) {
+  noteChild(s, parentID, childID)
   const candidates = [...s.own.entries()]
     .filter(([, c]) => c.s === parentID && !c.g)
     .sort((a, b) => a[1].t - b[1].t)
@@ -742,8 +882,39 @@ export function bindChild(s: State, parentID: string, childID: string) {
   return true
 }
 
+// Late recovery for a claim whose session.created arrived before the claim was
+// taken, which bindChild cannot match because it only looks at claims that
+// already exist. Deliberately conservative -- same parent, created at or after
+// the claim, not already owned by another claim -- because the cost of a wrong
+// guess is aborting a healthy session, while leaving a claim unbound only costs
+// one reap cycle.
+export function backfillChild(s: State, claim: Claim) {
+  if (claim.g || !claim.s) return false
+  const now = Date.now()
+  const taken = new Set([...s.own.values()].map((c) => c.g).filter((g): g is string => typeof g === "string"))
+  const ring = s.children.get(claim.s) ?? []
+  for (let i = ring.length - 1; i >= 0; i--) {
+    const child = ring[i]
+    if (now - child.t > CHILD_MEMORY_MS) break
+    if (child.t < claim.t - CHILD_SLACK_MS) continue
+    if (taken.has(child.id)) continue
+    claim.g = child.id
+    s.activity.set(child.id, now)
+    publish(s)
+    return true
+  }
+  return false
+}
+
 export function noteActivity(s: State, sessionID: string) {
-  s.activity.set(sessionID, Date.now())
+  const now = Date.now()
+  s.activity.set(sessionID, now)
+  // The message is proof the task is alive, so the claim that owns it must not be
+  // aged out from under it. Without this a task that runs past the TTL stops being
+  // counted while it keeps burning the provider, and the slot is handed out again.
+  let touched = false
+  for (const claim of s.own.values()) if (claim.g === sessionID) (claim.hb = now), (touched = true)
+  if (touched) publish(s)
 }
 
 export function idleFor(s: State, claim: Claim, now: number) {

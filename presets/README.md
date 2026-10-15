@@ -62,7 +62,7 @@ else means the flat form.
 | Field | Required | Meaning |
 |-------|----------|---------|
 | `model` | yes | `provider/model-id`, split on the **first** slash only |
-| `weight` | no | soft ceiling on concurrent claims, and priority. Absent = 1 |
+| `weight` | no | soft ceiling on concurrent claims, and turns taken per rotation. Absent = 1 |
 
 `$comment` is a JSON-legal array of strings and is ignored by the loader; the
 bundled preset uses it to explain itself in place.
@@ -91,17 +91,28 @@ because the pool requires it.
 
 ## Weight, precisely
 
-A weight is a count of concurrent sessions, used as both a ceiling and a
-priority:
+A weight is a count of concurrent sessions — a soft ceiling — and the number
+of turns a slot takes per rotation. Routing is **order-first weighted
+round-robin**:
 
-1. the **highest-weight** slot still under its own ceiling takes the next spawn
-2. so slot 1 fills to its number before slot 2 sees any work at all
+1. the slot list is expanded into a run in which each slot appears once per
+   unit of its weight — `[3,2,1,1]` becomes `1,1,1,2,2,3,4` — and the next
+   spawn takes the turn a persistent cursor (a file in the pool directory,
+   shared by every opencode process) points at
+2. a turn whose slot is cooling or already at its ceiling is **skipped**, and
+   the rotation resumes at the following turn
 3. once **every** slot is at its ceiling, overflow goes to the least loaded slot —
    a burst past the summed ceilings degrades to even spreading and never blocks
 
+Weight is no longer a priority: a heavy slot is not drained to its ceiling
+before the others see any work. Every slot gets a turn each cycle, so a fast
+provider with a large usage window is used early in the cycle while it is
+still fast — instead of one provider being refilled until it hits its limit
+and its 429s displace every agent type at once.
+
 Equal weights give a plain round robin in list order. List order is the
-tie-break, so put the models you want busiest first and treat the bottom of the
-list as reserve capacity.
+rotation itself, so put the models you want taking the earlier turns of a
+cycle at the top and the ones you want taking the later turns at the bottom.
 
 Spreading at least two providers across the slots is worth doing deliberately: a
 provider-wide rate limit takes out every slot on that provider at once.
