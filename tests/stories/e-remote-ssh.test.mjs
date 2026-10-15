@@ -312,11 +312,12 @@ test("[US-13] the notification crosses the hop as ONE delimited argument, never 
   const after = hop.slice(hop.indexOf("--") + 1)
   assert.equal(after.length, 1, `the hop must carry a single payload argument: ${JSON.stringify(hop)}`)
   const fields = after[0].split("\n")
-  assert.equal(fields.length, 4, `the payload must be newline-delimited into four fields: ${JSON.stringify(fields)}`)
+  assert.equal(fields.length, 5, `the payload must be newline-delimited into five fields: ${JSON.stringify(fields)}`)
   assert.ok(fields[0].includes(payload), `the payload must cross verbatim in field 1: ${JSON.stringify(fields)}`)
   assert.ok(fields[1].includes(`Message; touch ${marker}`), `field 2 must cross verbatim: ${JSON.stringify(fields)}`)
   assert.equal(fields[2], "normal")
   assert.equal(fields[3], "utilities-terminal")
+  assert.equal(fields[4], "none", "a four-argument caller still gets a valid payload with sound: 'none'")
   // ...and nothing was ever executed. A second command smuggled through the hop
   // would own the local desktop, which is why the receiver parses rather than
   // evaluates.
@@ -589,11 +590,7 @@ test("[US-14] doctor reports what the environment resolves to without failing wh
   assert.match(remote.stdout, /OC_LOCAL_USER is unset/, "doctor must say what is missing")
 })
 
-// ---------------------------------------------------------------------------
-// US-26 -- the local channel is chosen per platform
-// ---------------------------------------------------------------------------
-
-const { describe: describeEnv, localChannel, safeMessage, safeTitle, sendLocal } =
+const { describe: describeEnv, localChannel, safeMessage, safeTitle, sendLocal, soundChannel } =
   await import(join(ROOT, "src", "tunnel", "index.ts"))
 
 /**
@@ -834,5 +831,110 @@ test("[US-26] doctor names the channel this platform would use, not a binary it 
     assert.equal(localChannel("darwin"), "none")
     assert.equal(describeEnv({}, "darwin").channel, "none")
     assert.equal(localChannel("win32"), "none", "with nothing installed, any platform reports none rather than guessing")
+  })
+})
+
+// US-29 -- notification sound. The four outcomes each name a bundled WAV, and
+// the sound is played HERE, on the machine that renders the notification, which
+// is the only place a tone can be heard: a remote opencode host has no speakers.
+// These drive sendLocal directly, because the player is spawned detached and the
+// thing under test is which FILE it was handed, not what a notifier did with it.
+
+/** Every player `soundChannel` may pick, so the assertion is not machine-bound. */
+const PLAYERS = ["paplay", "aplay", "pw-play", "afplay"]
+
+/**
+ * Run `fn` with PATH holding only `names`, each a stub recording its argv.
+ *
+ * Its own helper rather than `withStubs`, because that one restores PATH in a
+ * `finally` around a non-awaited `fn`: fine for a synchronous notifier, wrong
+ * here, because the sound player is spawned detached and is still writing its
+ * log after `sendLocal` has already returned. Awaiting the body keeps PATH
+ * installed until the log it waits for actually exists.
+ */
+const withStubsAwaited = async (names, fn) => {
+  const bin = scratch("sound-")
+  const logs = {}
+  for (const name of names) {
+    const log = join(bin, `${name}.log`)
+    logs[name] = log
+    writeFileSync(join(bin, name), `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done\nexit 0\n`)
+    chmodSync(join(bin, name), 0o755)
+  }
+  // `command -v` is a shell builtin, so the probe needs a shell to run in.
+  symlinkSync("/bin/sh", join(bin, "sh"))
+
+  const argvOf = (name) => {
+    const log = logs[name]
+    if (!log || !existsSync(log)) return []
+    const parts = readFileSync(log, "utf8").split("\0")
+    if (parts[parts.length - 1] === "") parts.pop()
+    return parts
+  }
+  /** The detached spawn writes its log on a later tick than sendLocal returns. */
+  const waitFor = async (name) => {
+    for (let i = 0; i < 50 && argvOf(name).length === 0; i++) await settle()
+    return argvOf(name)
+  }
+
+  const previous = process.env.PATH
+  process.env.PATH = bin
+  try {
+    await fn({ argv: argvOf, waitFor })
+  } finally {
+    if (previous === undefined) delete process.env.PATH
+    else process.env.PATH = previous
+  }
+}
+
+test("[US-29] the sound is handed to the player as a bundled asset that exists", async () => {
+  await withStubsAwaited([...PLAYERS, "notify-send"], async ({ argv, waitFor }) => {
+    const channel = soundChannel()
+    assert.notEqual(channel, "none", "a player stub is on PATH, so one must be picked")
+
+    sendLocal({ title: "opencode", message: "Task finished", sound: "done" })
+    const played = await waitFor(channel)
+
+    assert.equal(played.length, 1, `the player is given the file and nothing else: ${JSON.stringify(played)}`)
+    assert.ok(existsSync(played[0]), `the sound must be a real asset, not a name or a path built from the wire: ${played[0]}`)
+    assert.match(played[0], /sounds[/\\]done\.wav$/, `the name must resolve to that outcome's own asset: ${played[0]}`)
+  })
+})
+
+test("[US-29] a sound name off the whitelist plays nothing and is never a path", async () => {
+  // The sender is the untrusted side of the hop. A name that is not one of the
+  // five must resolve to silence, because anything else turns the tunnel into a
+  // way to make the receiver open an arbitrary file.
+  await withStubsAwaited([...PLAYERS, "notify-send"], async ({ argv, waitFor }) => {
+    const channel = soundChannel()
+    assert.notEqual(channel, "none")
+
+    for (const hostile of ["noisy", "../../../../etc/passwd", "/etc/passwd", "done.wav"]) {
+      sendLocal({ title: "opencode", message: "Task finished", sound: hostile })
+      await waitFor(channel)
+      assert.deepEqual(argv(channel), [], `an unlisted name must play nothing, not ${hostile}`)
+    }
+
+    // And the notification itself is unaffected: audio is additive, never a gate.
+    assert.equal(sendLocal({ title: "opencode", message: "m", sound: "noisy" }).ok, true)
+  })
+})
+
+test("[US-29] the sound still plays on a desktop with no notification channel at all", async () => {
+  // No notifier stub is installed, so localChannel reports "none" and sendLocal
+  // takes its early return. That desktop is precisely where the tone is the only
+  // alert there is, so the sound must not be skipped along with the popup.
+  await withStubsAwaited(PLAYERS, async ({ argv, waitFor }) => {
+    assert.equal(localChannel(), "none", "this case is only meaningful with no notifier installed")
+
+    const channel = soundChannel()
+    assert.notEqual(channel, "none")
+
+    const result = sendLocal({ title: "opencode", message: "Task finished", sound: "error" })
+    const played = await waitFor(channel)
+
+    assert.equal(result.ok, false, "the popup is still reported as undelivered -- the sound does not fake a success")
+    assert.equal(played.length, 1, `the sound must still play: ${JSON.stringify(played)}`)
+    assert.match(played[0], /sounds[/\\]error\.wav$/)
   })
 })

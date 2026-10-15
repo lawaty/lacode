@@ -222,6 +222,18 @@ does not.
 - [ ] Given the plugin observes a permission prompt, When it handles the event, Then it is a read-only observer: the payload is not mutated and no `permission.ask` hook is registered, because that hook's `output.status` is the permission decision itself.
 - [ ] Given a `permission` notification is raised, When it is evaluated against the cooldown, Then it bypasses it, since an unannounced block is the failure this story exists to remove.
 
+### US-29: Notification sounds distinguish outcomes and can be switched off
+**As a** user running many parallel sessions, **I want** each notification to arrive with its own sound, **so that** I can tell a finished session from a question or a permission prompt without looking at the popup.
+
+**Story ID(s) for tests:** US-29
+**Acceptance criteria:**
+- [ ] Given any of the four outcomes, When its notification is delivered, Then it carries that outcome's own sound name — `done`, `question`, `permission` or `error` — and no two share one, so the four are distinguishable by ear alone.
+- [ ] Given a notification raised on a remote host, When it reaches the desktop, Then the sound plays where the notification is delivered and never on the opencode host, because a headless host has no speakers for you to hear.
+- [ ] Given no sound player is installed, or the player cannot start, When the notification is delivered, Then the notification is delivered unchanged and only the sound is skipped, because a missing audio tool must never cost you the alert itself.
+- [ ] Given a machine with no notification channel at all, When a notification is raised, Then its sound still plays, because on such a desktop the tone is the only alert there is.
+- [ ] Given the plugin option `sound` is `false`, or `LACODE_SOUND` is `0`, `false`, `off` or `no`, When a notification is delivered, Then its sound is `none`; when both are set the environment wins over the option, and any other value — a typo included — leaves sound on, because a misspelt variable must not be how you get silence.
+- [ ] Given a sound name that is not one of `none`, `done`, `question`, `permission` or `error`, When it arrives, Then it is treated as `none` and never becomes a path or a command, because the hop carries data only (see US-18).
+
 ---
 
 ## Epic E — Remote hosts over SSH
@@ -431,6 +443,7 @@ table was filled in.
 | US-11 | D | `tests/stories/d-notifications.test.mjs`, `tests/notify-test.mjs` |
 | US-12 | D | `tests/stories/d-notifications.test.mjs`, `tests/notify-test.mjs` |
 | US-25 | D | `tests/stories/d-notifications.test.mjs` |
+| US-29 | D | `tests/stories/d-notifications.test.mjs` |
 | US-13 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/notify-test.mjs`, `tests/oc-test.mjs` |
 | US-14 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |
 | US-18 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |

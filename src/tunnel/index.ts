@@ -27,9 +27,11 @@
 // environment (OC_LOCAL_USER, OC_TUNNEL_PORT, OC_NOTIFY_KEY) or by passing a
 // TunnelConfig; there is no discovery, no system probing, and no writes.
 
-import { spawnSync } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
+import { existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { PACKAGE_ROOT } from "../lib/package-root.ts"
 
 export type Urgency = "low" | "normal" | "critical"
 
@@ -51,11 +53,26 @@ export const ICONS: readonly Icon[] = [
   "emblem-default",
 ] as const
 
+export type Sound = "none" | "done" | "question" | "permission" | "error"
+
+/**
+ * The sound whitelist. The sender passes a name, the receiver maps it to a
+ * bundled WAV asset; this is data, never a path or a command.
+ */
+export const SOUNDS: readonly Sound[] = [
+  "none",
+  "done",
+  "question",
+  "permission",
+  "error",
+] as const
+
 export type NotifyRequest = {
   title: string
   message?: string
   urgency?: string
   icon?: string
+  sound?: string
 }
 
 export type Result = { ok: boolean; detail?: string; transport: "local" | "remote" | "none" }
@@ -103,6 +120,10 @@ export function normalizeIcon(raw: string | undefined): Icon {
   return ICONS.includes(raw as Icon) ? (raw as Icon) : "utilities-terminal"
 }
 
+export function normalizeSound(raw: string | undefined): Sound {
+  return SOUNDS.includes(raw as Sound) ? (raw as Sound) : "none"
+}
+
 // Strip control characters and cap the length: both values are user-visible text
 // that lands on a desktop, and a session title is not trusted input.
 //
@@ -122,7 +143,7 @@ export const safeMessage = (raw: string | undefined) => safeText(raw ?? "", "", 
 export const FIELD_SEPARATOR = "\n"
 
 /**
- * One argument, four newline-delimited fields: `title\nmessage\nurgency\nicon`.
+ * One argument, five newline-delimited fields: `title\nmessage\nurgency\nicon\nsound`.
  *
  * The single-argument shape is not a style choice, it is what the transport
  * actually provides. ssh concatenates everything after the host into ONE command
@@ -133,9 +154,9 @@ export const FIELD_SEPARATOR = "\n"
  * field fell back to its default and the popup was blank.
  *
  * Newline is the delimiter because `safeText` above strips every control
- * character (including \n) from both free-text fields, and the icon and urgency
- * are whitelisted values. No field can contain the delimiter, so the split is
- * lossless for a body containing spaces, quotes or glob characters.
+ * character (including \n) from both free-text fields, and the icon, urgency
+ * and sound are whitelisted values. No field can contain the delimiter, so the
+ * split is lossless for a body containing spaces, quotes or glob characters.
  */
 /**
  * The inverse of `encodePayload`: the newline-delimited payload a forced command
@@ -143,12 +164,13 @@ export const FIELD_SEPARATOR = "\n"
  * boundary, rather than assumed from the sender.
  */
 export function parsePayload(raw: string): NotifyRequest {
-  const [title, message, urgency, icon] = raw.split(FIELD_SEPARATOR)
+  const [title, message, urgency, icon, sound] = raw.split(FIELD_SEPARATOR)
   return {
     title: safeTitle(title),
     message: safeMessage(message),
     urgency: normalizeUrgency(urgency),
     icon: normalizeIcon(icon),
+    sound: normalizeSound(sound),
   }
 }
 
@@ -158,6 +180,7 @@ export const encodePayload = (request: NotifyRequest): string =>
     safeMessage(request.message),
     normalizeUrgency(request.urgency),
     normalizeIcon(request.icon),
+    normalizeSound(request.sound),
   ].join(FIELD_SEPARATOR)
 
 /**
@@ -228,6 +251,26 @@ const CHANNEL_BINARY: Record<Exclude<LocalChannel, "none">, string> = {
   "terminal-notifier": "terminal-notifier",
 }
 
+/** The sound player binary. One entry, so the channel IS the command. */
+const SOUND_BINARY = {
+  afplay: "afplay",
+  paplay: "paplay",
+  aplay: "aplay",
+  "pw-play": "pw-play",
+}
+
+/** Which sound player to use here. */
+export function soundChannel(platform: string = process.platform): keyof typeof SOUND_BINARY | "none" {
+  if (platform === "darwin") {
+    if (have(SOUND_BINARY.afplay)) return "afplay"
+  } else {
+    for (const cmd of [SOUND_BINARY.paplay, SOUND_BINARY.aplay, SOUND_BINARY["pw-play"]]) {
+      if (have(cmd)) return cmd
+    }
+  }
+  return "none"
+}
+
 /**
  * The AppleScript a macOS send runs.
  *
@@ -291,13 +334,47 @@ const NO_CHANNEL: Record<string, string> = {
  * Deliver straight to the local desktop session. Never throws, never blocks
  * longer than the notifier timeout.
  *
+ * Sound playback is fire-and-forget: it is detached and unref'd to outlive
+ * the parent process, and failures (missing player, missing asset) are
+ * silent and never affect the Result of the notification itself.
+ *
  * `platform` is a parameter rather than a bare `process.platform` read so the
  * channel a machine WOULD pick is observable from a test on any machine -- the
  * same reason `notifyHooks` takes a `deliver` seam.
  */
 export function sendLocal(request: NotifyRequest, platform: string = process.platform): Result {
+  // Play an alert sound, if available.
+  //
+  // This is spawned here because `sendLocal` is the only function that
+  // runs on the user's actual desktop in both topologies (local or
+  // through the SSH tunnel), so the sound is audible. The plugin's own
+  // spawn runs on a headless host where it would be silent.
+  //
+  // Audio success is independent of notification success: this is called
+  // in the `channel === "none"` branch too, because on a desktop with no
+  // notification daemon, the sound is the only alert the user gets.
+  // Therefore, a sound failure must never change the `Result` of `sendLocal`.
+  //
+  // The player is detached + unref'd so it can outlive the parent process,
+  // which may exit immediately after `sendLocal` returns (e.g. `lacode receive`).
+  //
+  // Assets are whitelisted via `normalizeSound`, so the path is never built
+  // from sender-supplied text, preventing arbitrary file access.
+  const sound = normalizeSound(request.sound)
+  const playSound = () => {
+    if (sound === "none") return
+    const channel = soundChannel(platform)
+    if (channel === "none") return
+    const path = join(PACKAGE_ROOT, "sounds", `${sound}.wav`)
+    if (!existsSync(path)) return
+    const child = spawn(channel, [path], { detached: true, stdio: "ignore" })
+    child.on("error", () => {})
+    child.unref()
+  }
+
   const channel = localChannel(platform)
   if (channel === "none") {
+    playSound()
     return { ok: false, detail: NO_CHANNEL[platform] ?? `no local notification channel on ${platform}`, transport: "local" }
   }
   const title = safeTitle(request.title)
@@ -310,6 +387,7 @@ export function sendLocal(request: NotifyRequest, platform: string = process.pla
         : // Byte-identical to the notify-send call this package has always made.
           [title, body, `--urgency=${normalizeUrgency(request.urgency)}`, `--icon=${normalizeIcon(request.icon)}`]
   const result = run(CHANNEL_BINARY[channel], args, 5000)
+  playSound()
   return { ok: result.ok, detail: result.ok ? undefined : result.stderr || result.detail, transport: "local" }
 }
 

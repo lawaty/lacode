@@ -3,6 +3,7 @@ import { existsSync } from "node:fs"
 import * as path from "node:path"
 import type { Hooks } from "@opencode-ai/plugin"
 import {
+  NOTIFY_OUTCOMES,
   Notifier,
   errorDetail,
   helperArgv,
@@ -50,11 +51,28 @@ import { PACKAGE_ROOT } from "../lib/pool.ts"
 // session.started notification was removed: it interrupts to say nothing, and
 // it fires before there is any result to name.
 //
+// Sound rides along with the notification (US-15), on the same wire field the
+// outcome already implies: four bundled WAVs, one per outcome, named after it --
+// done, question, permission, error. So the sound says WHICH kind of thing
+// happened even when the popup is out of sight, and nothing has to be translated
+// per outcome here: the name goes out as the outcome.
+//
 // This module is a HOOK FACTORY, not a plugin -- see the note at the top of
 // ./agent-pool.ts. It must export the factory and nothing else.
 
 const SERVICE = "notify"
 const COOLDOWN_MS = 5_000
+
+// The user's explicit off switch for notification sound. Deliberately NOT
+// exported: this file may export the factory and nothing else (opencode calls
+// every export of a plugins/ file as a plugin -- see the header), and the value
+// the switch has is observable anyway, through what the deliver seam receives.
+const SOUND_ENV = "LACODE_SOUND"
+// The only spellings that mean "off". Anything else -- including an empty
+// value, a typo, or a future flag someone assumes means on -- is NOT read as
+// truthy: the user who never asked for silence must not get it from a misspelt
+// variable.
+const SOUND_OFF_VALUES = ["0", "false", "off", "no"]
 
 // Where the notification helper lives, in order:
 //   1. OC_NOTIFY_HELPER -- an explicit override, so a user can point at their own
@@ -97,13 +115,44 @@ const findHelper = (): string | undefined => {
  * Omit it and nothing changes: the default spawns `bin/oc-notify` detached and
  * unref'd, exactly as before. This parameter is additive and last, so every
  * existing call site keeps its current behaviour.
+ *
+ * The fourth argument is the sound name -- an outcome, or "none" when the user
+ * has switched sound off. It is appended last and typed as `string` so a sender
+ * written before sounds existed still satisfies the type; an unknown name is the
+ * receiver's to normalize, not this file's.
  */
-export type Delivery = (title: string, message: string, urgency: string) => Promise<{ ok: boolean; detail?: string }>
+export type Delivery = (title: string, message: string, urgency: string, sound: string) => Promise<{ ok: boolean; detail?: string }>
 
 export type NotifyDeps = { deliver?: Delivery }
 
+/**
+ * The plugin options this factory reads, narrowed from the loose value opencode
+ * hands it -- the same cast agent-pool.ts and selfupdate.ts make. One field, and
+ * it is opt-out: an absent option means the full behaviour.
+ */
+export type NotifyOptions = {
+  /** Notification sounds. Absent (or anything but `false`) plays them. */
+  sound?: boolean
+}
+
 // A factory returning hooks, not a Plugin -- see the note in ./agent-pool.ts.
-export const notifyHooks = (async ({ client, directory }, _options?: unknown, deps: NotifyDeps = {}): Promise<Hooks> => {
+export const notifyHooks = (async ({ client, directory }, options?: unknown, deps: NotifyDeps = {}): Promise<Hooks> => {
+  // Sound on or off, decided ONCE and here, so the rest of the file works from a
+  // plain boolean and never re-reads the environment: there is exactly one place
+  // where "is sound on" is answered.
+  //
+  // Opt-OUT only, mirroring `selfUpdate: false` / LACODE_NO_SELFUPDATE (US-27).
+  // Audio is audible in a shared room, and a feature that is off by default is a
+  // feature nobody ever finds -- so the default is the full behaviour and the
+  // toggle exists to turn it off.
+  //
+  // The environment beats the option, so a shell can mute a machine whose config
+  // says otherwise; it is read first, trimmed and lowercased, and compared against
+  // the four off-spellings and nothing else.
+  const opts = (options ?? {}) as NotifyOptions
+  const soundEnv = (process.env[SOUND_ENV] ?? "").trim().toLowerCase()
+  const soundOn = !SOUND_OFF_VALUES.includes(soundEnv) && opts.sound !== false
+
   const notifier = new Notifier(COOLDOWN_MS)
   // Sessions this process has actually seen do work in. Distinguishes "finished
   // after a turn" from "an idle event for a session that was merely opened".
@@ -140,7 +189,7 @@ export const notifyHooks = (async ({ client, directory }, _options?: unknown, de
   // user believes the agent finished and stops watching. So delivery is verified,
   // not assumed -- the helper's exit status and stderr are captured and logged, and
   // "notified" is only claimed when the helper actually succeeded.
-  const deliverViaHelper = (title: string, message: string, urgency: string) =>
+  const deliverViaHelper = (title: string, message: string, urgency: string, sound: string) =>
     new Promise<{ ok: boolean; detail?: string }>((resolve) => {
       const helper = findHelper()
       if (!helper) {
@@ -155,7 +204,11 @@ export const notifyHooks = (async ({ client, directory }, _options?: unknown, de
       // stdio pipes (not ignore) because the helper's own diagnostics are the only
       // way a remote tunnel failure is ever visible -- oc-notify prints to stderr
       // and exits 0, so its output is the entire signal.
-      const child = spawn(helper, helperArgv(helper, title, message, urgency, "utilities-terminal"), {
+      //
+      // Sound last, matching the payload's own field order (TITLE, MESSAGE,
+      // URGENCY, ICON, SOUND) -- helperArgv puts it in the same slot for both
+      // helper CLIs, so there is no per-transport decision left to make here.
+      const child = spawn(helper, helperArgv(helper, title, message, urgency, "utilities-terminal", sound), {
         stdio: ["ignore", "ignore", "pipe"],
         detached: true,
       })
@@ -249,7 +302,13 @@ export const notifyHooks = (async ({ client, directory }, _options?: unknown, de
         return
       }
       const message = isRemote ? `${decision.message} (remote)` : decision.message
-      const sent = await deliver(decision.title, message, decision.urgency)
+      // The outcome IS the sound name: four outcomes, four bundled WAVs, one each,
+      // so there is nothing to translate. The membership test is the guard for a
+      // future fifth outcome -- silence until it has a WAV, rather than a name the
+      // receiver would have to reject. With the toggle off the sound is "none",
+      // which is the whitelist's own word for play nothing.
+      const sound = soundOn && NOTIFY_OUTCOMES.includes(outcome) ? outcome : "none"
+      const sent = await deliver(decision.title, message, decision.urgency, sound)
       // Claiming "notified" on a failed delivery is how this bug survived: the log
       // said notified five times while nothing reached the desktop. Only say it when
       // the helper confirmed, and say what failed when it did not.

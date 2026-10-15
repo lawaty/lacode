@@ -14,7 +14,7 @@ gets it back.
   │      │           │ ───────────────────────► │  (authorized_keys      │
   │      ▼           │   ONE argument:          │   forced command)      │
   │ lacode notify    │   title\nmessage\n       │      │                 │
-  │                  │   urgency\nicon          │      ▼                 │
+  │                  │   urgency\nicon\nsound   │      ▼                 │
   │                  │                          │  notify-send /         │
   │                  │                          │  osascript             │
   └──────────────────┘                          └────────────────────────┘
@@ -27,21 +27,26 @@ listening port, no systemd unit and nothing to sync: the plugin owns the
 transport, and it exists only while opencode runs — which is the only time a
 notification matters.
 
-**One argument, not four.** ssh concatenates everything after the host into a
+**One argument, not five.** ssh concatenates everything after the host into a
 single command string, and a forced command starts with *no* positional
-parameters. A sender that passes four quoted arguments arrives as the single
-string `"a b c d"`; a receiver reading `$1..$4` sees four empty strings, falls
-back to four defaults, and pops up a blank notification. So the payload crosses
+parameters. A sender that passes five quoted arguments arrives as the single
+string `"a b c d e"`; a receiver reading `$1..$5` sees five empty strings, falls
+back to five defaults, and pops up a blank notification. So the payload crosses
 as one newline-delimited argument:
 
 ```
-title\nmessage\nurgency\nicon
+title\nmessage\nurgency\nicon\nsound
 ```
 
+Five fields, and only the last one is new: `sound` is `none`, `done`,
+`question`, `permission` or `error`. A sender that stops at `icon` simply
+leaves it empty, and an empty or unrecognised name is `none`, so a four-field
+payload is still a valid one.
+
 Newline is safe as the delimiter because both ends strip control characters from
-the free-text fields before assembling or reading it, and `urgency` and `icon`
-come from whitelists. No field can contain the delimiter, so a message full of
-spaces, quotes or `*` survives intact.
+the free-text fields before assembling or reading it, and `urgency`, `icon` and
+`sound` come from whitelists. No field can contain the delimiter, so a message
+full of spaces, quotes or `*` survives intact.
 
 ## Setting it up
 
@@ -81,10 +86,14 @@ with `terminal-notifier` as the macOS fallback when `osascript` is missing.
 
 ```bash
 lacode notify "build finished" "4 files changed" normal dialog-information
-lacode notify "question" "which database should I use?" critical dialog-warning
+lacode notify "question" "which database should I use?" critical dialog-warning done
 lacode forward web-01 -- systemctl --user status something
 lacode doctor
 ```
+
+SOUND is optional and last: `none`, `done`, `question`, `permission` or `error`,
+one bundled tone per outcome. Leave it off and nothing plays; the line above
+without a fifth word is still correct.
 
 `notify` is fire-and-forget by design. An unreachable desktop, a missing key, no
 notifier installed at all — all of them print a warning on stderr and exit 0. A
@@ -109,6 +118,14 @@ receives notifications too.
 It never forwards: `SSH_CLIENT` is set for a forced command as well, so it calls
 the local channel directly rather than `notify()` (which would loop back).
 
+It plays the sound too, and that is not decoration. The notification is rendered
+on the desktop, so that is the only place a tone can be heard: the remote host
+runs the session and has no speakers. The name is validated against the sound
+whitelist at the same trust boundary as `urgency` and `icon`, and the receiver
+looks the file up in the package's own `sounds/` directory — the sender's word
+never becomes a path. `afplay` plays it on macOS, `paplay`, `aplay` or
+`pw-play` on Linux, and a machine with none of them still gets the notification.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -123,6 +140,16 @@ the local channel directly rather than `notify()` (which would loop back).
 `OC_LOCAL_USER` is read rather than probed on purpose. `id -un` on a remote
 account frequently returns `root`, and a dbus path built from that reaches
 nobody's desktop. Guessing the desktop user is worse than failing.
+
+`LACODE_SOUND` is deliberately absent from that table, and not by oversight:
+every `OC_*` name above is read by the hop — either by `lacode notify` or by the
+ssh call it makes — and `lacode tunnel setup` prints what it exports. Sound is
+not that. It is a plugin-level mute switch read by the process running opencode
+(`sound: false` is the same switch in the config), so listing it here would send
+you to export a variable into a hop environment where nothing looks at it. It is
+documented with the other plugin options in the README. Set it to `0`, `false`,
+`off` or `no` to silence notifications; anything else — a typo included — leaves
+sound on, because a misspelt variable must not be how you turn a feature off.
 
 ## Legacy: the reverse forward
 

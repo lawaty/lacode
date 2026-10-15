@@ -284,6 +284,7 @@ option is optional:
 | `modelsFile` | — | An explicit slot file; short-circuits the chain below. |
 | `reapMs` | `30000` | Hang-reaper interval. |
 | `selfUpdate` | `true` | Check for a newer release at most once per ~6h and install it in the background; it applies on the next opencode start. `false` — or `LACODE_NO_SELFUPDATE=1` — turns the check off. |
+| `sound` | `true` | Play a short tone with each notification, one per outcome, so you can tell a finished session from a question or a permission prompt without reading the popup. It is opt-out: `false` — or `LACODE_SOUND=0` (`false`, `off`, `no` work too, and beat the option) — turns the sound off, and anything else, a typo included, leaves it on. |
 | `omniroute` | — | Optional [OmniRoute](#configuring-omniroute) gateway integration. Absent or `{ enabled: false }` changes nothing. |
 
 ### Staying up to date
@@ -645,7 +646,7 @@ open are in [docs/TUNNEL.md](docs/TUNNEL.md).
 
 ## User stories
 
-Twenty-three stories across seven epics, each written as a behavioural contract
+Twenty-nine stories across seven epics, each written as a behavioural contract
 with acceptance criteria a test can assert mechanically — the pains behind them,
 the Given/When/Then criteria, and the story-to-test mapping are in
 [docs/USER-STORIES.md](docs/USER-STORIES.md).

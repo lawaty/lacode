@@ -273,10 +273,10 @@ await check("the helper's argv matches the CLI that was found", () => {
   // oc-notify takes TITLE first; the lacode CLI takes `notify TITLE ...`. The
   // shipped bug passed the oc-notify shape to dist/lacode.js and got
   // "unknown command" -- found, spawned, and useless.
-  const argv = (helper) => JSON.stringify(helperArgv(helper, "T", "M", "normal", "icon"))
-  assert(argv("/x/oc-notify") === JSON.stringify(["T", "M", "normal", "icon"]), `oc-notify keeps TITLE first, got ${argv("/x/oc-notify")}`)
-  assert(argv("/x/lacode") === JSON.stringify(["notify", "T", "M", "normal", "icon"]), `the lacode CLI takes the notify subcommand, got ${argv("/x/lacode")}`)
-  assert(argv("/pkg/dist/lacode.js") === JSON.stringify(["notify", "T", "M", "normal", "icon"]), `dist/lacode.js is the lacode CLI, got ${argv("/pkg/dist/lacode.js")}`)
+  const argv = (helper) => JSON.stringify(helperArgv(helper, "T", "M", "normal", "icon", "none"))
+  assert(argv("/x/oc-notify") === JSON.stringify(["T", "M", "normal", "icon", "none"]), `oc-notify keeps TITLE first, got ${argv("/x/oc-notify")}`)
+  assert(argv("/x/lacode") === JSON.stringify(["notify", "T", "M", "normal", "icon", "none"]), `the lacode CLI takes the notify subcommand, got ${argv("/x/lacode")}`)
+  assert(argv("/pkg/dist/lacode.js") === JSON.stringify(["notify", "T", "M", "normal", "icon", "none"]), `dist/lacode.js is the lacode CLI, got ${argv("/pkg/dist/lacode.js")}`)
 })
 
 await check("the notification helper is detached", () => {

@@ -2,7 +2,7 @@
 // lacode — the portable CLI half of LaCode.
 //
 // Subcommands:
-//   lacode notify TITLE [MESSAGE] [URGENCY] [ICON]
+//   lacode notify TITLE [MESSAGE] [URGENCY] [ICON] [SOUND]
 //   lacode forward HOST -- COMMAND [ARG...]
 //   lacode update [--check]
 //   lacode doctor
@@ -28,7 +28,7 @@ import { spawnSync } from "node:child_process"
 // "tunnel", "index.ts"))` survived type stripping but was opaque to esbuild, so
 // the shipped CLI would have reached back into a `src/` the tarball no longer
 // carries. It still runs unbundled straight from a git checkout.
-import { describe, forward, notify, parsePayload, resolveTunnel, safeTitle, sendLocal } from "../src/tunnel/index.ts"
+import { describe, forward, notify, normalizeSound, parsePayload, resolveTunnel, safeTitle, sendLocal } from "../src/tunnel/index.ts"
 import { PACKAGE_ROOT } from "../src/lib/package-root.ts"
 import { checkForUpdate, refreshCache } from "../src/lib/selfupdate.ts"
 
@@ -54,10 +54,13 @@ if (!process.features?.typescript) {
 
 const USAGE = `lacode — portable notifications and remote exec for LaCode
 
-  lacode notify TITLE [MESSAGE] [URGENCY] [ICON]
+  lacode notify TITLE [MESSAGE] [URGENCY] [ICON] [SOUND]
       Send one desktop notification. Local host: straight to the desktop
       session. Over ssh: handed to the desktop through the reverse forward.
-      URGENCY is low | normal | critical. Fire-and-forget: always exits 0.
+      URGENCY is low | normal | critical. SOUND is none | done | question |
+      permission | error; an omitted or unrecognised SOUND is none, so a
+      four-argument caller simply gets no sound. Fire-and-forget: always
+      exits 0.
 
   lacode forward HOST -- COMMAND [ARG...]
       Run COMMAND on HOST over ssh. Exits with the remote's status.
@@ -91,7 +94,7 @@ switch (command) {
     break
 
   case "notify": {
-    const [rawTitle, message, urgency, icon] = argv
+    const [rawTitle, message, urgency, icon, sound] = argv
     if (!rawTitle) {
       console.error("lacode notify: TITLE is required")
       console.error(USAGE)
@@ -100,7 +103,12 @@ switch (command) {
     // A failed send is reported on stderr and then deliberately swallowed: the
     // exit status stays 0 so a caller treating this as fire-and-forget is never
     // broken by a sleeping laptop.
-    const result = notify({ title: rawTitle, message, urgency, icon })
+    //
+    // SOUND is the fifth wire field and it is OPTIONAL: a sender that stops at
+    // ICON leaves it undefined, and normalizeSound maps undefined -- like every
+    // other unrecognised name -- to "none", so back-compat and validation are
+    // the same call rather than a default here and a check there.
+    const result = notify({ title: rawTitle, message, urgency, icon, sound: normalizeSound(sound) })
     if (!result.ok) console.error(`lacode: notification not delivered via ${result.transport}: ${result.detail ?? "unknown reason"}`)
     process.exit(0)
     break

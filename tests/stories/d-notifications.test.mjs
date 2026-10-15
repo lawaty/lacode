@@ -37,8 +37,8 @@ const notifier = async ({ sessions = {}, result = { ok: true } } = {}) => {
     stub.input,
     undefined,
     {
-      deliver: async (title, message, urgency) => {
-        sent.push({ title, message, urgency })
+      deliver: async (title, message, urgency, sound) => {
+        sent.push({ title, message, urgency, sound })
         return typeof result === "function" ? result() : result
       },
     },
@@ -49,9 +49,113 @@ const notifier = async ({ sessions = {}, result = { ok: true } } = {}) => {
 const busy = (emit, sessionID) => emit("session.status", { sessionID, status: { type: "busy" } })
 const idle = (emit, sessionID) => emit("session.idle", { sessionID })
 
-// ---------------------------------------------------------------------------
-// US-11 -- a session finishing
-// ---------------------------------------------------------------------------
+test("[US-29] notification sounds distinguish outcomes", async () => {
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Work" } } })
+  await busy(emit, "s1")
+  // done
+  await idle(emit, "s1")
+  // question
+  await emit("question.asked", { sessionID: "s1", questions: [{ question: "Q?" }] })
+  // permission
+  await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*"], metadata: {} })
+  // error
+  await emit("session.error", { sessionID: "s1", error: { message: "err" } })
+  await settle()
+
+  // Asserted as a SET, not by position. The contract is that each outcome gets
+  // its own tone and no two share one; the order they arrive in is the
+  // cooldown's business, and pinning it here would fail for a reason that has
+  // nothing to do with sound.
+  const sounds = sent.map((notice) => notice.sound)
+  assert.deepEqual(
+    [...sounds].sort(),
+    ["done", "error", "permission", "question"],
+    `each outcome must carry its own tone, all four distinct: ${JSON.stringify(sent)}`,
+  )
+})
+
+test("[US-29] sound: false in options delivers 'none'", async () => {
+  const stub = stubInput({ sessions: { s1: { id: "s1", title: "Work" } } })
+  const sent = []
+  // Options are the SECOND positional argument to notifyHooks
+  const hooks = await notifyHooks(stub.input, { sound: false }, {
+    deliver: async (title, message, urgency, sound) => {
+      sent.push({ title, message, urgency, sound })
+      return { ok: true }
+    },
+  })
+  const emit = (type, properties) => hooks.event({ event: { type, properties } })
+  await busy(emit, "s1")
+  await idle(emit, "s1")
+  await settle()
+  assert.equal(sent[0].sound, "none")
+})
+
+test("[US-29] env LACODE_SOUND beats option sound: true", async () => {
+  // Use try/finally to clean up env, so one test cannot leak the toggle into another.
+  try {
+    process.env.LACODE_SOUND = "0"
+    const stub = stubInput({ sessions: { s1: { id: "s1", title: "Work" } } })
+    const sent = []
+    const hooks = await notifyHooks(stub.input, { sound: true }, {
+      deliver: async (title, message, urgency, sound) => {
+        sent.push({ title, message, urgency, sound })
+        return { ok: true }
+      },
+    })
+    const emit = (type, properties) => hooks.event({ event: { type, properties } })
+    await busy(emit, "s1")
+    await idle(emit, "s1")
+    await settle()
+    assert.equal(sent[0].sound, "none", "env LACODE_SOUND=0 should beat sound: true")
+  } finally {
+    delete process.env.LACODE_SOUND
+  }
+})
+
+test("[US-29] various false values for LACODE_SOUND deliver 'none'", async () => {
+  for (const val of ["0", "false", "off", "no", " FALSE ", "OFF"]) {
+    try {
+      process.env.LACODE_SOUND = val
+      const stub = stubInput({ sessions: { s1: { id: "s1", title: "Work" } } })
+      const sent = []
+      const hooks = await notifyHooks(stub.input, {}, {
+        deliver: async (title, message, urgency, sound) => {
+          sent.push({ title, message, urgency, sound })
+          return { ok: true }
+        },
+      })
+      const emit = (type, properties) => hooks.event({ event: { type, properties } })
+      await busy(emit, "s1")
+      await idle(emit, "s1")
+      await settle()
+      assert.equal(sent[0].sound, "none", `value ${val} should be off`)
+    } finally {
+      delete process.env.LACODE_SOUND
+    }
+  }
+})
+
+test("[US-29] nonsense value for LACODE_SOUND is NOT read as off", async () => {
+  try {
+    process.env.LACODE_SOUND = "noisy"
+    const stub = stubInput({ sessions: { s1: { id: "s1", title: "Work" } } })
+    const sent = []
+    const hooks = await notifyHooks(stub.input, {}, {
+      deliver: async (title, message, urgency, sound) => {
+        sent.push({ title, message, urgency, sound })
+        return { ok: true }
+      },
+    })
+    const emit = (type, properties) => hooks.event({ event: { type, properties } })
+    await busy(emit, "s1")
+    await idle(emit, "s1")
+    await settle()
+    assert.notEqual(sent[0].sound, "none", "nonsense value should not disable sound")
+  } finally {
+    delete process.env.LACODE_SOUND
+  }
+})
 
 test("[US-11] a session that went busy and is now idle delivers a done notification", async () => {
   const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Fix the login redirect" } } })
@@ -540,8 +644,8 @@ test("[US-25] the notification goes through the injected seam, never a real desk
   const stub = stubInput({ sessions: { s1: { id: "s1", title: "Read the config" } } })
   const sent = []
   const hooks = await notifyHooks(stub.input, undefined, {
-    deliver: async (title, message, urgency) => {
-      sent.push({ title, message, urgency })
+    deliver: async (title, message, urgency, sound) => {
+      sent.push({ title, message, urgency, sound })
       return { ok: true }
     },
   })

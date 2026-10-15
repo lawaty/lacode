@@ -53,10 +53,13 @@ export const notifyMessage = (outcome: Outcome, detail?: string) => {
  *
  * Lives in lib/, not plugins/: opencode calls every export of a plugins/ file as
  * a plugin, so a second binding there poisons the hook registry (see the header).
+ *
+ * Both shapes take the same trailing fields, in the payload's own order: TITLE,
+ * MESSAGE, URGENCY, ICON, SOUND.
  */
-export const helperArgv = (helper: string, title: string, message: string, urgency: string, icon: string): string[] => {
+export const helperArgv = (helper: string, title: string, message: string, urgency: string, icon: string, sound: string): string[] => {
   const name = helper.split(/[\\/]/).pop() ?? ""
-  return name === "lacode" || name === "lacode.js" ? ["notify", title, message, urgency, icon] : [title, message, urgency, icon]
+  return name === "lacode" || name === "lacode.js" ? ["notify", title, message, urgency, icon, sound] : [title, message, urgency, icon, sound]
 }
 
 // ---------------------------------------------------------------------------
