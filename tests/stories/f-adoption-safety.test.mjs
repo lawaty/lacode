@@ -304,13 +304,26 @@ test("[US-15] the manifest publishes every entry-point shape a plugin loader may
  * discusses the cache, the `file://` fallback or which versions are verified, so
  * a claim satisfied from some unrelated section cannot satisfy these.
  */
+/**
+ * The install documentation, as one blob: the README's own `## Install` chapter
+ * plus docs/INSTALL.md, which holds the long tail — cache layout, the "agents are
+ * missing" procedure, the version matrix, macOS.
+ *
+ * These assertions are about a CLAIM being documented, not about which file holds
+ * it: the product README was split down to something a person can read end to
+ * end, and the detail it used to carry now lives one click away. Slicing only
+ * the README would let the suite fail on a restructure that lost nothing, and
+ * passing for the wrong reason if the claims were quietly deleted from both.
+ */
 const installChapter = () => {
   const readme = readFileSync(join(ROOT, "README.md"), "utf8")
   const start = readme.search(/^## Install\b/m)
   assert.ok(start !== -1, "README must have a `## Install` chapter")
   const rest = readme.slice(start)
   const next = rest.slice(1).search(/^## /m)
-  return next === -1 ? rest : rest.slice(0, next + 1)
+  const chapter = next === -1 ? rest : rest.slice(0, next + 1)
+  const detail = readFileSync(join(ROOT, "docs", "INSTALL.md"), "utf8")
+  return `${chapter}\n\n${detail}`
 }
 
 /** Every markdown table row in the install chapter, separator rows dropped. */
@@ -748,14 +761,18 @@ test("[US-24] removing the tools field removed nothing else: every agent field t
 })
 
 test("[US-24] the limitation is documented for users: README states it above the injection list and shows the config that actually works", async () => {
-  const readme = readFileSync(join(ROOT, "README.md"), "utf8")
+  // The warning and the injection list both moved into docs/CONFIGURATION.md,
+  // together and in that order. Read the README alongside it: the assertions
+  // below are about the claim being documented ahead of the list, not about
+  // which file carries it.
+  const readme = `${readFileSync(join(ROOT, "README.md"), "utf8")}\n\n${readFileSync(join(ROOT, "docs", "CONFIGURATION.md"), "utf8")}`
 
   // Prominent, not buried: the warning heading appears BEFORE "What gets
   // injected", so a reader meets it before the list of what the plugin provides.
   const warningAt = readme.indexOf("Per-agent tool grants must be in your own config")
-  const injectedAt = readme.indexOf("### What gets injected")
-  assert.ok(warningAt !== -1, `README must carry the tool-grant warning; found none:\n${readme}`)
-  assert.ok(injectedAt !== -1, "README must still have its injection section")
+  const injectedAt = readme.indexOf("## What gets injected")
+  assert.ok(warningAt !== -1, `the docs must carry the tool-grant warning; found none:\n${readme}`)
+  assert.ok(injectedAt !== -1, "the docs must still have an injection section")
   assert.ok(warningAt < injectedAt, "the warning must come BEFORE the injection list, not after it")
 
   // It must say the thing that is actually true, and not the thing that was
