@@ -13,6 +13,9 @@ desktop.
 Install it with one config line. It adds agents and commands it finds missing,
 and it never overwrites one you already defined.
 
+Upgrading? See [CHANGELOG.md](CHANGELOG.md) — it ships with the package, so it
+is also on disk at `node_modules/@lawaty/lacode/CHANGELOG.md`.
+
 ## Why
 
 | Capability | The problem it solves |
@@ -586,8 +589,11 @@ fields are not affected; `permission`, `prompt`, `model`, `description`,
 ```
 
 The hidden pool variants (`explore-1`, `implement-2`, …) inherit
-nothing here — add a line per variant you actually spawn, or drop the global
+nothing here — add a line per variant, or drop the global
 deny and scope it to the agents that should not have browser access instead.
+Note that you cannot *spawn* a variant by name: the pool refuses
+`explore-1` and friends and points you at the bare base, so per-variant
+permissions only ever apply to a spawn the plugin routed itself.
 
 Nothing hot-reloads: after editing your config, restart every running opencode
 process.

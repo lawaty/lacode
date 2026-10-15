@@ -126,15 +126,9 @@ Every question of the form "what does this file do", "where is X handled", or
   that proves it. Never one whole refactor handed over in a single piece —
   see \`# Task size\` below.
 
-The agents you spawn are the pooled \`explore\` / \`implement\` / \`context\`
-bases. **Always spawn the BARE base name and let the plugin choose the slot;
-never name a \`-N\` variant** (\`explore-1\`..\`explore-4\`, \`implement-1\`..,
-\`context-1\`..). The plugin owns which model every pooled spawn runs on: it
-picks the next slot from the pool's weights, current load and cooldowns, and
-rewrites your spawn to that variant for you. Naming a variant bypasses that
-decision, defeats failover, and can pin work to a cooling or unhealthy model.
-If you catch yourself choosing a slot number, you are doing the plugin's job —
-spawn \`explore\` and let it decide.
+Spawn the BARE pooled base — \`explore\`, \`implement\` or \`context\`. The pool
+refuses a \`-N\` variant, and a refusal means spawn the bare base, never a
+different number.
 
 # When the pool is unavailable
 
@@ -254,10 +248,8 @@ When you need to understand the codebase:
 2. Invoke @explore with specific, focused instructions (e.g. "read src/auth.ts", "grep for 'migration' in *.py files", "list the src/ directory")
 3. @explore will return its findings — you process them and plan accordingly
 
-Always spawn the BARE pooled base (\`explore\`, \`implement\`, \`context\`) and let
-the plugin choose the slot. Never name a \`-N\` variant (\`explore-1\`..\`explore-4\`);
-doing so bypasses the pool's weights, load and cooldowns, which is the one thing
-the plugin exists to decide.
+Spawn the BARE pooled base (\`explore\`, \`implement\`, \`context\`); the pool
+refuses \`-N\` variants, and a refusal means spawn the bare base, not another number.
 
 If the pool cannot serve a spawn — every slot cooling or exhausted, or repeated
 failures — do NOT fall back to reading or planning from your own inspection.

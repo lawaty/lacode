@@ -361,9 +361,28 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
 
     "tool.execute.before": async (input, output) => {
       if (input.tool !== "task") return
+      const requested = output.args?.subagent_type
+      if (typeof requested !== "string") return
+
+      // Refused here, ahead of routing and deliberately OUTSIDE the try below.
+      // That catch exists so a routing slip never costs the caller a spawn; a
+      // refusal is not a slip, and swallowing it into "spawn unchanged" would let
+      // the very spawn this forbids go through -- with a claim on a slot the pool
+      // never chose, above the ceiling that slot was meant to enforce.
+      const manual = pool.manualVariant(requested)
+      if (manual) {
+        await log("warn", `refused manual spawn of slot variant ${requested}; spawn "${manual}" instead`, {
+          variant: requested,
+          base: manual,
+        })
+        throw new Error(
+          `${requested} is a pool slot variant and cannot be spawned by name. Naming it lets the caller pick the provider: ` +
+            `it skips the round-robin rotation and the slot's ceiling, so one provider takes every concurrent claim. ` +
+            `Spawn "${manual}" and let the pool choose the slot.`,
+        )
+      }
+
       try {
-        const requested = output.args?.subagent_type
-        if (typeof requested !== "string") return
         await reapStuck()
         pool.refreshCatalog(s, serverUrl)
         const snap = pool.snapshot(s)
@@ -385,13 +404,6 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
             load: (snap.counts.get(slot.model) ?? 0) + 1,
           })
           return
-        }
-
-        // A directly spawned variant is still counted, never rewritten.
-        const direct = /^(.*)-([1-9][0-9]*)$/.exec(requested)
-        if (direct && pool.BASES.includes(direct[1])) {
-          const slot = s.slots.find((sl) => sl.index === Number(direct[2]))
-          if (slot) pool.acquire(s, direct[1], slot, input.sessionID, pool.claimKey(input.sessionID, input.callID))
         }
       } catch (error) {
         await log("error", `routing failed, spawn unchanged: ${String(error)}`)

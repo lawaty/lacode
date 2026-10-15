@@ -706,6 +706,26 @@ export function refreshCatalog(s: State, serverUrl?: URL) {
   })()
 }
 
+/**
+ * Whether a model may be routed to right now.
+ *
+ * Deliberately FAIL-OPEN in two places, and both are load-bearing:
+ *
+ * 1. ABSENT IS NOT UNAVAILABLE. A model the catalog has never seen reads as
+ *    available. This is the gap a dead gateway falls through: when OmniRoute is
+ *    down `GET /models` fails, `omniroute/<id>` is absent from the catalog
+ *    entirely, and an absent entry would otherwise look exactly like a healthy
+ *    one that simply has not been probed. Only an explicitly bad status
+ *    disqualifies a model.
+ * 2. THE POOL PREFERS A BAD MODEL TO NO MODEL. When every slot is cooling the
+ *    caller re-admits them all (see pickSlot) rather than refusing the work,
+ *    because a spawn that fails fast with a 429 is more useful than a spawn that
+ *    never happens -- and the 429 is what produces the strike that cools it
+ *    properly next time.
+ *
+ * The cost of both is that an unhealthy provider can take a turn it should not
+ * have. That is the trade: prefer a wasted spawn over a stranded one.
+ */
 export function isAvailable(s: State, model: string, cooling: Map<string, Strike>) {
   if (cooling.has(model)) return false
   const status = s.catalog.get(model)
@@ -830,6 +850,10 @@ export function pickSlot(s: State, snap: Snapshot, options?: { advance?: boolean
     }
   }
   const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
+  // If EVERY slot is cooling, fall back to all of them rather than to none. This
+  // is fail-open on purpose -- see the note on isAvailable -- and the two cost the
+  // same thing: a request goes to a provider already known to be unhealthy, and
+  // gets a fast, self-cooling rejection instead of no request at all.
   const pool = usable.length > 0 ? usable : slots
   // Every slot is at or over its ceiling, so no weight can gate the pick: spread the
   // overflow over the least loaded slot rather than refusing the work.
@@ -838,6 +862,21 @@ export function pickSlot(s: State, snap: Snapshot, options?: { advance?: boolean
 
 export function agentFor(base: string, slot: number) {
   return `${base}-${slot}`
+}
+
+// The base name if `name` is one of the pool's own slot variants -- `explore-2`,
+// `implement-4`, and so on -- otherwise undefined.
+//
+// A variant is only ever the OUTPUT of routing: a caller spawns the bare base and
+// the pool picks the slot. Naming a variant is the one way to reach a provider
+// without asking the pool, and it is not a small one: it bypasses the round-robin
+// rotation AND the slot's ceiling, so naming slot 1 six times puts six concurrent
+// claims on a slot whose ceiling is three. Counting such a spawn, as this once
+// did, cannot help -- the ceiling is precisely what it evades.
+export function manualVariant(name: string): string | undefined {
+  const direct = /^(.*)-([1-9][0-9]*)$/.exec(name)
+  if (!direct) return undefined
+  return BASES.includes(direct[1]) ? direct[1] : undefined
 }
 
 // Records an in-flight claim. `target` is the session that actually runs the

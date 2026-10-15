@@ -288,14 +288,31 @@ assert(
   `TTL should empty the pool, got ${afterTtl}`,
 )
 
-// 9. untouched: non-task tool, non-pool spawn, direct variant, malformed args
+// 9. untouched: non-task tool, non-pool spawn, malformed args
 const other = { args: { filePath: "/etc" } }
 await a.hooks["tool.execute.before"]({ tool: "read", sessionID: "s1", callID: "x1" }, other)
 assert(other.args.filePath === "/etc", "non-task tool must not be touched")
 assert((await a.spawn("x2", "build")) === "build", "non-pool spawn must not be rewritten")
-assert((await a.spawn("x3", "explore-2")) === "explore-2", "direct variant must not be rewritten")
 await a.hooks["tool.execute.before"]({ tool: "task", sessionID: "s1", callID: "x5" }, {})
 await a.finish("nonexistent")
+
+// 9b. a slot variant named by hand is REFUSED, not counted and not rewritten.
+//     Naming one is how a caller reaches a provider without asking the pool, and
+//     counting it was never enough: it evades the ceiling, which is the number
+//     that bounds the damage. The refusal must also escape the routing catch --
+//     swallowed into "spawn unchanged" it would admit the spawn it forbids.
+let refused = null
+try {
+  await a.spawn("x3", "explore-2")
+} catch (error) {
+  refused = String(error?.message ?? error)
+}
+assert(refused !== null, "naming a slot variant must be refused outright")
+assert(refused.includes('Spawn "explore"'), `the refusal must name the bare base to use, got: ${refused}`)
+assert(
+  !/\/(usr|etc|bin)/.test(refused),
+  `the refusal must be a message, not a path leak: ${refused}`,
+)
 
 // 10. config invariants: every pooled base has one hidden variant per slot in
 //     presets/free-tier.json, each running that slot's model -- and none of them
