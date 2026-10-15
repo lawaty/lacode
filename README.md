@@ -673,25 +673,32 @@ in [docs/CONTEXT.md](docs/CONTEXT.md).
 
 ## Managerial directions
 
-You can optionally add `manager.md` to `.opencode/context/`. This file is owned
-by you alone and is never written, edited, pruned, or promoted by any agent. It
-outranks the five generated files on focus and settled decisions, but it is
-secondary to the source code: if the code disagrees, the code wins and the
-conflict is reported back to you.
+The plugin creates `manager.md` in `.opencode/context/` for you, and never
+overwrites it once it exists. It is your file: it records what you want done
+and how you want it approached — what is being worked on, what comes next,
+what you have settled, and what every agent should keep in mind. It says
+nothing about where code lives, so it can never contradict the code, and
+within that domain it outranks the five generated files and any agent's
+inference about what matters right now.
 
-The file is per-clone, not committed, and entirely optional: if it is missing,
-agents behave exactly as before. When present, it should contain these three
-sections:
+The file is per-clone and not committed, so it is yours rather than shared
+team state. It has no fixed schema — the headings below are a convenience.
+Add your own; every heading in it is treated as direction.
 
-- `## Stage`: A snapshot of your current work-in-progress. Rewrite this section
-  rather than appending to it to keep it concise. If this file passes roughly 150
-  lines, run `/context-review`.
-- `## Confirmed`: Facts and decisions you have personally ratified. Treat these
-  as settled, but not as permission to skip reading the code.
-- `## Instructions`: Standing managerial directions for all agents.
+- `## Current`: what is being worked on right now. Rewrite it rather than
+  appending, so it does not become a running history. If the file passes
+  roughly 150 lines, run `/context-review`.
+- `## Next`: what comes next, in order.
+- `## Confirmed`: what you have personally ratified. Treat these as settled
+  decisions, not as permission to skip reading the code.
+- `## Instructions`: standing direction beyond the current task — priorities,
+  things to care about, constraints that are not obvious from the code.
 
-No agent may write this file at all: the context agent's edit permission denies
-`manager.md` explicitly, so ratification can only ever come from your hand.
+**Who may write it.** The context agent is explicitly permission-denied from
+touching this path, so the automatic post-session run can never alter it. An
+agent working in your live session may write it only when you explicitly ask
+it to, and only what you asked for — never on its own initiative, and never
+to "keep it up to date".
 
 ## Cost
 

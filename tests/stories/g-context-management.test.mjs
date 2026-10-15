@@ -27,7 +27,7 @@ import assert from "node:assert/strict"
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { AGENTS, POOLED_BASES } from "../../src/agents.ts"
-import { COMMANDS, STANDING_INSTRUCTION } from "../../src/commands.ts"
+import { COMMANDS, STANDING_INSTRUCTION, INSTRUCTION_MARKER } from "../../src/commands.ts"
 import { MAX_SLOTS } from "../../src/lib/pool.ts"
 import { verifyWriterRule } from "../../src/lib/writer-rule.ts"
 import { contextAutoUpdateHooks } from "../../src/plugins/context-autoupdate.ts"
@@ -226,7 +226,7 @@ test("[US-19] the map protocol reaches every agent as a standing rule", async ()
   await hooks.config(cfg)
   await hooks.dispose()
 
-  assert.deepEqual(cfg.instructions, [STANDING_INSTRUCTION], "the rule must be injected when the user has none")
+  assert.deepEqual(cfg.instructions, [`${INSTRUCTION_MARKER}\n\n${STANDING_INSTRUCTION}`], "the rule must be injected when the user has none")
   for (const name of MAP_FILES) {
     assert.ok(STANDING_INSTRUCTION.includes(name), `the standing rule must name ${name} so an agent knows what it may read`)
   }
@@ -676,8 +676,11 @@ test("[US-21] non-cartographer agents are told to report map changes rather than
   // the write, and the instruction tells the agent what to do instead. Without
   // the second half an agent that tries, fails, and reports "permission denied"
   // has told the user nothing.
-  assert.match(STANDING_INSTRUCTION, /Never edit `\.opencode\/context\/`/, "the standing rule must forbid editing the map")
-  assert.match(STANDING_INSTRUCTION, /context agent owns it/, "the standing rule must name the owner")
+  assert.match(STANDING_INSTRUCTION, /Never edit the five context files yourself/, "the standing rule must forbid editing the map")
+  assert.match(STANDING_INSTRUCTION, /permission-denied from writing it/, "the standing rule must record that the cartographer cannot write manager.md at all")
+  assert.match(STANDING_INSTRUCTION, /only when the client\s+explicitly asks/, "manager.md must be writable on an explicit request, and not otherwise")
+  assert.match(STANDING_INSTRUCTION, /never on your own initiative/, "the standing rule must forbid keeping manager.md up to date unasked")
+  assert.match(STANDING_INSTRUCTION, /context agent owns them/, "the standing rule must name the owner")
   assert.match(STANDING_INSTRUCTION, /final report/, "the standing rule must say where to report instead")
   assert.match(STANDING_INSTRUCTION, /Source code is authoritative/, "the map must never outrank the code")
 
@@ -687,6 +690,82 @@ test("[US-21] non-cartographer agents are told to report map changes rather than
     assert.match(cfg.agent[name].prompt, /\.opencode\/context\//, `${name}'s prompt must mention the map`)
     assert.match(cfg.agent[name].prompt, /context|context-update/, `${name}'s prompt must say who owns it`)
   }
+})
+
+test("[US-21] the client's manager.md is created once, and never overwritten", async () => {
+  const { ensureManagerFile } = await import("../../src/plugins/context-autoupdate.ts")
+  const root = scratch()
+
+  // Absent: created, with the parent directory made for it.
+  const first = ensureManagerFile(root)
+  assert.equal(first.created, true, "the scaffold must be written when the file is absent")
+  const target = join(root, ".opencode", "context", "manager.md")
+  assert.ok(existsSync(target), "manager.md must exist after the first run")
+
+  // It has to be usable, not just present: the headings the rules key on.
+  const body = readFileSync(target, "utf8")
+  for (const heading of ["## Current", "## Next", "## Confirmed", "## Instructions"]) {
+    assert.ok(body.includes(heading), `the scaffold must offer ${heading}`)
+  }
+
+  // Present: the client's content is never touched, byte for byte.
+  writeFileSync(target, "# mine\n\ndo not lose this\n")
+  const second = ensureManagerFile(root)
+  assert.equal(second.created, false, "an existing file must not be recreated")
+  assert.equal(readFileSync(target, "utf8"), "# mine\n\ndo not lose this\n", "the client's bytes must survive a second run")
+
+  // A directory that cannot be created must not take the plugin down with it.
+  const blocked = join(root, "blocked")
+  mkdirSync(blocked)
+  writeFileSync(join(blocked, ".opencode"), "not a directory")
+  assert.doesNotThrow(() => ensureManagerFile(blocked), "an unwritable project must not throw")
+})
+
+test("[US-16] applyInstructions appends, is idempotent, and respects opt-out", async () => {
+  const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
+  const stub = stubInput()
+  const hooks = await LaCode(stub.input)
+
+  // 1. Appends
+  const cfg1 = { instructions: ["rule1"] }
+  await hooks.config(cfg1)
+  assert.equal(cfg1.instructions.length, 2)
+  assert.ok(cfg1.instructions[1].includes(INSTRUCTION_MARKER))
+
+  // 2. Idempotent
+  const cfg2 = JSON.parse(JSON.stringify(cfg1))
+  await hooks.config(cfg2)
+  assert.deepEqual(cfg1.instructions, cfg2.instructions, "second call must be no-op")
+
+  // 3. Opt-out
+  const cfg3 = { instructions: ["<!-- lacode:context-map-instruction:off -->"] }
+  await hooks.config(cfg3)
+  assert.equal(cfg3.instructions.length, 1)
+  assert.ok(cfg3.instructions[0].includes("off"))
+
+  await hooks.dispose()
+})
+
+test("[US-21] the context agent edit permission denies manager.md while allowing map files", async () => {
+  const stub = stubInput()
+  const hooks = await bootLaCode(stub, { id: "us21-perms", dir: scratch() })
+  const cfg = emptyConfig()
+  await hooks.config(cfg)
+  await hooks.dispose()
+
+  const edit = cfg.agent.context.permission.edit
+  
+  // Allow map files
+  assert.equal(verdict(edit, ".opencode/context/architecture.md"), "allow")
+  
+  // Deny manager.md
+  assert.equal(verdict(edit, ".opencode/context/manager.md"), "deny")
+  
+  // Assert deny entries come after allow
+  const keys = Object.keys(edit)
+  const allow = keys.indexOf(".opencode/context/**")
+  const deny = keys.indexOf(".opencode/context/manager.md")
+  assert.ok(deny > allow, "deny must come after allow")
 })
 
 // ---------------------------------------------------------------------------

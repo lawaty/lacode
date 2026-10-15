@@ -143,7 +143,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
         await log("info", `commands: added ${cmds.added.join(", ")}; kept ${cmds.kept.join(", ") || "none"} already defined`)
       }
       if (applyInstructions(cfg as Record<string, unknown>).added) {
-        await log("info", "instructions: added the standing context-map rule (no user instructions were present)")
+        await log("info", "instructions: ensured the standing context-map rule is present")
       }
       // OmniRoute runs BEFORE the pool so it can register `provider.omniroute`
       // first: a pool slot naming an `omniroute/...` model then resolves, and the

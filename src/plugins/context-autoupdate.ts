@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, statSync } from "node:fs"
+import { existsSync, readdirSync, statSync, mkdirSync, writeFileSync } from "node:fs"
 import * as path from "node:path"
 import type { Hooks, PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
@@ -38,6 +38,53 @@ const IGNORED_SEGMENTS = new Set([
   ".cache",
   ".git",
 ])
+
+const MANAGER_TEMPLATE = `# Managerial directions
+
+This file is yours. No agent writes it: the context agent is explicitly denied
+permission to touch this path, and nothing changes it except you, or an agent
+acting on your explicit instruction in that conversation.
+
+It records what you want done and how you want it approached — what is being
+worked on, what comes next, what you have settled, and what every agent should
+keep in mind. It deliberately says nothing about where code lives: the source
+and the five generated context files are the only authority on that, so this
+file can never contradict the code.
+
+Add any headings you like. The four below are a convenience, not a schema —
+every heading in this file is direction.
+
+## Current
+
+<!-- What is being worked on right now. Rewrite it; do not append a history. -->
+
+## Next
+
+<!-- What comes next, in order. -->
+
+## Confirmed
+
+<!-- What you have personally ratified. Nothing enters or leaves this list
+     except by your hand — no agent promotes, prunes or rewrites it. -->
+
+## Instructions
+
+<!-- Standing direction that applies beyond the current task: priorities, things
+     to care about, constraints that are not obvious from the code. -->`
+
+export const ensureManagerFile = (root: string): { created: boolean } => {
+  try {
+    const target = path.join(root, ".opencode", "context", "manager.md")
+    if (existsSync(target)) return { created: false }
+    mkdirSync(path.dirname(target), { recursive: true })
+    writeFileSync(target, MANAGER_TEMPLATE, { flag: "wx" })
+    return { created: true }
+  } catch (error: any) {
+    if (error?.code === "EEXIST") return { created: false }
+    console.warn(`[context-autoupdate] ensureManagerFile failed: ${error}`)
+    return { created: false }
+  }
+}
 
 const toPosix = (value: string) => value.split(path.sep).join("/")
 
@@ -109,6 +156,11 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
 
   const root = path.resolve(directory)
   const contextAbs = path.join(root, CONTEXT_DIR)
+
+  // The client's own file, created once at startup rather than on the first idle:
+  // "written by default" has to mean it is already there when the session begins,
+  // not one file-changing run later. Idempotent, and never touches an existing one.
+  if (ensureManagerFile(root).created) void log("info", `created ${CONTEXT_DIR}/manager.md`)
 
   // Fail loudly and immediately rather than weeks later as a silently stale map.
   const config = findProjectConfig()
@@ -195,7 +247,10 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           for (const file of files) pending.add(file)
         }
 
-        const mode = existsSync(contextAbs) ? "update" : "bootstrap"
+        // Keyed on a generated map file, not on the directory: ensureManagerFile creates
+// the directory at startup, so existsSync(contextAbs) would report "update" for a
+// project that has no map at all and skip the bootstrap entirely.
+const mode = existsSync(path.join(contextAbs, "contexts.md")) ? "update" : "bootstrap"
 
         // Borrow a slot from the shared free-model pool. This agent is spawned
         // through the session API rather than the task tool, so it never passes

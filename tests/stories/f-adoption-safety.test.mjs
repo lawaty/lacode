@@ -578,12 +578,14 @@ test("[US-16] a merge preserves every pre-existing key in the file across a roun
   const reread = JSON.parse(written)
 
   for (const key of Object.keys(original)) {
-    if (key === "agent" || key === "command") continue // asserted separately below
+    if (key === "agent" || key === "command" || key === "instructions") continue // asserted separately below
     assert.deepEqual(reread[key], original[key], `pre-existing key "${key}" must survive the round trip unchanged`)
   }
   assert.deepEqual(reread.agent.mine, original.agent.mine, "a pre-existing agent must survive byte-identically")
   assert.deepEqual(reread.command.mine, original.command.mine, "a pre-existing command must survive byte-identically")
-  assert.equal(reread.instructions.length, 1, "existing standing instructions must not be appended to or rewritten")
+  assert.equal(reread.instructions.length, 2, "the standing rule must be appended to the existing instruction")
+  assert.equal(reread.instructions[0], original.instructions[0], "the client's own instruction must be first and unmodified")
+  assert.ok(reread.instructions[1].includes("<!-- lacode:context-map-instruction:v1 -->"), "the standing rule must be appended with the marker")
   await hooks.dispose()
 })
 
