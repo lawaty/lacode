@@ -4,8 +4,8 @@ All notable changes to LaCode are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Versions come from git release commits — this file is written before a release
-is cut, and the npm version is bumped in the release commit itself.
+Versions come from git release commits; the npm version is bumped in the same
+commit as the changelog entry it describes.
 
 ## [Unreleased]
 
