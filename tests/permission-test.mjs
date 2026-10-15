@@ -61,11 +61,16 @@ writeFileSync(
 // Fixtures declare only `edit`, the way LaCode now emits them: opencode folds
 // "write" and "apply_patch" onto "edit", so a `write` key is never read and
 // declaring one here would assert a rule opencode would ignore.
-const config = (rules) => {
+// A correct config denies manager.md LAST, after every broad allow. The tests about
+// the map's own rules go through config() so they model a real one; the Direction 3
+// tests use rawConfig() to drop that deny and prove the gap is caught.
+const MGR = '"*/.opencode/context/manager.md":"deny",".opencode/context/manager.md":"deny"'
+const rawConfig = (rules) => {
   const file = join(dir, "opencode.jsonc")
   writeFileSync(file, `{"agent":{"context-1":{"permission":{"edit":{"*":"deny",${rules}}}}}}`)
   return file
 }
+const config = (rules) => rawConfig(`${rules},${MGR}`)
 
 let checks = 0
 const ok = (name) => {
@@ -115,6 +120,46 @@ try {
   ok("missing config file does not raise a false alarm")
   assert.equal(verifyWriterRule(config('"*":"allow"'), REPO_MAP, REPO), undefined)
   ok("catch-all allow rule is accepted")
+
+  // A correct config is silent about manager.md because the deny is there.
+  assert.equal(verifyWriterRule(config(REL), REPO_MAP, REPO), undefined)
+  assert.equal(verifyWriterRule(config(`${REL},${ABS}`), "/srv/work/app/.opencode/context", "/srv/work/app"), undefined)
+  ok("a deny-last manager.md rule satisfies the client's file being untouchable")
+
+  // Direction 3 -- and this is the one that cannot be configured away. The shipped
+  // deny lives in OUR agent definition, and applyAgents replaces an agent the user
+  // defines themselves wholesale, permission and all. So a config that grants the
+  // cartographer the context directory without carving manager.md out silently
+  // gives the one agent that writes the map permission to write the client's own
+  // file. Direction 2 skips writer agents, so without this nothing looks.
+  const gap = verifyWriterRule(rawConfig(REL), REPO_MAP, REPO)
+  assert.ok(gap, "a context-dir grant with no manager.md deny must be reported")
+  assert.match(gap, /manager\.md is writable by permission/)
+  assert.match(gap, /context-1/, "the offending agent must be named")
+  assert.match(gap, /no agent writes it/, "the message must state the rule")
+  assert.match(gap, /LAST matching rule/, "the message must state why order matters")
+  ok("a context-dir grant that does not carve out manager.md is reported")
+
+  // …including when the user defined the context agent themselves, which is the
+  // case the shipped deny cannot cover.
+  const userDefined = join(dir, "user-context.jsonc")
+  writeFileSync(
+    userDefined,
+    `{"agent":{"context":{"permission":{"edit":{"*":"deny",${REL},${MGR}}}}}}`,
+  )
+  assert.equal(verifyWriterRule(userDefined, REPO_MAP, REPO), undefined)
+  writeFileSync(userDefined, `{"agent":{"context":{"permission":{"edit":{"*":"allow"}}}}}`)
+  const overridden = verifyWriterRule(userDefined, REPO_MAP, REPO)
+  assert.ok(overridden, "a user-defined context agent with a broad grant must be reported")
+  assert.match(overridden, /manager\.md is writable/)
+  assert.match(overridden, /context \(edit rule/, "the cartographer itself must be named")
+  ok("the cartographer's own broad grant on manager.md is reported")
+
+  // A deny sitting behind a broad allow still denies: the LAST matching rule wins,
+  // so this must stay silent rather than report a hole that is not there.
+  assert.equal(verifyWriterRule(config('"*":"allow"'), REPO_MAP, REPO), undefined)
+  assert.equal(verifyWriterRule(rawConfig('"*":"allow",".opencode/context/**":"deny"'), REPO_MAP, REPO), undefined)
+  ok("a deny written AFTER a broad allow is still a deny")
 
   // No project root given: fall back to the absolute check rather than guessing.
   assert.equal(verifyWriterRule(config(ABS), REPO_MAP), undefined)

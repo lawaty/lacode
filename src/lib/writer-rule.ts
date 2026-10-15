@@ -118,6 +118,18 @@ const evaluatedForm = (mapDir: string, projectRoot?: string) => {
   return projectRoot ? toPosix(path.relative(projectRoot, absolute)) : absolute
 }
 
+/**
+ * The path form opencode would evaluate for the client's own file. Deliberately
+ * ONE form, mirroring evaluatedForm: when a project root is known that is the
+ * only form opencode tests, and checking the other one too reports holes that
+ * do not exist. The deny has to carry both spellings precisely because only one
+ * of them is ever evaluated at a time.
+ */
+const managerForm = (mapDir: string, projectRoot?: string) => {
+  const absolute = toPosix(path.join(mapDir, "manager.md"))
+  return projectRoot ? toPosix(path.relative(projectRoot, absolute)) : absolute
+}
+
 // Verifies the one-writer permission rule actually matches this project's map.
 //
 // opencode evaluates a file permission against the path RELATIVE TO THE PROJECT ROOT,
@@ -199,6 +211,34 @@ export const verifyWriterRule = (configPath: string, mapDir: string, projectRoot
         + `LAST matching rule, so "${CONTEXT_DIR}/**": "deny" written after "*": "allow" is what denies it: `
         + `"*": "allow", "*/${CONTEXT_DIR}/**": "deny", "${CONTEXT_DIR}/**": "deny". `
         + `Both spellings are required because the evaluated path depends on the project root.`
+    }
+  }
+
+  // Direction 3 -- manager.md is the CLIENT'S, and no agent may write it.
+  //
+  // This one deliberately includes the cartographer itself, which Direction 2
+  // skips. The shipped deny-last for manager.md lives in our agent definition,
+  // and applyAgents leaves a key the user already defines byte-for-byte alone
+  // ("no permission is merged"). So a user who declares their own `context` agent
+  // silently discards that deny -- and because the only other check deliberately
+  // skips writer agents, the one file built to be untouchable becomes the one file
+  // nothing inspects. Checked here, where it cannot be configured away.
+  const managerPath = managerForm(mapDir, projectRoot)
+  const agentDefs = readAgents(raw)
+  if (agentDefs) {
+    const writers: string[] = []
+    for (const [name, def] of Object.entries(agentDefs)) {
+      const win = winningRule(permissionOf(def), managerPath)
+      if (win?.action === "allow") writers.push(`${name} (edit rule "${win.pattern}": "${win.action}")`)
+    }
+    if (writers.length > 0) {
+      return `${CONTEXT_DIR}/manager.md is writable by permission: ${writers.join(", ")}. `
+        + `It is the client's own file — what they are working on, what is ratified, what every agent `
+        + `must respect — and no agent writes it. Deny it LAST, after any broad allow, because opencode `
+        + `takes the LAST matching rule: `
+        + `"*": "allow", "*/${CONTEXT_DIR}/manager.md": "deny", "${CONTEXT_DIR}/manager.md": "deny". `
+        + `Declare this on every agent above, including \`${WRITER}\`: an agent you define yourself replaces `
+        + `the shipped one wholesale, permission and all.`
     }
   }
 

@@ -612,7 +612,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
   const blanket = verifyWriterRule(
     configFile({
       build: { permission: { edit: "allow" } },
-      "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
+      "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow", "*/.opencode/context/manager.md": "deny", ".opencode/context/manager.md": "deny" } } },
     }),
     MAP_UNDER_TEST,
     ROOT_UNDER_TEST,
@@ -635,7 +635,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
   // difference between this check working and crying wolf on a correct config.
   const denying = configFile({
     build: { permission: { edit: { "*": "allow", "*/.opencode/context/**": "deny", ".opencode/context/**": "deny" } } },
-    "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
+    "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow", "*/.opencode/context/manager.md": "deny", ".opencode/context/manager.md": "deny" } } },
   })
   assert.equal(verifyWriterRule(denying, MAP_UNDER_TEST, ROOT_UNDER_TEST), undefined, "a correctly-ordered narrow deny is not a violation")
 
@@ -643,7 +643,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
   // loses in opencode, and must be reported as the hole it actually is.
   const misordered = configFile({
     build: { permission: { edit: { ".opencode/context/**": "deny", "*": "allow" } } },
-    "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
+    "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow", "*/.opencode/context/manager.md": "deny", ".opencode/context/manager.md": "deny" } } },
   })
   const report = verifyWriterRule(misordered, MAP_UNDER_TEST, ROOT_UNDER_TEST)
   assert.ok(report, "a deny that loses to a later blanket allow is a real hole")
@@ -651,7 +651,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
 
   // The cartographer's own variants are exempt — including hidden slot variants.
   assert.equal(
-    verifyWriterRule(configFile({ "context-3": { permission: { edit: { "*": "deny", ".opencode/context/**": "allow" } } } }), MAP_UNDER_TEST, ROOT_UNDER_TEST),
+    verifyWriterRule(configFile({ "context-3": { permission: { edit: { "*": "deny", ".opencode/context/**": "allow", "*/.opencode/context/manager.md": "deny", ".opencode/context/manager.md": "deny" } } } }), MAP_UNDER_TEST, ROOT_UNDER_TEST),
     undefined,
     "context-N is the same writer and must not be flagged",
   )
