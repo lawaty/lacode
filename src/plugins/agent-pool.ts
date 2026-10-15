@@ -52,8 +52,11 @@ import type { Claim } from "../lib/pool.ts"
 //   3. watchdog -- a hang is silent: no error event, no log line, no message
 //                  delta. So an in-flight claim older than STUCK_MIN_AGE_MS whose
 //                  target session has been silent for STUCK_IDLE_MS is presumed
-//                  wedged. That session is aborted, returning control to the
-//                  caller, freeing the slot, and cooling the model.
+//                  wedged. Silence is only evidence while it PERSISTS, though, and
+//                  any message delta resets the clock -- so a claim outliving
+//                  MAX_CLAIM_AGE_MS is condemned too, however chatty it was. That
+//                  session is aborted, returning control to the caller, freeing
+//                  the slot, and cooling the model.
 
 const SERVICE = "agent-pool"
 const REAP_INTERVAL_MS = 30_000
@@ -145,7 +148,7 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
       const stuck = pool.findStuck(s)
       if (stuck.length === 0) return
       const released: string[] = []
-      for (const { key, claim } of stuck) {
+      for (const { key, claim, reason } of stuck) {
         // A child that bound late (or whose session.created raced the claim) has no
         // target yet; bind it now so the abort has something to aim at.
         if (!claim.g) pool.backfillChild(s, claim)
@@ -160,9 +163,15 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
           if (kill.ok) {
             released.push(key)
             s.reaped++
+            // Two faults, two words. The ceiling fires on a task that was never
+            // silent -- it kept trickling output for half an hour -- so reporting
+            // "with 3s of silence" there would state the opposite of the truth, and
+            // an operator greps these lines to find out why a task was killed.
             await log(
               "warn",
-              `hung ${claim.v} on ${claim.m} after ${age}s with ${since}; aborted session ${claim.g}`,
+              reason === "overran"
+                ? `overran ${claim.v} on ${claim.m} after ${age}s; aborted session ${claim.g}`
+                : `hung ${claim.v} on ${claim.m} after ${age}s with ${since}; aborted session ${claim.g}`,
               { base: claim.v, model: claim.m, slot: claim.k, session: claim.g, aborted: true },
             )
             await coolForHang(claim, log)
@@ -221,7 +230,7 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
   timer.unref?.()
   void log(
     "info",
-    `reaper armed: every ${Math.round(reapMs / 1000)}s, aborts a claim older than ${Math.round(pool.STUCK_MIN_AGE_MS / 60000)}m whose target has been silent ${Math.round(pool.STUCK_IDLE_MS / 60000)}m`,
+    `reaper armed: every ${Math.round(reapMs / 1000)}s, aborts a claim older than ${Math.round(pool.STUCK_MIN_AGE_MS / 60000)}m whose target has been silent ${Math.round(pool.STUCK_IDLE_MS / 60000)}m, or any claim past the ${Math.round(pool.MAX_CLAIM_AGE_MS / 60000)}m ceiling however chatty`,
   )
 
   return {
@@ -338,12 +347,20 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
         const status = typeof (info.error as { data?: { statusCode?: number } }).data?.statusCode === "number"
           ? (info.error as { data: { statusCode: number } }).data.statusCode
           : undefined
-        if (!pool.isLimitText(haystack) && status !== 429) return
+        const limited = pool.isLimitText(haystack) || status === 429
+        // A gateway 5xx, a queue budget, or a stalled request aborted on timeout
+        // is a transient fault: the gateway is saying it cannot serve the request
+        // right now, not that the key is out of quota.
+        const gateway5xx = status !== undefined && status >= 500 && status <= 599
+        const transientGateway = gateway5xx || pool.isTransientGatewayText(haystack)
+        if (!limited && !transientGateway) return
         const model = `${info.providerID ?? "?"}/${info.modelID ?? "?"}`
         // A transient upstream outage is not a limit: it lifts on its own, so it
         // gets a short, flat cooldown and is never counted as a strike (which
         // would escalate the cooldown past the outage -- see pool.coolUnavailable).
-        if (pool.isUnavailableText(haystack)) {
+        // A gateway 5xx, a queue budget, or a timeout is the same kind of fault
+        // and takes the same flat path; a real limit still escalates below.
+        if (pool.isUnavailableText(haystack) || (!limited && transientGateway)) {
           const transient = pool.coolUnavailable(s, model)
           if (transient) await log("warn", `cooling ${model} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason})`)
           return
@@ -458,7 +475,12 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
 
           const total = [...snap.counts.values()].reduce((sum, n) => sum + n, 0)
           const coolingNow = [...snap.cooling.entries()].filter(([, st]) => st.until > now)
-          const hung = [...snap.own.values()].filter((c) => now - c.t > pool.STUCK_MIN_AGE_MS && pool.idleFor(s, c, now) >= pool.STUCK_IDLE_MS).length
+          // Judged by the reaper's own rule, not a restatement of it: the status
+          // and the sweep must describe the same rule, or a claim the status
+          // calls healthy is one the reaper is about to condemn.
+          const verdicts = [...snap.own.values()].map((claim) => pool.condemnReason(s, claim, now))
+          const hung = verdicts.filter((verdict) => verdict === "hung").length
+          const overran = verdicts.filter((verdict) => verdict === "overran").length
 
           return {
             title: `agent-pool: ${total} task(s) in flight, ${coolingNow.length} model(s) cooling`,
@@ -472,6 +494,7 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
               "",
               `${total} claim(s) in flight across ${snap.siblings.length + 1} process(es).`,
               `hung past ${Math.round(pool.STUCK_MIN_AGE_MS / 60000)}min with ${Math.round(pool.STUCK_IDLE_MS / 60000)}min silence: ${hung} (auto-aborted); reaped total: ${s.reaped}.`,
+              `overran past ${Math.round(pool.MAX_CLAIM_AGE_MS / 60000)}min: ${overran} (auto-aborted).`,
               `watchdog alive: last sweep ${s.lastSweep ? `${Math.max(0, Math.round((now - s.lastSweep) / 1000))}s ago` : "never"} (every ${Math.round(reapMs / 1000)}s).`,
               coolingNow.length === 0
                 ? "no models cooling down."

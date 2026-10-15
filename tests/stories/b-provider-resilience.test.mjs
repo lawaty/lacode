@@ -178,6 +178,142 @@ test("[US-4] a Retry-After header is honoured when the error text states no rese
   await hooks.dispose()
 })
 
+// A gateway that cannot serve the request right now -- a 5xx, a queue budget, a
+// stalled request aborted on timeout -- is transient, not a limit. It must take
+// the same short, flat cooldown as "Endpoint is unavailable" and never the
+// escalating strike path, or a congested model stays benched long after the
+// outage has passed. The recogniser used to see only limit text and 429, so a
+// real 503 fell straight through and benched nothing.
+
+test("[US-4] a gateway 503 carrying a queue-budget message benches the model flat, and it is selectable again after the cooldown", async () => {
+  const clock = fakeClock()
+  const slots = [
+    { model: "prov/gateway", weight: 1 },
+    { model: "prov/other", weight: 1 },
+  ]
+  const { dir, hooks, cfg, models } = await bootPool(slots, "us4-gateway-503")
+
+  // The real message captured from the pool: a 503 whose body is a queue budget,
+  // not a rate limit. The old recogniser saw status 503 != 429 and returned.
+  await emit(hooks, "message.updated", {
+    info: {
+      role: "assistant",
+      providerID: "prov",
+      modelID: "gateway",
+      error: {
+        name: "APIError",
+        data: {
+          statusCode: 503,
+          responseBody:
+            "[503]: Request exceeded queue budget maxWaitMs=30000ms for gemini/gemini-3.1-flash-lite — queue budget does not bound execution (executionMaxWaitMs=600000ms)",
+        },
+      },
+    },
+  })
+
+  const strike = JSON.parse(readFileSync(limitFile(dir, models[0]), "utf8"))
+  assert.equal(strike.reason, "endpoint-unavailable", `a gateway 5xx must take the flat path, got ${strike.reason}`)
+  assert.equal(strike.strikes, 1, `the flat path must not escalate, got strike ${strike.strikes}`)
+  assert.equal(Math.round((strike.until - clock.now()) / 1000), 60, `the flat cooldown must be the short one, got ${Math.round((strike.until - clock.now()) / 1000)}s`)
+
+  // While it is benched, routing avoids it.
+  const { routed } = await spawn(hooks, cfg, { callID: "during", sessionID: "during" })
+  assert.equal(routed, "explore-2", `a benched gateway must not be picked, got ${routed}`)
+
+  // The flat window is transient: once it lapses the model is selectable again.
+  clock.advance(61_000)
+  const status = await hooks.tool.pool_status.execute({}, {})
+  assert.doesNotMatch(status.output, /COOLING/, `the model must be selectable again after the flat cooldown:\n${status.output}`)
+  await hooks.dispose()
+})
+
+test("[US-4] a TimeoutError with no status code benches the model flat", async () => {
+  const clock = fakeClock()
+  const { dir, hooks, models } = await bootPool([{ model: "prov/stalled", weight: 1 }], "us4-timeout")
+
+  // A stalled request surfaces as a DOMException with no statusCode at all, so
+  // the status check cannot see it and no limit pattern matches it.
+  await emit(hooks, "message.updated", {
+    info: {
+      role: "assistant",
+      providerID: "prov",
+      modelID: "stalled",
+      error: { name: "TimeoutError", message: "The operation was aborted due to timeout" },
+    },
+  })
+
+  const strike = JSON.parse(readFileSync(limitFile(dir, models[0]), "utf8"))
+  assert.equal(strike.reason, "endpoint-unavailable", `a timeout must take the flat path, got ${strike.reason}`)
+  assert.equal(strike.strikes, 1, `a timeout must not escalate, got strike ${strike.strikes}`)
+  assert.equal(Math.round((strike.until - clock.now()) / 1000), 60, `a timeout must cool flat, got ${Math.round((strike.until - clock.now()) / 1000)}s`)
+  await hooks.dispose()
+})
+
+test("[US-4] a gateway 502 or 504 benches the model flat", async () => {
+  const clock = fakeClock()
+  const slots = [
+    { model: "prov/bad502", weight: 1 },
+    { model: "prov/bad504", weight: 1 },
+  ]
+  const { dir, hooks, models } = await bootPool(slots, "us4-5xx")
+
+  for (const [i, statusCode] of [502, 504].entries()) {
+    const [provider, modelID] = [models[i].slice(0, models[i].indexOf("/")), models[i].slice(models[i].indexOf("/") + 1)]
+    await emit(hooks, "message.updated", {
+      info: {
+        role: "assistant",
+        providerID: provider,
+        modelID,
+        error: { name: "APIError", data: { statusCode, responseBody: `[${statusCode}] gateway error` } },
+      },
+    })
+    const strike = JSON.parse(readFileSync(limitFile(dir, models[i]), "utf8"))
+    assert.equal(strike.reason, "endpoint-unavailable", `a ${statusCode} must take the flat path, got ${strike.reason}`)
+    assert.equal(strike.strikes, 1, `a ${statusCode} must not escalate, got strike ${strike.strikes}`)
+    assert.equal(Math.round((strike.until - clock.now()) / 1000), 60, `a ${statusCode} must cool flat, got ${Math.round((strike.until - clock.now()) / 1000)}s`)
+  }
+  await hooks.dispose()
+})
+
+test("[US-4] a 429 still escalates through recordStrike and never takes the flat path", async () => {
+  // The regression guard: the new transient handling must not swallow a real
+  // limit. A 429 keeps its escalating strike backoff, which the flat path never
+  // produces.
+  const clock = fakeClock()
+  const { dir, hooks, models } = await bootPool([{ model: "prov/limited", weight: 1 }], "us4-429-guard")
+
+  const error = { name: "APIError", data: { statusCode: 429, responseBody: "Rate limit reached for requests" } }
+  await emit(hooks, "message.updated", { info: { role: "assistant", providerID: "prov", modelID: "limited", error } })
+  const first = JSON.parse(readFileSync(limitFile(dir, models[0]), "utf8"))
+  assert.notEqual(first.reason, "endpoint-unavailable", `a 429 must not take the flat path, got ${first.reason}`)
+  assert.match(first.reason, /rate-limit|quota|usage/i, `the limit reason must be recorded, got ${first.reason}`)
+  assert.equal(first.strikes, 1, `the first 429 is strike 1, got ${first.strikes}`)
+
+  // A repeat after the first window lapses must escalate, which the flat path
+  // never does.
+  clock.advance(first.until - clock.now() + 1000)
+  await emit(hooks, "message.updated", { info: { role: "assistant", providerID: "prov", modelID: "limited", error } })
+  const second = JSON.parse(readFileSync(limitFile(dir, models[0]), "utf8"))
+  assert.equal(second.strikes, 2, `a repeat 429 must escalate to strike 2, got ${second.strikes}`)
+  assert.ok(second.until > first.until, `the escalated cooldown must be longer (got ${first.until} then ${second.until})`)
+  await hooks.dispose()
+})
+
+test("[US-4] an unrelated benign error benches nothing", async () => {
+  const { dir, hooks } = await bootPool([{ model: "prov/fine", weight: 1 }], "us4-benign")
+
+  await emit(hooks, "message.updated", {
+    info: { role: "assistant", providerID: "prov", modelID: "fine", error: { name: "Error", message: "tool call failed: file not found" } },
+  })
+
+  assert.deepEqual(
+    readdirSync(dir).filter((f) => f.startsWith("limit.")),
+    [],
+    `a benign error must bench nothing, got ${readdirSync(dir).join(", ")}`,
+  )
+  await hooks.dispose()
+})
+
 // ---------------------------------------------------------------------------
 // US-5 — weighted preference
 // ---------------------------------------------------------------------------

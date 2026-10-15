@@ -138,7 +138,8 @@ Print one PASS/FAIL line per check below, with the exact fix for any FAIL.
    trap: an id that is a valid gateway route but is NOT in the plugin's
    \`omniroute.models\` allowlist fails with
    \`ProviderModelNotFoundError: Model not found\`; the fix is to add that id to
-   the \`models\` array, or use the always-registered \`auto\`.
+   the \`models\` array, or set it as \`combo\` — the combo id is registered
+   whether or not the gateway advertises it, so it needs no allowlist entry.
 
 Change nothing. Print a final one-line summary of failures.`,
   },

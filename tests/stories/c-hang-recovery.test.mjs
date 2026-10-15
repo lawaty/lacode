@@ -9,11 +9,19 @@
 // so the clock is injected and minutes pass in microseconds. The one place a
 // real timer is unavoidable -- proving the reaper's interval fires on its own --
 // uses a 40 ms interval and a 150 ms wait, justified inline.
+//
+// A third duration bounds the whole thing: MAX_CLAIM_AGE_MS. The other two are
+// silence-based, and silence is resettable by any message event, so a task that
+// hangs while still trickling output resets the clock every time it emits and can
+// therefore never be condemned -- it outlives the mechanism meant to kill it. The
+// tests below pin both halves of the replacement rule: chatty and past the
+// ceiling is killed, chatty and under it is not.
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { existsSync, readdirSync, utimesSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+import * as pool from "../../src/lib/pool.ts"
 import { bootLaCode, cleanupAll, configFor, emit, fakeClock, scratch, spawn, stubInput } from "./_harness.mjs"
 
 test.after(cleanupAll)
@@ -24,6 +32,7 @@ const MIN = 60_000
 // that the shipped numbers still match the story, which is worth catching.
 const STUCK_MIN_AGE = 5 * MIN
 const STUCK_IDLE = 3 * MIN
+const MAX_CLAIM_AGE = 30 * MIN
 
 const bootPool = async (id, options = {}) => {
   const stub = stubInput()
@@ -55,6 +64,14 @@ const spawnChild = async (hooks, cfg, { callID, sessionID = "parent", childID })
   await spawn(hooks, cfg, { subagent: "explore", callID, sessionID })
   await emit(hooks, "session.created", { info: { id: childID, parentID: sessionID } })
 }
+
+/**
+ * One message event for a child session. That is the whole of "proof of life":
+ * it resets the silence clock, and it is the reason a hung-but-chatty task used
+ * to be unkillable. The ceiling tests below use it to make the child look, at
+ * every sweep, like the healthiest task in the pool.
+ */
+const keepAlive = (hooks, sessionID) => emit(hooks, "message.part.updated", { part: { sessionID, type: "text" } })
 
 // ---------------------------------------------------------------------------
 // US-8 -- detection and abort
@@ -144,6 +161,102 @@ test("[US-8] a swept claim raises the reaped total and is named in a greppable l
   )
   net.restore()
   await hooks.dispose()
+})
+
+// ---------------------------------------------------------------------------
+// US-8 -- the ceiling, which is what condemns a task that is never silent
+// ---------------------------------------------------------------------------
+
+test("[US-8] a claim that keeps emitting output is still reaped once it outlives the ceiling", async () => {
+  // The bug this exists for. Every 60s the child emits something, so the silence
+  // clock is reset 31 times and never once reaches STUCK_IDLE: at every sweep
+  // this task looks exactly like the "working subagent must never be killed"
+  // case above. Observed live, a claim's silence fell from 122.5s to 3.2s on one
+  // stray delta and the kill slid out three more minutes. Silence is resettable,
+  // so it cannot be the only bound; MAX_CLAIM_AGE_MS is.
+  const clock = fakeClock()
+  const net = stubFetch()
+  const { hooks } = await bootPool("us8-overran")
+
+  await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "child-endless" })
+  for (let minute = 1; minute <= MAX_CLAIM_AGE / MIN + 1; minute++) {
+    clock.advance(MIN)
+    await keepAlive(hooks, "child-endless")
+    // Control, one minute short of the ceiling: nothing has condemned it yet.
+    if (minute === MAX_CLAIM_AGE / MIN - 1) {
+      await spawn(hooks, { agent: {} }, { subagent: "explore", callID: `under-${minute}`, sessionID: `under-${minute}` })
+      assert.deepEqual(net.aborted, [], `a chatty claim under the ceiling must live, got ${JSON.stringify(net.aborted)}`)
+      await hooks["tool.execute.after"]({ tool: "task", sessionID: `under-${minute}`, callID: `under-${minute}` }, {})
+    }
+  }
+
+  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+
+  assert.deepEqual(
+    net.aborted,
+    ["child-endless"],
+    `a task past the ceiling must be killed however much it talks, got ${JSON.stringify(net.aborted)}`,
+  )
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-8] a chatty claim under the ceiling keeps its slot for as long as it takes", async () => {
+  // The other half, and the one that must not be broken by fixing the first: the
+  // ceiling is a bound on LIFE, not a new deadline. A task that is young enough
+  // and demonstrably alive is untouched however much it emits.
+  const clock = fakeClock()
+  const net = stubFetch()
+  const { hooks } = await bootPool("us8-under-ceiling")
+
+  await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "child-prolific" })
+  for (let minute = 1; minute < MAX_CLAIM_AGE / MIN; minute++) {
+    clock.advance(MIN)
+    await keepAlive(hooks, "child-prolific")
+  }
+  // 29 minutes old and never silent for three: a sweep must pass it by.
+  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+
+  assert.deepEqual(net.aborted, [], `a working subagent must not be killed for being busy, got ${JSON.stringify(net.aborted)}`)
+  const reaped = await hooks.tool.pool_status.execute({}, {})
+  assert.match(reaped.output, /hung past \d+min with \d+min silence: 0/, `a busy task is not hung:\n${reaped.output}`)
+
+  // Releasing the sweep trigger leaves only the claim that survived, which is the
+  // claim under test -- if the ceiling had taken it, the pool would be empty.
+  await hooks["tool.execute.after"]({ tool: "task", sessionID: "trigger", callID: "trigger" }, {})
+  const after = await hooks.tool.pool_status.execute({}, {})
+  assert.match(after.output, /1 claim\(s\) in flight/, `the working task must still hold its claim:\n${after.output}`)
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-8] findStuck names the fault it condemned on: overran at the ceiling, hung on silence", async () => {
+  // The unit behind the wording above, asserted directly so a caller cannot
+  // regress into guessing. findStuck takes `now`, so no clock is faked at all.
+  const s = pool.state({ id: "us8-reason", dir: scratch("lacode-reason-") })
+  const t0 = 1_700_000_000_000
+  const now = t0 + MAX_CLAIM_AGE + MIN
+
+  // Past the ceiling, and seen talking a moment ago: silence cannot condemn it,
+  // so if it is condemned at all it can only be for outliving the ceiling.
+  s.own.set("overran", { v: "explore", k: 1, m: "hang/model", t: t0, g: "child-overran" })
+  s.activity.set("child-overran", now)
+  // Inside the ceiling but silent for exactly STUCK_IDLE: the ordinary hang.
+  s.own.set("hung", { v: "explore", k: 1, m: "hang/model", t: now - STUCK_MIN_AGE - MIN, g: "child-hung" })
+  s.activity.set("child-hung", now - STUCK_IDLE)
+  // Inside the ceiling, young enough to be under STUCK_MIN_AGE, and silent: not
+  // a hang, and nowhere near the ceiling.
+  s.own.set("young", { v: "explore", k: 1, m: "hang/model", t: now - MIN, g: "child-young" })
+  s.activity.set("child-young", now - STUCK_IDLE)
+
+  const stuck = pool.findStuck(s, now)
+  const reasons = Object.fromEntries(stuck.map((entry) => [entry.key, entry.reason]))
+
+  assert.deepEqual(reasons, { overran: "overran", hung: "hung" }, `each fault must be named:\n${JSON.stringify(stuck)}`)
+  assert.ok(!("young" in reasons), `age alone must still not condemn a young claim, got ${JSON.stringify(stuck)}`)
+  // And the ceiling is checked FIRST, so a claim that is both old and silent is
+  // reported for what actually stopped it rather than for the stale clue.
+  assert.deepEqual(pool.findStuck(s, now + MIN).map((e) => e.reason), ["overran", "hung"], `reasons must not drift:\n${JSON.stringify(stuck)}`)
 })
 
 // ---------------------------------------------------------------------------
@@ -255,6 +368,98 @@ test("[US-10] the reaper log names the reaped session and why it was reaped", as
   // The reason, in the words an operator would grep for.
   assert.match(line, /with \d+s of silence/, `the reason must be stated: ${line}`)
   assert.match(line, /^warn hung \S+ on hang\/model after \d+s/, `the model and elapsed time must be stated: ${line}`)
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-10] a claim killed at the ceiling is reported as 'overran', never as a hang", async () => {
+  // The same line has to mean two different things depending on which fault
+  // stopped the task, because the operator reads it to find out why their agent
+  // disappeared. Calling a ceiling kill a "hang" would claim the task had gone
+  // silent -- the precise opposite of why it died, and the one thing an operator
+  // would go looking for is the silence that never happened.
+  const clock = fakeClock()
+  const net = stubFetch()
+  const { hooks, stub } = await bootPool("us10-overran")
+
+  await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "victim-overran" })
+  for (let minute = 1; minute <= MAX_CLAIM_AGE / MIN + 1; minute++) {
+    clock.advance(MIN)
+    await keepAlive(hooks, "victim-overran")
+  }
+  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+
+  const killed = stub.text().filter((l) => l.includes("aborted session"))
+  assert.equal(killed.length, 1, `exactly one reaped session:\n${stub.text().join("\n")}`)
+  assert.match(
+    killed[0],
+    /^warn overran explore on hang\/model after \d+s; aborted session victim-overran$/,
+    `the ceiling must be named in the line:\n${killed[0]}`,
+  )
+  assert.doesNotMatch(killed[0], /silence/, `a task killed while it was still talking must not be reported as silent: ${killed[0]}`)
+  assert.ok(
+    !stub.text().some((l) => l.startsWith("warn hung ")),
+    `the ceiling must not borrow the hang wording:\n${stub.text().join("\n")}`,
+  )
+  // The model is cooled exactly as for a hang -- an overrun still tells you
+  // something about the slot it was on, so the behaviour is deliberately shared.
+  const status = await hooks.tool.pool_status.execute({}, {})
+  assert.match(status.output, /cooling:.*hang\/model/, `an overrun must cool like a hang:\n${status.output}`)
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-10] pool_status reports an overran claim the reaper would condemn, not a healthy one", async () => {
+  // The bug this pins: pool_status recomputed the hang condition inline and knew
+  // nothing about the ceiling, so a claim 40 minutes old and still emitting was
+  // reported as not-hung while the reaper was about to kill it. The status must
+  // judge a claim with the reaper's own rule, not a restatement of it.
+  const clock = fakeClock()
+  const net = stubFetch()
+  const { hooks } = await bootPool("us10-status-overran")
+
+  await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "child-chatty" })
+  for (let minute = 1; minute <= MAX_CLAIM_AGE / MIN + 1; minute++) {
+    clock.advance(MIN)
+    await keepAlive(hooks, "child-chatty")
+  }
+
+  // Status only: no sweep has run, so the claim is still held and the status is
+  // the only thing that can report it. It must not call this healthy.
+  const status = await hooks.tool.pool_status.execute({}, {})
+  assert.match(status.output, /overran past 30min: 1 \(auto-aborted\)/, `the status must agree with the reaper:\n${status.output}`)
+  assert.match(status.output, /hung past 5min with 3min silence: 0/, `an overrun is not a hang:\n${status.output}`)
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-10] pool_status still reports a silent, aged claim with the hung wording", async () => {
+  const clock = fakeClock()
+  const net = stubFetch()
+  const { hooks } = await bootPool("us10-status-hung")
+
+  await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "child-silent" })
+  clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
+
+  const status = await hooks.tool.pool_status.execute({}, {})
+  assert.match(status.output, /hung past 5min with 3min silence: 1 \(auto-aborted\)/, `the existing hung wording must survive:\n${status.output}`)
+  assert.match(status.output, /overran past 30min: 0 \(auto-aborted\)/, `a silent claim under the ceiling is not overran:\n${status.output}`)
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-10] pool_status reports a young, active claim as not hung", async () => {
+  const clock = fakeClock()
+  const net = stubFetch()
+  const { hooks } = await bootPool("us10-status-alive")
+
+  await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "child-busy" })
+  clock.advance(2 * MIN)
+  await keepAlive(hooks, "child-busy")
+
+  const status = await hooks.tool.pool_status.execute({}, {})
+  assert.match(status.output, /hung past 5min with 3min silence: 0/, `a working claim is not hung:\n${status.output}`)
+  assert.match(status.output, /overran past 30min: 0/, `a young claim is not overran:\n${status.output}`)
   net.restore()
   await hooks.dispose()
 })

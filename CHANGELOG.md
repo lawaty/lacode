@@ -9,6 +9,21 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [0.4.2] — fix silent claim eviction, unkillable chatty tasks, and gateway 5xx misclassification
+
+### Fixed
+
+- **Heartbeat-aware claim publishing**: `publish()` now filters claims by `(claim.hb ?? claim.t)` instead of `claim.t`, matching how `pruneOwn` and `readSiblings` already judge liveness. A claim past `CLAIM_TTL_MS` with a fresh heartbeat was being written out of its own file, causing every other process to hand the slot out again while the task still held it.
+- **Claim ceiling (`MAX_CLAIM_AGE_MS`)**: a claim older than 30 minutes is now condemned regardless of activity. Previously, any message event reset the silence clock, so a task that hung while trickling output could reset it forever and never be killed. The ceiling is checked first; a claim that is both past it and silent is reported as `overran`, not `hung`.
+- **Single condemn rule**: `condemnReason()` is now the one place the condemn logic lives. Both `findStuck()` (the reaper) and `pool_status` use it, so a claim the status reports as healthy cannot be one the reaper is about to kill.
+- **Gateway 5xx and transient errors take the flat cooldown**: a 502, 503, 504, queue-budget exhaustion, or `TimeoutError` now cools the model flat (~60s, `strikes: 1`, reason `endpoint-unavailable`) instead of falling through unhandled. A real 429 or limit-shaped error still escalates through `recordStrike` unchanged.
+- **Reaper log distinguishes `overran` from `hung`**: a ceiling kill logs `overran <variant> on <model> after <age>s; aborted session <id>` with no silence claim; a silence kill keeps the existing `hung` wording.
+- **`pool_status` reports `overran` count**: a new line shows how many claims are past the ceiling and would be condemned, matching the reaper's own judgment.
+
+### Documented
+
+- `docs/OMNIROUTE.md`: corrected the `ProviderModelNotFoundError` troubleshooting row — `combo` is registered whether or not the gateway advertises it, so a valid gateway route works there without an allowlist entry.
+
 ## [0.4.1] — refuse hand-named slot variants, and ship a changelog
 
 ### Added

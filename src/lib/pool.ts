@@ -51,6 +51,10 @@ export const ORPHAN_TMP_MS = 60 * 1000
 export const CATALOG_TTL_MS = 10 * 60 * 1000
 export const STUCK_MIN_AGE_MS = 5 * 60 * 1000
 export const STUCK_IDLE_MS = 3 * 60 * 1000
+/** Absolute ceiling on a claim's life. The silence check below can be reset by
+ * any message event, so a task that hangs while still trickling output would
+ * otherwise never be condemned. This bounds it regardless. */
+export const MAX_CLAIM_AGE_MS = 30 * 60 * 1000
 export const HANG_COOLDOWN_MS = 10 * 60 * 1000
 // A transient upstream outage self-resolves, so it is cooled briefly and re-probed
 // rather than escalated like a strike. See coolUnavailable().
@@ -391,6 +395,14 @@ export const isLimitText = (text: string) => LIMIT_PATTERNS.some((re) => re.test
 
 export const isUnavailableText = (text: string) => UNAVAILABLE_PATTERN.test(text)
 
+// A gateway that cannot serve the request right now: a queue budget exhausted,
+// a request aborted on timeout. Like an unavailable endpoint it self-resolves,
+// so it is cooled flat rather than escalated as a strike. Deliberately separate
+// from LIMIT_PATTERNS: quota/limit semantics must stay untouched.
+const TRANSIENT_GATEWAY_PATTERNS = [/queue budget/i, /exceeded queue/i, /aborted due to timeout/i, /timeout/i]
+
+export const isTransientGatewayText = (text: string) => TRANSIENT_GATEWAY_PATTERNS.some((re) => re.test(text))
+
 // Providers sometimes state exactly when the window reopens; prefer that over a
 // guessed backoff. Handles "Resets in 35min", "Resets in 2hr 17min", "retry in 90s".
 export const statedCooldown = (text: string): number | undefined => {
@@ -531,7 +543,7 @@ export function publish(s: State) {
   if (!s.dirReady) return
   const now = Date.now()
   const payload: Record<string, Claim> = {}
-  for (const [key, claim] of s.own) if (now - claim.t <= CLAIM_TTL_MS) payload[key] = claim
+  for (const [key, claim] of s.own) if (now - (claim.hb ?? claim.t) <= CLAIM_TTL_MS) payload[key] = claim
   try {
     writeFileSync(join(s.dir, `${selfFile(s.id)}.tmp`), JSON.stringify(payload))
     renameSync(join(s.dir, `${selfFile(s.id)}.tmp`), join(s.dir, selfFile(s.id)))
@@ -963,15 +975,32 @@ export function idleFor(s: State, claim: Claim, now: number) {
   return seen ? now - seen : Infinity
 }
 
+// The condemn rule, in exactly ONE place. The reaper (findStuck) and the status
+// view (pool_status) both judge a claim with this, so a claim the status reports
+// as healthy cannot be one the reaper is about to kill: two sources of truth for
+// the same rule is the bug this function exists to prevent.
+//
 // A usage limit hangs instead of failing, so nothing releases the claim and the
 // caller never regains control. An aged claim whose target has gone silent is
-// presumed wedged.
+// presumed wedged -- but silence is only evidence when it PERSISTS, and any
+// message event resets the clock, so a task that hangs while still trickling
+// output would reset it forever. MAX_CLAIM_AGE_MS is the unconditional bound.
+//
+// The ceiling is checked FIRST, so a claim that is both past it and silent is
+// reported for what actually stopped it rather than for the stale clue; "hung"
+// still requires BOTH age and silence.
+export function condemnReason(s: State, claim: Claim, now = Date.now()): "hung" | "overran" | undefined {
+  const age = now - claim.t
+  if (age > MAX_CLAIM_AGE_MS) return "overran"
+  if (age > STUCK_MIN_AGE_MS && idleFor(s, claim, now) >= STUCK_IDLE_MS) return "hung"
+  return undefined
+}
+
 export function findStuck(s: State, now = Date.now()) {
-  const stuck: { key: string; claim: Claim }[] = []
+  const stuck: { key: string; claim: Claim; reason: "hung" | "overran" }[] = []
   for (const [key, claim] of s.own) {
-    if (now - claim.t <= STUCK_MIN_AGE_MS) continue
-    if (idleFor(s, claim, now) < STUCK_IDLE_MS) continue
-    stuck.push({ key, claim })
+    const reason = condemnReason(s, claim, now)
+    if (reason) stuck.push({ key, claim, reason })
   }
   return stuck
 }

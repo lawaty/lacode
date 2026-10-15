@@ -415,7 +415,37 @@ for (const model of SLOT_MODELS) {
   assert(entry.tool_call === true, `${model} must support tool calls to be usable as an explore agent`)
 }
 
+// 12. a claim that keeps working past the TTL must still be PUBLISHED. Liveness is
+//     the heartbeat everywhere else -- pruneOwn counts the claim by it, readSiblings
+//     accepts it by it -- so a publisher filtering on the spawn time wrote a live
+//     claim out of its own file and every other process then handed the slot out
+//     again while the task still held it. The other half of block 8: a claim with no
+//     heartbeat ages out; a claim with a fresh one does not.
+const dir4 = mkdtempSync(join(tmpdir(), "agent-pool-hb-"))
+const p = await make("proc-heartbeat", dir4)
+const observer = await make("proc-observer", dir4)
+const liveSlot = slotNum(await p.spawn("hb1", "explore"))
+const liveModel = SLOT_MODELS[liveSlot - 1]
+// The child session the claim runs in: bound the way opencode binds it, then kept
+// alive by message traffic, which is the only proof the task has not been abandoned.
+await p.hooks.event({ event: { type: "session.created", properties: { info: { id: "child-hb", parentID: "s1" } } } })
+const wallClock = Date.now
+Date.now = () => wallClock() + 11 * 60 * 1000
+await p.hooks.event({ event: { type: "message.part.updated", properties: { part: { sessionID: "child-hb", type: "text" } } } })
+const fromPeer = await observer.status()
+Date.now = wallClock
+const peerLine = fromPeer.split("\n").find((l) => l.includes(liveModel))
+assert(
+  /load=1\//.test(peerLine ?? ""),
+  `a claim past the TTL whose heartbeat is fresh must still count in another process, got:\n${fromPeer}`,
+)
+assert(
+  new RegExp(`proc-heartbeat: 1 claim\\(s\\)`).test(fromPeer),
+  `the live claim must stay in the shared file after it passes the TTL, got:\n${fromPeer}`,
+)
+
 console.log(statusOut)
 rmSync(dir1, { recursive: true, force: true })
 rmSync(dir3, { recursive: true, force: true })
+rmSync(dir4, { recursive: true, force: true })
 console.log("\nALL CHECKS PASSED")
