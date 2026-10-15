@@ -291,7 +291,7 @@ test("[US-15] the manifest publishes every entry-point shape a plugin loader may
 })
 
 /**
- * The `## Install` chapter, as text.
+ * The `## Getting started` chapter, as text.
  *
  * Deliberately NOT anchored to a `###` heading. The old assertion pinned the
  * exact string "### If the plugin does not load on opencode 1.18.35" and its
@@ -300,12 +300,12 @@ test("[US-15] the manifest publishes every entry-point shape a plugin loader may
  * are about the substance a reader needs, so they locate the chapter by its
  * stable top-level heading and then require the concepts to be present.
  *
- * The chapter is still a meaningful scope: nothing outside `## Install`
+ * The chapter is still a meaningful scope: nothing outside `## Getting started`
  * discusses the cache, the `file://` fallback or which versions are verified, so
  * a claim satisfied from some unrelated section cannot satisfy these.
  */
 /**
- * The install documentation, as one blob: the README's own `## Install` chapter
+ * The install documentation, as one blob: the README's own `## Getting started` chapter
  * plus docs/INSTALL.md, which holds the long tail — cache layout, the "agents are
  * missing" procedure, the version matrix, macOS.
  *
@@ -317,8 +317,8 @@ test("[US-15] the manifest publishes every entry-point shape a plugin loader may
  */
 const installChapter = () => {
   const readme = readFileSync(join(ROOT, "README.md"), "utf8")
-  const start = readme.search(/^## Install\b/m)
-  assert.ok(start !== -1, "README must have a `## Install` chapter")
+  const start = readme.search(/^## Getting started\b/m)
+  assert.ok(start !== -1, "README must have a `## Getting started` chapter")
   const rest = readme.slice(start)
   const next = rest.slice(1).search(/^## /m)
   const chapter = next === -1 ? rest : rest.slice(0, next + 1)
@@ -372,6 +372,36 @@ const sectionOf = (chapter, headingRe) => {
   const next = after.search(/^#{1,3} /m)
   return next === -1 ? after : after.slice(0, next)
 }
+
+test("[US-15] the getting started is self-contained: install, restart, verify, first use", () => {
+  const chapter = installChapter()
+  const readme = readFileSync(join(ROOT, "README.md"), "utf8")
+  const start = readme.search(/^## Getting started\b/m)
+  const rest = readme.slice(start)
+  const next = rest.slice(1).search(/^## /m)
+  const short = next === -1 ? rest : rest.slice(0, next + 1)
+
+  // The other US-15 docs tests read the README *and* docs/INSTALL.md as one blob,
+  // so they keep passing if a claim survives in either file. That is right for a
+  // claim, and wrong for the HAPPY PATH: the point of a short getting started is
+  // that someone succeeds without clicking through to the troubleshooting page,
+  // so the verification step has to be in the chapter itself. This is the guard
+  // against that being quietly delegated to a drill-down.
+  assert.ok(/opencode agent list/.test(short), "getting started must verify the load itself, not link to a page that does")
+  assert.ok(/Restart opencode/i.test(short), "getting started must say to restart, before anything is verified")
+  assert.ok(/npm i -g/.test(short), "getting started must still say the global install does not load the plugin")
+
+  // Short means short. A cap, not a taste call: this chapter is the one thing a
+  // new user reads, and it regressed into 200 lines of troubleshooting once
+  // already by being the only place that detail had.
+  const lines = short.split("\n").filter((l) => l.trim()).length
+  assert.ok(lines < 90, `getting started must stay short; it is ${lines} non-blank lines`)
+
+  // …and it must not be short by having lost the explanation of WHY the check
+  // matters: a silent plugin failure that reads like a broken grep sends people
+  // to the wrong page.
+  assert.ok(/silent|not tell you|nothing/i.test(short), "getting started must say the failure is silent, or the check reads as optional")
+})
 
 /**
  * "does not fix" / "do **not** fix" / "not a fix", emphasis and line-wrapping

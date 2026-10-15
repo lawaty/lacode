@@ -27,7 +27,9 @@ is also on disk at `node_modules/@lawaty/lacode/CHANGELOG.md`.
 | SSH notification tunnel | Work on a remote host raises its notification on that host, which has no desktop. |
 | Repository context map | Every task starts by exploring your codebase cold, and every agent re-discovers the same layout, the same entry points and the same boundaries — paid for again on every run. |
 
-## Install
+## Getting started
+
+### 1. Install
 
 Add one line to your opencode config — `~/.config/opencode/opencode.json`, or
 the `.jsonc` beside it:
@@ -38,27 +40,58 @@ the `.jsonc` beside it:
 
 **That is the entire install.** opencode resolves an npm plugin specifier itself
 and installs it at startup, so there is no `npm install` to run first and no
-directory to create. Do not run `npm i -g @lawaty/lacode`: a global npm install
-is never consulted by opencode, so it changes nothing about whether the plugin
+directory to create. Do not run `npm i -g @lawaty/lacode`: a global npm install is
+never consulted by opencode, so it changes nothing about whether the plugin
 loads.
 
-It is also the form to keep as your default: if your opencode does not load the
-bare specifier, add to this line rather than replacing it. The
-[troubleshooting guide](docs/INSTALL.md#if-the-agents-are-missing) says when that is, and
-[which versions this is known on](docs/INSTALL.md#which-opencode-versions-this-is-known-on)
-says what is actually verified.
-
-To install it explicitly instead — or to install it once for every project on
-the machine rather than per config — use the CLI, which does the same thing:
+To install it for every project on the machine rather than per config, let the
+CLI do the same thing:
 
 ```bash
-opencode plugin @lawaty/lacode        # this project
-opencode plugin @lawaty/lacode -g     # global, for every project on the machine
+opencode plugin @lawaty/lacode -g
 ```
 
-**Restart opencode afterwards.** Nothing here hot-reloads: the `plugin` array is
-read at startup, so without a restart the change does not take effect and the
-agent set will look stale for no visible reason.
+### 2. Restart opencode
+
+**Nothing here hot-reloads.** The `plugin` array is read at startup, so without a
+restart the change does not take effect and the agent set will look stale for no
+visible reason.
+
+### 3. Check it loaded
+
+```bash
+opencode agent list | grep -E '^(explore|implement|context)'
+```
+
+You should see `explore`, `implement` and `context`, each with hidden `-1`..`-4`
+pool variants alongside. That is the whole install, and you are done.
+
+**If that prints nothing, the plugin did not load** — and opencode will not tell
+you: it starts normally, logs nothing, and the agents are simply absent. A
+plugin that fails to load is silent by design of the host, so this check is the
+only way to know. The
+[troubleshooting guide](docs/INSTALL.md#if-the-agents-are-missing) walks the
+procedure.
+
+### 4. Use it
+
+Nothing to turn on. Ask for something that delegates, and the pool takes it from
+there:
+
+```
+> use the explore agent to find where auth tokens are validated
+```
+
+To see what the pool is doing underneath:
+
+```bash
+/lacode-doctor        # slots, model resolution, OmniRoute — report only, changes nothing
+lacode version        # which LaCode is actually running, and whether opencode loads that one
+```
+
+In a repository with no `.opencode/context/` yet, the first session builds it in
+the background; `/context-init` forces it, and [Context map](#context-map)
+explains what it is for.
 
 ## Configure
 

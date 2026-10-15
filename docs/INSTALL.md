@@ -1,6 +1,6 @@
 # Install and troubleshooting
 
-Everything about getting LaCode loaded, and what to do when it silently is not. The one-line install is in the [README](../README.md#install); this page is for the rest of it.
+Everything about getting LaCode loaded, and what to do when it silently is not. The one-line install is in the [README](../README.md#getting-started); this page is for the rest of it.
 
 A plugin that fails to load is silent — opencode starts normally, prints nothing, logs nothing, and the agents are simply not there. Start at [If the agents are missing](#if-the-agents-are-missing).
 
