@@ -4,6 +4,7 @@
 // Subcommands:
 //   lacode notify TITLE [MESSAGE] [URGENCY] [ICON] [SOUND]
 //   lacode forward HOST -- COMMAND [ARG...]
+//   lacode version
 //   lacode update [--check]
 //   lacode doctor
 //   lacode receive            (the forced-command end of a direct hop)
@@ -31,6 +32,7 @@ import { spawnSync } from "node:child_process"
 import { describe, forward, notify, normalizeSound, parsePayload, resolveTunnel, safeTitle, sendLocal } from "../src/tunnel/index.ts"
 import { PACKAGE_ROOT } from "../src/lib/package-root.ts"
 import { checkForUpdate, refreshCache } from "../src/lib/selfupdate.ts"
+import { formatVersion, readVersionReport } from "../src/lib/version.ts"
 
 // Two forms of this file exist and both must work. Run from a checkout it IS
 // TypeScript-in-Node, exactly like the opencode plugins: node strips the types on
@@ -67,6 +69,15 @@ const USAGE = `lacode — portable notifications and remote exec for LaCode
 
   lacode doctor
       Print what the environment resolves to. Diagnostics only.
+
+  lacode version
+      Report WHICH LaCode is speaking and WHICH one opencode actually loads.
+      Version, source (checkout or install), the commit it was built from,
+      and whether dist/ is behind src/ after a git pull. Compares itself
+      against the plugin array in your opencode config, because a config may
+      load the plugin by absolute path and report a version you did not ask
+      about. Never reaches the network; \`lacode update --check\` is what asks
+      npm whether something newer exists.
 
   lacode update [--check]
       Bring this machine's installed LaCode up to the latest published
@@ -139,6 +150,18 @@ switch (command) {
       // The silent case this report exists to rule out: nothing is wrong, and
       // nothing will ever pop up here either.
       console.log("\nNo local notification channel: `lacode notify` on this machine has nothing to deliver with, and every send will be reported as failed rather than shown.")
+    }
+    process.exit(0)
+    break
+  }
+
+  case "version": {
+    const report = readVersionReport()
+    console.log(formatVersion(report))
+    if (report.note) console.log(`\n${report.note}`)
+    if (report.dist === "stale") {
+      console.log("\nRebuild before trusting the rest of this report: npm run build")
+      for (const file of report.staleSources ?? []) console.log(`  newer than dist: ${file}`)
     }
     process.exit(0)
     break

@@ -70,10 +70,27 @@ export function compareSemver(a: string, b: string): number {
   return 0
 }
 
-/** The version of the package rooted at `packageRoot`, if it is really ours. */
-export function readInstalledVersion(packageRoot: string): string | undefined {
+/**
+ * The version of the package rooted at `packageRoot`, if it is really ours.
+ *
+ * `read` is injectable so a caller can describe a package root that is not on
+ * this filesystem — `lacode version` reports on a copy the caller names, and a
+ * test must not have to build one to assert a version string.
+ */
+export function readInstalledVersion(
+  packageRoot: string,
+  read: (path: string) => string | undefined = (path) => {
+    try {
+      return readFileSync(path, "utf8")
+    } catch {
+      return undefined
+    }
+  },
+): string | undefined {
   try {
-    const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as {
+    const raw = read(join(packageRoot, "package.json"))
+    if (raw === undefined) return undefined
+    const manifest = JSON.parse(raw) as {
       name?: string
       version?: string
     }
