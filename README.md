@@ -2,6 +2,11 @@
 
 > Ultimate opencode setup for Go users
 
+> **Beta — experimental, changing fast.** For the next month LaCode ships on the
+> npm **`beta`** dist-tag rather than `latest`, so nothing pulls it by accident:
+> install `@lawaty/lacode@beta`, or pin an exact version. Interfaces here can
+> change between releases without a major bump while the project stabilises.
+
 LaCode is an opencode plugin. It routes delegated work onto a weighted pool of
 cheap models instead of the expensive one, reaps subagents that hang without
 telling anyone, keeps a maintained map of your repository so agents stop

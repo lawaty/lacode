@@ -11,6 +11,9 @@ commit as the changelog entry it describes.
 
 ## [0.5.0] — a user-only /manager-directive, instant limit failover, and the longcat preset
 
+Released on the npm **`beta`** dist-tag (not `latest`) while the project is
+experimental; `latest` remains 0.4.2.
+
 ### Added
 
 - **`/manager-directive <text>`** — a client-only command that runs a hidden

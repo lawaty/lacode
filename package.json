@@ -60,5 +60,8 @@
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "1.18.34"
+  },
+  "publishConfig": {
+    "tag": "beta"
   }
 }
