@@ -338,6 +338,54 @@ const dirB = scratch()
   assert(Number(/strike (\d+)/.exec(after)?.[1]) === before, "reaping must not inflate the strike count")
 }
 
+// 16. a usage-limit error on a claim's OWN session aborts that session at once,
+//     so the pool fails over in seconds instead of leaving the task to hang until
+//     the ~5-minute reaper. The claim is freed, so the slot is reusable immediately.
+{
+  const dir = scratch()
+  const q = await mk("p16", dir)
+  const baseline = await q.spawn("q1")
+  const slot = SLOTS[Number(/-(\d+)$/.exec(baseline)[1]) - 1]
+  // Bind the subagent session opencode creates for the task to the claim.
+  await q.hooks.event({ event: { type: "session.created", properties: { info: { id: "child-q", parentID: "s1" } } } })
+  const before = aborted.length
+  await q.hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { role: "assistant", sessionID: "child-q", providerID: slot.provider, modelID: slot.modelID, error: rateError("Rate limit exceeded") },
+      },
+    },
+  })
+  assert(
+    aborted.length === before + 1 && aborted.at(-1) === "child-q",
+    `a limit on a claimed session must abort it at once, got ${JSON.stringify(aborted.slice(before))}`,
+  )
+  assert(readFileSync(join(dir, "claims.p16.json"), "utf8") === "{}", "the claim must be released so its slot is free again")
+  assert(logs.some((l) => l.includes("fail over now")), `the failover must be logged, got ${logs.slice(-3).join(" | ")}`)
+}
+
+// 17. the abort is scoped to the claim that owns the erroring session: a limit on
+//     an unrelated session must not kill an in-flight task.
+{
+  const dir = scratch()
+  const z = await mk("p17", dir)
+  const baseline = await z.spawn("z1")
+  const slot = SLOTS[Number(/-(\d+)$/.exec(baseline)[1]) - 1]
+  await z.hooks.event({ event: { type: "session.created", properties: { info: { id: "child-z", parentID: "s1" } } } })
+  const before = aborted.length
+  await z.hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { role: "assistant", sessionID: "some-other-session", providerID: slot.provider, modelID: slot.modelID, error: rateError("Rate limit exceeded") },
+      },
+    },
+  })
+  assert(aborted.length === before, `an unrelated session's limit must not abort a claim, got ${JSON.stringify(aborted.slice(before))}`)
+  assert(readFileSync(join(dir, "claims.p17.json"), "utf8") !== "{}", "the unrelated error must leave the claim in flight")
+}
+
 globalThis.fetch = realFetch
 for (const dir of made) rmSync(dir, { recursive: true, force: true })
 if (failures === 0) console.log("\nALL LIMIT CHECKS PASSED")

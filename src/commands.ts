@@ -18,6 +18,8 @@
 // user who wrote their own `/context-update` keeps it; this set only fills the
 // names nobody has taken.
 
+import { MANAGER_AGENT_NAME } from "./lib/manager-directive.ts"
+
 export type CommandDef = {
   template: string
   description?: string
@@ -109,6 +111,18 @@ Audit the five context files for:
 
 Fix what you find in \`.opencode/context/\` only, then report: findings, fixes,
 and anything you could not verify.`,
+  },
+
+  "manager-directive": {
+    description:
+      "Apply a client instruction to .opencode/context/manager.md. Client-only — runs the manager agent, the only writer of that file.",
+    agent: MANAGER_AGENT_NAME,
+    subtask: true,
+    template: `Apply this instruction to \`.opencode/context/manager.md\`, and edit only that file:
+
+$ARGUMENTS
+
+Follow the rules for the file in your system prompt, then report what you changed.`,
   },
 
   "lacode-doctor": {

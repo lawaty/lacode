@@ -102,7 +102,7 @@ your pool like any other model:
 # ~/.config/lacode/pool.txt
 omniroute/auto             3
 opencode/space-bunny-free  2
-opencode-go/step-5-preview-free 1
+opencode-go/longcat-2.5-preview-free 1
 opencode/big-pickle        1
 ```
 

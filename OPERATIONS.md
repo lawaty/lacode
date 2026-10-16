@@ -59,10 +59,10 @@ Edit `presets/free-tier.json` (or drop a `pool.txt` — `model [weight]` per lin
 
 ```json
 { "slots": [
-  { "model": "opencode-go/step-5-preview-free", "weight": 3 },
+  { "model": "opencode-go/longcat-2.5-preview-free", "weight": 3 },
   { "model": "opencode/space-bunny-free", "weight": 2 },
   { "model": "opencode/big-pickle", "weight": 1 },
-  { "model": "opencode/step-5-preview-free", "weight": 1 }
+  { "model": "opencode/longcat-2.5-preview-free", "weight": 1 }
 ] }
 ```
 

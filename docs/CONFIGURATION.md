@@ -75,9 +75,11 @@ process.
 
 ## What gets injected
 
-**17 agent keys**: the 5 bases `build`, `plan`, `explore`, `implement`,
+**18 agent keys**: the 5 bases `build`, `plan`, `explore`, `implement`,
 `context`, plus one hidden
-`<base>-1`..`-4` pool variant for each of the 3 pooled bases.
+`<base>-1`..`-4` pool variant for each of the 3 pooled bases, plus the hidden
+`manager` agent — the one writer of `.opencode/context/manager.md`, reachable
+only from the `/manager-directive` command.
 
 `build` and `plan` exist in opencode as built-ins, so on a stock config those
 two keys are already taken and merge-without-clobber keeps the built-in — the

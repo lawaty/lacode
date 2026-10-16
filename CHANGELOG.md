@@ -9,6 +9,33 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [0.5.0] — a user-only /manager-directive, instant limit failover, and the longcat preset
+
+### Added
+
+- **`/manager-directive <text>`** — a client-only command that runs a hidden
+  `manager` agent to apply your instruction to `.opencode/context/manager.md`
+  (record it, move it between sections, rewrite `## Current`, …). The `manager`
+  agent is the only agent permitted to edit that file, its grant is scoped to
+  `manager.md` alone, and no other agent can spawn it — the command is the only
+  route in. The one-writer guard (`writer-rule.ts` Direction 3) now exempts
+  exactly that agent name and still reports every other writer.
+
+### Changed
+
+- **Bundled pool preset** — `opencode-go/step-5-preview-free` and
+  `opencode/step-5-preview-free` were retired upstream. Slots 2 and 4 now name
+  `longcat-2.5-preview-free` on the same providers (`opencode-go`, `opencode`).
+  Update `~/.config/lacode/pool.txt` if you pinned the old ids there.
+
+### Fixed
+
+- **Immediate failover on a usage limit** — when a limit-shaped assistant error or
+  a limit-shaped `session.status` retry names the session an in-flight claim is
+  running on, the pool aborts that session at once instead of leaving it for the
+  ~5-minute hang reaper. The claim is released and the next spawn routes to a slot
+  that answers; a limit on an unrelated session never kills a claim.
+
 ## [0.4.2] — fix silent claim eviction, unkillable chatty tasks, and gateway 5xx misclassification
 
 ### Fixed
@@ -166,7 +193,8 @@ commit as the changelog entry it describes.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/lawaty/lacode/compare/v0.4.2...v0.5.0
 [0.4.1]: https://github.com/lawaty/lacode/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/lawaty/lacode/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lawaty/lacode/compare/v0.2.2...v0.3.0

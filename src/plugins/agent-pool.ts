@@ -140,6 +140,30 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
     if (strike) await log("warn", `cooling ${claim.m} for ${Math.round((strike.until - now) / 1000)}s (hang)`)
   }
 
+  // A usage limit HANGS rather than failing: opencode keeps retrying the same
+  // refused model, so the claim it is holding never comes back and the reaper
+  // would only condemn it after STUCK_MIN_AGE_MS of age -- minutes the caller
+  // spends waiting on a provider that has already said no. When the limit signal
+  // names the session a claim is running on, abort that session at once: control
+  // returns to the caller and the next spawn routes to a slot that answers, in
+  // seconds instead of minutes. Scoped to the claim that owns the session so an
+  // unrelated session's error never kills someone else's work.
+  const failOver = async (sessionID: string | undefined, model: string, reason: string) => {
+    if (!sessionID) return
+    const entry = [...s.own.entries()].find(([, claim]) => claim.g === sessionID)
+    if (!entry) return
+    const [key, claim] = entry
+    const kill = await abortSession(sessionID)
+    pool.release(s, key)
+    await log(
+      "warn",
+      kill.ok
+        ? `limit (${reason}) on ${model}; aborted in-flight ${claim.v} session ${sessionID} to fail over now`
+        : `limit (${reason}) on ${model}; released in-flight ${claim.v} claim after a failed abort (${kill.why})`,
+      { base: claim.v, model: claim.m, slot: claim.k, session: sessionID, aborted: kill.ok, reason },
+    )
+  }
+
   const reapStuck = async () => {
     if (s.reaping) return
     s.reaping = true
@@ -303,20 +327,31 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
         // attached to a message, and it is provider-wide, so cool every slot on
         // that provider until the stated reset.
         if (event.type === "session.status") {
+          const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined
           const status = props.status as
             | { type?: string; message?: string; next?: number; action?: { reason?: string; provider?: string } }
             | undefined
-          if (status?.type === "retry" && status.action?.reason === "free_tier_limit" && status.action.provider) {
+          const reason = status?.action?.reason ?? ""
+          // opencode reports a provider-wide limit itself, per session: a retry
+          // status carrying the provider and a `next` reset timestamp. This fires
+          // even when no assistant error is attached to a message, and it is
+          // provider-wide, so cool every slot on that provider until the stated
+          // reset. "free_tier_limit" is opencode's own reason; a limit-shaped
+          // reason from any other provider is the same statement, so both count.
+          if (status?.type === "retry" && status.action?.provider && (reason === "free_tier_limit" || pool.isLimitText(reason))) {
             const provider = status.action.provider
             const until = typeof status.next === "number" && status.next > Date.now() ? status.next : Date.now() + HANG_FALLBACK_MS
-            const cooled = pool.coolProvider(s, provider, until, "free_tier_limit")
+            const cooled = pool.coolProvider(s, provider, until, reason || "rate-limited")
             if (cooled.length > 0) {
-              await log("warn", `free tier exhausted on provider ${provider}; cooling ${cooled.length} slot(s) until ${new Date(until).toISOString().slice(11, 19)}Z`, {
+              await log("warn", `limit on provider ${provider} (${reason || "rate-limited"}); cooling ${cooled.length} slot(s) until ${new Date(until).toISOString().slice(11, 19)}Z`, {
                 provider,
                 until,
                 models: cooled.map((c) => c.model),
               })
             }
+            // The provider is benched, but the task already retrying on it is not:
+            // abort it now rather than leave it to burn the whole retry budget.
+            await failOver(sessionID, provider, reason || "rate-limited")
           }
           return
         }
@@ -338,7 +373,7 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
         }
 
         if (event.type !== "message.updated") return
-        const info = props.info as { role?: string; error?: unknown; providerID?: string; modelID?: string } | undefined
+        const info = props.info as { role?: string; error?: unknown; providerID?: string; modelID?: string; sessionID?: string } | undefined
         if (!info || info.role !== "assistant" || !info.error) return
         // Shape-agnostic: the error surfaces under different keys depending on
         // whether it came from the AI SDK or the gateway, so scan the whole
@@ -371,6 +406,9 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
           .replace(/[\s_]/g, "-")
         const strike = pool.recordStrike(s, model, reason ?? "rate-limited", stated)
         if (strike) await log("warn", `cooling ${model} for ${Math.round((strike.until - Date.now()) / 1000)}s (${reason ?? "rate-limited"}, strike ${strike.strikes})`)
+        // The model is benched; the task already in flight on it is not. Abort it
+        // so the caller re-routes now instead of after the ~5-minute hang reaper.
+        await failOver(info.sessionID, model, reason ?? "rate-limited")
       } catch (error) {
         await log("error", `limit detection failed: ${String(error)}`)
       }

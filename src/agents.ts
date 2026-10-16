@@ -78,6 +78,7 @@
 // the exception that matters: the pool needs them, and a user who defined one
 // by hand keeps their definition.
 import { MAX_SLOTS } from "./lib/pool.ts"
+import { MANAGER_AGENT_NAME } from "./lib/manager-directive.ts"
 
 export type AgentDef = {
   description?: string
@@ -776,6 +777,80 @@ Finish with a short report:
 }
 
 /**
+ * The one agent permitted to write the client's `manager.md`, run only by the
+ * `/manager-directive` command.
+ *
+ * It is deliberately NOT a pooled base and NOT in any agent's `task` allow-list:
+ * the only route to it is the user's own command, and its `edit` grant is scoped
+ * to `manager.md` alone. writer-rule.ts exempts exactly this name -- and no
+ * other -- from its "no agent writes manager.md" check, so the guard still
+ * catches every other agent, including one a user declares to copy this grant.
+ */
+export const MANAGER_AGENT: AgentDef = {
+  description:
+    "Records and edits the client's .opencode/context/manager.md. Run only by the /manager-directive command; no agent or subagent can spawn it.",
+  mode: "subagent",
+  hidden: true,
+  temperature: 0.1,
+  prompt: `# Role
+
+You maintain one file and nothing else: \`.opencode/context/manager.md\`, the
+client's own statement of intent. You are not a coding agent and you touch no
+other path.
+
+You are run only by the \`/manager-directive\` command. The client tells you what
+they want recorded or changed in the file; you apply that to the file and report
+what you changed. You have no permission to edit anything else, and you need
+none.
+
+# The file
+
+It records what is being worked on (\`## Current\`), what comes next
+(\`## Next\`), what the client has ratified (\`## Confirmed\`), and standing
+direction (\`## Instructions\`). The client may use any headings — every heading
+is direction, and the four above are a convenience, not a schema.
+
+# How to apply a directive
+
+- Do what the client asked. "Append", "rewrite Current", "move X to Confirmed",
+  "add a heading" all mean exactly that; a bare sentence goes under the most
+  fitting existing heading, and you create one only if none fits.
+- Never invent facts, never record your own inference as the client's, and never
+  tidy, reorder or delete content the client did not ask you to touch.
+- \`## Current\` is rewritten, not appended to, so it does not become a running
+  history.
+- Keep the file concise. If it is growing past roughly 150 lines, say so.
+
+# Reporting
+
+Report briefly what you changed and where. Do not edit any other file.`,
+  permission: {
+    // Read is scoped to the one file too: the directive is about manager.md, and
+    // nothing else is any of this agent's business.
+    read: {
+      "*": "deny",
+      ".opencode/context/manager.md": "allow",
+      "*/.opencode/context/manager.md": "allow",
+    },
+    glob: "deny",
+    grep: "deny",
+    list: "deny",
+    edit: {
+      "*": "deny",
+      ".opencode/context/manager.md": "allow",
+      "*/.opencode/context/manager.md": "allow",
+    },
+    bash: "deny",
+    webfetch: "deny",
+    websearch: "deny",
+    question: "allow",
+    task: {
+      "*": "deny",
+    },
+  },
+}
+
+/**
  * The full set: the bases above plus one hidden `<base>-<slot>` variant per slot.
  *
  * The variants are generated rather than written out twelve times, and the slot
@@ -803,6 +878,9 @@ export function buildAgentSet(): Record<string, AgentDef> {
       set[`${base}-${slot}`] = variant
     }
   }
+  // The client's own file has exactly one writer, reachable only from the user's
+  // /manager-directive command (see MANAGER_AGENT).
+  set[MANAGER_AGENT_NAME] = MANAGER_AGENT
   return set
 }
 

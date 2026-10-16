@@ -136,7 +136,7 @@ try {
   assert.ok(gap, "a context-dir grant with no manager.md deny must be reported")
   assert.match(gap, /manager\.md is writable by permission/)
   assert.match(gap, /context-1/, "the offending agent must be named")
-  assert.match(gap, /no agent writes it/, "the message must state the rule")
+  assert.match(gap, /only the `manager` agent/, "the message must name the one sanctioned writer")
   assert.match(gap, /LAST matching rule/, "the message must state why order matters")
   ok("a context-dir grant that does not carve out manager.md is reported")
 

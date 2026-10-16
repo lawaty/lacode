@@ -1,6 +1,7 @@
 import { parseJsonc } from "./jsonc.ts"
 import { readFileSync } from "node:fs"
 import * as path from "node:path"
+import { MANAGER_AGENT_NAME } from "./manager-directive.ts"
 
 // A plugin module's exports ARE its plugins: opencode iterates every export of a
 // plugin file and calls it, then uses the return value as a hooks object
@@ -15,6 +16,15 @@ const CONTEXT_DIR = path.join(".opencode", "context")
 
 /** The agent family allowed to write the map, including every hidden slot variant. */
 const WRITER = "context"
+
+/**
+ * The ONE agent allowed to write the client's manager.md, and the only name
+ * Direction 3 skips. It is reachable solely through the user's
+ * `/manager-directive` command and its grant is scoped to that file (see
+ * MANAGER_AGENT in src/agents.ts). Every other agent -- including one a user
+ * declares to copy this grant under a different name -- is still reported.
+ */
+const MANAGER_WRITER = MANAGER_AGENT_NAME
 
 const toPosix = (value: string) => value.split(path.sep).join("/")
 
@@ -179,18 +189,26 @@ export const verifyWriterRule = (configPath: string, mapDir: string, projectRoot
   // silently discards that deny -- and because the only other check deliberately
   // skips writer agents, the one file built to be untouchable becomes the one file
   // nothing inspects. Checked here, where it cannot be configured away.
+  //
+  // The `manager` agent is the ONE sanctioned exception, skipped by name just
+  // below: it exists solely to serve the user's /manager-directive command and
+  // its grant is scoped to this one file. Skipping the name (not the grant) is
+  // deliberate -- any OTHER agent that can write manager.md, including one that
+  // copies the grant under a different name, is still reported.
   const managerPath = managerForm(mapDir, projectRoot)
   const agentDefs = readAgents(raw)
   if (agentDefs) {
     const writers: string[] = []
     for (const [name, def] of Object.entries(agentDefs)) {
+      if (name === MANAGER_WRITER) continue
       const win = winningRule(permissionOf(def), managerPath)
       if (win?.action === "allow") writers.push(`${name} (edit rule "${win.pattern}": "${win.action}")`)
     }
     if (writers.length > 0) {
       return `${CONTEXT_DIR}/manager.md is writable by permission: ${writers.join(", ")}. `
         + `It is the client's own file — what they are working on, what is ratified, what every agent `
-        + `must respect — and no agent writes it. Deny it LAST, after any broad allow, because opencode `
+        + `must respect — and only the \`${MANAGER_WRITER}\` agent (run solely by /manager-directive) may write it. `
+        + `Deny it LAST on every other agent, after any broad allow, because opencode `
         + `takes the LAST matching rule: `
         + `"*": "allow", "*/${CONTEXT_DIR}/manager.md": "deny", "${CONTEXT_DIR}/manager.md": "deny". `
         + `Declare this on every agent above, including \`${WRITER}\`: an agent you define yourself replaces `

@@ -36,10 +36,10 @@ in place, no JSON and no objects:
 
 ```text
 # provider/model-id                       weight
-opencode-go/step-5-preview-free           3
+opencode-go/longcat-2.5-preview-free      3
 opencode/space-bunny-free                 2
 opencode/big-pickle                       1
-opencode/step-5-preview-free              1
+opencode/longcat-2.5-preview-free         1
 ```
 
 `#` starts a comment (whole-line or trailing), blank lines are ignored, and the
