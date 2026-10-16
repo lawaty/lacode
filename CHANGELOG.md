@@ -9,6 +9,16 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [0.7.1] — /agent-instructions creates AGENTS.md on first use
+
+### Changed
+
+- **`/agent-instructions` creates `AGENTS.md` on first use.** The hidden
+  `instructions` agent now creates the project's root `AGENTS.md` when it does
+  not exist, seeded with the instruction you pass, instead of refusing. Nothing
+  is created at startup and no placeholder content is written — the file appears
+  only when you run the command, and holds only what you asked for.
+
 ## [0.7.0] — standing instructions move to the project AGENTS.md
 
 ### Changed
@@ -235,7 +245,8 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/lawaty/lacode/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/lawaty/lacode/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/lawaty/lacode/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/lawaty/lacode/compare/v0.4.2...v0.5.0

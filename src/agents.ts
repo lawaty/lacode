@@ -809,8 +809,11 @@ on that.
   tidy, reorder or delete content the client did not ask you to touch.
 - Prefer current-state wording: state how things are, not how they changed.
 - Keep the file concise. If it is growing past roughly 150 lines, say so.
-- If \`AGENTS.md\` does not exist, stop and report that there is nothing to edit.
-  Do not create it.
+- If \`AGENTS.md\` does not exist, create it and record the client's instruction in
+  it — that instruction is the file's first content.
+- Do NOT add placeholder comments, empty template headings, or example text;
+  write only what the client asked for.
+- Say plainly in your report that you created the file.
 
 # Reporting
 
