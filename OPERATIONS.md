@@ -10,13 +10,14 @@ and how the pieces are distributed.
 author's live opencode config is beside it at `~/.config/opencode`:
 `opencode.jsonc`, `AGENTS.md`, `commands/`, `rules/`, `.opencode/prompts/`,
 `.env`. Those are **not in git** and are not published — they are one person's
-configuration. Paths below say which tree they are in, because getting it wrong
-is what `bin/oc-sync` regressed on.
+configuration. Paths below say which tree they are in: `bin/oc-sync` reads each item
+from the tree that owns it, and a path resolved against the wrong tree ships the
+wrong bytes.
 
 | Path | Tree | Role |
 |---|---|---|
 | `presets/free-tier.json` | repo | the bundled default pool: models and weights. Resolution chain: plugin `models` option > `~/.config/lacode/pool.txt` (flat; `pool.json` also accepted) > this file. See `presets/README.md` |
-| `src/agents.ts` | repo | the **17 agent keys the plugin injects** when the config lacks them: 5 bases (`build`, `plan`, `explore`, `implement`, `context`) plus 12 hidden `<base>-1..4` variants, one per slot. Injection is merge-without-clobber, so a config that declares a name keeps its own. The variants declare **no model**: it is written from `presets/free-tier.json` |
+| `src/agents.ts` | repo | the **18 agent keys the plugin injects** when the config lacks them: 5 bases (`build`, `plan`, `explore`, `implement`, `context`) plus 12 hidden `<base>-1..4` variants (3 pooled bases × 4 slots), plus the hidden `instructions` agent — the one writer of the project's root `AGENTS.md`, reachable only from `/agent-instructions`. Injection is merge-without-clobber, so a config that declares a name keeps its own. The variants declare **no model**: it is written from `presets/free-tier.json` |
 | `src/commands.ts` | repo | the three `/context-init`, `/context-update`, `/context-review` commands, injected as inline templates the same way |
 | `src/lib/pool.ts` | repo | shared state and the slot decision; imported by both plugins, exports no plugin |
 | `src/lib/writer-rule.ts` | repo | startup check that the one-writer permission rule actually fires; imported by `context-autoupdate.ts` |
@@ -81,12 +82,13 @@ number is its priority. Two rules, in order:
 So `3,2,1,1` produces `1,1,1,2,2,3,4,…` — ordered preference, with the bottom of the list as
 reserve. Weights are dynamic and deliberately unequal, so this is never a share calculation:
 a slot either has room under its ceiling or it does not. Equal weights give a round robin in
-list order, and `2,2,1,1` reproduces the old primary/overflow cycle exactly.
+list order, and `2,2,1,1` is a primary/overflow cycle: two slots share the load
+before either overflow slot sees work.
 
 Raise a weight to let a model run more sessions at once, lower it to make it more of a
 reserve. No weight means `1`; anything that is not a number in `(0, 100]` warns and means `1`.
-The old `tier` key is still read as a deprecated alias — `primary` is weight 2, `overflow` is
-weight 1 — with a warning, so a host that has not picked up this file keeps two slots' worth
+`tier` is an accepted alias for `weight` — `primary` is weight 2, `overflow` is
+weight 1 — read with a warning, so a host that has not picked up this file keeps two slots' worth
 of headroom.
 
 Do **not** add a `model` to a variant agent anywhere — they carry none on purpose. The
@@ -94,7 +96,7 @@ plugin's config hook writes `<base>-<slot>` for `explore`, `implement` and
 `context` from this file, and appends a slot's model id to a provider whitelist that
 already exists (it never writes one where you have none — an absent whitelist already allows
 every model). A
-`model` that reappears on a variant is stale: the plugin logs `still hard-codes …
+`model` on a variant is a second source of truth that loses: the plugin logs `still hard-codes …
 presets/free-tier.json wins` on every start. There is usually nothing to edit — the
 variants are injected, not declared — so a hit here means the config defines one itself,
 and that definition is the thing to delete.
@@ -144,32 +146,29 @@ against the file mtime before concluding a change is live.
 
 ## What opencode.jsonc holds now
 
-The file is in the personal config dir, it is **224 lines**, and it is no longer
-where the agents come from. Audited, most of what is left is structural rather
-than redundant:
+The file is in the personal config dir, it is **224 lines**, and it is not
+where the agents come from. `src/agents.ts` injects all 18 agent keys, variants
+included, and they resolve (`opencode debug agent explore-1`).
+Merge-without-clobber is why `build` and `plan` still appear in the config —
+the config's own definitions win — which is what leaves 8 keys: the 3 built-in
+stubs, plus `build`, `plan`, `basic`, `expert`, `context`.
 
-- **None of the 12 pool variants are in it.** They used to be, and the old
-  version of this file explained why generating them from the plugin "does not
-  work". It does now: `src/agents.ts` injects all 19 agent keys, variants
-  included, and they resolve (`opencode debug agent explore-1`).
-  Merge-without-clobber is why `build` and `plan` still appear in the config —
-  the config's own definitions win — which is what leaves 8 keys: the 3 built-in
-  stubs, plus `build`, `plan`, `basic`, `expert`, `context`.
+- **None of the 12 pool variants are in it.** They are generated by the plugin,
+  and a variant named in this file would be a definition the plugin cannot merge
+  with its own.
 - **Task rules use globs** (`explore*`), because opencode compiles a permission
   pattern to an anchored regex with `*` → `.*` and the longest match wins. Listing all
   four variants per base meant adding a line to two agents for every new slot.
 - **The models are not there at all** — `presets/free-tier.json` owns them and the plugin
   injects them.
-- **There is no Playwright grant, and putting one back would do nothing.** The file
-  used to carry a per-agent `tools: {"playwright_*": true}` on the explore and
-  implement bases and explain, at length, why it had to stay there. That grant was
-  dropped: opencode folds `agent.tools` into the permission list at config-load time,
-  while decoding the config, so a `tools` value a plugin writes from its `config` hook
-  is never read by anything. It was dead code wearing a verified-looking comment.
-  What remains is the top-level `"tools": { "playwright_*": false }`, which keeps the
-  MCP tools away from every agent. **Browser automation is therefore off for the
-  injected agents**, including the ones this file is run from. `src/agents.ts` carries
-  the full reasoning under NOT INJECTED; read it before re-adding anything.
+- **There is no Playwright grant, and adding one would do nothing.** opencode folds
+  `agent.tools` into the permission list at config-load time, while decoding the
+  config, so a `tools` value a plugin writes from its `config` hook is never read
+  by anything. What the file carries is the top-level
+  `"tools": { "playwright_*": false }`, which keeps the MCP tools away from every
+  agent. **Browser automation is therefore off for the injected agents**, including
+  the ones this file is run from. `src/agents.ts` carries the full reasoning under
+  NOT INJECTED; read it before re-adding anything.
 - `explore`, `general` and `implement` are disabled. These are opencode's built-in
   generic subagents; they would always be spawnable, cost a full-price model, and bypass
   `explore*` / `implement*` entirely. Only `basic`, `expert`, the pool bases and
@@ -177,11 +176,11 @@ than redundant:
   `tests/fixtures/opencode.json`, not this file — so a built-in that becomes usable
   fails there rather than quietly doubling the delegation paths.
 
-> **Legacy deploy.** The `bin/oc-sync` flow below is the author's older
-> source-sync + reverse-tunnel tooling, kept for reference. Remote hosts are now
-> plain npm clients: install the plugin (`opencode plugin @lawaty/lacode -g`) and
-> copy `opencode.jsonc`; there is nothing to rsync, and notifications use a direct
-> ssh hop (`lacode tunnel setup`), not a systemd-held reverse forward.
+> **Deploy.** Remote hosts are plain npm clients: install the plugin
+> (`opencode plugin @lawaty/lacode -g`) and copy `opencode.jsonc`; there is
+> nothing to rsync, and notifications use a direct ssh hop (`lacode tunnel setup`),
+> not a systemd-held reverse forward. The `bin/oc-sync` flow below is the
+> source-sync + reverse-tunnel path, and it still exists.
 
 ## Deploying to the other hosts
 
@@ -199,35 +198,36 @@ Pushes, with a remote backup first:
   `rules/`, `.opencode/prompts/`
 - the tunnel key, from `~/.ssh/`
 
-Each item is read from the tree that owns it, because the two were one tree until
-the move and every path in this script used to be a repo path. `.opencode/` is
+Each item is read from the tree that owns it: the script resolves every path
+against one tree or the other, and a path resolved against the wrong tree ships
+the wrong bytes. `.opencode/` is
 pushed as `prompts/` only: it also carries a `package.json`, a lockfile and tens
 of megabytes of `node_modules`, none of which belong on a host. `dist/` is **not**
 pushed — the hosts load the plugin from the `plugins/` shims described below, not
 from a build of this repo. `OC_SYNC_CONFIG_DIR` overrides the config dir; it is
 what a second setup or a test points at.
 
-**The config is the default, not an opt-in.** Plain `bin/oc-sync` used to ship only `oc`,
-which meant a fix to `AGENTS.md` stayed on this machine while hosts kept the old rules.
-The run looked successful. Use `--scripts-only` when you genuinely want just the
-launcher.
+**The config is the default, not an opt-in.** Plain `bin/oc-sync` ships the config
+alongside `oc`; a run that ships only `oc` leaves a fix to `AGENTS.md` on this
+machine while the hosts keep the rules they already have, and the run reports
+success either way. Use `--scripts-only` when you genuinely want just the launcher.
 
 **`AGENTS.md`, `commands/` and `rules/` are not optional extras.** `AGENTS.md` is the
 global instruction file opencode auto-loads into every session, and `commands/` +
 `rules/` are what it points at. A host missing them runs agents that were never told
 `.opencode/context/` exists, and they will report skipping the map while claiming the
-protocol was loaded. That is exactly what happened: one host carried a 368-byte stub
-`AGENTS.md` claiming the protocol arrived via `instructions` in `opencode.jsonc` — a key
-that was never added — while another had no `AGENTS.md` at all. Both were in git and in
-`OPERATIONS.md`, so the bug was invisible locally. If a host's agents ever deny reading
+protocol was loaded. The failure is invisible locally in both directions: a host
+carrying a stub `AGENTS.md` that claims the protocol arrived via `instructions` in
+`opencode.jsonc` — a key nothing loads the map through — looks fine from here, and so
+does a host with no `AGENTS.md` at all. If a host's agents ever deny reading
 the map, diff the remote's `AGENTS.md` byte count against the local one before touching
 anything else.
 
-All three now live in the personal config dir rather than in this repo, so they are read
-from there and shipped from there — and, note the consequence, they are **no longer under
-version control at all**. They are the rules that generate every context map, so a change
-to one now has no history and no review; that is a real loss, and it is the one thing in
-this split worth deciding about rather than living with.
+All three live in the personal config dir rather than in this repo, so they are read
+from there and shipped from there — and they are **not under version control at
+all**. They are the rules that generate every context map, so a change to one has
+no history and no review; that is the one thing in this split worth deciding about
+rather than living with.
 
 A failed transfer is a failure, not a detail: every rsync's exit status is checked
 before its output is filtered, and the host is listed under `failed` with the
@@ -247,12 +247,13 @@ needs the tunnel to notify you. The script itself never needs a forward — the
 
 A notification raised on a host has to travel back to the desktop. The desktop is
 behind NAT, so a direct ssh back times out and the return path must be a reverse
-tunnel — but *who owns that tunnel* is the part that used to be wrong.
+tunnel — and the tunnel's owner is whichever session connects first, so a session
+that starts before the tunnel does has no notification path.
 
 `oc-sync` installs one **systemd --user unit per host**, `oc-tunnel@<alias>`, holding
 `ssh -N -T -R <port>:localhost:22 <alias>` with `Restart=always` and `enable-linger`.
 Each host gets its own port, derived from its name. On the desktop side the
-provisioning is the same as before: a dedicated `~/.ssh/oc_notify` keypair (never your
+provisioning is a dedicated `~/.ssh/oc_notify` keypair (never your
 personal key — this private half is on every host) whose `authorized_keys` entry
 carries `restrict` plus `command=`, so a host can raise a notification and nothing
 else.
@@ -262,26 +263,26 @@ systemctl --user status 'oc-tunnel@<alias>'   # is the tunnel up?
 cat ~/.config/opencode/remote.env             # this host's desktop user + port
 ```
 
-Four things that each broke this before, worth knowing if it fails again:
+Four constraints, each with its failure mode if it is not met:
 
-- **The tunnel must not belong to a login session.** It used to be a
-  `RemoteForward` line in `~/.ssh/config`, so the listener existed only while whichever
-  ssh connection won the port race was alive. On dev-host a session started at 13:54
-  and the tunnel's owner at 15:19: five tasks finished in between and notified a port
-  that did not exist. Nothing said so, because the local end is a forced command — it
-  simply had nothing listening. The unit fixes the lifetime; `oc-sync` now removes the
-  config lines (backed up to `~/.ssh/config.ocsync-backup`) so they cannot win the port
-  back and then drop it when you close that terminal.
+- **The tunnel must not belong to a login session.** A `RemoteForward` line in
+  `~/.ssh/config` ties the listener to whichever ssh connection won the port race, so
+  it exists only while that connection is alive and drops when the terminal closes.
+  A session that finishes while no tunnel is listening notifies a port that does not
+  exist, and nothing says so: the local end is a forced command, so there is simply
+  nothing listening. The unit owns the lifetime. `oc-sync` removes any such
+  `RemoteForward` lines (backed up to `~/.ssh/config.ocsync-backup`) so they cannot
+  win the port race.
 - **The desktop user must not come from the rc files.** `OC_LOCAL_USER` is exported
   from `.bashrc`/`.profile`, which covers an interactive ssh and nothing else. The
   notify plugin calls `oc-notify` as a *detached child of an already-running server*,
-  so it was unset, the fallback was `id -un` = `root`, and the hop died with
-  `root@localhost: Permission denied (publickey,password)`. Hence
-  `~/.config/opencode/remote.env`: readable by anything, rewritten on every sync. `oc`
-  refuses to guess a username rather than produce a confusing publickey failure.
-- **The dbus path must be the *local* uid.** The old script built the notify command on
-  the host, where `id -u` is `0` for root, producing `/run/user/0/bus` — which does not
-  exist on the desktop. Every notification vanished silently.
+  where neither file is read; an unset variable falls back to `id -un` = `root`, and
+  the hop dies with `root@localhost: Permission denied (publickey,password)`.
+  `~/.config/opencode/remote.env` is readable by anything and rewritten on every sync.
+  `oc` refuses to guess a username rather than produce a confusing publickey failure.
+- **The dbus path must be the *local* uid.** A notify command built on the host, where
+  `id -u` is `0` for root, produces `/run/user/0/bus` — which does not exist on the
+  desktop. Every notification then vanishes silently.
 - **One alias per machine in `.env`.** `dev-host` and `192.0.2.10` are the same host;
   listing both installs two units and flaps `remote.env` between ports on every sync.
 
@@ -315,15 +316,15 @@ opencode — Deploy run                  Awaiting your response — Which option
 opencode — Deploy run                  Failed                        (critical)
 ```
 
-Both are about what *you* must do, not about what opencode did. "Session finished" was
-the old wording and it overstated things twice over: the session is still open, and
-there was no name on it.
+Both are about what *you* must do, not about what opencode did. The wording is
+"Task finished, waiting for your review" — accurate about both halves: the session
+is still open, and the name on the notification is the session's.
 
 What is deliberately **not** notified:
 
 - **Session start.** It interrupts to say nothing — no result, no title, nothing to act
   on. A notification you learn to dismiss on sight is one you dismiss when it matters.
-  `oc` no longer sends one either.
+  `oc` sends none either.
 - **Subagents.** `parentID` is set, so ten delegated `explore` children raise
   zero notifications. The value is one notice per thing you asked for.
 - **The cartographer.** `context-autoupdate` spawns `context` through the
@@ -355,15 +356,15 @@ public and holds no host names, addresses or usernames. `.env` is host-specific,
 it lives in the personal config dir with the rest of it — `oc-sync` reads
 `OC_HOSTS` (whitespace, comma or newline separated) and optional overrides from
 there, and the repo ships `.env.example` as the template. With no `.env` anywhere,
-the script falls back to the legacy `~/.oc-hosts`. `.env` is sourced before the
+the script falls back to `~/.oc-hosts`. `.env` is sourced before the
 script's defaults, so it wins over exported variables. `OC_SYNC_ENV_FILE` overrides
 the path, and both `.env` locations are tried in the order config dir, then repo,
-so an older checkout that keeps one beside the script still works.
+so a checkout that keeps one beside the script works too.
 
-**`~/bin/oc`, `~/bin/oc-notify` and `~/bin/oc-sync` currently dangle.** They are
-symlinks into `~/.config/opencode/bin/`, which no longer exists — they were made
-when the repo *was* that directory. Repoint them at `~/Projects/lacode/bin/` (and
-refresh `PATH`, or nothing on this machine finds `oc`).
+**`~/bin/oc`, `~/bin/oc-notify` and `~/bin/oc-sync` dangle.** They are
+symlinks into `~/.config/opencode/bin/`, and that target directory does not exist.
+Repoint them at `~/Projects/lacode/bin/` (and refresh `PATH`, or nothing on this
+machine finds `oc`).
 
 Two ordering and scope rules that are easy to get wrong:
 
@@ -373,9 +374,10 @@ Two ordering and scope rules that are easy to get wrong:
   silently falls back to the pool's built-in defaults instead of the intended models.
 - **No module under `src/` may export a plugin except `src/index.ts`.** opencode calls
   every export of every file in `plugins/` as a plugin and uses the return value as a
-  hooks object, so a helper left there is a broken plugin. One did exactly that
-  (`verifyWriterRule`) and opencode stopped starting. The published package follows the
-  same rule with a single entry point that merges the three hook factories.
+  hooks object, so a helper left there is a broken plugin, and opencode stops
+  starting — `verifyWriterRule` is the case that lives in `src/lib/` for this reason.
+  The published package follows the same rule with a single entry point that merges
+  the three hook factories.
 - **`node_modules`, `package-lock.json`, `tests/` and `dist/` are not synced.** Each
   host keeps its own install and SDK version. Consequence: the `1.18.34` pin in
   `package.json` is **not** enforced anywhere — it is documentation, not a
@@ -410,9 +412,9 @@ to the remotes; `AGENTS.md`, `commands/context-*.md` and `rules/browser.md` are 
 personal config dir, ship to the remotes, and are in no repository at all. The map
 itself is rebuilt on demand by the next cartographer run.
 
-There is no `rules/context-protocol.md` anymore. It duplicated the global `AGENTS.md`
-while nothing loaded it, so it was deleted; `rules/browser.md` survives because its
-Playwright anti-loop rules exist nowhere else and are loaded through the `instructions`
+There is no `rules/context-protocol.md`; the global `AGENTS.md` covers it. What the
+personal config dir does carry is `rules/browser.md`, whose Playwright anti-loop rules
+exist nowhere else and are loaded through the `instructions`
 key in the personal `opencode.jsonc`. The context map is deliberately **not** in
 `instructions` — that would inject all five files into every session and every pooled
 subagent, defeating the read-one-file rule `AGENTS.md` states.
@@ -432,11 +434,12 @@ Two operational rules:
   `.opencode/context/architecture.md`. Patterns are anchored, so neither spelling covers
   every project on its own: `.opencode/context/**` fires for a normally-rooted project but
   not when the project root is `/`, and `*/.opencode/context/**` fires *only* when it is.
-  **Both are required.** A relative-only rule was silently broken first; "fixing" it to the
-  absolute form (`6f6af0a`) silently broke it again, because the detector was checking the
-  absolute path too. `src/lib/writer-rule.ts` now checks the form that applies to the running
-  project's root and logs an error naming the offending rule; `tests/permission-test.mjs`
-  pins both directions, including against the real `opencode.jsonc`.
+  **Both are required.** A rule in only one form silently covers nothing when the project
+  root is the other shape: the relative form matches nothing from `/`, and the absolute
+  form matches nothing from a repo root. `src/lib/writer-rule.ts` checks the form that
+  applies to the running project's root and logs an error naming the offending rule;
+  `tests/permission-test.mjs` pins both directions, including against the real
+  `opencode.jsonc`.
 
 Force a run with `/context-update` rather than waiting for the idle trigger.
 
@@ -450,9 +453,9 @@ has no `.git`, no history and no review.
 Not covered by git:
 
 - **The whole personal config dir** — `opencode.jsonc`, `AGENTS.md`, `commands/`,
-  `rules/`, `.env`, the prompt files. It is one person's configuration and was never
-  meant to be published, but note that `AGENTS.md` and `commands/context-*.md` are
-  the rules every context map is generated from, and they are now versioned nowhere.
+  `rules/`, `.env`, the prompt files. It is one person's configuration and is not
+  published, but note that `AGENTS.md` and `commands/context-*.md` are
+  the rules every context map is generated from, and they are versioned nowhere.
 - **The context map** (`<project>/.opencode/context/`) — intentionally outside git and
   not synced. Derived, per-project, and rebuilt on demand; see
   [The context map](#the-context-map).
@@ -478,9 +481,9 @@ A provider-wide `free_tier_limit` cools every slot on that provider at once, whi
 intentional: the alternative is a hang.
 
 **`oc-sync` says `opencode.jsonc not found`.** `CONFIG_DIR` is pointing at the wrong
-tree. It is `~/.config/opencode` by default and nothing else — if it says the repo, an
-`OC_SYNC_CONFIG_DIR` is still set from the era when one tree was both; unset it or point
-it at the config dir. `--scripts-only` skips the check and the config entirely.
+  tree. It is `~/.config/opencode` by default and nothing else — if it says the repo, an
+  `OC_SYNC_CONFIG_DIR` is set pointing at the wrong tree; unset it or point
+  it at the config dir. `--scripts-only` skips the check and the config entirely.
 
 **The map is stale / the cartographer reports success but nothing changed.** Look for
 `context map is not writable` in the log first, then confirm the map files' mtimes.

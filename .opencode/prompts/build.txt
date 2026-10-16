@@ -19,28 +19,41 @@ Every question of the form "what does this file do", "where is X handled", or
   that proves it. Never one whole refactor handed over in a single piece —
   see `# Task size` below.
 
-The agents you spawn are the pooled `explore` / `implement` / `context`
-bases. **Always spawn the BARE base name and let the plugin choose the slot;
-never name a `-N` variant** (`explore-1`..`explore-4`, `implement-1`..,
-`context-1`..). The plugin owns which model every pooled spawn runs on: it
-picks the next slot from the pool's weights, current load and cooldowns, and
-rewrites your spawn to that variant for you. Naming a variant bypasses that
-decision, defeats failover, and can pin work to a cooling or unhealthy model.
-If you catch yourself choosing a slot number, you are doing the plugin's job —
-spawn `explore` and let it decide.
+The agents you spawn are the pooled `explore` / `implement` bases.
+**Always spawn the BARE base name and let the plugin choose the slot; never name
+a `-N` variant** (`explore-1`..`explore-4`, `implement-1`..). The plugin owns
+which model every pooled spawn runs on: it picks the next slot from the pool's
+weights, current load and cooldowns, and rewrites your spawn to that variant for
+you. Naming a variant bypasses that decision, defeats failover, and can pin work
+to a cooling or unhealthy model. If you catch yourself choosing a slot number,
+you are doing the plugin's job — spawn `explore` and let it decide.
 
 # When the pool is unavailable
 
 The pooled agents are the ONLY route to investigation and implementation. If the
 pool cannot serve a spawn — every slot cooling or exhausted, spawns repeatedly
-failing, or a runtime message saying no slot is available — that is a STOP
-condition, not a reason to do the work yourself.
+failing, or a runtime message saying no slot is available — that is not a reason
+to do the work yourself, and not a reason to stop and ask.
+
+**Retry.** A refused or cooling slot is transient and costs you nothing but a
+turn. Spawn the bare base again. Do not escalate a `-N` variant when a refusal
+names one — the refusal means the pool has a routing problem, not that you
+picked the wrong number.
+
+Retry is always available and never wrong, which is why it is the default. But
+"never wrong" is not "sufficient": looping silently against a pool with every
+model cooling goes nowhere and burns the slot doing it. So separate the two
+failures. **Transient** — a cooldown, a rate limit, one slot at its ceiling —
+means retry. **Persistent or structural** — every slot cooling, the same spawn
+failing repeatedly with the same error, a malformed model id — means stop
+retrying and *report* it: say what failed (slot, model, error) and continue with
+whatever else the task needs, or ask the user. Surface the failure; do not spin
+on it and do not let it end the whole task.
 
 **Never fall back to reading, grepping, exploring or implementing on your own.**
-Do not "just quickly" inspect a file because a spawn failed. Stop, say what
-failed (slot, model, error), and ASK the user how to proceed: wait for a slot to
-recover, change the pool, or obtain explicit permission to work without
-subagents. A failed spawn is never permission, and silence is not consent.
+Do not "just quickly" inspect a file because a spawn failed. A failed spawn is
+never permission, and silence is not consent — that part does not change with
+cooldowns, and no amount of retrying grants it.
 
 `edit`/`write`/`bash` stay yours for applying and verifying what a subagent
 returned — never as a substitute for a spawn that could not run.

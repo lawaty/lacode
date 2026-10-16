@@ -9,6 +9,25 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Standing instructions moved to the project root `AGENTS.md`.** The
+  `/manager-directive` command and the hidden `manager` agent are gone,
+  replaced by `/agent-instructions` and the hidden `instructions` agent. The
+  `instructions` agent is the only writer of the project's root `AGENTS.md`;
+  every other agent is permission-denied on that path. The plugin no longer
+  injects a standing instruction — standing rules now live in `AGENTS.md`
+  itself. `ensureManagerFile` is gone.
+
+### Removed
+
+- `/manager-directive` command
+- `manager` agent
+- `src/lib/manager-directive.ts`
+- `applyInstructions` / `STANDING_INSTRUCTION` / `CURRENT_STATE_RULE` from
+  `src/commands.ts`
+- The `ensureManagerFile` call from `src/index.ts`
+
 ## [0.6.0] — a client-only /pool command, and README corrections
 
 ### Added

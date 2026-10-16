@@ -1,7 +1,7 @@
 import { parseJsonc } from "./jsonc.ts"
 import { readFileSync } from "node:fs"
 import * as path from "node:path"
-import { MANAGER_AGENT_NAME } from "./manager-directive.ts"
+import { AGENT_INSTRUCTIONS_WRITER } from "./agent-instructions.ts"
 
 // A plugin module's exports ARE its plugins: opencode iterates every export of a
 // plugin file and calls it, then uses the return value as a hooks object
@@ -18,13 +18,14 @@ const CONTEXT_DIR = path.join(".opencode", "context")
 const WRITER = "context"
 
 /**
- * The ONE agent allowed to write the client's manager.md, and the only name
+ * The ONE agent allowed to write the project's AGENTS.md, and the only name
  * Direction 3 skips. It is reachable solely through the user's
- * `/manager-directive` command and its grant is scoped to that file (see
- * MANAGER_AGENT in src/agents.ts). Every other agent -- including one a user
- * declares to copy this grant under a different name -- is still reported.
+ * `/agent-instructions` command and its grant is scoped to that file (see
+ * AGENT_INSTRUCTIONS_WRITER in src/agents.ts). Every other agent -- including
+ * one a user declares to copy this grant under a different name -- is still
+ * reported.
  */
-const MANAGER_WRITER = MANAGER_AGENT_NAME
+const INSTRUCTIONS_WRITER = AGENT_INSTRUCTIONS_WRITER
 
 const toPosix = (value: string) => value.split(path.sep).join("/")
 
@@ -85,14 +86,14 @@ const evaluatedForm = (mapDir: string, projectRoot?: string) => {
 }
 
 /**
- * The path form opencode would evaluate for the client's own file. Deliberately
- * ONE form, mirroring evaluatedForm: when a project root is known that is the
- * only form opencode tests, and checking the other one too reports holes that
- * do not exist. The deny has to carry both spellings precisely because only one
- * of them is ever evaluated at a time.
+ * The path form opencode would evaluate for the project's root AGENTS.md.
+ * Deliberately ONE form, mirroring evaluatedForm: when a project root is known
+ * that is the only form opencode tests, and checking the other one too reports
+ * holes that do not exist. The deny has to carry both spellings precisely
+ * because only one of them is ever evaluated at a time.
  */
-const managerForm = (mapDir: string, projectRoot?: string) => {
-  const absolute = toPosix(path.join(mapDir, "manager.md"))
+const agentsForm = (mapDir: string, projectRoot?: string) => {
+  const absolute = toPosix(path.join(mapDir, "..", "..", "AGENTS.md"))
   return projectRoot ? toPosix(path.relative(projectRoot, absolute)) : absolute
 }
 
@@ -180,37 +181,37 @@ export const verifyWriterRule = (configPath: string, mapDir: string, projectRoot
     }
   }
 
-  // Direction 3 -- manager.md is the CLIENT'S, and no agent may write it.
+  // Direction 3 -- AGENTS.md is the PROJECT'S, and no agent may write it.
   //
   // This one deliberately includes the cartographer itself, which Direction 2
-  // skips. The shipped deny-last for manager.md lives in our agent definition,
+  // skips. The shipped deny-last for AGENTS.md lives in our agent definition,
   // and applyAgents leaves a key the user already defines byte-for-byte alone
   // ("no permission is merged"). So a user who declares their own `context` agent
   // silently discards that deny -- and because the only other check deliberately
   // skips writer agents, the one file built to be untouchable becomes the one file
   // nothing inspects. Checked here, where it cannot be configured away.
   //
-  // The `manager` agent is the ONE sanctioned exception, skipped by name just
-  // below: it exists solely to serve the user's /manager-directive command and
+  // The `instructions` agent is the ONE sanctioned exception, skipped by name just
+  // below: it exists solely to serve the user's /agent-instructions command and
   // its grant is scoped to this one file. Skipping the name (not the grant) is
-  // deliberate -- any OTHER agent that can write manager.md, including one that
+  // deliberate -- any OTHER agent that can write AGENTS.md, including one that
   // copies the grant under a different name, is still reported.
-  const managerPath = managerForm(mapDir, projectRoot)
+  const agentsPath = agentsForm(mapDir, projectRoot)
   const agentDefs = readAgents(raw)
   if (agentDefs) {
     const writers: string[] = []
     for (const [name, def] of Object.entries(agentDefs)) {
-      if (name === MANAGER_WRITER) continue
-      const win = winningRule(permissionOf(def), managerPath)
+      if (name === INSTRUCTIONS_WRITER) continue
+      const win = winningRule(permissionOf(def), agentsPath)
       if (win?.action === "allow") writers.push(`${name} (edit rule "${win.pattern}": "${win.action}")`)
     }
     if (writers.length > 0) {
-      return `${CONTEXT_DIR}/manager.md is writable by permission: ${writers.join(", ")}. `
-        + `It is the client's own file — what they are working on, what is ratified, what every agent `
-        + `must respect — and only the \`${MANAGER_WRITER}\` agent (run solely by /manager-directive) may write it. `
+      return `AGENTS.md is writable by permission: ${writers.join(", ")}. `
+        + `It is the project's own file — the standing instructions every agent runs under — and only the `
+        + `\`${INSTRUCTIONS_WRITER}\` agent (run solely by /agent-instructions) may write it. `
         + `Deny it LAST on every other agent, after any broad allow, because opencode `
         + `takes the LAST matching rule: `
-        + `"*": "allow", "*/${CONTEXT_DIR}/manager.md": "deny", "${CONTEXT_DIR}/manager.md": "deny". `
+        + `"*": "allow", "AGENTS.md": "deny", "*/AGENTS.md": "deny". `
         + `Declare this on every agent above, including \`${WRITER}\`: an agent you define yourself replaces `
         + `the shipped one wholesale, permission and all.`
     }

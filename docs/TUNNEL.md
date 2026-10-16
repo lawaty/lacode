@@ -38,10 +38,10 @@ as one newline-delimited argument:
 title\nmessage\nurgency\nicon\nsound
 ```
 
-Five fields, and only the last one is new: `sound` is `none`, `done`,
-`question`, `permission` or `error`. A sender that stops at `icon` simply
-leaves it empty, and an empty or unrecognised name is `none`, so a four-field
-payload is still a valid one.
+Five fields — `title`, `message`, `urgency`, `icon`, `sound`. `sound` is `none`,
+`done`, `question`, `permission` or `error`. A sender that stops at `icon`
+simply leaves it empty, and an empty or unrecognised name is `none`, so a
+four-field payload is a valid one.
 
 Newline is safe as the delimiter because both ends strip control characters from
 the free-text fields before assembling or reading it, and `urgency`, `icon` and
@@ -93,7 +93,7 @@ lacode doctor
 
 SOUND is optional and last: `none`, `done`, `question`, `permission` or `error`,
 one bundled tone per outcome. Leave it off and nothing plays; the line above
-without a fifth word is still correct.
+without a fifth word is correct.
 
 `notify` is fire-and-forget by design. An unreachable desktop, a missing key, no
 notifier installed at all — all of them print a warning on stderr and exit 0. A
@@ -124,7 +124,8 @@ runs the session and has no speakers. The name is validated against the sound
 whitelist at the same trust boundary as `urgency` and `icon`, and the receiver
 looks the file up in the package's own `sounds/` directory — the sender's word
 never becomes a path. `afplay` plays it on macOS, `paplay`, `aplay` or
-`pw-play` on Linux, and a machine with none of them still gets the notification.
+`pw-play` on Linux, and a machine with none of them gets the notification
+regardless.
 
 ## Configuration
 
@@ -135,7 +136,7 @@ never becomes a path. `afplay` plays it on macOS, `paplay`, `aplay` or
 | `OC_NOTIFY_KEY` | `~/.ssh/lacode_notify` | The dedicated key. Never a personal key. |
 | `OC_CONNECT_TIMEOUT_MS` | `5000` | Ceiling on the hop. |
 | `OC_SSH_TIMEOUT_MS` | `30000` | Ceiling on `forward`. |
-| `OC_TUNNEL_PORT` | `10022` | **Legacy** reverse-forward listener port. Used only when `OC_LOCAL_HOST` is unset. |
+| `OC_TUNNEL_PORT` | `10022` | Reverse-forward listener port. Used when `OC_LOCAL_HOST` is unset. |
 
 `OC_LOCAL_USER` is read rather than probed on purpose. `id -un` on a remote
 account frequently returns `root`, and a dbus path built from that reaches
@@ -151,11 +152,12 @@ documented with the other plugin options in the README. Set it to `0`, `false`,
 `off` or `no` to silence notifications; anything else — a typo included — leaves
 sound on, because a misspelt variable must not be how you turn a feature off.
 
-## Legacy: the reverse forward
+## The reverse forward
 
-The original design opened a reverse forward (`ssh -R`) held by a `systemd --user`
-unit on the desktop, and delivered to a `notify-send`-only bash receiver
-(`bin/oc-notify-receiver`). It is kept only for hosts that still set
-`OC_TUNNEL_PORT` and leave `OC_LOCAL_HOST` unset: `sendRemote` falls back to an
-ssh call to `localhost:<port>`. New setups should use the direct ssh above. See
-the git history for the old systemd unit shape.
+A host that sets `OC_TUNNEL_PORT` and leaves `OC_LOCAL_HOST` unset reaches the
+desktop through a reverse forward: `sendRemote` falls back to an ssh call to
+`localhost:<port>`, where a `systemd --user` unit on the desktop holds an
+`ssh -R` forward open and delivers to a `notify-send`-only bash receiver
+(`bin/oc-notify-receiver`). That receiver is the Linux end of the hop: it
+delivers through `notify-send`, and libnotify is a Linux thing, so a Mac cannot
+be this end of the tunnel.

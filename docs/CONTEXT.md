@@ -45,9 +45,9 @@ independently measured.** A number derived from somebody else's repository and
 token mix is not a claim about yours; see [BENCHMARKS.md](BENCHMARKS.md) for the
 harness that produces a number for your own workload.
 
-## The five files
+## The files in the map
 
-`.opencode/context/` holds exactly these, and nothing else:
+`.opencode/context/` holds the five generated files below:
 
 | File | What belongs in it |
 | --- | --- |
@@ -56,6 +56,12 @@ harness that produces a number for your own workload.
 | `conventions.md` | Repository-specific rules: naming, module layout, error handling, testing, persistence. Read this before writing code, not after. |
 | `workflows.md` | The few runtime flows worth tracing end to end — how a request becomes a mutation, how a plugin hook reaches the thing it hooks. Read this when you need to know what actually happens at runtime. |
 | `decisions.md` | Architectural decisions that the repository's own decision log does not already record. Concise, variable length. |
+
+The project's root `AGENTS.md` is the standing-instructions home: the client's
+own statement of intent, what they want worked on and how they want it
+approached. It sits outside the map, is per-clone and not committed, and has
+no prescribed structure. It has exactly one writer — the hidden `instructions`
+agent, reachable only from the `/agent-instructions` command.
 
 Files the user or the plan explicitly names always win over the map. The map is
 a shortcut to the right starting point, not an authority: when it disagrees with
@@ -98,12 +104,20 @@ formatting, local renames, added tests and dependency bumps rarely alter what
 the map should say. The cartographer is told to edit only when the work
 introduced or revealed something that will help a future agent — a new boundary,
 a new or moved entry point, a changed workflow, a new convention, an
-architectural decision, a previously undocumented invariant — and to report
+architectural decision, an undocumented invariant — and to report
 "no update needed" otherwise.
 
-If the map is missing entirely, nothing breaks: agents check, find nothing, and
-explore as they always did. The standing rule that tells them to check is
-injected into your config only when you have no `instructions` array of your own.
+If the map is missing entirely, nothing breaks: agents run the check, find no
+`.opencode/context/`, and explore from scratch. What tells them to run the check
+is an entry appended to your config's `instructions` array: your own entries are
+kept as they are, and a marked entry goes after them unless one of your entries
+already carries its marker or its opt-out. LaCode appends two such entries, each
+governed by its own pair — the context-map rule
+(`<!-- lacode:context-map-instruction:v1 -->`, opt out with
+`<!-- lacode:context-map-instruction:off -->`) and the rule that documentation
+states the current state (`<!-- lacode:current-state-rule:v1 -->`, opt out with
+`<!-- lacode:current-state-rule:off -->`). One opt-out suppresses only the rule
+it names.
 
 ### On demand
 
@@ -132,10 +146,10 @@ outside the map — not by convention, but by an `edit` rule that allows
 The rule runs in both directions. The agents that *could* write anywhere else in
 the repository — the root `build` agent and both implement tiers — carry the
 mirror image of the cartographer's grant: `"*": "allow"` followed by a `deny` on
-`.opencode/context/**`, so they edit everything except the map. The instruction
-telling them not to touch it is still there, and still matters — a permission
-denial tells an agent nothing about what it should have done instead — but it is
-no longer the only thing standing between them and the map.
+`.opencode/context/**`, so they edit everything except the map. Enforcement is
+two mechanisms at once, and both are load-bearing: the injected instruction
+naming the one writer, and the permission rule — a permission denial tells an
+agent nothing about what it should have done instead.
 
 This exists because two writers produce a map that is neither current nor
 trustworthy. Concurrent sessions rewriting the same five files produce
@@ -150,14 +164,14 @@ writes every narrow rule last, in both files (`src/agents.ts` and your own
 grepping for the word `allow` — which is what stops a correctly-placed deny from
 being reported as a hole.
 
-The rule has a sharp edge worth knowing about, because it has already bitten
-this project: **opencode evaluates a file permission against the path relative
-to the project root, not the absolute path the tool was given.** A rule written
-as `*/.opencode/context/**` matches an absolute path and therefore matches
-nothing at all. Both spellings are therefore required — `.opencode/context/**`
-for a normally-rooted project and `*/.opencode/context/**` for one rooted at
-`/` — and LaCode ships both. At startup the plugin checks your config for that,
-and logs an error naming the rules it saw if neither form would ever fire.
+The rule has a sharp edge worth knowing about: **opencode evaluates a file
+permission against the path relative to the project root, not the absolute path
+the tool was given.** A rule written as `*/.opencode/context/**` matches an
+absolute path and therefore matches nothing at all. Both spellings are therefore
+required — `.opencode/context/**` for a normally-rooted project and
+`*/.opencode/context/**` for one rooted at `/` — and LaCode ships both. At
+startup the plugin checks your config for that, and logs an error naming the
+rules it saw if neither form would ever fire.
 
 ### The residual risk: a subdirectory worktree
 
@@ -181,14 +195,13 @@ How to detect it: open opencode from the repository root, not from a
 subdirectory of it. If `ls .opencode/context` from your shell's current
 directory does not list the five files, your shell is not at the root and
 neither is opencode's worktree. The cost of getting it wrong is not a crash —
-it is a silent return to a map maintained only by prompt, which is the exact
-state US-21 exists to eliminate.
+it is a map maintained only by prompt, with no mechanism enforcing who writes it.
 
-The symptom of getting this wrong is not a crash. The cartographer's writes are
-simply denied, its run still "succeeds", and the map quietly stops changing. So
-a run that changed nothing on disk is reported as a warning, not as a success:
-if you see `auto update finished without changing the map` repeatedly, the first
-thing to check is that permission rule, not the map's content.
+The symptom is silence: the cartographer's writes are denied without an error,
+its run reports success, and the map quietly stops changing. So a run that
+changed nothing on disk is reported as a warning, not as a success: if you see
+`auto update finished without changing the map` repeatedly, the first thing
+to check is that permission rule, not the map's content.
 
 ## What you will see in the log
 

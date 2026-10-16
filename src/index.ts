@@ -77,7 +77,7 @@
 
 import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { applyAgents, buildAgentSet } from "./agents.ts"
-import { applyCommands, applyInstructions } from "./commands.ts"
+import { applyCommands } from "./commands.ts"
 import { agentPoolHooks } from "./plugins/agent-pool.ts"
 import { contextAutoUpdateHooks } from "./plugins/context-autoupdate.ts"
 import { notifyHooks } from "./plugins/notify.ts"
@@ -141,9 +141,6 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       const cmds = applyCommands(cfg as Record<string, unknown>)
       if (cmds.added.length > 0) {
         await log("info", `commands: added ${cmds.added.join(", ")}; kept ${cmds.kept.join(", ") || "none"} already defined`)
-      }
-      if (applyInstructions(cfg as Record<string, unknown>).added) {
-        await log("info", "instructions: ensured the standing context-map rule is present")
       }
       // OmniRoute runs BEFORE the pool so it can register `provider.omniroute`
       // first: a pool slot naming an `omniroute/...` model then resolves, and the

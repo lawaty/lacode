@@ -4,8 +4,8 @@
 
 Every story below is a behavioural contract, not a feature wish. Each one is
 traceable to a pain point the author actually hit, and each carries acceptance
-criteria written so that a test can assert them mechanically. Phase 3 fills in
-the test file for each row of the Coverage table.
+criteria written so that a test can assert them mechanically. Every row of the
+Coverage table has a test file.
 
 **Reading the criteria.** Every criterion is written as *Given … When … Then …
 * so that it maps to one test case. "Given" is a state or fixture, "When" is a
@@ -27,13 +27,13 @@ spawn recorded in `claims.<pid>.json`. A *context map* is the five-file
 
 | Epic | Pain point it solves |
 | --- | --- |
-| **A — Cost control** | Quota exhaustion. Routine work (grep, reading, cartography) was consuming the same expensive budget as design work, and the main model was being spent on file listing. |
-| **B — Provider resilience** | Provider limits. Free-tier quotas are per-provider and per-minute, so a long session would hard-fail the moment one provider's window closed, even while three other providers sat idle. |
-| **C — Hang recovery** | Hangs. A wedged or silently-stalled subagent held its slot forever; one bad task stalled the session with no error and no timeout. |
-| **D — Notifications** | Parallel sessions. With several sessions open, work finishing — or a question blocking — was invisible unless you happened to be looking at that terminal. |
-| **E — Remote hosts** | Remote SSH notification. Work ran on remote hosts, so notifications raised there died on that host's nonexistent desktop instead of reaching the local one. |
+| **A — Cost control** | Quota exhaustion. Routine work (grep, reading, cartography) consumes the same expensive budget as design work, and the main model is spent on file listing. |
+| **B — Provider resilience** | Provider limits. Free-tier quotas are per-provider and per-minute, so a long session hard-fails the moment one provider's window closes, even while three other providers sit idle. |
+| **C — Hang recovery** | Hangs. A wedged or silently-stalled subagent holds its slot forever; one bad task stalls the session with no error and no timeout. |
+| **D — Notifications** | Parallel sessions. With several sessions open, work finishing — or a question blocking — is invisible unless you happen to be looking at that terminal. |
+| **E — Remote hosts** | Remote SSH notification. Work runs on remote hosts, so notifications raised there die on that host's nonexistent desktop instead of reaching the local one. |
 | **F — Adoption and safety** | Installability. A personal config cannot be adopted safely: it either clobbers what you already have, or needs manual surgery before it runs. |
-| **G — Context and cost** | Cold exploration. Every task started by re-discovering the structure of the codebase from scratch, so the same layout was re-read — and re-paid for — on every single run. |
+| **G — Context and cost** | Cold exploration. Every task starts by re-discovering the structure of the codebase from scratch, so the same layout is re-read — and re-paid for — on every single run. |
 
 ---
 
@@ -275,16 +275,16 @@ does not.
 
 **Story ID(s) for tests:** US-26
 **Acceptance criteria:**
-- [ ] Given the notification is raised on macOS, When it is delivered locally, Then it goes to `osascript` — or to `terminal-notifier` if `osascript` is not installed — and not to `notify-send`, which does not exist there. Before this, the send exited 0, printed nothing, and popped up nothing.
+- [ ] Given the notification is raised on macOS, When it is delivered locally, Then it goes to `osascript` — or to `terminal-notifier` if `osascript` is not installed — and not to `notify-send`, which does not exist there.
 - [ ] Given the channel is chosen, When it is picked, Then it is decided by `process.platform` and by which binary is actually installed, never by guessing, and every platform other than macOS keeps the `notify-send` call it has always made.
 - [ ] Given the title and the body reach `osascript`, When the script runs, Then they are passed as arguments to an `on run argv` handler and never concatenated into the script source, because both fields are attacker-influenced text — a session title, a file path, a command.
 - [ ] Given a body containing `"`, `'`, `;`, `$(…)` or backticks, When the macOS send runs, Then it reaches `display notification` byte-for-byte as data and nothing is executed.
 - [ ] Given a machine has no notifier for its platform, When a notification is sent, Then the result is a failed delivery with a reason and no exception, and `lacode doctor` names the channel that would run — or reports that there is none — instead of reporting a binary that is not used there.
 - [ ] Given the CLI runs on macOS, When the send does not complete, Then it is still bounded by a timeout, exactly as on Linux.
-- [ ] Given the notification hop, When it is documented, Then the doc leads with the shipped path — the npm-installed plugin, a direct ssh hop (`ControlMaster`) set up by `lacode tunnel setup`, and the portable `lacode receive` forced command that delivers through the platform channel (`notify-send` or `osascript`) — and marks the older reverse-forward scripts (`bin/oc`, `bin/oc-notify`, `bin/oc-notify-receiver`, `bin/oc-sync`) as the author's legacy tooling, so a Mac user is not sent to debug a script that was never meant to run on their machine.
-- [ ] Given a machine without GNU `timeout` or with bash older than 4.0, When `bin/oc-sync` runs, Then it refuses **before** touching anything, names each missing prerequisite, and names the `lacode` subcommand to use instead. It must never report a misleading cause: the host list is read with `mapfile`, so without it the run used to die at "no hosts configured" — a confident wrong answer that sends the reader to edit `.env`.
+- [ ] Given the notification hop, When it is documented, Then the doc leads with the shipped path — the npm-installed plugin, a direct ssh hop (`ControlMaster`) set up by `lacode tunnel setup`, and the portable `lacode receive` forced command that delivers through the platform channel (`notify-send` or `osascript`) — and marks the reverse-forward scripts (`bin/oc`, `bin/oc-notify`, `bin/oc-notify-receiver`, `bin/oc-sync`) as the author's legacy tooling, so a Mac user is not sent to debug a script that was never meant to run on their machine.
+- [ ] Given a machine without GNU `timeout` or with bash older than 4.0, When `bin/oc-sync` runs, Then it refuses **before** touching anything, names each missing prerequisite, and names the `lacode` subcommand to use instead. It must never report a misleading cause: the host list is read with `mapfile`, so without it the run dies at "no hosts configured" — a confident wrong answer that sends the reader to edit `.env`.
 - [ ] Given `bin/oc-notify-receiver` runs where `notify-send` does not exist, When it is invoked, Then it exits non-zero and names both the missing channel and the portable path, because its stderr reaches whoever opened the ssh connection and nobody else, and a bare "command not found" reads as a desktop that quietly stopped notifying.
-- [ ] Given the payload is parsed, When the receiver splits `$SSH_ORIGINAL_COMMAND`, Then it splits on newlines only using constructs that exist in bash 3.2 as well as bash 5, and the suite **proves the split by running the receiver** rather than by finding the word `mapfile` in the file. Under bash 3.2 — the version macOS ships — a bash-4-only builtin left every field at its default, so the popup said "LaCode" with an empty body and no error anywhere: the same silent blank notification the argv bug caused once, reached again through a different door.
+- [ ] Given the payload is parsed, When the receiver splits `$SSH_ORIGINAL_COMMAND`, Then it splits on newlines only using constructs that exist in bash 3.2 as well as bash 5, and the suite **proves the split by running the receiver** rather than by finding the word `mapfile` in the file. Under bash 3.2 — the version macOS ships — a bash-4-only builtin leaves every field at its default, so the popup says "LaCode" with an empty body and no error anywhere: the same silent blank notification the argv bug causes, reached through a different door.
 - [ ] Given the whole suite, When it runs on macOS, Then it passes there too. Checks that exercise the Linux-only shell scripts **skip** on a machine that cannot run them, each naming the specific missing prerequisite (a bash version below 4.0, an absent GNU `timeout`) rather than passing silently.
 - [ ] Given the local notification channel differs by platform, When a test asserts on the notifier's argv, Then it reads **every** channel's stub rather than only `notify-send`. A Mac picks `osascript` and never invokes `notify-send` at all, so a suite that stubbed only `notify-send` would pass on Linux, read an empty log on a Mac, and in the process invoke the runner's real `osascript` against a desktop session that is not there.
 
@@ -300,7 +300,7 @@ does not.
 - [ ] Given a fresh machine with no LaCode config, When the install runs, Then one config line is sufficient and no further manual step is required.
 - [ ] Given no configuration is present at all, When LaCode boots, Then it falls back to shipped defaults and still functions.
 - [ ] Given the plugin package is installed, When its peer dependency is unmet, Then the requirement is declared rather than silently duplicated inside the package.
-- [ ] Given the published manifest, When a plugin loader looks for an entry point, Then it finds one in both shapes a resolver may consult — a top-level `main` and `exports["./server"]` — while `exports["."]` keeps pointing at the same built plugin, and the documentation states plainly that these are forward-compatibility metadata and **not** a fix for opencode 1.18.35, where adding them to the installed copy was tested and the bare specifier still loaded nothing.
+- [ ] Given the published manifest, When a plugin loader looks for an entry point, Then it finds one in both shapes a resolver may consult — a top-level `main` and `exports["./server"]` — while `exports["."]` keeps pointing at the same built plugin, and the documentation states plainly that these are forward-compatibility metadata and **not** a fix for opencode 1.18.35, where the bare specifier still loads nothing.
 - [ ] Given an opencode that does not load the bare specifier, When the reader follows the install documentation, Then the README offers a numbered procedure that holds **whichever version they run** — write the bare specifier and restart, verify with `opencode agent list`, and only if the agents are still missing while the package is installed, add a `file://` entry and restart — rather than instructions scoped to one build. Each step is justified by what the previous step showed, not by what the reader's version is known to do.
 - [ ] Given a version nobody has tested, When the reader checks the version table, Then **every** row other than the measured one is marked untested or unknown, the README claims no loading behaviour for any version it has not run, and it tells the reader to follow the procedure rather than to read the table as coverage of their build. The one row that does claim behaviour records the evidence behind it, and says that installing the package and then silently dropping it is what was measured.
 - [ ] Given any operating system, When the reader needs the package directory to build a `file://` entry, Then the path comes from `opencode debug paths` rather than a hardcoded root, and any literal path in the document is marked as an illustration of one platform's layout instead of a value to copy. Where a platform's cache root has not been established, the README says so rather than guessing it.
@@ -329,7 +329,7 @@ does not.
 ### US-24: Tool grants are documented, not injected, because a plugin cannot set them
 **As a** user who keeps a global `"tools"` block, **I want** to know that per-agent tool grants must be declared in my own config, **so that** browser automation is not silently denied on the agents that need it.
 
-The pain: LaCode once shipped a `tools: { "playwright_*": true }` grant on its four exploration and implementation tiers, with a comment claiming it rescued anyone who had globally disabled Playwright. It did not. opencode folds an agent's `tools` into its permission list **at config-load time**, inside the schema decode that runs before any plugin is called; a plugin's `config` hook mutates the already-decoded object, so the fold never re-runs and the injected value is read by nothing. The grant was dead code asserting a rescue it never performed. The fix is not to re-inject it — it is to tell the truth about it and document the one-line fix the user can apply themselves.
+A plugin cannot set per-agent tool grants. opencode folds an agent's `tools` into its permission list **at config-load time**, inside the schema decode that runs before any plugin is called; a plugin's `config` hook mutates the already-decoded object, so the fold never re-runs and any injected `tools` value is read by nothing. A `tools: { "playwright_*": true }` grant on the exploration and implementation tiers would therefore be dead code asserting a rescue it never performs. The fix is not to inject it — it is to tell the truth about it and document the one-line fix the user can apply themselves.
 
 **Story ID(s) for tests:** US-24
 **Acceptance criteria:**
@@ -343,7 +343,7 @@ The pain: LaCode once shipped a `tools: { "playwright_*": true }` grant on its f
 ### US-27: The package keeps itself current, without npm and without being asked
 **As a** user who installed LaCode once, **I want** each new release to reach my machine automatically, **so that** I never have to learn that opencode freezes the plugin version and hand-clear a cache to upgrade.
 
-The pain: opencode's plugin cache is **write-once**. It resolves `@lawaty/lacode` to an exact version once and never re-resolves — not on restart, not with `opencode plugin -g -f`, not with a range pin, not with a tagged config spec (all four verified against opencode 1.18.34). A published release therefore reaches a client only when something installs it into that cache again, and nothing in opencode ever does. The plugin has to do it itself, and it may assume only one tool: the opencode binary the code already runs inside.
+opencode's plugin cache is **write-once**. It resolves `@lawaty/lacode` to an exact version once and never re-resolves — not on restart, not with `opencode plugin -g -f`, not with a range pin, not with a tagged config spec (all four verified against opencode 1.18.34). A published release therefore reaches a client only when something installs it into that cache again, and nothing in opencode ever does. The plugin has to do it itself, and it may assume only one tool: the opencode binary the code already runs inside.
 
 **Story ID(s) for tests:** US-27
 **Acceptance criteria:**
@@ -361,11 +361,11 @@ The pain: opencode's plugin cache is **write-once**. It resolves `@lawaty/lacode
 
 ## Epic G — Context and cost (a maintained map instead of cold exploration)
 
-The pain: every task opened by exploring the repository from scratch. The same
-directory layout, the same entry points and the same layering were rediscovered
-— and re-paid for — on every run, and nothing written down survived the session
-that learned it. LaCode keeps a five-file codemap at `.opencode/context/` and
-makes agents read it before they explore, then keeps it current on its own.
+Every task opens by exploring the repository from scratch. The same directory
+layout, the same entry points and the same layering are rediscovered — and
+re-paid for — on every run, and nothing written down survives the session that
+learned it. LaCode keeps a five-file codemap at `.opencode/context/` and makes
+agents read it before they explore, then keeps it current on its own.
 
 ### US-19: Curated map replaces cold exploration
 **As a** user, **I want** agents to start from a maintained map of the codebase, **so that** each task spends fewer tokens on re-discovering structure that is already written down.
@@ -458,10 +458,9 @@ table was filled in.
 | US-21 | G | `tests/stories/g-context-management.test.mjs`, `tests/permission-test.mjs` |
 | US-22 | G | `tests/stories/g-context-management.test.mjs` |
 
-The nine suites under `tests/` are unit-style and are kept as they are; the
-`tests/stories/` suites are the behavioural layer, written one epic per file with
-every test name carrying its story id. Run everything with `npm test`.
+The nine suites under `tests/` are unit-style; the `tests/stories/` suites are
+the behavioural layer, written one epic per file with every test name carrying
+its story id. Run everything with `npm test`.
 
-**No story is uncovered.** The previously uncovered set — US-1, US-2, US-3,
-US-6, and all of epic F — now has tests, and the coverage guard fails the build
-if any of them loses one.
+**No story is uncovered.** US-1, US-2, US-3, US-6, and all of epic F have tests,
+and the coverage guard fails the build if any of them loses one.

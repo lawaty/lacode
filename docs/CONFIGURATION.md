@@ -43,10 +43,10 @@ writes the context map and has no business in a browser.
 opencode folds an agent's `tools` into its permission list **at config-load
 time**, while decoding the config — before any plugin runs. A plugin's `config`
 hook mutates the already-decoded config, so the fold never re-runs and anything
-it puts in `agent.tools` is inert. (Verified on opencode 1.18.34/1.18.35 with
-`opencode debug agent explore`: a grant written in your own config shows two
-`playwright_*` entries — `deny` then `allow`, last one winning — while the same
-grant injected by the plugin shows only the `deny`.) LaCode's other injected
+it puts in `agent.tools` is inert. On opencode 1.18.34/1.18.35, a grant
+written in your own config shows two `playwright_*` entries — `deny` then
+`allow`, last one winning — while the same grant injected by the plugin shows
+only the `deny`. LaCode's other injected
 fields are not affected; `permission`, `prompt`, `model`, `description`,
 `temperature`, `mode` and `hidden` are all read after the plugin hook runs.
 
@@ -78,8 +78,8 @@ process.
 **18 agent keys**: the 5 bases `build`, `plan`, `explore`, `implement`,
 `context`, plus one hidden
 `<base>-1`..`-4` pool variant for each of the 3 pooled bases, plus the hidden
-`manager` agent — the one writer of `.opencode/context/manager.md`, reachable
-only from the `/manager-directive` command.
+`instructions` agent — the one writer of the project's root `AGENTS.md`,
+reachable only from the `/agent-instructions` command.
 
 `build` and `plan` exist in opencode as built-ins, so on a stock config those
 two keys are already taken and merge-without-clobber keeps the built-in — the
@@ -92,13 +92,13 @@ duplicate of `plan` apart from a pinned model, and `plan` is injected instead.
 description — a package cannot ship someone else's provider, quota or benchmark
 results — though its escalation ladder still resolves, because the two deep
 tiers it escalates to *are* injected. And `explore`, `general` and `implement`
-are only `{ "disable": true }` stubs in the author's own config: turning off
-opencode's built-in agents is a decision about one person's configuration, not
-a default a package should impose on a stranger.
+are only `{ "disable": true }` stubs: turning off opencode's built-in agents
+is a decision about one person's configuration, not a default a package should
+impose on a stranger.
 
-One **field** is deliberately not injected either: `tools`, for the
-load-time-folding reason explained above. Nothing else the plugin writes into
-an agent is subject to it.
+One **field** is deliberately not injected: `tools`, for the load-time-folding
+reason explained above. Nothing else the plugin writes into an agent is subject
+to it.
 
 **Installation merges, it does not clobber** (US-16). An agent, command or
 instruction is added only when that key is absent from your config. A

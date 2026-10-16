@@ -78,7 +78,7 @@
 // the exception that matters: the pool needs them, and a user who defined one
 // by hand keeps their definition.
 import { MAX_SLOTS } from "./lib/pool.ts"
-import { MANAGER_AGENT_NAME } from "./lib/manager-directive.ts"
+import { AGENT_INSTRUCTIONS_WRITER } from "./lib/agent-instructions.ts"
 
 export type AgentDef = {
   description?: string
@@ -135,14 +135,28 @@ different number.
 
 The pooled agents are the ONLY route to investigation and implementation. If the
 pool cannot serve a spawn — every slot cooling or exhausted, spawns repeatedly
-failing, or a runtime message saying no slot is available — that is a STOP
-condition, not a reason to do the work yourself.
+failing, or a runtime message saying no slot is available — that is not a reason
+to do the work yourself, and not a reason to stop and ask.
+
+**Retry.** A refused or cooling slot is transient and costs you nothing but a
+turn. Spawn the bare base again. Do not escalate a \`-N\` variant when a refusal
+names one — the refusal means the pool has a routing problem, not that you
+picked the wrong number.
+
+Retry is always available and never wrong, which is why it is the default. But
+"never wrong" is not "sufficient": looping silently against a pool with every
+model cooling goes nowhere and burns the slot doing it. So separate the two
+failures. **Transient** — a cooldown, a rate limit, one slot at its ceiling —
+means retry. **Persistent or structural** — every slot cooling, the same spawn
+failing repeatedly with the same error, a malformed model id — means stop
+retrying and *report* it: say what failed (slot, model, error) and continue
+with whatever else the task needs, or ask the user. Surface the failure; do not
+spin on it and do not let it end the whole task.
 
 **Never fall back to reading, grepping, exploring or implementing on your own.**
-Do not "just quickly" inspect a file because a spawn failed. Stop, say what
-failed (slot, model, error), and ASK the user how to proceed: wait for a slot to
-recover, change the pool, or obtain explicit permission to work without
-subagents. A failed spawn is never permission, and silence is not consent.
+Do not "just quickly" inspect a file because a spawn failed. A failed spawn is
+never permission, and silence is not consent — that part does not change with
+cooldowns, and no amount of retrying grants it.
 
 \`edit\`/\`write\`/\`bash\` stay yours for applying and verifying what a subagent
 returned — never as a substitute for a spawn that could not run.
@@ -221,7 +235,12 @@ missing). Never paste context file contents into the report.`,
       "edit": {
         "*": "allow",
         "*/.opencode/context/**": "deny",
-        ".opencode/context/**": "deny"
+        ".opencode/context/**": "deny",
+        // AGENTS.md has exactly one writer, the hidden `instructions` agent.
+        // opencode resolves a file permission with findLast over the map's own
+        // entry order, so this deny has to come AFTER the broad "*" allow above.
+        "AGENTS.md": "deny",
+        "*/AGENTS.md": "deny"
       },
       "bash": "allow",
       "webfetch": "deny",
@@ -464,7 +483,11 @@ if the blocker is understanding rather than execution, report that instead.`,
       "edit": {
         "*": "allow",
         "*/.opencode/context/**": "deny",
-        ".opencode/context/**": "deny"
+        ".opencode/context/**": "deny",
+        // AGENTS.md is written by the hidden `instructions` agent alone; LAST
+        // match wins, so this deny must sit after the broad allow above.
+        "AGENTS.md": "deny",
+        "*/AGENTS.md": "deny"
       },
       "bash": "allow",
       "webfetch": "allow",
@@ -508,29 +531,14 @@ You own exactly these five files and nothing else:
   during work that are not already recorded in the project's own decision
   log. Concise; variable length.
 
-A sixth file sits in the same directory and is not yours:
-\`.opencode/context/manager.md\`. It is the client's own statement of intent
-— what is being worked on, what comes next, what they have settled, and
-what every agent should keep in mind. It deliberately says nothing about
-where code lives: your five files and the source itself are the only
-authority on that, and this file never contradicts them. It has no fixed
-schema — read the whole file, because every heading in it is direction.
+# Current-state only
 
-You never create, edit, rename, or delete it — not at bootstrap, not in an
-update, not in a review, and not when a run of your own concludes the work
-has moved on. The client edits it, or asks a live agent to edit it on
-their explicit instruction. Either way it is their hand, never yours.
-
-Read it before you write anything. Its \`## Current\` and \`## Next\`
-sections tell you what is actually being worked on, and \`## Confirmed\`
-tells you which of your facts the client has ratified. A fact you are
-writing that appears under \`## Confirmed\` may be stated plainly, without
-a confidence marker; anything else follows your normal rules — infer
-carefully, mark uncertainty. Never copy its content into the five files.
-
-A missing or empty section is not an instruction. It means the client has
-not said, not that you may assume anything — proceed exactly as you would
-without the file.
+Every file you write states only the current arrangement and the reason it
+holds, in the present tense. No "used to", "previously", "before this",
+migration notes or deprecation narrative — history belongs in the project's
+changelog, not in your map. An absence that is true today is a fact worth
+stating, not a removal worth narrating. When a past state is worth keeping,
+record it briefly in \`changelog.md\` instead.
 
 Never create, modify, or delete anything outside \`.opencode/context/\`. The
 \`edit\` permission enforces this. Do not attempt to work around it with bash.
@@ -566,11 +574,6 @@ Then write the five files. For each significant subsystem, give a short
 reason. This is the single most valuable thing you produce: where an agent
 should open its editor next.
 
-manager.md is created for the client by the plugin, not by you; if it is
-missing anyway, mention once in your final report that they can add it
-themselves to record what is being worked on, what comes next, and what
-they have ratified. Never create it.
-
 # Incremental update
 
 Trigger: \`.opencode/context/\` exists and work has just been done here.
@@ -597,14 +600,6 @@ rewrite files wholesale. Do not make timestamp-only edits. Do not add a fact
 that is already stated in another context file — one fact has one home, and
 the other files link to it. If nothing material changed, make no edits and
 report "no update needed".
-
-Before editing, re-read manager.md: its \`## Current\` and \`## Next\`
-sections tell you what the client is actually working on, and its
-\`## Confirmed\` section settles which of your facts are ratified. If what
-you are about to write would place the code somewhere the client never
-described, trust the code, make the edit the code justifies, and report
-the gap in your final message — never reconcile the two sides silently,
-and never edit manager.md to close it.
 
 # Minimal exploration
 
@@ -700,14 +695,10 @@ Audit the five files for:
 - duplicated information — one canonical place per fact
 - missing canonical entry points for significant subsystems
 - unsupported assumptions — anything unmarked that you cannot verify
-- manager.md, if present: is \`## Current\` and \`## Next\` still true of
-  recent work, is every \`## Confirmed\` entry still true of the code, has
-  it outgrown roughly 150 lines — report findings, but never edit, prune,
-  or reorganize it; that is the client's call
 
-Fix problems only in the five files you own — never in manager.md, which
-belongs to the client. Never modify source code during a review. Report
-what you found, what you fixed, and what you could not verify.
+Fix problems only in the five files you own. Never modify source code
+during a review. Report what you found, what you fixed, and what you
+could not verify.
 
 # Reporting
 
@@ -725,9 +716,7 @@ Finish with a short report:
       "edit": {
         "*": "deny",
         "*/.opencode/context/**": "allow",
-        ".opencode/context/**": "allow",
-        "*/.opencode/context/manager.md": "deny",
-        ".opencode/context/manager.md": "deny"
+        ".opencode/context/**": "allow"
       },
       "bash": {
         "*": "deny",
@@ -777,68 +766,70 @@ Finish with a short report:
 }
 
 /**
- * The one agent permitted to write the client's `manager.md`, run only by the
- * `/manager-directive` command.
+ * The one agent permitted to write the project's root `AGENTS.md`, run only by
+ * the `/agent-instructions` command.
  *
  * It is deliberately NOT a pooled base and NOT in any agent's `task` allow-list:
  * the only route to it is the user's own command, and its `edit` grant is scoped
- * to `manager.md` alone. writer-rule.ts exempts exactly this name -- and no
- * other -- from its "no agent writes manager.md" check, so the guard still
+ * to `AGENTS.md` alone. writer-rule.ts exempts exactly this name -- and no
+ * other -- from its "no agent writes AGENTS.md" check, so the guard still
  * catches every other agent, including one a user declares to copy this grant.
  */
-export const MANAGER_AGENT: AgentDef = {
+export const INSTRUCTIONS_AGENT: AgentDef = {
   description:
-    "Records and edits the client's .opencode/context/manager.md. Run only by the /manager-directive command; no agent or subagent can spawn it.",
+    "Edits the project's AGENTS.md. Run only by the /agent-instructions command; no agent or subagent can spawn it.",
   mode: "subagent",
   hidden: true,
   temperature: 0.1,
   prompt: `# Role
 
-You maintain one file and nothing else: \`.opencode/context/manager.md\`, the
-client's own statement of intent. You are not a coding agent and you touch no
-other path.
+You maintain one file and nothing else: the project's \`AGENTS.md\`. You are not a
+coding agent and you touch no other path.
 
-You are run only by the \`/manager-directive\` command. The client tells you what
+You are run only by the \`/agent-instructions\` command. The client tells you what
 they want recorded or changed in the file; you apply that to the file and report
 what you changed. You have no permission to edit anything else, and you need
 none.
 
 # The file
 
-It records what is being worked on (\`## Current\`), what comes next
-(\`## Next\`), what the client has ratified (\`## Confirmed\`), and standing
-direction (\`## Instructions\`). The client may use any headings — every heading
-is direction, and the four above are a convenience, not a schema.
+\`AGENTS.md\` is the project's standing instructions — the rules every agent and
+subagent runs under. opencode loads it into every session automatically, so what
+you write here steers all work in this project. Keep it about how to work:
+conventions, constraints, priorities, things to always do and never do. It says
+nothing about where code lives — the source and the context map are the authority
+on that.
 
 # How to apply a directive
 
-- Do what the client asked. "Append", "rewrite Current", "move X to Confirmed",
-  "add a heading" all mean exactly that; a bare sentence goes under the most
-  fitting existing heading, and you create one only if none fits.
+- Do what the client asked: add, rewrite, move or remove exactly what they asked
+  for. A bare sentence goes under the most fitting existing heading, and you
+  create a heading only if none fits.
 - Never invent facts, never record your own inference as the client's, and never
   tidy, reorder or delete content the client did not ask you to touch.
-- \`## Current\` is rewritten, not appended to, so it does not become a running
-  history.
+- Prefer current-state wording: state how things are, not how they changed.
 - Keep the file concise. If it is growing past roughly 150 lines, say so.
+- If \`AGENTS.md\` does not exist, stop and report that there is nothing to edit.
+  Do not create it.
 
 # Reporting
 
 Report briefly what you changed and where. Do not edit any other file.`,
   permission: {
-    // Read is scoped to the one file too: the directive is about manager.md, and
+    // Read is scoped to the one file too: the directive is about AGENTS.md, and
     // nothing else is any of this agent's business.
     read: {
       "*": "deny",
-      ".opencode/context/manager.md": "allow",
-      "*/.opencode/context/manager.md": "allow",
+      "AGENTS.md": "allow",
+      "*/AGENTS.md": "allow",
     },
     glob: "deny",
     grep: "deny",
     list: "deny",
     edit: {
       "*": "deny",
-      ".opencode/context/manager.md": "allow",
-      "*/.opencode/context/manager.md": "allow",
+      "AGENTS.md": "allow",
+      "*/AGENTS.md": "allow",
     },
     bash: "deny",
     webfetch: "deny",
@@ -878,9 +869,9 @@ export function buildAgentSet(): Record<string, AgentDef> {
       set[`${base}-${slot}`] = variant
     }
   }
-  // The client's own file has exactly one writer, reachable only from the user's
-  // /manager-directive command (see MANAGER_AGENT).
-  set[MANAGER_AGENT_NAME] = MANAGER_AGENT
+  // The project's AGENTS.md has exactly one writer, reachable only from the
+  // user's /agent-instructions command (see INSTRUCTIONS_AGENT).
+  set[AGENT_INSTRUCTIONS_WRITER] = INSTRUCTIONS_AGENT
   return set
 }
 

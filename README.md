@@ -2,10 +2,10 @@
 
 > Ultimate opencode setup for Go users
 
-> **Beta — experimental, changing fast.** For the next month LaCode ships on the
-> npm **`beta`** dist-tag rather than `latest`, so nothing pulls it by accident:
-> install `@lawaty/lacode@beta`, or pin an exact version. Interfaces here can
-> change between releases without a major bump while the project stabilises.
+> **Beta — experimental, changing fast.** LaCode ships on the npm **`beta`**
+> dist-tag rather than `latest`, so nothing pulls it by accident: install
+> `@lawaty/lacode@beta`, or pin an exact version. Interfaces here can change
+> between releases without a major bump.
 
 LaCode is an opencode plugin. It routes delegated work onto a weighted pool of
 cheap models instead of the expensive one, reaps subagents that hang without
@@ -133,13 +133,14 @@ option is optional:
 
 opencode's plugin cache is **write-once**: it resolves `@lawaty/lacode` to an
 exact version once and never re-resolves — not on restart, not with
-`opencode plugin -g -f`, not with a range pin, not with a tagged config spec. So
-LaCode keeps itself current instead (US-27): at startup it compares its own
-version to npm's `latest` (at most once per ~6h, silent when offline) and, when
-behind, reinstalls its own cache entry in the background using the opencode
-binary — no npm or bun required. The running session keeps its loaded code; the
-new version takes effect on the next start, and the log says so. Run
-`lacode update` to do it on demand, or `lacode update --check` to just report.
+`opencode plugin -g -f`, not with a range pin, not with a tagged config spec.
+Nothing in the host re-resolves it, so the plugin owns its own currency
+(US-27): at startup LaCode compares its own version to npm's `latest` (at most
+once per ~6h, silent when offline) and, when behind, reinstalls its own cache
+entry in the background using the opencode binary — no npm or bun required.
+The running session keeps its loaded code; the new version takes effect on the
+next start, and the log says so. Run `lacode update` to do it on demand, or
+`lacode update --check` to just report.
 
 ### Which LaCode is running
 
@@ -154,7 +155,7 @@ lacode version
 version    0.4.1
 root       /home/you/lacode
 source     checkout
-commit     9446c88 (dirty)
+commit     <hash> (dirty)
 dist       current
 config     /home/you/.config/opencode/opencode.jsonc
 plugin     file:///home/you/lacode/dist/index.js
@@ -163,14 +164,15 @@ this copy  yes — opencode loads this copy
 
 `npm ls -g @lawaty/lacode` answers a different question. It reports the package
 opencode resolves *by name*, which is not necessarily the one running: a config
-may load the plugin by absolute path, in which case a stale global install can
-sit there reporting a version nothing uses. So this command reads your actual
-`plugin` array and says whether it resolves to the copy speaking.
+may load the plugin by absolute path, and a global install can sit there
+reporting a version nothing uses. So this command reads your actual `plugin`
+array and says whether it resolves to the copy speaking.
 
 `source` distinguishes a git checkout from an npm install, `commit` and the
 dirty flag name what the code was built from, and `dist` is the trap worth
 knowing about — opencode loads `dist/index.js` while you edit and pull `src/`,
-so a `git pull` can leave you running yesterday's build with nothing failing.
+so a `git pull` can leave you running a build that differs from the installed
+package, with nothing failing.
 When it reports `stale`, rebuild with `npm run build`. No network is touched;
 `lacode update --check` is what asks npm whether something newer exists.
 
@@ -184,7 +186,7 @@ directly, which is exactly what the rotation and the per-slot ceiling exist to
 prevent, so it is refused.
 
 Six commands: `/context-init`, `/context-update`, `/context-review`,
-`/lacode-doctor`, `/manager-directive` and `/pool`. Everything is added **only
+`/lacode-doctor`, `/agent-instructions` and `/pool`. Everything is added **only
 when your config does not already
 define it** — an agent or command you wrote yourself is left byte-identical,
 never patched or partially merged. `{"enabled": false}` turns the whole thing off
@@ -218,55 +220,46 @@ are reading:
 /context-update    # incremental refresh; accepts a focus, e.g. /context-update src/payments
 /context-review    # audit it for staleness, contradictions, duplication and bloat
 /lacode-doctor     # check the pool, model resolution and the OmniRoute gateway. Report only
-/manager-directive # record a managerial direction in manager.md — client-only, see below
+/agent-instructions # apply a client instruction to the project's AGENTS.md — client-only, see below
 /pool              # rewrite the pool slot table in ~/.config/lacode/pool.txt; restart to apply
 ```
 
 The map is local and untracked — it describes your checkout on your machine, so
 it is not committed and not synced. If it is missing, agents check, find
-nothing and carry on as before. What this buys is tokens not spent
+nothing and carry on without it. What this buys is tokens not spent
 re-discovering structure; as with everything else here, no savings percentage is
 published, because none has been independently measured. The mechanism, the
 permission rule that makes one writer possible, and what the log lines mean are
 in [docs/CONTEXT.md](docs/CONTEXT.md).
 
-## Managerial directions
+## Standing instructions
 
-The plugin creates `manager.md` in `.opencode/context/` for you, and never
-overwrites it once it exists. It is your file: it records what you want done
-and how you want it approached — what is being worked on, what comes next,
-what you have settled, and what every agent should keep in mind. It says
-nothing about where code lives, so it can never contradict the code, and
-within that domain it outranks the five generated files and any agent's
-inference about what matters right now.
+The project's root `AGENTS.md` is your own statement of intent: it records
+what you want worked on and how you want it approached. It says nothing about
+where code lives, so it can never contradict the code, and within that domain
+it outranks the five generated context files and any agent's inference about what
+matters right now.
 
 The file is per-clone and not committed, so it is yours rather than shared
-team state. It has no fixed schema — the headings below are a convenience.
-Add your own; every heading in it is treated as direction.
+team state. There is no fixed schema and no prescribed headings — you write
+whatever you like, and every heading you add is treated as direction.
 
-- `## Current`: what is being worked on right now. Rewrite it rather than
-  appending, so it does not become a running history. If the file passes
-  roughly 150 lines, run `/context-review`.
-- `## Next`: what comes next, in order.
-- `## Confirmed`: what you have personally ratified. Treat these as settled
-  decisions, not as permission to skip reading the code.
-- `## Instructions`: standing direction beyond the current task — priorities,
-  things to care about, constraints that are not obvious from the code.
+Anything you have recorded there is read before work starts, and what you have
+recorded is treated as settled by the agents — not as permission to skip
+reading the code.
 
-**Who may write it.** The context agent is explicitly permission-denied from
-touching this path, so the automatic post-session run can never alter it. An
-agent working in your live session may write it only when you explicitly ask
-it to, and only what you asked for — never on its own initiative, and never
-to "keep it up to date".
+**Who may write it.** Every agent is explicitly permission-denied from
+touching this path, so no automatic run can ever alter it. The one exception
+is the hidden `instructions` agent, reachable solely through the
+`/agent-instructions` command.
 
-**`/manager-directive` — the one sanctioned write path.** Type
-`/manager-directive <text>` and the `manager` agent applies your instruction to
-`manager.md` — recording it, moving it between sections, rewriting `## Current`,
-whatever you asked — then reports what it changed. It is a normal agent turn, not
-a dead append: tell it what you want and review the result. The `manager` agent
-is the one agent permitted to edit that file, its grant is scoped to
-`manager.md` alone, and no other agent can spawn it — the command is the only
-route in.
+**`/agent-instructions` — the one sanctioned write path.** Type
+`/agent-instructions <text>` and the `instructions` agent applies whatever
+instruction you have given to `AGENTS.md`, then reports what it changed. It is
+a normal agent turn, not a dead append: tell it what you want and review the
+result. The `instructions` agent is the one agent permitted to edit that file,
+its grant is scoped to `AGENTS.md` alone, and no other agent can spawn it —
+the command is the only route in.
 
 ## Cost
 
@@ -385,7 +378,7 @@ gitignored; `prepack` builds it, so `npm pack` cannot produce a stale tarball.
 
 The sources are TypeScript and the tests import `src/` directly (node strips the
 types outside `node_modules`, which is exactly where the tests live), so the
-loop stays: edit `src/`, run `npm test`. Only the packaging fixtures build, and
+loop is: edit `src/`, run `npm test`. Only the packaging fixtures build, and
 they call the same `scripts/build.mjs` the tarball does.
 
 `tests/stories/` holds the story suites and `tests/stories/coverage.test.mjs`

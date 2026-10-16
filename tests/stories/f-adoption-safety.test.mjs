@@ -116,7 +116,9 @@ test("[US-15] one config line is enough: a bare config boots and delivers the wh
   for (const command of ["context-init", "context-update", "context-review"]) {
     assert.ok(cfg.command[command], `/${command} must be injected by the single config line`)
   }
-  assert.ok(Array.isArray(cfg.instructions) && cfg.instructions.length > 0, "the standing rule must be injected too")
+  // The plugin injects NO standing instruction — the map protocol lives in the
+  // cartographer's own prompt, not in a config-level rule.
+  assert.equal(cfg.instructions, undefined, "the plugin must not inject any standing instruction")
 
   // And the injected set actually routes work, so this is value, not decoration.
   const { routed } = await spawn(hooks, cfg, {})
@@ -626,9 +628,7 @@ test("[US-16] a merge preserves every pre-existing key in the file across a roun
   }
   assert.deepEqual(reread.agent.mine, original.agent.mine, "a pre-existing agent must survive byte-identically")
   assert.deepEqual(reread.command.mine, original.command.mine, "a pre-existing command must survive byte-identically")
-  assert.equal(reread.instructions.length, 2, "the standing rule must be appended to the existing instruction")
-  assert.equal(reread.instructions[0], original.instructions[0], "the client's own instruction must be first and unmodified")
-  assert.ok(reread.instructions[1].includes("<!-- lacode:context-map-instruction:v1 -->"), "the standing rule must be appended with the marker")
+  assert.deepEqual(reread.instructions, original.instructions, "the plugin must not inject any standing instruction — the client's own instructions survive untouched")
   await hooks.dispose()
 })
 

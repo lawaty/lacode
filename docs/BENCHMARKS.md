@@ -88,10 +88,9 @@ never priced at 0 and never priced at a guess. If you name such a model
 explicitly with `--model` / `--baseline-model`, the run exits non-zero and tells
 you to refresh or to pass `--allow-unknown`.
 
-This is the reason the results table below is empty. The pinned snapshot covers
-the bundled free preset only; the default baseline model is not in it, so the
-default offline run cannot produce an honest ratio. That is the harness working
-as designed.
+This is why the results table below is empty. The pinned snapshot covers the
+bundled free preset only; the default baseline model is not in it, so the
+default offline run cannot produce an honest ratio.
 
 ## Results
 
@@ -116,11 +115,10 @@ harness prints `unknown`.
 `--out docs/BENCHMARKS.md` and exits 2.
 
 That refusal is the point. This file ships inside the npm tarball (`files`
-includes `docs`). A generated table dropped on top of it would replace the
-explanation with a dated artifact that reads as a published measurement of the
-package, and it would outlive the machine and the day that produced it. So the
-hand-written explainer is protected, and the generated output — which carries a
-footer pointing back here — goes to its own gitignored filename.
+includes `docs`) and is the hand-written explainer. A generated table is a
+measurement of one machine on one day, not a claim about the package, so the
+explainer is protected and the generated output — which carries a footer
+pointing back here — goes to its own gitignored filename.
 
 ```bash
 npm run benchmark -- --out docs/BENCHMARKS.generated.md

@@ -118,26 +118,25 @@ This package also publishes `main` and an `exports["./server"]` entry pointing a
 the same built file, because those are two of the shapes a plugin loader
 resolving an entry point consults. They are forward-compatibility metadata and
 they cost nothing — but they do **not** fix this on 1.18.35: adding either one to
-the *installed* cache copy was tested there and the bare specifier still loaded
-nothing. No other version has been observed where they help either. Use the
-`file://` entry.
+the *installed* cache copy leaves the bare specifier loading nothing. Whether
+they help on any other version is unknown. Use the `file://` entry.
 
 
 ## Which opencode versions this is known on
 
-Exactly one version has been measured, and the procedure above is deliberately
+Exactly one version is measured, and the procedure above is deliberately
 not built around that fact. Treat this table as the evidence it is, which is one
 row wide.
 
 | opencode version | bare spec loads? | `file://` needed? | evidence |
 | --- | --- | --- | --- |
-| 1.18.35 | No — installs the package, then silently drops it | Yes | **Verified** on 1.18.35: a populated cache directory, zero agents injected, no error and no log line; the `file://` entry loads the full agent set. |
-| Any other version | **Unknown** | **Unknown** | **Untested.** No other opencode version has been run against this package in either direction. |
+| 1.18.35 | No — installs the package, then silently drops it | Yes | Measured on 1.18.35: a populated cache directory, zero agents injected, no error and no log line; the `file://` entry loads the full agent set. |
+| Any other version | **Unknown** | **Unknown** | No other opencode version is covered by this table, in either direction. |
 
-Every command quoted on this page was run against 1.18.35. **If your version is
-not the one measured here, follow the procedure above rather than reading this
-table as coverage of your build**: each step stands on its own, and step 2 tells
-you which situation you are in before any version-specific advice is relevant.
+**If your version is not the one measured here, follow the procedure above
+rather than reading this table as coverage of your build**: each step stands on
+its own, and step 2 tells you which situation you are in before any
+version-specific advice is relevant.
 
 
 ## macOS
@@ -168,8 +167,8 @@ Three things differ, and all three are worth reading rather than assuming:
   notification hop is a direct ssh (`ControlMaster` + `ControlPersist`) set up
   once with `lacode tunnel setup` — no reverse forward, no listening port, no
   systemd unit. See [Remote hosts](../README.md#remote-hosts) and docs/TUNNEL.md.
-- The repo still carries the author's personal, Linux-only tooling from the older
-  reverse-forward setup (`bin/oc`, `bin/oc-notify`, `bin/oc-notify-receiver`,
+- The repo carries the author's personal, Linux-only reverse-forward tooling
+  (`bin/oc`, `bin/oc-notify`, `bin/oc-notify-receiver`,
   `bin/oc-sync`). None of it is in the published package, and none of it is needed
   for the npm-client path above.
 
@@ -205,6 +204,6 @@ Two things are worth knowing about what npm actually hands you:
   `dist/`, built from `src/` at pack time (`prepack` runs the build, so a stale
   `dist/` cannot be published). This is not a preference: node strips types
   natively from 22.18 but **refuses to for files under `node_modules`**, so a
-  package that shipped `.ts` worked fine in a checkout and failed on install —
-  `lacode --help` died with `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`. A
-  published package cannot depend on its consumer's loader being lenient.
+  package that ships `.ts` fails on install — `lacode --help` exits with
+  `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`. A published package cannot
+  depend on its consumer's loader being lenient.

@@ -1,6 +1,6 @@
 # OmniRoute gateway integration
 
-[OmniRoute](https://github.com/diegosouzapw/OmniRoute) is a local OpenAI-compatible gateway that routes a request across many providers with fallback and "combos". LaCode can register it as an opencode provider. It is **off by default**. The summary is in the [README](../README.md#configure); this page is the full reference, including a latency-measured combo that is worth applying on a new client.
+[OmniRoute](https://github.com/diegosouzapw/OmniRoute) is a local OpenAI-compatible gateway that routes a request across many providers with fallback and "combos". LaCode can register it as an opencode provider. It is **off by default**. The summary is in the [README](../README.md#configure); this page is the full reference, including a combo ordered for latency that is worth applying on a new client.
 
 ## Configuring OmniRoute
 
@@ -119,11 +119,10 @@ fails; every other slot keeps working. See
 
 `combo: "auto"` is the zero-configuration default, but `auto` inherits whatever
 the gateway chooses, and on a busy free tier that is frequently the slowest
-chain available. The combo below was **measured** against a live free-tier
-gateway and is ordered for latency rather than for breadth. Apply it during the
-"Setting it up on a client machine" steps above and pooled work is usable
-straight away, instead of starting from a gateway that queues for half a minute
-per call.
+chain available. The combo below is ordered for latency rather than for
+breadth. Apply it during the "Setting it up on a client machine" steps above
+and pooled work is usable straight away, instead of starting from a gateway that
+queues for half a minute per call.
 
 ```jsonc
 {
@@ -146,32 +145,20 @@ per call.
 }
 ```
 
-Why this order, from 859 calls over a single day against that gateway:
+Why this order — it is the two free-tier failure modes, a hard reject and a
+slow queue-budget timeout:
 
-| Model | Observed behaviour | Position |
+| Model | Behaviour on a busy free tier | Position |
 | --- | --- | --- |
-| `gemini/gemini-3.1-flash-lite` | **165/172 succeeded (96%)**, ~4.5s median | **first** |
-| `gemini-3.8-flash` / `3.7-flash` / `3-flash-preview` | succeed intermittently, but **burn exactly 30.0s** on a `503` queue-budget timeout when they do not | next |
-| `openrouter/*:free` | **~90% `429`**, but fails *fast* (~1.8s) and occasionally succeeds | last, as a cheap final fallback |
+| `gemini/gemini-3.1-flash-lite` | succeeds on the large majority of calls, ~4.5s median | **first** |
+| `gemini-3.8-flash` / `3.7-flash` / `3-flash-preview` | succeed intermittently, but **stall ~30s** on a `503` queue-budget timeout when they do not | next |
+| `openrouter/*:free` | **mostly `429`**, but fail *fast* (~1.8s) and occasionally succeed | last, as a cheap final fallback |
 | `gemini-2.5-flash`, `gemini-2.5-flash-lite` | **`404` on every attempt** — dead ids | **omitted entirely** |
 
 The ordering matters because a combo pays for *every* step it walks past. Put the
-96%-success model first and the common case is a single hop; the 30s models sit
+reliable model first and the common case is a single hop; the 30s models sit
 behind it where they cost nothing, and the 429s sit last where they give up in
 under two seconds.
-
-Measured on the same gateway, same day, `max_tokens: 10`:
-
-| | Before | After |
-| --- | --- | --- |
-| `free-mix` response | 42.7s / 41.8s / 34.7s | 4.1s / 3.1s / 3.2s / 4.0s / 3.2s |
-| Median | **~41.8s** | **~3.2s** |
-| Provider time burned on calls >25s | **56.9 of 102.4 min (56%)** | — |
-
-Before the change, the real call sequence was a `429` after 2.7s, then a `503`
-after 30.0s, then the actual work in 5.7s — roughly **33 seconds of dead time in
-front of every successful request**, and a p90 of 100s when three 30s steps
-chained.
 
 These free-tier endpoints change availability constantly, so treat the ordering
 as a **starting point to re-measure, not a permanent truth**. Re-check it with

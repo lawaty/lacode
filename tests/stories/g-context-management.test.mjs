@@ -27,7 +27,7 @@ import assert from "node:assert/strict"
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { AGENTS, POOLED_BASES } from "../../src/agents.ts"
-import { COMMANDS, STANDING_INSTRUCTION, INSTRUCTION_MARKER } from "../../src/commands.ts"
+import { COMMANDS } from "../../src/commands.ts"
 import { MAX_SLOTS } from "../../src/lib/pool.ts"
 import { verifyWriterRule } from "../../src/lib/writer-rule.ts"
 import { contextAutoUpdateHooks } from "../../src/plugins/context-autoupdate.ts"
@@ -217,25 +217,6 @@ test("[US-19] every slot the pool can hand out has a hidden cartographer variant
       `context-${slot} must carry the base agent's permissions unchanged`,
     )
   }
-})
-
-test("[US-19] the map protocol reaches every agent as a standing rule", async () => {
-  const stub = stubInput()
-  const hooks = await bootLaCode(stub, { id: "us19-standing", dir: scratch() })
-  const cfg = emptyConfig()
-  await hooks.config(cfg)
-  await hooks.dispose()
-
-  assert.deepEqual(cfg.instructions, [`${INSTRUCTION_MARKER}\n\n${STANDING_INSTRUCTION}`], "the rule must be injected when the user has none")
-  for (const name of MAP_FILES) {
-    assert.ok(STANDING_INSTRUCTION.includes(name), `the standing rule must name ${name} so an agent knows what it may read`)
-  }
-  // "Check the map, don't go cold" only pays off if the check is cheap and the
-  // result is used: one file, then the entry points it lists.
-  assert.match(STANDING_INSTRUCTION, /ls \.opencode\/context/, "the check must be ls, not a glob that skips hidden directories")
-  assert.match(STANDING_INSTRUCTION, /never the\s+`glob`/, "the rule must say the glob tool does not see it")
-  assert.match(STANDING_INSTRUCTION, /canonical entry points/, "the rule must send the agent to the entry points the map lists")
-  assert.match(STANDING_INSTRUCTION, /trust the code/i, "the map is an index; source stays authoritative")
 })
 
 test("[US-19] the cartographer is told to write an index, not an inventory", async () => {
@@ -612,7 +593,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
   const blanket = verifyWriterRule(
     configFile({
       build: { permission: { edit: "allow" } },
-      "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow", "*/.opencode/context/manager.md": "deny", ".opencode/context/manager.md": "deny" } } },
+      "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
     }),
     MAP_UNDER_TEST,
     ROOT_UNDER_TEST,
@@ -634,8 +615,8 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
   // about whether the word "allow" appears anywhere in the table, is the whole
   // difference between this check working and crying wolf on a correct config.
   const denying = configFile({
-    build: { permission: { edit: { "*": "allow", "*/.opencode/context/**": "deny", ".opencode/context/**": "deny" } } },
-    "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow", "*/.opencode/context/manager.md": "deny", ".opencode/context/manager.md": "deny" } } },
+    build: { permission: { edit: { "*": "allow", "*/.opencode/context/**": "deny", ".opencode/context/**": "deny", "AGENTS.md": "deny", "*/AGENTS.md": "deny" } } },
+    "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
   })
   assert.equal(verifyWriterRule(denying, MAP_UNDER_TEST, ROOT_UNDER_TEST), undefined, "a correctly-ordered narrow deny is not a violation")
 
@@ -643,7 +624,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
   // loses in opencode, and must be reported as the hole it actually is.
   const misordered = configFile({
     build: { permission: { edit: { ".opencode/context/**": "deny", "*": "allow" } } },
-    "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow", "*/.opencode/context/manager.md": "deny", ".opencode/context/manager.md": "deny" } } },
+    "context": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
   })
   const report = verifyWriterRule(misordered, MAP_UNDER_TEST, ROOT_UNDER_TEST)
   assert.ok(report, "a deny that loses to a later blanket allow is a real hole")
@@ -651,7 +632,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
 
   // The cartographer's own variants are exempt — including hidden slot variants.
   assert.equal(
-    verifyWriterRule(configFile({ "context-3": { permission: { edit: { "*": "deny", ".opencode/context/**": "allow", "*/.opencode/context/manager.md": "deny", ".opencode/context/manager.md": "deny" } } } }), MAP_UNDER_TEST, ROOT_UNDER_TEST),
+    verifyWriterRule(configFile({ "context-3": { permission: { edit: { "*": "deny", ".opencode/context/**": "allow" } } } }), MAP_UNDER_TEST, ROOT_UNDER_TEST),
     undefined,
     "context-N is the same writer and must not be flagged",
   )
@@ -663,109 +644,6 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
     undefined,
     "an agent that never configured `edit` is not a writer",
   )
-})
-
-test("[US-21] non-cartographer agents are told to report map changes rather than make them", async () => {
-  const stub = stubInput()
-  const hooks = await bootLaCode(stub, { id: "us21-report", dir: scratch() })
-  const cfg = emptyConfig()
-  await hooks.config(cfg)
-  await hooks.dispose()
-
-  // Ownership is enforced twice, and both halves matter: the permission denies
-  // the write, and the instruction tells the agent what to do instead. Without
-  // the second half an agent that tries, fails, and reports "permission denied"
-  // has told the user nothing.
-  assert.match(STANDING_INSTRUCTION, /Never edit the five context files yourself/, "the standing rule must forbid editing the map")
-  assert.match(STANDING_INSTRUCTION, /permission-denied from writing it/, "the standing rule must record that the cartographer cannot write manager.md at all")
-  assert.match(STANDING_INSTRUCTION, /only when the client\s+explicitly asks/, "manager.md must be writable on an explicit request, and not otherwise")
-  assert.match(STANDING_INSTRUCTION, /never on your own initiative/, "the standing rule must forbid keeping manager.md up to date unasked")
-  assert.match(STANDING_INSTRUCTION, /context agent owns them/, "the standing rule must name the owner")
-  assert.match(STANDING_INSTRUCTION, /final report/, "the standing rule must say where to report instead")
-  assert.match(STANDING_INSTRUCTION, /Source code is authoritative/, "the map must never outrank the code")
-
-  // Every other tier carries the same rule inline, so an agent that was given a
-  // narrow prompt and never read the standing rule still cannot go rogue.
-  for (const name of ["build", "plan", "explore", "implement"]) {
-    assert.match(cfg.agent[name].prompt, /\.opencode\/context\//, `${name}'s prompt must mention the map`)
-    assert.match(cfg.agent[name].prompt, /context|context-update/, `${name}'s prompt must say who owns it`)
-  }
-})
-
-test("[US-21] the client's manager.md is created once, and never overwritten", async () => {
-  const { ensureManagerFile } = await import("../../src/plugins/context-autoupdate.ts")
-  const root = scratch()
-
-  // Absent: created, with the parent directory made for it.
-  const first = ensureManagerFile(root)
-  assert.equal(first.created, true, "the scaffold must be written when the file is absent")
-  const target = join(root, ".opencode", "context", "manager.md")
-  assert.ok(existsSync(target), "manager.md must exist after the first run")
-
-  // It has to be usable, not just present: the headings the rules key on.
-  const body = readFileSync(target, "utf8")
-  for (const heading of ["## Current", "## Next", "## Confirmed", "## Instructions"]) {
-    assert.ok(body.includes(heading), `the scaffold must offer ${heading}`)
-  }
-
-  // Present: the client's content is never touched, byte for byte.
-  writeFileSync(target, "# mine\n\ndo not lose this\n")
-  const second = ensureManagerFile(root)
-  assert.equal(second.created, false, "an existing file must not be recreated")
-  assert.equal(readFileSync(target, "utf8"), "# mine\n\ndo not lose this\n", "the client's bytes must survive a second run")
-
-  // A directory that cannot be created must not take the plugin down with it.
-  const blocked = join(root, "blocked")
-  mkdirSync(blocked)
-  writeFileSync(join(blocked, ".opencode"), "not a directory")
-  assert.doesNotThrow(() => ensureManagerFile(blocked), "an unwritable project must not throw")
-})
-
-test("[US-16] applyInstructions appends, is idempotent, and respects opt-out", async () => {
-  const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
-  const stub = stubInput()
-  const hooks = await LaCode(stub.input)
-
-  // 1. Appends
-  const cfg1 = { instructions: ["rule1"] }
-  await hooks.config(cfg1)
-  assert.equal(cfg1.instructions.length, 2)
-  assert.ok(cfg1.instructions[1].includes(INSTRUCTION_MARKER))
-
-  // 2. Idempotent
-  const cfg2 = JSON.parse(JSON.stringify(cfg1))
-  await hooks.config(cfg2)
-  assert.deepEqual(cfg1.instructions, cfg2.instructions, "second call must be no-op")
-
-  // 3. Opt-out
-  const cfg3 = { instructions: ["<!-- lacode:context-map-instruction:off -->"] }
-  await hooks.config(cfg3)
-  assert.equal(cfg3.instructions.length, 1)
-  assert.ok(cfg3.instructions[0].includes("off"))
-
-  await hooks.dispose()
-})
-
-test("[US-21] the context agent edit permission denies manager.md while allowing map files", async () => {
-  const stub = stubInput()
-  const hooks = await bootLaCode(stub, { id: "us21-perms", dir: scratch() })
-  const cfg = emptyConfig()
-  await hooks.config(cfg)
-  await hooks.dispose()
-
-  const edit = cfg.agent.context.permission.edit
-  
-  // Allow map files
-  assert.equal(verdict(edit, ".opencode/context/architecture.md"), "allow")
-  
-  // Deny manager.md
-  assert.equal(verdict(edit, ".opencode/context/manager.md"), "deny")
-  
-  // Assert deny entries come after allow
-  const keys = Object.keys(edit)
-  const allow = keys.indexOf(".opencode/context/**")
-  const deny = keys.indexOf(".opencode/context/manager.md")
-  assert.ok(deny > allow, "deny must come after allow")
 })
 
 // ---------------------------------------------------------------------------
