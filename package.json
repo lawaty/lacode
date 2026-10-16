@@ -1,6 +1,6 @@
 {
   "name": "@lawaty/lacode",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Ultimate opencode setup for Go users — cost-controlled pooled subagents, hang recovery, and notifications for opencode.",
   "license": "MIT",
   "type": "module",

@@ -9,6 +9,24 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [0.6.0] — a client-only /pool command, and README corrections
+
+### Added
+
+- **`/pool <instruction>`** — a client-only command that rewrites this machine's
+  pool override, `~/.config/lacode/pool.txt`, from a short instruction. It
+  applies the loader's rules (at most 4 distinct slots, weight in (0, 100], line
+  order is the rotation), writes the WHOLE file rather than a patch, reports the
+  before → after table, and reminds you that nothing hot-reloads.
+
+### Fixed
+
+- README: the count of agent keys deliberately *not* injected was stated as
+  three, not the five `docs/CONFIGURATION.md` lists; and the `lacode` CLI section
+  was missing `version`, `update`, `receive` and `tunnel setup`.
+  `docs/INSTALL.md`'s CLI list gained `version` and `update`. A stale test title
+  ("three commands") was corrected to match what it asserts.
+
 ## [0.5.0] — a user-only /manager-directive, instant limit failover, and the longcat preset
 
 Released on the npm **`beta`** dist-tag (not `latest`) while the project is
@@ -196,7 +214,8 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/lawaty/lacode/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/lawaty/lacode/compare/v0.4.2...v0.5.0
 [0.4.1]: https://github.com/lawaty/lacode/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/lawaty/lacode/compare/v0.3.0...v0.4.0

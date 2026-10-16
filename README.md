@@ -183,12 +183,12 @@ only thing that works: naming a variant lets the caller choose the provider
 directly, which is exactly what the rotation and the per-slot ceiling exist to
 prevent, so it is refused.
 
-Five commands: `/context-init`, `/context-update`, `/context-review`,
-`/lacode-doctor` and `/manager-directive`. Everything is added **only when your
-config does not already
+Six commands: `/context-init`, `/context-update`, `/context-review`,
+`/lacode-doctor`, `/manager-directive` and `/pool`. Everything is added **only
+when your config does not already
 define it** — an agent or command you wrote yourself is left byte-identical,
 never patched or partially merged. `{"enabled": false}` turns the whole thing off
-without leaving a trace. The exact injection list, and the three keys that are
+without leaving a trace. The exact injection list, and the five keys that are
 deliberately *not* injected, are in
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md#what-gets-injected).
 
@@ -219,6 +219,7 @@ are reading:
 /context-review    # audit it for staleness, contradictions, duplication and bloat
 /lacode-doctor     # check the pool, model resolution and the OmniRoute gateway. Report only
 /manager-directive # record a managerial direction in manager.md — client-only, see below
+/pool              # rewrite the pool slot table in ~/.config/lacode/pool.txt; restart to apply
 ```
 
 The map is local and untracked — it describes your checkout on your machine, so
@@ -337,6 +338,13 @@ lacode doctor                                        # what the environment reso
 must never be able to fail the process that tried to notify you. `lacode forward
 HOST -- COMMAND` runs a command on another host over ssh and exits with its
 status.
+
+The full CLI is `notify`, `forward`, `doctor`, `version`, `update`, `receive`
+and `tunnel setup`. `version` reports which copy of LaCode is running — and
+whether opencode is loading that same copy — and `update [--check]` refreshes an
+installed one. `receive` is the desktop end of the tunnel (the forced command a
+remote key is restricted to) and `tunnel setup` provisions the key and the
+forward.
 
 Configuration, the payload format, the receiver contract and holding the forward
 open are in [docs/TUNNEL.md](docs/TUNNEL.md).

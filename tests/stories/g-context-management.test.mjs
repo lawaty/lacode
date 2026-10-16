@@ -873,7 +873,7 @@ test("[US-22] every injected command resolves to an agent that exists in the sam
   }
 })
 
-test("[US-22] the shipped package documents the same three commands the plugin injects", async () => {
+test("[US-22] the shipped package documents every command the plugin injects", async () => {
   // The command set is also a published surface: the package ships `docs/`, and
   // a doc that lists commands the plugin stopped injecting is worse than none.
   const readme = readFileSync(join(ROOT, "README.md"), "utf8")

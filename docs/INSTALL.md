@@ -182,7 +182,8 @@ or no GNU `timeout` — rather than passing silently or failing confusingly.
 
 ## The `lacode` CLI
 
-The package also ships the `lacode` CLI (`notify`, `forward`, `doctor`, `receive`, `tunnel setup`) — see
+The package also ships the `lacode` CLI (`notify`, `forward`, `doctor`, `version`,
+`update`, `receive`, `tunnel setup`) — see
 [Remote hosts](../README.md#remote-hosts). The plugin install does **not** put it on your
 `PATH`; run it from the package's `node_modules/.bin`, or install just the CLI
 globally with `npm i -g @lawaty/lacode` if you want the bare command. (That
