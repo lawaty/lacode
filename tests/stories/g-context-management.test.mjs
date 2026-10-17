@@ -24,7 +24,8 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { AGENTS, POOLED_BASES } from "../../src/agents.ts"
 import { COMMANDS } from "../../src/commands.ts"
@@ -389,6 +390,79 @@ test("[US-20] a failed run releases its slot and requeues its paths instead of s
   assert.equal(stub.created.length, 2, `the requeued path must produce a second run:\n${stub.text().join("\n")}`)
   assert.ok(stub.prompts[1].body.parts[0].text.includes("src/tunnel/index.ts"), "a failed run's paths must survive to the next one")
   await hooks.dispose?.()
+})
+
+// Every autoupdate test below now ends with a retirement, and a retirement writes
+// a transcript. Pinned for the WHOLE file, not per test: the run happens on a
+// later microtask, by which point any per-test HOME override has been restored,
+// so a per-test redirect silently writes into the developer's real data
+// directory instead. One directory for the file cannot drift.
+const TRANSCRIPT_DIR = mkdtempSync(join(tmpdir(), "lacode-transcripts-"))
+process.env.LACODE_TRANSCRIPT_DIR = TRANSCRIPT_DIR
+
+// The transcript directory is pinned above. It cannot be done by
+// redirecting HOME: the retirement runs on a later microtask, by which time
+// bootAutoupdate's withHome has already restored HOME, so the plugin would write
+// into the developer's real data directory instead.
+const withTranscriptDir = async (fn) => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-transcripts-case-"))
+  const previous = process.env.LACODE_TRANSCRIPT_DIR
+  process.env.LACODE_TRANSCRIPT_DIR = dir
+  try {
+    return { dir, ...(await fn()) }
+  } finally {
+    process.env.LACODE_TRANSCRIPT_DIR = previous ?? TRANSCRIPT_DIR
+  }
+}
+
+test("[US-20] a finished cartographer run retires its session and keeps the transcript", async () => {
+  const { stub, hooks } = await bootAutoupdate()
+  await withTranscriptDir(async () => {
+    await hooks.event({ event: { type: "file.edited", properties: { file: "src/tunnel/index.ts" } } })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+    // prompt() resolves on a microtask and the retirement follows it.
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  })
+
+  // The user's session list is root sessions only, and the cartographer is created
+  // with no parent -- so it lands in the main list and buries real work. It is
+  // exported first and deleted second, in that order: the transcript is the only
+  // record of what the run did.
+  assert.deepEqual(stub.messages, ["created-1"], "the transcript must be read BEFORE the session is deleted")
+  assert.deepEqual(stub.deleted, ["created-1"], "the finished session must leave the user's session list")
+})
+
+test("[US-20] the transcript is written where the user can read it, and is not an empty shell", async () => {
+  const { stub, hooks } = await bootAutoupdate()
+  const { dir } = await withTranscriptDir(async () => {
+    await hooks.event({ event: { type: "file.edited", properties: { file: "src/tunnel/index.ts" } } })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    return {}
+  })
+  void stub
+
+  const written = existsSync(dir) ? readdirSync(dir) : []
+  assert.equal(written.length, 1, `expected one transcript on disk, got ${JSON.stringify(written)}`)
+  const saved = JSON.parse(readFileSync(join(dir, written[0]), "utf8"))
+  assert.equal(saved.sessionID, "created-1", "the transcript must name the session it came from")
+  assert.ok(Array.isArray(saved.messages) && saved.messages.length > 0, "the transcript must carry the messages, not an empty shell")
+})
+
+test("[US-20] a cartographer run that fails is retired too, so a failing loop cannot fill the list", async () => {
+  const { stub, hooks } = await bootAutoupdate()
+  stub.client.session.prompt = async () => {
+    throw new Error("gateway refused")
+  }
+  await withTranscriptDir(async () => {
+    await hooks.event({ event: { type: "file.edited", properties: { file: "src/tunnel/index.ts" } } })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  })
+
+  // A failing cartographer is the case that matters most: it retries on every
+  // window, so leaving its sessions behind is exactly what fills the list.
+  assert.deepEqual(stub.deleted, ["created-1"], "a failed run must be retired as well")
 })
 
 // ---------------------------------------------------------------------------

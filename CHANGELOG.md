@@ -11,6 +11,20 @@ commit as the changelog entry it describes.
 
 ### Changed
 
+- **A finished cartographer run leaves the session list.** opencode's list shows
+  root sessions, and the cartographer was created with no `parentID` — so every
+  automatic run landed in the user's main list and buried real work (112 of them
+  on one machine). Nesting it under the triggering session is unsafe:
+  `pool.bindChild` adopts a fresh child into any claim the parent holds without a
+  target, which is exactly what a root has while its own explore tasks are in
+  flight, and the reaper would abort the cartographer as though it were the hung
+  task. Archiving is unavailable in 1.18.34 — no archive method, and `session.list`
+  takes only `directory`. So the run now exports its transcript to
+  `~/.local/share/opencode/lacode/cartographer/` (last 20 kept, override with
+  `LACODE_TRANSCRIPT_DIR`) and deletes the session, on the failure path as well as
+  the success path, since a retrying cartographer is what fills a list fastest.
+  Its notifications were already suppressed.
+
 - **A slot's concurrency ceiling is now twice its weight.** Weight still sets how
   many turns a slot takes per weighted round-robin rotation, but the ceiling is
   `2 × weight`, so one full rotation fills only half the pool and the run is walked

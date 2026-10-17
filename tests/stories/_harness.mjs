@@ -89,7 +89,7 @@ export const fakeClock = (start = 1_700_000_000_000) => {
  * `created` collects `session.create` calls (context-autoupdate borrows a slot
  * that way, bypassing the task hook entirely).
  */
-export const stubInput = ({ sessions = {}, directory = "/tmp/lacode-story", created = [], prompts = [] } = {}) => {
+export const stubInput = ({ sessions = {}, directory = "/tmp/lacode-story", created = [], prompts = [], messages = [], deleted = [] } = {}) => {
   const lines = []
   const client = {
     app: {
@@ -107,6 +107,17 @@ export const stubInput = ({ sessions = {}, directory = "/tmp/lacode-story", crea
         prompts.push(input)
         return { data: { info: {} } }
       },
+      // The cartographer retires its own session once the turn ends: it writes the
+      // transcript out and then deletes the session so it stops appearing in the
+      // user's session list. Both are observable here.
+      messages: async ({ path: p }) => {
+        messages.push(p.id)
+        return { data: [{ info: { id: "m1" }, parts: [{ type: "text", text: `transcript for ${p.id}` }] }] }
+      },
+      delete: async ({ path: p }) => {
+        deleted.push(p.id)
+        return { data: true }
+      },
     },
   }
   return {
@@ -118,6 +129,8 @@ export const stubInput = ({ sessions = {}, directory = "/tmp/lacode-story", crea
     text: () => lines.map((l) => `${l.level} ${l.message}`),
     created,
     prompts,
+    messages,
+    deleted,
   }
 }
 

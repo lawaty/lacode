@@ -1,4 +1,5 @@
-import { existsSync, readdirSync, statSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
 import * as path from "node:path"
 import type { Hooks, PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
@@ -116,6 +117,72 @@ const changedSince = (before: Map<string, string>, dir: string) => {
   for (const [name, stamp] of after) if (before.get(name) !== stamp) changed++
   for (const name of before.keys()) if (!after.has(name)) changed++
   return changed
+}
+
+/** How many finished cartographer transcripts to keep on disk. */
+const RETAIN_TRANSCRIPTS = 20
+// Resolved LAZILY, at call time, and never cached: `os.homedir()` reads HOME when
+// it is called, so a test that redirects HOME gets its own directory for free.
+// Computing it once at module load would pin the real one and let the suite write
+// into the developer's data directory.
+const transcriptDir = () =>
+  process.env.LACODE_TRANSCRIPT_DIR ?? path.join(homedir(), ".local", "share", "opencode", "lacode", "cartographer")
+
+/**
+ * Take a finished cartographer session out of the user's session list, keeping
+ * its transcript somewhere readable.
+ *
+ * The obvious alternative — nest it under the session that triggered it, so
+ * opencode's list (which shows only root sessions) skips it — is unsafe. Nesting
+ * makes it a child of a root that is holding unbound claims for its own in-flight
+ * explore tasks, and `pool.bindChild` adopts a fresh child into exactly such a
+ * claim; the reaper would then abort the cartographer as though it were the hung
+ * task. Archiving is not available either: 1.18.34 exposes no archive method and
+ * `session.list` takes only `directory`.
+ *
+ * So the session is written out and then deleted. The transcript is the point:
+ * deleting without it would lose the only record of what the cartographer did,
+ * and the user asked to be able to look without it cluttering the list.
+ *
+ * Never throws. Retiring is housekeeping; a failure here must not be able to
+ * fail the autoupdate run that triggered it.
+ */
+const retireSession = async (
+  client: { session: { messages: (o: unknown) => Promise<unknown>; delete: (o: unknown) => Promise<unknown> } },
+  directory: string,
+  sessionID: string,
+  mode: string,
+) => {
+  try {
+    const transcript = await client.session
+      .messages({ path: { id: sessionID }, query: { directory } })
+      .then((r) => (r as { data?: unknown }).data)
+      .catch(() => undefined)
+    const dir = transcriptDir()
+    mkdirSync(dir, { recursive: true })
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-")
+    const file = path.join(dir, `${stamp}-${mode}.json`)
+    writeFileSync(file, JSON.stringify({ sessionID, mode, messages: transcript ?? null }, null, 2))
+    pruneTranscripts(dir)
+    await client.session.delete({ path: { id: sessionID }, query: { directory } }).catch(() => undefined)
+  } catch {
+    /* an unreadable or undeletable session stays in the list; that is survivable */
+  }
+}
+
+// Oldest-first, by the timestamp in the filename. Bounded so a long-lived server
+// does not trade a cluttered list for a cluttered disk.
+const pruneTranscripts = (dir: string) => {
+  try {
+    const entries = readdirSync(dir)
+      .filter((name) => name.endsWith(".json"))
+      .sort()
+    for (const name of entries.slice(0, Math.max(0, entries.length - RETAIN_TRANSCRIPTS))) {
+      try { unlinkSync(path.join(dir, name)) } catch {}
+    }
+  } catch {
+    /* no transcripts yet */
+  }
 }
 
 // NOTE: this module exports the hook factory and nothing else. opencode treats
@@ -277,6 +344,10 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           })
           .then(async (result) => {
             pool.release(state, claimKey)
+            // Retire the session from the list as soon as it is done with, and
+            // only AFTER writing its transcript somewhere the user can still read
+            // it. See retireSession for why it cannot simply be nested away.
+            await retireSession(client, directory, target, mode)
             // prompt() resolves when the turn ends — including when it ends in
             // an abort (host shutting down) or an error. Only report success
             // when the assistant message actually completed.
@@ -307,6 +378,7 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           })
           .catch(async (error) => {
             pool.release(state, claimKey)
+            await retireSession(client, directory, target, mode)
             requeue()
             await log("error", `auto ${mode} failed: ${String(error)}`)
           })
