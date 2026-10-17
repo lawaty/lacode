@@ -25,6 +25,14 @@ commit as the changelog entry it describes.
   the life of the process. Both are now swept by the reaper and on every spawn, and
   the notifier's per-session bookkeeping (`active` / `titles`) is capped at 500.
 
+- **The routing log no longer prints a slot variant's name.** It read
+  `routed explore -> explore-2`, which is read by the very agent being routed and
+  hands it a valid-looking agent name in the exact place it decides what to spawn.
+  The refusals that followed were the model copying those names back —
+  `implement-4` 23 times, `implement-2` 20, `explore-2` 12, roughly one per routed
+  spawn. The line now names the slot and the model, which is the same diagnostic
+  value with nothing for the model to echo. The refusal itself is unchanged.
+
 - **A provider-stated reset can no longer bench a model for days.** A stated
   window ("Resets in 35min") is still trusted over the computed backoff, but the
   parse was unbounded, so one malformed upstream number removed a slot from

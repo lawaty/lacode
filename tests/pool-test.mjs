@@ -488,6 +488,27 @@ assert(
 )
 
 console.log(statusOut)
+
+// The routing log is read by the agent it routes. It must therefore never print a
+// slot variant's NAME: that hands the model a valid-looking agent name in the
+// exact place it decides what to spawn, and the refusals that followed showed it
+// copying them straight back (implement-4 23x, explore-2 12x -- one per routed
+// spawn). The slot index and the model carry the same diagnostic value.
+{
+  const routed = logs.filter((l) => l.includes("routed "))
+  assert(routed.length > 0, "the burst must have produced routing lines to check")
+  for (const line of routed) {
+    assert(
+      !/routed (explore|implement|context)-\d/.test(line),
+      `a routing line must not name a slot variant, got: ${line}`,
+    )
+  }
+  assert(
+    routed.some((l) => /routed explore to slot \d+ on \S+/.test(l)),
+    `a routing line must still name the slot and the model, got: ${routed[0]}`,
+  )
+}
+
 rmSync(dir1, { recursive: true, force: true })
 rmSync(dir3, { recursive: true, force: true })
 rmSync(dir4, { recursive: true, force: true })

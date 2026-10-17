@@ -479,7 +479,16 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
           }
           pool.acquire(s, requested, slot, input.sessionID, pool.claimKey(input.sessionID, input.callID))
           output.args.subagent_type = variant
-          await log("info", `routed ${requested} -> ${variant}`, {
+          // The variant's NAME is deliberately absent from this line.
+          //
+          // This log is read by the very agent it routes. Printing "routed explore
+          // -> explore-2" hands the model a valid-looking agent name in the exact
+          // place it is deciding what to spawn, and the refusals that follow show
+          // it copying those names straight back: `implement-4` 23 times,
+          // `implement-2` 20, `explore-2` 12 -- one occurrence per routed spawn.
+          // The slot index and the model say everything an operator needs and give
+          // the model nothing to echo.
+          await log("info", `routed ${requested} to slot ${slot.index} on ${slot.model}`, {
             slot: slot.index,
             weight: slot.weight,
             model: slot.model,
