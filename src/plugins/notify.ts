@@ -62,6 +62,24 @@ import { PACKAGE_ROOT } from "../lib/pool.ts"
 
 const SERVICE = "notify"
 const COOLDOWN_MS = 5_000
+// Bounds on the SPAWN, deliberately not on which notifications are decided.
+//
+// Question, permission and error outcomes bypass the notification cooldown on
+// purpose -- three tests pin it, and the reason is right: a session blocked on a
+// prompt the user was never told about is the exact silent stall this plugin
+// exists to prevent. What that permits is an unbounded number of helper
+// PROCESSES: each delivery spawns `bin/oc-notify` -> `bin/oc` -> an ssh attempt,
+// detached and unref'd, so a failure storm can start one per event with nothing
+// reaping them.
+//
+// So the bound goes here, on the transport, where it cannot suppress a decision
+// the plugin already made. A delivery dropped by the cap is still logged, and the
+// user's next notification arrives normally.
+const MAX_INFLIGHT_HELPERS = 4
+// An ssh hop to a machine that has gone away can sit there indefinitely. This is
+// generous enough for a slow but working tunnel, and short enough that a dead
+// one is not held for the life of the server.
+const HELPER_TIMEOUT_MS = 30_000
 // Hard cap on the per-session bookkeeping (`active` / `titles`). `session.deleted`
 // is the intended cleanup, but a long-running server must not depend on EVERY
 // session being deleted to stay bounded -- an abandoned session may never emit it.
@@ -129,7 +147,7 @@ const findHelper = (): string | undefined => {
  */
 export type Delivery = (title: string, message: string, urgency: string, sound: string) => Promise<{ ok: boolean; detail?: string }>
 
-export type NotifyDeps = { deliver?: Delivery }
+export type NotifyDeps = { deliver?: Delivery; maxInflightHelpers?: number; helperTimeoutMs?: number }
 
 /**
  * The plugin options this factory reads, narrowed from the loose value opencode
@@ -143,6 +161,10 @@ export type NotifyOptions = {
 
 // A factory returning hooks, not a Plugin -- see the note in ./agent-pool.ts.
 export const notifyHooks = (async ({ client, directory }, options?: unknown, deps: NotifyDeps = {}): Promise<Hooks> => {
+  // Overridable so a test can drive both bounds without waiting 30 seconds or
+  // starting four real helpers. The defaults are what ship.
+  const maxInflight = deps.maxInflightHelpers ?? MAX_INFLIGHT_HELPERS
+  const helperTimeoutMs = deps.helperTimeoutMs ?? HELPER_TIMEOUT_MS
   // Sound on or off, decided ONCE and here, so the rest of the file works from a
   // plain boolean and never re-reads the environment: there is exactly one place
   // where "is sound on" is answered.
@@ -179,6 +201,9 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   // session announce itself as finished.
   const permissions = new Set<string>()
   let warnedHelper = false
+  // Helpers currently running. Bounded by MAX_INFLIGHT_HELPERS; see that constant
+  // for why the bound is on the spawn and not on the notification decision.
+  let inflight = 0
 
   // The two per-session stores that grow with every session seen; both are capped
   // so a long-running server cannot let them grow without bound. See MAX_TRACKED_SESSIONS.
@@ -208,6 +233,13 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   // "notified" is only claimed when the helper actually succeeded.
   const deliverViaHelper = (title: string, message: string, urgency: string, sound: string) =>
     new Promise<{ ok: boolean; detail?: string }>((resolve) => {
+      // The cap, before anything is spawned. Settled exactly once on every path
+      // below, so the count can never drift upward and wedge the transport shut.
+      if (inflight >= maxInflight) {
+        void log("warn", `notification dropped: ${inflight} helpers already in flight`, { title })
+        resolve({ ok: false, detail: `too many notification helpers in flight (${inflight})` })
+        return
+      }
       const helper = findHelper()
       if (!helper) {
         if (!warnedHelper) {
@@ -229,13 +261,32 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         stdio: ["ignore", "ignore", "pipe"],
         detached: true,
       })
+      inflight++
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const finish = (result: { ok: boolean; detail?: string }) => {
+        if (settled) return
+        settled = true
+        inflight--
+        if (timer) clearTimeout(timer)
+        resolve(result)
+      }
+      // A hop to a machine that is gone must not hold its slot forever. Killed,
+      // not merely abandoned: the process is already detached, so leaving it
+      // running is what the timeout exists to prevent.
+      timer = setTimeout(() => {
+        try { child.kill("SIGKILL") } catch {}
+        void log("warn", `notification helper timed out after ${helperTimeoutMs}ms`, { title })
+        finish({ ok: false, detail: `helper timed out after ${helperTimeoutMs}ms` })
+      }, helperTimeoutMs)
+      timer.unref?.()
       let stderr = ""
       child.stderr?.on("data", (chunk) => {
         if (stderr.length < 400) stderr += String(chunk)
       })
       child.on("error", (error) => {
         void log("warn", `notification helper failed: ${String(error)}`, { title })
-        resolve({ ok: false, detail: String(error) })
+        finish({ ok: false, detail: String(error) })
       })
       child.on("exit", (code) => {
         const noise = stderr.trim()
@@ -243,8 +294,8 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         // exit code, and any text it wrote to stderr.
         //
         // The exit code is primary -- oc-notify propagates send_notify's status, and
-        // the hop's real failure (ssh's "Permission denied (publickey,password)")
-        // is a bare non-zero exit from ssh, which the tunnel's LogLevel=ERROR hides.
+        // the hop's real failure (ssh's "Permission denied (publickey,password)") is
+        // a bare non-zero exit from ssh, which the tunnel's LogLevel=ERROR hides.
         // Matching on stderr text alone missed exactly that case and logged a
         // failed delivery as sent. Stderr is still treated as a failure, because a
         // successful send is silent and there is nothing benign for it to print.
@@ -255,7 +306,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
             message,
           })
         }
-        resolve({ ok, detail: noise || undefined })
+        finish({ ok, detail: noise || undefined })
       })
       child.unref()
     })

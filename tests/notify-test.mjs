@@ -666,6 +666,73 @@ await check("the handler swallows a session.get failure", async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
+// The two spawn bounds. Both live on the TRANSPORT, not on which notifications
+// are decided: a blocked session must never be silenced, but it also must not be
+// able to start an unbounded number of helper processes.
+//
+// Neither test injects the `deliver` seam -- that would bypass the spawn these
+// bounds exist to constrain and make the test assert nothing. Both drive the real
+// spawn through a fake OC_NOTIFY_HELPER and read the delivery detail back out of
+// the log the failure path already writes.
+
+// Collects the `detail` the plugin logs when a delivery does not succeed.
+const collecting = () => {
+  const details = []
+  const client = {
+    app: {
+      log: async ({ body }) => {
+        if (body.message === "notification failed" && body.extra?.detail) details.push(body.extra.detail)
+      },
+    },
+    session: { get: async () => ({ data: { id: "r", title: "Deploy" } }) },
+  }
+  return { client, details }
+}
+// An unrecognized error notifies, and blocking outcomes bypass the cooldown, so
+// each of these is a distinct delivery rather than a suppressed duplicate.
+const fireError = (hooks, message) =>
+  hooks.event({ event: { type: "session.error", properties: { sessionID: "r", error: { message } } } })
+
+await check("the helper spawn is capped, and the cap drops only the excess", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-cap-"))
+  // Slow enough that every notification is still in flight when the next arrives.
+  const helper = join(dir, "oc-notify")
+  writeFileSync(helper, `#!/usr/bin/env bash\nsleep 2\n`, { mode: 0o755 })
+  const { client, details } = collecting()
+  const hooks = await Notify({ client, directory: dir }, undefined, { maxInflightHelpers: 2, helperTimeoutMs: 30_000 })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "r", status: { type: "busy" } } } })
+  for (const message of ["one", "two", "three", "four", "five"]) await fireError(hooks, `boom ${message}`)
+  await new Promise((resolve) => setTimeout(resolve, 3500))
+
+  const capped = details.filter((d) => d.includes("too many notification helpers in flight"))
+  assert(capped.length === 3, `with a cap of 2 and five notifications, exactly three must be dropped, got ${capped.length}: ${JSON.stringify(details)}`)
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("a helper that never answers is reported as a timeout, not waited on", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-timeout-"))
+  const helper = join(dir, "oc-notify")
+  // Far longer than the timeout under test: the point is that we do not wait.
+  writeFileSync(helper, `#!/usr/bin/env bash\nsleep 30\n`, { mode: 0o755 })
+  const { client, details } = collecting()
+  const hooks = await Notify({ client, directory: dir }, undefined, { helperTimeoutMs: 300 })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "r", status: { type: "busy" } } } })
+  await fireError(hooks, "never answers")
+  await new Promise((resolve) => setTimeout(resolve, 900))
+
+  assert(details.length === 1, `the hung helper must produce exactly one outcome, got ${details.length}: ${JSON.stringify(details)}`)
+  assert(details[0].includes("timed out"), `a hung helper must be reported as a timeout, got: ${details[0]}`)
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
 // ---------------------------------------------------------------------------
 
 console.log(`${passed} checks passed`)

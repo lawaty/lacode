@@ -33,6 +33,15 @@ commit as the changelog entry it describes.
   spawn. The line now names the slot and the model, which is the same diagnostic
   value with nothing for the model to echo. The refusal itself is unchanged.
 
+- **The notification helper spawn is bounded.** Question, permission and error
+  outcomes bypass the notification cooldown on purpose — a session blocked on a
+  prompt the user was never told about is the silent stall this plugin exists to
+  prevent — so a failure storm could start one detached helper per event, each
+  `bin/oc-notify` → `bin/oc` → an ssh attempt, with nothing reaping them. The
+  bound is on the transport, not on the decision: at most 4 helpers in flight,
+  and one that has not answered in 30s is killed. Which notifications fire is
+  unchanged.
+
 - **A provider-stated reset can no longer bench a model for days.** A stated
   window ("Resets in 35min") is still trusted over the computed backoff, but the
   parse was unbounded, so one malformed upstream number removed a slot from

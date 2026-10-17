@@ -46,21 +46,6 @@ than a dirty list.
 Whichever is chosen needs a test that a cartographer never appears in the list,
 and one that a root with an in-flight claim does not adopt it.
 
-## No helper-spawn bound on the notification path
-
-`src/plugins/notify.ts` spawns one detached, unref'd helper per notification
-(`bin/oc-notify` → `bin/oc` → an ssh attempt). Blocking outcomes — question,
-permission, error — deliberately bypass the cooldown, which three `[US-11]` and
-`[US-25]` tests pin, so a failure storm can spawn a subprocess per event with
-nothing reaping them.
-
-The notification semantics must not change: a blocked session must never be
-silenced. The fix belongs in the spawn itself — a cap on helpers in flight and
-a timeout on the helper — not in which notifications are decided.
-
-Not the cause of the MLBB memory crash: the captured processes were Node's test
-runner, not this path. It is still an unbounded spawn.
-
 ## Session memory has no user story
 
 `docs/USER-STORIES.md` has no requirement covering a long-running session
