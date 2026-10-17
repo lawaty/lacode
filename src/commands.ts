@@ -124,7 +124,8 @@ Follow the rules for the file in your system prompt, then report what you change
 Print one PASS/FAIL line per check below, with the exact fix for any FAIL.
 
 1. Pool status — call the \`pool_status\` tool. Report the slot list, each
-   slot's load against its weight ceiling, and which models are cooling.
+   slot's load against its ceiling (twice the slot's weight), and which models
+   are cooling.
 
 2. OmniRoute configured — inspect the \`@lawaty/lacode\` plugin options in the
    user's opencode config for an \`omniroute\` block with \`enabled: true\`. If it
@@ -163,7 +164,7 @@ The pool is ONE global slot table shared by every pooled base (explore, implemen
 2. Resolve the instruction above into a target slot table. These are the rules the loader enforces — never write a file that breaks one:
    - one slot per line: \`<provider>/<model-id>  [weight]\`
    - at most ${MAX_SLOTS} slots, and a model may appear only once
-   - weight is optional (default 1) and must be a number in (0, ${MAX_WEIGHT}]. It is the soft ceiling on concurrent claims and the slot's share of the rotation — NOT a priority; pick order follows line order.
+   - weight is optional (default 1) and must be a number in (0, ${MAX_WEIGHT}]. It is the slot's share of the rotation — how many turns it takes per cycle — and its concurrency ceiling is twice that. NOT a priority; pick order follows line order.
    - \`#\` starts a comment (whole-line or trailing); blank lines are ignored.
    If the instruction names a model ambiguously, or would need more than ${MAX_SLOTS} slots, stop and ask rather than guessing.
 

@@ -25,8 +25,10 @@ as an opencode provider for you. It is **off by default**: if you do not set
    `auto` is the zero-config default, but on a free tier it often resolves to a
    slow chain. [A tested fast combo](#a-tested-fast-combo-free-mix) below is
    ordered for latency and is worth applying on a new client.
-3. Optionally, to route pooled work through it, make `omniroute/auto 3` the
-   **first** line of `~/.config/lacode/pool.txt`. `pool.txt` is optional user
+3. Optionally, to route pooled work through it, add an `omniroute/<id>` slot to
+   `~/.config/lacode/pool.txt` exactly as you would any other provider. The
+   integration gives it no special precedence, priority or weight — its place and
+   weight in the pool are whatever you configure. `pool.txt` is optional user
    config; the bundled default preset does **not** include OmniRoute.
 4. **Restart opencode.** Nothing here hot-reloads.
 
@@ -64,7 +66,7 @@ The full option set, for reference:
 | `enabled` | `false` | Turns the integration on. |
 | `baseURL` | `http://localhost:20128/v1` | Gateway base URL, normalised to exactly one `/v1`. |
 | `apiKey` | — | Bearer key. **`OMNIROUTE_API_KEY` overrides this value.** The key is never logged. |
-| `combo` | — | An OmniRoute combo id (or `auto`) to expose as a selectable model even though the gateway does not list it. Exposed first. |
+| `combo` | — | An OmniRoute combo id (or `auto`) to expose as a selectable model even though the gateway does not list it. It leads the provider's own model list — an OmniRoute-side detail, unrelated to pool order. |
 | `models` | — | A **hard allowlist**: only these ids are ever exposed, even if the gateway lists more. |
 | `tiers` | — | `{ "primary": [...], "backup": [...] }` preference order over models the allowlist already permits. |
 | `stickyPerSession` | `true` | Keep a session on one model while that model is healthy. |
@@ -95,23 +97,23 @@ failed.
 
 **Using OmniRoute in the pool.** The integration only *registers* the provider —
 it never touches your pool, and it does not place a slot for you. To route pooled
-work (exploration, implementation, cartography) through the gateway, list it in
-your pool like any other model:
+work (exploration, implementation, cartography) through the gateway, add an
+`omniroute/<id>` slot to your pool like any other model:
 
 ```
 # ~/.config/lacode/pool.txt
-omniroute/auto             3
-opencode/space-bunny-free  2
-opencode-go/longcat-2.5-preview-free 1
-opencode/big-pickle        1
+omniroute/free-mix
+opencode/space-bunny-free
+opencode-go/longcat-2.5-preview-free
 ```
 
-`omniroute/auto` then takes slot 1 (weight 3) and drains pooled mechanical work
-before it reaches the bundled opencode/opencode-go ("zen") models. Any
-`omniroute/<id>` works, provided the id is exposed — by `combo`/`models`, or the
-whole catalog when neither is set. Because the plugin writes the pool nothing,
-the only thing that changes when the gateway is down is that `omniroute/<id>`
-fails; every other slot keeps working. See
+OmniRoute is a provider like any other: the pool decides its place and weight,
+and neither the pool nor this integration gives it any built-in precedence or
+priority — where it sits and how many turns it takes are whatever you configure.
+Any `omniroute/<id>` works, provided the id is exposed — by `combo`/`models`, or
+the whole catalog when neither is set. Because the plugin writes the pool
+nothing, the only thing that changes when the gateway is down is that
+`omniroute/<id>` fails; every other slot keeps working. See
 [docs/USER-STORIES.md](USER-STORIES.md) US-28.
 
 

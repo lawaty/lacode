@@ -9,7 +9,8 @@
 // the next position in that run, and each spawn scans the run from there and takes the
 // FIRST slot which is both not cooling and under its ceiling. Weight therefore says
 // how OFTEN a slot is preferred; the cursor says WHICH turn comes next, and the
-// ceiling is unchanged either way: a slot still holds at most `weight` claims.
+// ceiling is twice the weight, so a slot holds up to 2 x its weight claims -- one full
+// rotation fills half the pool, and the run must be walked twice to fill it.
 //
 // The difference from weight-as-priority is visible in the very first spawn. The old
 // rule drained the heaviest slot first, so a light slot declared before a heavy one

@@ -102,10 +102,10 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 **Story ID(s) for tests:** US-5
 **Acceptance criteria:**
 - [ ] Given a heavy slot and a light slot, When spawns are routed below both ceilings, Then the rotation walks the list in order with each slot taking as many consecutive turns as its weight says, rather than the heavy slot being filled and refilled first.
-- [ ] Given a slot is at its weight ceiling or cooling, When its turn comes up in the rotation, Then the turn is skipped and the rotation resumes at the following turn.
+- [ ] Given a slot is at its ceiling (twice its weight) or cooling, When its turn comes up in the rotation, Then the turn is skipped and the rotation resumes at the following turn.
 - [ ] Given every slot is at its ceiling, When another spawn is routed, Then it goes to the least-loaded slot as overflow.
 - [ ] Given all slots carry equal weight, When spawns are routed, Then the picks round-robin in declaration order.
-- [ ] Given per-slot load is read, When it is asserted, Then a slot's load never exceeds its weight ceiling except by overflow.
+- [ ] Given per-slot load is read, When it is asserted, Then a slot's load never exceeds its ceiling (twice its weight) except by overflow.
 
 ### US-6: Live pool visibility
 **As a** user, **I want** to see per-slot load and which model is cooling and why, **so that** I understand where my subagents are going.

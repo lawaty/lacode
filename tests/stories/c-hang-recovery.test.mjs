@@ -259,6 +259,34 @@ test("[US-8] findStuck names the fault it condemned on: overran at the ceiling, 
   assert.deepEqual(pool.findStuck(s, now + MIN).map((e) => e.reason), ["overran", "hung"], `reasons must not drift:\n${JSON.stringify(stuck)}`)
 })
 
+test("[US-9] the per-session maps are pruned, so a long-running server stays bounded", async () => {
+  // The leak this exists for: `activity` and `children` were written on every
+  // message event and every session.created and never removed, so a server
+  // accumulated one entry per session it had ever seen for the life of the process.
+  // pruneSessions() (called by the reaper and by snapshot) must drop the dead ones
+  // while keeping everything a live claim still needs.
+  const s = pool.state({ id: "prune-sessions", dir: scratch("lacode-prune-") })
+  const now = Date.now()
+  const staleActivity = now - 20 * MIN // past CLAIM_TTL (10m)
+  const staleChild = now - 40 * MIN // past CHILD_MEMORY (30m)
+
+  // A live claim's target keeps its activity however old the last event was.
+  s.own.set("live", { v: "explore", k: 1, m: "hang/model", t: now, g: "child-live" })
+  s.activity.set("child-live", staleActivity)
+  // No live claim points at this one: dead weight, to be dropped.
+  s.activity.set("child-orphan", staleActivity)
+
+  s.children.set("parent-live", [{ id: "child-live", t: now }])
+  s.children.set("parent-stale", [{ id: "child-stale", t: staleChild }])
+
+  pool.pruneSessions(s)
+
+  assert.ok(s.activity.has("child-live"), "a live claim's target must be kept")
+  assert.ok(!s.activity.has("child-orphan"), "an activity entry nothing references must be dropped")
+  assert.ok(s.children.has("parent-live"), "a parent with a recent child must be kept")
+  assert.ok(!s.children.has("parent-stale"), "a parent with only expired children must be dropped")
+})
+
 // ---------------------------------------------------------------------------
 // US-9 -- capacity recovers
 // ---------------------------------------------------------------------------
@@ -268,11 +296,11 @@ test("[US-9] a reaped claim's capacity is available to the next routing decision
   const net = stubFetch()
   const { hooks, cfg } = await bootPool("us9-recover")
 
-  // Fill the only slot to its ceiling of 2, then wedge both claims.
+  // Fill the only slot to its doubled ceiling of 4, then wedge both claims.
   await spawnChild(hooks, cfg, { callID: "a", childID: "w1" })
   await spawnChild(hooks, cfg, { callID: "b", childID: "w2" })
   const full = await hooks.tool.pool_status.execute({}, {})
-  assert.match(full.output, /load=2\/2/, `control: the slot is full:\n${full.output}`)
+  assert.match(full.output, /load=2\/4/, `control: the slot is filling:\n${full.output}`)
 
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
   await spawn(hooks, cfg, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
@@ -281,7 +309,7 @@ test("[US-9] a reaped claim's capacity is available to the next routing decision
   await hooks["tool.execute.after"]({ tool: "task", sessionID: "trigger", callID: "trigger" }, {})
 
   const after = await hooks.tool.pool_status.execute({}, {})
-  assert.match(after.output, /load=0\/2/, `both wedged claims must be gone in the same process:\n${after.output}`)
+  assert.match(after.output, /load=0\/4/, `both wedged claims must be gone in the same process:\n${after.output}`)
   assert.match(after.output, /\[idle[;\]]/, `the slot must carry nothing:\n${after.output}`)
   assert.match(after.output, /0 claim\(s\) in flight/, `the slot must be free again:\n${after.output}`)
 

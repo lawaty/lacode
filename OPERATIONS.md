@@ -71,22 +71,25 @@ At most **4 slots**: the plugin injects one hidden variant per base per slot fro
 `src/agents.ts`, so a fifth entry would route spawns at an agent that does not exist.
 Entries past the fourth are dropped with a warning, not silently ignored.
 
-`weight` is a **soft ceiling on how many concurrent sessions one slot runs**, and that same
-number is its priority. Two rules, in order:
+`weight` is a slot's **share of the rotation** — how many turns it takes per cycle — and its
+concurrency ceiling is **twice that**. Two rules, in order:
 
-1. the **highest-weight slot still under its ceiling** takes the spawn, so the main model
-   gets its 3 sessions to itself before slot 2 sees any work
+1. the weighted round-robin run (each slot one position per unit of weight, in list order:
+   `3,2,1,1` → `1,1,1,2,2,3,4`) is walked from a shared cursor, and the first slot that is
+   neither cooling nor at its ceiling takes the spawn, so no slot is drained before the others
+   see work
 2. once **every** slot is at its ceiling, the overflow goes to the least loaded slot, so a
    burst past the summed ceilings equalises instead of piling up or blocking
 
 So `3,2,1,1` produces `1,1,1,2,2,3,4,…` — ordered preference, with the bottom of the list as
-reserve. Weights are dynamic and deliberately unequal, so this is never a share calculation:
-a slot either has room under its ceiling or it does not. Equal weights give a round robin in
-list order, and `2,2,1,1` is a primary/overflow cycle: two slots share the load
-before either overflow slot sees work.
+reserve. The ceiling is deliberately larger than the rotation share, so one full rotation fills
+only half the pool and the run is walked twice before every slot is full; a burst that outruns
+one rotation still lands on the heavy slot rather than falling straight through to overflow.
+Equal weights give a plain round robin in list order.
 
-Raise a weight to let a model run more sessions at once, lower it to make it more of a
-reserve. No weight means `1`; anything that is not a number in `(0, 100]` warns and means `1`.
+Raise a weight to let a model take more turns — and hold twice as many concurrent sessions;
+lower it to make it more of a reserve. No weight means `1`; anything that is not a number in
+`(0, 100]` warns and means `1`.
 `tier` is an accepted alias for `weight` — `primary` is weight 2, `overflow` is
 weight 1 — read with a warning, so a host that has not picked up this file keeps two slots' worth
 of headroom.
@@ -113,7 +116,7 @@ restart every opencode process and confirm what is actually live:
 ```bash
 npm run build                   # this machine loads dist/, not src/
 opencode debug agent explore-1   # model it resolved
-opencode run "pool_status"            # slots, load/weight, ceilings, cooldowns
+opencode run "pool_status"            # slots, load/ceiling, cooldowns
 ```
 
 Failure modes are logged, never silent: a bad entry (no `provider/model-id`, a repeated
@@ -471,10 +474,11 @@ in `~/.local/share/opencode/` where it is.
 ## Troubleshooting
 
 **A pooled spawn went to an unexpected model.** Read the `routed` log line for the `slot=`,
-`weight=` and `ceiling=` fields, then check for a `limit.<provider>__<model>.json` file — a
+`weight=`, `ceiling=` and `load=` fields, then check for a `limit.<provider>__<model>.json` file — a
 stale one with a future `until` will keep diverting work. If the model is right but the slot
-is not the one you expected, that is the weight: routing takes the heaviest slot still under
-its ceiling, not the emptiest one.
+is not the one you expected, that is the rotation: routing walks the weighted run from a shared
+cursor and takes the first slot that is neither cooling nor at its ceiling (twice its weight) —
+not the emptiest and not the heaviest.
 
 **Everything routes to one provider.** Check for `limit.*.json` files cooling the other.
 A provider-wide `free_tier_limit` cools every slot on that provider at once, which is

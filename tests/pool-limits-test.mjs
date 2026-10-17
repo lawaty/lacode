@@ -129,6 +129,28 @@ const dirB = scratch()
   assert(seconds > 2000 && seconds <= 2100, `stated 35min cooldown should be honoured, got ${seconds}s`)
 }
 
+// 3b. a stated window is BOUNDED -- an absurd one is discarded, not obeyed.
+//
+// The failure this pins is real: an `account_rate_limit` carrying "retry in
+// 329917s" (~3.8 days) was honoured verbatim and benched a slot for 91.6 hours,
+// long past the window it was waiting for. A stated reset is text parsed out of
+// an upstream error, so it is trusted up to a ceiling and no further.
+{
+  assert(pool.statedCooldown("retry in 329917s") === undefined, "an absurd stated window must be discarded, not honoured")
+  assert(pool.statedCooldown("Resets in 35min.") === 35 * 60 * 1000, "an ordinary stated window must still be honoured")
+  assert(pool.statedCooldown("Resets in 2hr 17min") === (2 * 60 + 17) * 60 * 1000, "an hours+minutes stated window must still be honoured")
+  assert(pool.statedCooldown("retry in 90s") === 90 * 1000, "a seconds stated window must still be honoured")
+  assert(pool.statedCooldown("no window here") === undefined, "text with no stated window must stay undefined")
+
+  const c = await mk("p3b", scratch())
+  await c.limitEvent(FOREIGN.provider, FOREIGN.modelID, rateError("account_rate_limit: retry in 329917s"))
+  const seconds = Number(new RegExp(`${FOREIGN.modelID} for (\\d+)s`).exec(await c.status())?.[1])
+  assert(
+    seconds > 0 && seconds <= 6 * 3600,
+    `an absurd stated reset must not bench the model for days, got ${seconds}s`,
+  )
+}
+
 // 4. retry-after response header is honoured
 {
   const d = await mk("p4", scratch())

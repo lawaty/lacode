@@ -406,6 +406,37 @@ test("a sticky session keeps its model even when another model answers faster", 
   assert.equal(selector.select("s1"), "a")
 })
 
+test("the sticky table is bounded: a long-lived selector forgets its oldest assignments", () => {
+  // Only a FAILURE released a sticky assignment, so the table grew with every
+  // session the process ever served rather than with the sessions in flight --
+  // a slow leak in exactly the long-running server this plugin lives in. The
+  // bound evicts oldest-first, so the newest assignment is the one that survives.
+  const { selector } = clocked({ stickyPerSession: true })
+  selector.setCandidates(["a"])
+  for (let i = 0; i < 600; i++) selector.select(`s${i}`)
+  assert.ok(selector.stickySize() <= 500, `sticky table must stay bounded, got ${selector.stickySize()}`)
+  assert.equal(selector.stickyFor("s599"), "a", "the newest assignment must survive")
+  assert.equal(selector.stickyFor("s0"), null, "the oldest assignment is the one forgotten")
+})
+
+test("a refreshed sticky assignment counts as the newest entry", () => {
+  // select() re-inserts on every success -- including the fast path where it
+  // simply returns the held model -- so a session that keeps working keeps its
+  // row young. Without the re-insert, eviction order stays first-seen order and
+  // s0 (inserted first, still in active use) is dropped on the very next
+  // eviction instead of surviving it.
+  const { selector } = clocked({ stickyPerSession: true })
+  selector.setCandidates(["a"])
+  for (let i = 0; i < 500; i++) selector.select(`s${i}`)
+  selector.select("s0") // refresh the OLDEST row while it is still in use
+  // Exactly 499 fresh sessions: each evicts the current oldest, and after 499
+  // those evictions s0 has just become the oldest survivor. A 500th would evict
+  // it legitimately, which would assert nothing about the refresh.
+  for (let i = 500; i < 999; i++) selector.select(`s${i}`)
+  assert.equal(selector.stickyFor("s0"), "a", "a refreshed assignment must not be evicted as the oldest")
+  assert.equal(selector.stickyFor("s1"), null, "the un-refreshed oldest must be the one evicted")
+})
+
 test("without stickiness the selector prefers the lower measured latency", () => {
   const first = clocked()
   first.selector.setCandidates(["a", "b"])

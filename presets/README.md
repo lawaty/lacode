@@ -62,7 +62,7 @@ else means the flat form.
 | Field | Required | Meaning |
 |-------|----------|---------|
 | `model` | yes | `provider/model-id`, split on the **first** slash only |
-| `weight` | no | soft ceiling on concurrent claims, and turns taken per rotation. Absent = 1 |
+| `weight` | no | turns taken per rotation (the slot's share of the rotation); its concurrency ceiling is twice that. Absent = 1 |
 
 `$comment` is a JSON-legal array of strings and is ignored by the loader; the
 bundled preset uses it to explain itself in place.
@@ -91,9 +91,9 @@ because the pool requires it.
 
 ## Weight, precisely
 
-A weight is a count of concurrent sessions — a soft ceiling — and the number
-of turns a slot takes per rotation. Routing is **order-first weighted
-round-robin**:
+A weight is the number of turns a slot takes per rotation — its share of the
+work — and its concurrency ceiling is **twice that weight**: a weight-3 slot may
+hold 6 concurrent sessions. Routing is **order-first weighted round-robin**:
 
 1. the slot list is expanded into a run in which each slot appears once per
    unit of its weight — `[3,2,1,1]` becomes `1,1,1,2,2,3,4` — and the next

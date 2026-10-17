@@ -26,9 +26,27 @@ const MAX_WEIGHT = Math.max(...SHIPPED.map((s) => s.weight))
 const MIN_WEIGHT = Math.min(...SHIPPED.map((s) => s.weight))
 const HEAVY_MODELS = SHIPPED.filter((s) => s.weight === MAX_WEIGHT).map((s) => s.model)
 const LIGHT_MODELS = SHIPPED.filter((s) => s.weight === MIN_WEIGHT).map((s) => s.model)
+// A slot holds at most TWICE its weight (src/lib/pool.ts SLOT_CEILING_FACTOR): the
+// weight is its share of the rotation and the ceiling is deliberately larger than that
+// share, so a whole rotation can be walked twice before the pool is full. Written out
+// here as a literal rather than read off the module, because the doubled ceiling is the
+// rule under test, not a value to follow.
+const CEILING_FACTOR = 2
+const CEILINGS = SHIPPED.map((s) => s.weight * CEILING_FACTOR)
+// One rotation of the run: a slot takes one turn per unit of its weight, in
+// declaration order, so weights [3,2,1,1] walk 1,1,1,2,2,3,4. Derived from the file, so
+// a preset change is not a test edit.
+const RUN = SHIPPED.flatMap((slot, i) => Array(slot.weight).fill(i + 1))
+const ROTATION = RUN.length
 // The summed ceilings are where the weighted phase ends and overflow begins, so the
-// depth needed to see both is derived rather than guessed.
-const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
+// depth needed to see both is derived rather than guessed: a slot cannot reach twice
+// its weight on its own positions in a single rotation, so the weighted phase is
+// exactly two rotations long.
+const CAPACITY = ROTATION * CEILING_FACTOR
+// How far the burst has to go for the overflow to have levelled the pool: it can only
+// ever raise the least loaded slot, so the totals converge on the largest ceiling in
+// the pool and are equal from there on -- and stay within one past it.
+const LEVELED = SLOT_MODELS.length * MAX_WEIGHT * CEILING_FACTOR
 
 const logs = []
 const client = { app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) } }
@@ -41,6 +59,10 @@ const assert = (cond, msg) => {
     process.exit(1)
   }
 }
+assert(
+  pool.SLOT_CEILING_FACTOR === CEILING_FACTOR,
+  `src/lib/pool.ts must double a slot's weight (SLOT_CEILING_FACTOR ${CEILING_FACTOR}), got ${pool.SLOT_CEILING_FACTOR}`,
+)
 
 const make = async (id, dir) => {
   const hooks = await AgentPool({ client }, { id, dir, modelsFile: PRESET })
@@ -64,16 +86,16 @@ const seq = (calls) => calls.map((c) => c.replace(/^[a-z-]+-/, "")).join(",")
 //    round-robin run -- one position per unit of weight, in declaration order -- and
 //    each spawn scans that run from a persisted cursor, taking the first slot which is
 //    available and still under its ceiling. So the run is walked in order rather than
-//    the heaviest slot being drained first, weight is a soft ceiling on how many
-//    concurrent claims a slot holds, and only past the summed ceilings does the
-//    overflow spread evenly. Slot numbers, weights and pick order are
-//    presets/free-tier.json's business, so what is pinned here is the property, not a
-//    literal sequence.
+//    the heaviest slot being drained first, a slot's ceiling is TWICE its weight (so
+//    the rotation can be walked twice before any slot is full), and only past the
+//    summed ceilings does the overflow spread evenly. Slot numbers, weights and pick
+//    order are presets/free-tier.json's business, so what is pinned here is the
+//    property, not a literal sequence.
 const a = await make("solo", dir1)
 const calls = []
-// Deep enough to exhaust every ceiling and then overflow, whatever the shipped
-// weights are.
-const CONCURRENCY = CAPACITY + SLOT_MODELS.length
+// Deep enough to exhaust every ceiling, then overflow, and then overflow far enough
+// that the overflow has levelled the totals -- whatever the shipped weights are.
+const CONCURRENCY = LEVELED
 for (let i = 1; i <= CONCURRENCY; i++) calls.push(await a.spawn(`c${i}`, "explore"))
 // A release only means anything on a live claim, and the tests below release claims out
 // of the middle of that run, so track which spawns still hold one.
@@ -92,20 +114,31 @@ assert(
   new Set(numbers).size === SLOT_MODELS.length,
   `all ${SLOT_MODELS.length} slots must be used under ${CONCURRENCY} concurrent, got ${seq(calls)}`,
 )
-// inside the summed ceilings the pick is always a slot of the heaviest weight that
-// still has room: the heaviest slot holds the first positions of the run, so it is
-// chosen until it reaches its own ceiling and the next slot is the next position
+// inside the summed ceilings the pick is the NEXT TURN of the run and nothing is
+// skipped: a slot's ceiling is twice its weight, so a slot cannot fill up on the
+// positions it holds in a single rotation, and the weighted phase is the run walked
+// twice from a cold start
 const countsByModel = (ns) => {
   const m = new Map()
   for (const n of ns) m.set(SLOT_MODELS[n - 1], (m.get(SLOT_MODELS[n - 1]) ?? 0) + 1)
   return m
 }
 for (let i = 0; i < CAPACITY; i++) {
-  const sofar = countsByModel(numbers.slice(0, i))
-  const topWeight = Math.max(...SHIPPED.filter((x) => (sofar.get(x.model) ?? 0) < x.weight).map((x) => x.weight))
   assert(
-    SHIPPED[numbers[i] - 1].weight === topWeight,
-    `spawn ${i + 1} must go to the heaviest slot with room (weight ${topWeight}), got ${SLOT_MODELS[numbers[i] - 1]}`,
+    numbers[i] === RUN[i % ROTATION],
+    `spawn ${i + 1} must take turn ${i % ROTATION} of the run (slot ${RUN[i % ROTATION]}), got slot ${numbers[i]} from ${seq(calls)}`,
+  )
+}
+// the ceiling binds every slot to twice its weight, and the ONLY way past it is the
+// overflow -- which is not reached until EVERY slot stands at or over its own ceiling
+for (let i = 1; i <= CONCURRENCY; i++) {
+  const tally = countsByModel(numbers.slice(0, i))
+  const prefixLoads = SHIPPED.map((slot) => tally.get(slot.model) ?? 0)
+  const above = prefixLoads.map((l, j) => l > CEILINGS[j])
+  const full = prefixLoads.map((l, j) => l >= CEILINGS[j])
+  assert(
+    !above.some(Boolean) || full.every(Boolean),
+    `a slot may pass its ceiling of ${CEILING_FACTOR}x its weight only once EVERY slot is at one, after spawn ${i}: ${SHIPPED.map((slot, j) => `${slot.model}=${prefixLoads[j]}/${CEILINGS[j]}`).join(" ")}`,
   )
 }
 // and the heaviest slot really does hold every position at the top of the run before
@@ -115,10 +148,14 @@ assert(
   heavyLead.every((n) => HEAVY_MODELS.includes(SLOT_MODELS[n - 1])),
   `the first ${MAX_WEIGHT} spawns must all be the heaviest slot, got ${seq(calls)}`,
 )
-assert(
-  (countsByModel(heavyLead).get(HEAVY_MODELS[0]) ?? 0) === MAX_WEIGHT,
-  `the heaviest slot must reach exactly its ceiling of ${MAX_WEIGHT}, got ${seq(calls)}`,
-)
+// collecting twice its weight takes a whole rotation of turns, so a slot can only
+// reach its ceiling on the second pass -- and then it stands at exactly that
+for (const [j, slot] of SHIPPED.entries()) {
+  assert(
+    (countsByModel(numbers.slice(0, CAPACITY)).get(slot.model) ?? 0) === CEILINGS[j],
+    `${slot.model} must reach exactly its ceiling of ${CEILINGS[j]} (weight ${slot.weight}) inside the weighted phase, got ${seq(calls)}`,
+  )
+}
 // past every ceiling the overflow equalises instead of piling on slot 1, so the totals
 // converge even though the ceilings do not
 const finalTally = countsByModel(numbers)
@@ -178,8 +215,11 @@ for (const v of ["r3", "r4", "r5"]) live.add(v)
 // 4. pool_status reports global load, models, weights, per-process breakdown
 const statusOut = await a.status()
 for (const model of SLOT_MODELS) assert(statusOut.includes(model), `status should list ${model}`)
-for (const slot of SHIPPED) {
-  assert(new RegExp(`slot ${SLOT_MODELS.indexOf(slot.model) + 1} w${slot.weight}\\b`).test(statusOut), `status should show slot weight for ${slot.model}`)
+for (const [j, slot] of SHIPPED.entries()) {
+  assert(
+    new RegExp(`slot ${j + 1} w${slot.weight}\\b.*load=\\d+/${CEILINGS[j]}\\b`).test(statusOut),
+    `status should show slot weight and the doubled ceiling for ${slot.model}`,
+  )
 }
 assert(/across 1 process\(es\)/.test(statusOut), "solo process should report one process")
 
@@ -187,18 +227,21 @@ assert(/across 1 process\(es\)/.test(statusOut), "solo process should report one
 const dir3 = mkdtempSync(join(tmpdir(), "agent-pool-share-"))
 const x = await make("proc-x", dir3)
 const y = await make("proc-y", dir3)
-// Enough spawns to walk every slot's positions in the run -- each heavy slot's whole
-// share -- so the first process reaches every slot before the second one starts.
-// Scales with the slot count: a fixed literal only covered the four-slot pool.
+// Enough spawns to walk every slot's positions in the run -- one full rotation, each
+// heavy slot's whole share -- so the first process reaches every slot before the second
+// one starts, and the two together stand the pool at exactly its summed ceilings. That
+// is the depth this wants: a deeper burst would say LESS, because past the summed
+// ceilings the overflow levels the loads and a heavy slot stops out-holding a light
+// one. Scales with the slot count: a fixed literal only covered the four-slot pool.
 const xCalls = []
-for (let i = 1; i <= CONCURRENCY; i++) xCalls.push(await x.spawn(`x${i}`, "explore"))
+for (let i = 1; i <= ROTATION; i++) xCalls.push(await x.spawn(`x${i}`, "explore"))
 const xNums = xCalls.map(slotNum)
 assert(
   new Set(xNums).size === SLOT_MODELS.length,
   `first process should reach all ${SLOT_MODELS.length} slots, got ${seq(xCalls)}`,
 )
 const yCalls = []
-for (let i = 1; i <= CONCURRENCY; i++) yCalls.push(await y.spawn(`y${i}`, "explore"))
+for (let i = 1; i <= ROTATION; i++) yCalls.push(await y.spawn(`y${i}`, "explore"))
 // Both processes route over one shared run, each advancing the cursor the other one
 // reads and seeing the other's claims in the shared dir. Which slot y starts on
 // depends on x's residual load, so the load check below is what proves sharing; here
@@ -222,8 +265,8 @@ const report = SHIPPED.map((s, i) => `${s.model}(w${s.weight})=${loadList[i]}`).
 const heavyLoads = HEAVY_MODELS.map(loadOf)
 const lightLoads = LIGHT_MODELS.map(loadOf)
 assert(
-  loadList.reduce((a, b) => a + b, 0) === 2 * CONCURRENCY,
-  `all ${2 * CONCURRENCY} claims must be shared, got ${report}`,
+  loadList.reduce((a, b) => a + b, 0) === 2 * ROTATION,
+  `all ${2 * ROTATION} claims must be shared, got ${report}`,
 )
 // Slots of the same weight hold the same number of positions in the run, so they take
 // the same number of turns: loads stay within one of each other, equal when the group
@@ -237,12 +280,12 @@ assert(
 )
 assert(/across 2 process\(es\)/.test(crossStatus), "status should count both processes")
 assert(
-  new RegExp(`proc-x \\(this process\\): ${CONCURRENCY} claim\\(s\\)`).test(crossStatus) &&
-    new RegExp(`proc-y: ${CONCURRENCY} claim\\(s\\)`).test(crossStatus),
+  new RegExp(`proc-x \\(this process\\): ${ROTATION} claim\\(s\\)`).test(crossStatus) &&
+    new RegExp(`proc-y: ${ROTATION} claim\\(s\\)`).test(crossStatus),
   "status should break load down per process",
 )
 await x.finish("x1")
-const afterOneRelease = CONCURRENCY - 1
+const afterOneRelease = ROTATION - 1
 assert(
   new RegExp(`proc-x \\(this process\\): ${afterOneRelease} claim\\(s\\)`).test(await x.status()),
   "release in one process must be visible to itself",
@@ -252,7 +295,7 @@ assert(
   "release in one process must be visible to the other process",
 )
 assert(
-  new RegExp(`proc-y \\(this process\\): ${CONCURRENCY} claim\\(s\\)`).test(await y.status()),
+  new RegExp(`proc-y \\(this process\\): ${ROTATION} claim\\(s\\)`).test(await y.status()),
   "a peer release must not disturb this process's own count",
 )
 
@@ -436,8 +479,8 @@ const fromPeer = await observer.status()
 Date.now = wallClock
 const peerLine = fromPeer.split("\n").find((l) => l.includes(liveModel))
 assert(
-  /load=1\//.test(peerLine ?? ""),
-  `a claim past the TTL whose heartbeat is fresh must still count in another process, got:\n${fromPeer}`,
+  new RegExp(`load=1/${CEILINGS[liveSlot - 1]}\\b`).test(peerLine ?? ""),
+  `a claim past the TTL whose heartbeat is fresh must still count in another process (1 of the slot's ceiling of ${CEILINGS[liveSlot - 1]}), got:\n${fromPeer}`,
 )
 assert(
   new RegExp(`proc-heartbeat: 1 claim\\(s\\)`).test(fromPeer),

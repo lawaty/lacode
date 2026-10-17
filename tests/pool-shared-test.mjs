@@ -3,7 +3,8 @@
 // busy agent type cannot protect its own capacity. Also checks that the
 // context-autoupdate plugin borrows a slot correctly.
 // Run: node tests/pool-shared-test.mjs
-import { mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs"
+import { spawn } from "node:child_process"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -71,7 +72,7 @@ const firstOf = (xs) => xs[0]
 // ratio rule rather than written as a literal: handover happens at
 // weight * PRIORITY_MARGIN / weight - PRIORITY_MARGIN claims.
 // The summed ceilings are where the weighted phase ends and the overflow begins.
-const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
+const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
 
 // 1. slot N is the same model for every base, so the pool is genuinely shared
 {
@@ -111,7 +112,7 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
     `mixed base types must follow the same shared cycle, got ${picks.join(",")}, want ${soloPicks.join(",")}`,
   )
   // An idle pool starts on its heaviest slots, so the leading picks are heavy ones
-  // until the lightest is a full weight behind.
+  // until the heavy slots reach their ceilings.
   assert(
     HEAVY_SLOTS.includes(picks[0]) && HEAVY_SLOTS.includes(picks[1]),
     `an idle pool must start on the heaviest slots, got ${picks.slice(0, 2).join(",")}`,
@@ -164,8 +165,8 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
   assert(busy.own.get(key).g === "ses_borrow", "the claim must target the working session for the reaper")
   // A second borrow must not land on the busy slot while another slot is
   // eligible. With a single heavy slot there is nothing to switch to: the only
-  // other slots are lighter and stay empty until the heavy one is a full weight
-  // ahead, so handing out the same heavy slot again is the pool behaving as
+  // other slots are lighter and stay empty until the heavy one reaches its ceiling,
+  // so handing out the same heavy slot again is the pool behaving as
   // designed, not a routing failure.
   const slot2 = pool.pickSlot(state, pool.snapshot(state))
   if (HEAVY_SLOTS.length > 1) {
@@ -274,14 +275,97 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
     },
   })
   pool.init(state, () => {})
-  const first = pool.pickSlot(state, pool.snapshot(state))
-  assert(first.index === 1, `an idle tie must go to the earlier-declared slot, got slot ${first.index}`)
-  pool.acquire(state, "explore", first, "s1", "tie-1")
-  const second = pool.pickSlot(state, pool.snapshot(state))
-  assert(second.index === 1, `the earlier slot has room under its weight-2 ceiling, so it keeps the spawn, got slot ${second.index}`)
-  pool.acquire(state, "explore", second, "s1", "tie-2")
-  const third = pool.pickSlot(state, pool.snapshot(state))
-  assert(third.index === 2, `once the earlier slot hits its ceiling the equal-weight sibling takes over (round robin), got slot ${third.index}`)
+  // Slot 1 and 2, weight 2, ceiling 4.
+  // Spawns 1, 2, 3, 4 should all go to slot 1.
+  // Spawn 5 should go to slot 2.
+  // Slot 1 and 2, weight 2, ceiling 4.
+  // Spawns 1, 2 should go to slot 1, spawns 3, 4 should go to slot 2.
+  for (let i = 0; i < 2; i++) {
+    const slot = pool.pickSlot(state, pool.snapshot(state))
+    assert(slot.index === 1, `slot 1 should take the first 2 spawns, got slot ${slot.index}`)
+    pool.acquire(state, "explore", slot, `s${i}`, `tie-${i}`)
+  }
+  for (let i = 2; i < 4; i++) {
+    const slot = pool.pickSlot(state, pool.snapshot(state))
+    assert(slot.index === 2, `slot 2 should take the next 2 spawns, got slot ${slot.index}`)
+    pool.acquire(state, "explore", slot, `s${i}`, `tie-${i}`)
+  }
+  const fifth = pool.pickSlot(state, pool.snapshot(state))
+  assert(fifth.index === 1, `once slot 2 hits its ceiling slot 1 takes over again, got slot ${fifth.index}`)
+}
+
+// The shared state directory is cleaned by traffic alone -- dead claims and
+// lapsed cooldowns go when readSiblings/readLimits run, which is snapshot(),
+// which only happens on a spawn. So an idle machine carries a dead process's
+// claims file and every lapsed cooldown forever. sweepStateDir is that same
+// policy with no activity required, which is the only cleanup an idle box gets.
+{
+  const dir = scratch()
+  const s = pool.state({ id: "sweeper", dir })
+  pool.init(s, () => {})
+
+  // Pinned deliberately: the cadence is a product decision (stale files are re-read
+  // on every routing decision), not an incidental constant. Hourly.
+  assert(
+    pool.STATE_SWEEP_INTERVAL_MS === 60 * 60 * 1000,
+    `the sweep interval is hourly, got ${pool.STATE_SWEEP_INTERVAL_MS}ms`,
+  )
+  // It rides the existing 30s watchdog as a timestamp gate rather than owning a
+  // timer, so a tick must cost nothing when it is not due.
+  assert(
+    typeof s.lastDirSweep === "number" && pool.STATE_SWEEP_INTERVAL_MS > 30_000,
+    "the sweep must be gated on a time window, not run on every watchdog tick",
+  )
+
+  // A pid that has genuinely exited, and one that is genuinely running: the
+  // dead/live distinction is the whole point of the dead-pid branch, so it must
+  // be decided by a real signal rather than by a made-up number.
+  const deadPid = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["-e", "0"])
+    const pid = c.pid
+    c.on("exit", () => resolve(pid))
+  })
+  const aliveChild = spawn(process.execPath, ["-e", "setTimeout(()=>{},60000)"])
+  const alivePid = aliveChild.pid
+
+  const now = Date.now()
+  const write = (name, body, ageMs = 0) => {
+    writeFileSync(join(dir, name), body)
+    if (ageMs > 0) {
+      const when = new Date(now - ageMs)
+      utimesSync(join(dir, name), when, when)
+    }
+  }
+  const strike = (untilOffsetMs, lastOffsetMs, strikes = 1) =>
+    JSON.stringify({ model: "prov/m", until: now + untilOffsetMs, strikes, last: now + lastOffsetMs })
+
+  write("claims.dead.json", "{}")
+  writeFileSync(join(dir, `claims.${deadPid}.json`), "{}") // dead pid: reclaimed at once
+  writeFileSync(join(dir, `claims.${alivePid}.json`), "{}") // live pid: kept
+  write(pool.selfFile(s.id), "{}") // our own: never ours to delete
+  write("cursor.json", '{"i":1}')
+  write("limit.active.json", strike(3600_000, 0)) // still cooling: kept
+  write("limit.decay.json", strike(-1000, -1000, 2)) // lapsed, inside decay: kept (strike memory)
+  write("limit.stale.json", strike(-1000, -40 * 60_000, 3)) // lapsed past decay: removed
+  write("old.tmp", "partial", 120_000) // partial write: removed
+  write("new.tmp", "partial") // too fresh to judge: kept
+
+  const removed = pool.sweepStateDir(s)
+  const gone = (name) => !existsSync(join(dir, name))
+  const kept = (name) => existsSync(join(dir, name))
+
+  assert(gone(`claims.${deadPid}.json`), "a dead pid's claims file must be reclaimed")
+  assert(kept(`claims.${alivePid}.json`), "a LIVE pid's claims file must never be swept")
+  assert(kept(pool.selfFile(s.id)), "our own claims file must never be swept")
+  assert(kept("cursor.json"), "cursor.json is live rotation state, never stale by age")
+  assert(kept("limit.active.json"), "a running cooldown must be kept")
+  assert(kept("limit.decay.json"), "a lapsed cooldown inside its strike-decay window must be kept, or the backoff restarts at 1")
+  assert(gone("limit.stale.json"), "a cooldown lapsed past strike decay must be swept")
+  assert(gone("old.tmp"), "a stale .tmp from a half-written file must be swept")
+  assert(kept("new.tmp"), "a fresh .tmp is not yet knowable; it must be left alone")
+  assert(!gone("claims.dead.json"), "a non-numeric owner is not a pid; only its age may remove it")
+  assert(Array.isArray(removed) && removed.includes("limit.stale.json"), "sweepStateDir must report what it removed")
+  aliveChild.kill()
 }
 
 for (const d of made) rmSync(d, { recursive: true, force: true })

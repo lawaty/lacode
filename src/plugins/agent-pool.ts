@@ -101,6 +101,24 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
 
   pool.init(s, (m) => void warnOnce(m))
 
+  // Sweep the shared state directory on its own clock, independent of traffic.
+  //
+  // The directory's other cleanup (dead claims, lapsed cooldowns) happens only as
+  // a side effect of `snapshot()`, which runs when something spawns. So without
+  // this, an idle machine -- or one whose process was killed before its next
+  // spawn -- carries a dead process's claims file and every lapsed cooldown
+  // indefinitely, and those files are read on every routing decision.
+  //
+  // Defined here, before the reaper below, and run once at startup so the debris
+  // of the previous run goes immediately rather than after a day.
+  const sweepDirIfDue = () => {
+    if (Date.now() - s.lastDirSweep < pool.STATE_SWEEP_INTERVAL_MS) return
+    s.lastDirSweep = Date.now()
+    const removed = pool.sweepStateDir(s)
+    if (removed.length > 0) void log("info", `swept ${removed.length} stale pool file(s): ${removed.join(", ")}`)
+  }
+  sweepDirIfDue()
+
   // A successful POST is NOT proof the session died: this endpoint answers 200 and
   // body "true" for a session id that does not exist, and it answers 200 for a
   // 404/500 upstream. So the response is checked, and the reason a kill failed is
@@ -169,6 +187,16 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
     s.reaping = true
     s.lastSweep = Date.now()
     try {
+      // Bound the per-session maps even when nothing is spawning: activity is
+      // written on every message event and children on every session.created, so
+      // an idle-looking server can still be accumulating both. See pool.pruneSessions.
+      pool.pruneSessions(s)
+      // Housekeeping for the SHARED directory, on its own much slower clock. This
+      // is the only cleanup that happens without a spawn, so it is what keeps a
+      // dead process's claims file and lapsed cooldowns from outliving an idle
+      // night. Runs before the `stuck.length === 0` return below, or a machine
+      // with nothing stuck would never sweep at all.
+      sweepDirIfDue()
       const stuck = pool.findStuck(s)
       if (stuck.length === 0) return
       const released: string[] = []
@@ -455,10 +483,26 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
             slot: slot.index,
             weight: slot.weight,
             model: slot.model,
-            ceiling: slot.weight,
+            ceiling: pool.slotCeiling(slot),
             load: (snap.counts.get(slot.model) ?? 0) + 1,
           })
           return
+        }
+
+        // A spawn the pool does NOT own (basic, expert -- anything with its own
+        // hard-coded model) falls through here with nothing logged, because the
+        // pool neither routed it nor claimed a slot. So when that pinned model
+        // is cooling, the spawn is going to fail and the log says nothing about
+        // why: the escalation agent simply "cancelled". Naming the model and the
+        // reason is the difference between "expert is broken" and "expert's
+        // provider is benched", and it is the only signal available -- a pinned
+        // agent gets no cooldown-driven failover, so the bench is not survivable.
+        const pinned = s.models.get(requested)
+        const bench = pinned ? snap.cooling.get(pinned) : undefined
+        if (pinned && bench) {
+          await warnOnce(
+            `${requested} runs ${pinned}, which is cooling (${bench.reason}, strike ${bench.strikes}) -- it cannot fail over, because only ${pool.BASES.join("/")} are pooled. Drop the model line from ${requested} to route it through the pool, or wait out the cooldown.`,
+          )
         }
       } catch (error) {
         await log("error", `routing failed, spawn unchanged: ${String(error)}`)
@@ -473,7 +517,7 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
     tool: {
       pool_status: tool({
         description:
-          "Show live pool load across every opencode process, per free model and per agent type, each slot's load against its weight ceiling, the slot marked <- next that the next spawn would take, and which models are cooling after a rate limit or a stuck task. Check it before launching many parallel subagents.",
+          "Show live pool load across every opencode process, per free model and per agent type, each slot's load against its ceiling, the slot marked <- next that the next spawn would take, and which models are cooling after a rate limit or a stuck task. Check it before launching many parallel subagents.",
         args: {},
         async execute() {
           pool.refreshCatalog(s, serverUrl)
@@ -504,11 +548,12 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
               status && status !== "active" && status !== "unknown" ? `catalog:${status}` : "",
             ].filter(Boolean)
             const marker = slot.index === next.index ? " <- next" : ""
-            // claims/weight: the ceiling is reached at the denominator, and a slot at
-            // its ceiling is only used again once every other slot is also there.
+            // claims/ceiling: the ceiling is reached at the denominator (twice the
+            // slot's weight), and a slot at its ceiling is only used again once every
+            // other slot is also there.
             const load = entry?.total ?? 0
             const atCeiling = !pool.underCeiling(slot, snap.counts)
-            return `  slot ${slot.index} w${slot.weight}  ${slot.model}  load=${load}/${slot.weight}${atCeiling ? " FULL" : ""}${marker}  [${users}${notes.length ? "; " + notes.join("; ") : ""}]`
+            return `  slot ${slot.index} w${slot.weight}  ${slot.model}  load=${load}/${pool.slotCeiling(slot)}${atCeiling ? " FULL" : ""}${marker}  [${users}${notes.length ? "; " + notes.join("; ") : ""}]`
           }
 
           const total = [...snap.counts.values()].reduce((sum, n) => sum + n, 0)
@@ -546,6 +591,11 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
     dispose: async () => {
       clearInterval(timer)
       s.own.clear()
+      // Drop the per-session bookkeeping with the claims: nothing can be running
+      // once the hooks are gone, and these are the two maps that would otherwise
+      // be the last to be released. See pool.pruneSessions.
+      s.activity.clear()
+      s.children.clear()
       // Publish the empty set so this process's claims stop counting as load for
       // every sibling the moment it exits. Clearing memory alone left the claims
       // in `claims.<id>.json`, so a dead process's "locks" outlived it until the

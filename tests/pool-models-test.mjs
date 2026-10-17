@@ -15,8 +15,9 @@
 //      instead of a pool that cannot route
 //   5. slot count is data, not code: three slots route 1,2,3 and the fourth agent
 //      name is simply absent
-//   6. weight is a ceiling and a priority: the heaviest slot fills to its own weight
-//      before the next slot starts, a bad weight warns and keeps the slot, and the
+//   6. weight is the slot's share of the rotation and the basis of its ceiling: a slot
+//      may hold twice its weight at once (slotCeiling), the heaviest slot leads the run
+//      and is the last to fill, a bad weight warns and keeps the slot, and the
 //      pre-weight `tier` spelling still maps to the weight it used to imply
 //   7. the pool is capped at pool.MAX_SLOTS, because the injected agent set declares
 //      one variant per base per slot and a bigger pool would route to nothing
@@ -69,6 +70,7 @@ const apply = async (modelsFile, id) => {
       await hooks["tool.execute.before"]({ tool: "task", sessionID, callID }, out)
       return out.args.subagent_type
     },
+    status: async () => (await hooks.tool.pool_status.execute({}, {})).output,
     lines,
     warned: () => lines.filter((l) => l.startsWith("warn")),
   }
@@ -146,10 +148,10 @@ const fallbackPick = await missing.spawn("f1")
 assert(fallbackPick === "explore-1", `defaults should still route, got ${fallbackPick}`)
 
 // 6. individual bad entries are dropped with a warning; the good slots still route
-// A bad weight is NOT in that set: it is preference only, so it warns and keeps the
-// slot at weight 1 rather than throwing away a model. Two rejection rules are under
-// test, each needing a distinct violation: a repeat of slot 1's model and a model
-// with no provider prefix.
+// A bad weight is NOT in that set: it is share and preference, not validity, so it warns
+// and keeps the slot at weight 1 rather than throwing away a model. Two rejection rules
+// are under test, each needing a distinct violation: a repeat of slot 1's model and a
+// model with no provider prefix.
 const GOOD_1 = `${PROV_A}/fixture-good-1`
 const GOOD_2 = `${PROV_B}/fixture-good-2`
 const GOOD_3 = `${PROV_B}/fixture-good-3`
@@ -179,36 +181,93 @@ for (const base of BASES) {
   assert(broken.cfg.agent[`${base}-3`].model === GOOD_3, `slot 3 must run the third valid entry, got ${broken.cfg.agent[`${base}-3`].model}`)
 }
 
-// 7. weight is a ceiling AND a priority. The heaviest slot must take all of its own
-//    spawns before the lighter one sees any, then both overflow evenly -- which is what
-//    a main model "3 sessions to itself" means. Measured by spawns, because the claim
-//    files pool_status reads are exactly those spawns.
+// 7. weight is a ceiling AND a priority -- both of them now as multiples of the weight:
+//    the weight is the slot's SHARE of the rotation, which is what makes it a priority,
+//    and twice that share is how many claims it may hold at once, which is what makes it
+//    a ceiling. So the heaviest slot takes its whole share of the run before the lighter
+//    one sees any, stands at twice its weight while the lighter one is still filling,
+//    and only then do both overflow evenly -- which is what a main model "3 sessions to
+//    itself" means. Measured by spawns, because the claim files pool_status reads are
+//    exactly those spawns.
 const HEAVY = `${PROV_A}/fixture-weight-heavy`
 const LIGHT = `${PROV_B}/fixture-weight-light`
-const weighted = await apply(file("weighted.json", { slots: [{ model: HEAVY, weight: 3 }, { model: LIGHT, weight: 1 }] }), "weighted")
-const HEAVY_CEILING = 3
+const HEAVY_WEIGHT = 3
+const LIGHT_WEIGHT = 1
+const weighted = await apply(file("weighted.json", { slots: [{ model: HEAVY, weight: HEAVY_WEIGHT }, { model: LIGHT, weight: LIGHT_WEIGHT }] }), "weighted")
+// the run the pool routes by, straight off the rule: one position per unit of weight, in
+// declaration order, so weights 3 and 1 become 1,1,1,2
+const RUN = pool.roundRobinSequence([
+  { index: 1, model: HEAVY, weight: HEAVY_WEIGHT },
+  { index: 2, model: LIGHT, weight: LIGHT_WEIGHT },
+])
+const ROTATION = RUN.length
+assert(RUN.join(",") === "1,1,1,2", `weights ${HEAVY_WEIGHT}/${LIGHT_WEIGHT} must expand to one turn per unit in declaration order, got ${RUN.join(",")}`)
+// a slot's ceiling is TWICE its weight (src/lib/pool.ts SLOT_CEILING_FACTOR), which is
+// why the weighted phase is the run walked twice rather than once: a slot cannot fill up
+// on the positions it holds in a single rotation
+const CEILING_FACTOR = 2
+const HEAVY_CEILING = 6
+const LIGHT_CEILING = 2
+const WEIGHTED = ROTATION * CEILING_FACTOR
+assert(
+  pool.SLOT_CEILING_FACTOR === CEILING_FACTOR &&
+    pool.slotCeiling({ weight: HEAVY_WEIGHT }) === HEAVY_CEILING &&
+    pool.slotCeiling({ weight: LIGHT_WEIGHT }) === LIGHT_CEILING,
+  `a slot's ceiling must be ${CEILING_FACTOR}x its weight (${HEAVY_CEILING} and ${LIGHT_CEILING} here), got factor ${pool.SLOT_CEILING_FACTOR}`,
+)
 const tally = { [HEAVY]: 0, [LIGHT]: 0 }
 const tallyPick = async (callID) => {
   const slot = (await weighted.spawn(callID)).replace("explore-", "")
   tally[slot === "1" ? HEAVY : LIGHT]++
   return slot
 }
-for (let i = 0; i < HEAVY_CEILING; i++) {
+// PRIORITY: the run puts the weight-3 slot's whole share of 3 turns at the top, so the
+// weight-1 slot is not touched until it has taken every one of them
+for (let i = 0; i < HEAVY_WEIGHT; i++) {
   const slot = await tallyPick(`w${i}`)
-  assert(slot === "1", `spawn ${i + 1} must go to the weight-3 slot before the weight-1 slot is touched, got slot ${slot}`)
+  assert(slot === "1", `spawn ${i + 1} must go to the weight-3 slot, which leads the run with ${HEAVY_WEIGHT} turns, got slot ${slot}`)
 }
-// the ceiling is a ceiling: the heavy slot holds no more than its weight until the
-// light one has caught up
-const SPILL = 3
-for (let i = HEAVY_CEILING; i < HEAVY_CEILING + SPILL; i++) {
-  await tallyPick(`w${i}`)
+// CEILING: the rest of the weighted phase. Every spawn takes the run's next turn in
+// order, and no slot passes twice its weight while the other still has room under its own
+for (let i = HEAVY_WEIGHT; i < WEIGHTED; i++) {
+  const slot = Number(await tallyPick(`w${i}`))
+  assert(slot === RUN[i % ROTATION], `spawn ${i + 1} must take turn ${i % ROTATION} of the run (slot ${RUN[i % ROTATION]}), got slot ${slot}`)
   assert(
-    tally[HEAVY] <= HEAVY_CEILING + 1,
-    `the weight-3 slot must stop at its ceiling while the weight-1 slot has room, got ${tally[HEAVY]}/${HEAVY_CEILING} vs ${tally[LIGHT]}`,
+    tally[HEAVY] <= HEAVY_CEILING && tally[LIGHT] <= LIGHT_CEILING,
+    `the weight-3 slot must stop at its ceiling of ${HEAVY_CEILING} while the weight-1 slot has room at ${LIGHT_CEILING}, got ${tally[HEAVY]}/${HEAVY_CEILING} vs ${tally[LIGHT]}/${LIGHT_CEILING}`,
   )
 }
+// two rotations is exactly what it takes to stand every slot at its ceiling: one
+// rotation leaves each slot short of it, which is the whole reason the ceiling is a
+// multiple of the weight and not the weight itself
+assert(
+  tally[HEAVY] === HEAVY_CEILING && tally[LIGHT] === LIGHT_CEILING,
+  `${WEIGHTED} spawns (the run walked ${CEILING_FACTOR} times) must stand each slot at twice its weight, got ${tally[HEAVY]}/${HEAVY_CEILING} heavy vs ${tally[LIGHT]}/${LIGHT_CEILING} light`,
+)
+// and pool_status reports that ceiling as the denominator, marking a slot FULL exactly
+// when it reaches it
+const weightedStatus = await weighted.status()
+for (const [model, weight, ceiling] of [
+  [HEAVY, HEAVY_WEIGHT, HEAVY_CEILING],
+  [LIGHT, LIGHT_WEIGHT, LIGHT_CEILING],
+]) {
+  assert(
+    new RegExp(`slot \\d+ w${weight}\\s+${model}\\s+load=${ceiling}/${ceiling} FULL`).test(weightedStatus),
+    `status should report ${model} at load=${ceiling}/${ceiling} FULL (a weight-${weight} slot's ceiling is twice its weight), got:\n${weightedStatus}`,
+  )
+}
+// OVERFLOW: every slot now stands at its ceiling, so nothing gates the pick and it goes
+// to the least loaded one -- the weight-1 slot, four times over, while the weight-3 slot
+// stays exactly where the ceiling left it
+const SPILL = ROTATION
+const spill = []
+for (let i = 0; i < SPILL; i++) spill.push(await tallyPick(`x${i}`))
+assert(
+  spill.every((slot) => slot === "2") && tally[HEAVY] === HEAVY_CEILING,
+  `past every ceiling the overflow must go to the least loaded slot, not pile on the weight-3 slot, got ${spill.join(",")} after ${tally[HEAVY]}/${HEAVY_CEILING} heavy vs ${tally[LIGHT]}/${LIGHT_CEILING} light`,
+)
 // past every ceiling the overflow equalises rather than piling on the heavy slot
-const heavyShare = tally[HEAVY] / (HEAVY_CEILING + SPILL)
+const heavyShare = tally[HEAVY] / (WEIGHTED + SPILL)
 assert(
   heavyShare < 0.8 && heavyShare > 0.3,
   `the overflow must spread rather than pile on the heavy slot, got ${tally[HEAVY]} heavy vs ${tally[LIGHT]} light`,

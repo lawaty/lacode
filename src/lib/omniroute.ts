@@ -96,6 +96,8 @@ export type Selector = {
   recordFailure(sessionID: string, modelID: string, opts?: { status?: number; retryAfterMs?: number; transient?: boolean; message?: string }): void
   isCooling(modelID: string): boolean
   stats(): Record<string, ModelStat>
+  /** Size of the sticky-assignment table; exposed so the bound is testable. */
+  stickySize(): number
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +467,22 @@ export function createSelector(config: OmniRouteConfig, deps: { now?: () => numb
   const now = deps.now ?? Date.now
   const stats = new Map<string, ModelStat>()
   const sticky = new Map<string, string>()
+  // `sticky` is keyed by session, and only a FAILURE removes an entry -- every
+  // successful select() adds one and leaves it. It therefore grew with every
+  // session the process ever served rather than with the sessions in flight,
+  // which is a slow leak in exactly the long-running server this plugin lives
+  // in. Bounded oldest-first, like the notification bookkeeping: insertion order
+  // is select order, so the oldest assignment is the least likely to be asked
+  // about again. Forgetting one costs that session a single re-selection, and
+  // re-selection is re-measured, so nothing can be pinned wrong by forgetting.
+  const MAX_STICKY = 500
+  const rememberSticky = (sessionID: string, modelID: string) => {
+    // Delete first so a REFRESHED assignment counts as the newest entry rather
+    // than keeping the position it was first inserted at.
+    sticky.delete(sessionID)
+    sticky.set(sessionID, modelID)
+    while (sticky.size > MAX_STICKY) sticky.delete(sticky.keys().next().value as string)
+  }
   let cands: string[] = []
 
   const ensure = (modelID: string): ModelStat => {
@@ -518,7 +536,15 @@ export function createSelector(config: OmniRouteConfig, deps: { now?: () => numb
         // not cooling. A session that just watched its model fail over must not
         // be pinned back onto it by the next select().
         const held = sticky.get(sessionID)
-        if (held !== undefined && list.includes(held) && !cooling(held)) return held
+        if (held !== undefined && list.includes(held) && !cooling(held)) {
+          // Re-insert on the way out. Eviction is oldest-first by insertion
+          // order, so a session that is STILL WORKING must keep its row young --
+          // returning here without touching the map left a long-lived session
+          // sitting at its original position and it was evicted as "oldest" while
+          // actively in use.
+          rememberSticky(sessionID, held)
+          return held
+        }
       }
       let bestID: string | null = null
       let bestStat: ModelStat | null = null
@@ -536,7 +562,7 @@ export function createSelector(config: OmniRouteConfig, deps: { now?: () => numb
         }
       }
       if (bestID === null) return null
-      if (config.stickyPerSession) sticky.set(sessionID, bestID)
+      if (config.stickyPerSession) rememberSticky(sessionID, bestID)
       return bestID
     },
 
@@ -592,6 +618,10 @@ export function createSelector(config: OmniRouteConfig, deps: { now?: () => numb
       const out: Record<string, ModelStat> = {}
       for (const [id, stat] of stats) out[id] = { ...stat }
       return out
+    },
+
+    stickySize() {
+      return sticky.size
     },
   }
 }

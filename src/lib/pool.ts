@@ -12,9 +12,11 @@ import { PACKAGE_ROOT } from "./package-root.ts"
 // same model, so `explore-2` and `context-2` are the same model and
 // share one load counter.
 //
-// Every slot carries a `weight` (the preset), and that is the only knob. A
-// slot's weight is a SOFT CEILING on how many claims it holds at once, and routing is an
-// ORDER-FIRST weighted round robin: the slots are expanded into a run in which each one
+// Every slot carries a `weight` (the preset), and that is the only knob. A slot's
+// weight is its SHARE OF THE ROTATION, and how many claims it may hold at once is a
+// deliberate multiple of that share (slotCeiling: twice the weight), so the ceiling is
+// never what makes a slot busy. WHICH slot comes next is an ORDER-FIRST weighted round
+// robin: the slots are expanded into a run in which each one
 // appears once per unit of its weight ([3,2,1,1] -> [1,1,1,2,2,3,4]), the next spawn
 // takes the first slot in that run which is available and still under its ceiling, and
 // a cursor shared by every opencode process remembers where it got to. So weight says
@@ -24,9 +26,9 @@ import { PACKAGE_ROOT } from "./package-root.ts"
 // plain round robin in declaration order, and 2 over 2 / 1 over 1 reproduces the old
 // primary/overflow cycle exactly.
 //
-// Once EVERY slot is at or over its ceiling the weight can no longer gate anything,
-// so the overflow goes to the least loaded slot -- the pool never blocks, and a burst
-// past the summed ceilings degrades to even spreading rather than piling on slot 1.
+// Once EVERY slot is at or over its ceiling nothing can gate anything, so the overflow
+// goes to the least loaded slot -- the pool never blocks, and a burst past the summed
+// ceilings degrades to even spreading rather than piling on slot 1.
 //
 // This module holds the state and the decision; src/plugins/agent-pool.ts owns
 // the hooks (task routing, limit detection, hang reaping) and
@@ -59,11 +61,22 @@ export const HANG_COOLDOWN_MS = 10 * 60 * 1000
 // A transient upstream outage self-resolves, so it is cooled briefly and re-probed
 // rather than escalated like a strike. See coolUnavailable().
 export const UNAVAILABLE_COOLDOWN_MS = 60 * 1000
-// A weight is a count of concurrent sessions, so this bounds both the ceiling and
-// the total pool capacity (4 slots at MAX_WEIGHT each). Past it the number stops
-// describing concurrency and becomes a way to silence load balancing entirely, which
-// is a config error rather than a value to honour.
+// A weight counts the turns a slot takes per rotation, and its ceiling is a small
+// multiple of that (SLOT_CEILING_FACTOR), so this bounds both the ceiling and the
+// total pool capacity (4 slots at MAX_WEIGHT, each ceilinged at SLOT_CEILING_FACTOR
+// times that). Past it the number stops describing concurrency and becomes a way to
+// silence load balancing entirely, which is a config error rather than a value to
+// honour.
 export const MAX_WEIGHT = 100
+// Weight is the slot's share of the rotation -- roundRobinSequence gives it one
+// position per unit, so it decides how OFTEN the slot is preferred. The ceiling is
+// deliberately larger than that share (twice it), so a full weighted rotation can be
+// traversed twice before the pool is full: a heavy slot keeps its proportional share
+// while a burst that outruns one rotation still lands on it instead of falling
+// straight through to the overflow path.
+export const SLOT_CEILING_FACTOR = 2
+/** How many claims a slot may hold at once: twice its share of the rotation. */
+export const slotCeiling = (slot: Slot) => slot.weight * SLOT_CEILING_FACTOR
 // opencode.jsonc -- and, for an installed package, the agent set injected by
 // src/index.ts -- declares exactly one hidden variant per base per slot, and a
 // pool larger than that would route to agents that do not exist, so the slot
@@ -82,6 +95,23 @@ const COOLDOWN_MAX_MS = 15 * 60 * 1000
 export const QUOTA_COOLDOWN_BASE_MS = 15 * 60 * 1000
 export const QUOTA_COOLDOWN_MAX_MS = 6 * 60 * 60 * 1000
 const STRIKE_DECAY_MS = 30 * 60 * 1000
+
+/**
+ * Ceiling on a provider-STATED reset ("retry in 45min"), whatever it claims.
+ *
+ * A stated window is still trusted over the computed backoff, because it is the
+ * provider telling us when it reopens. But it is TEXT parsed out of an upstream
+ * error, and an uncapped parse turns one bad number into a permanent bench: a
+ * real `account_rate_limit` carrying "retry in 329917s" (~3.8 days) cooled a
+ * slot for 91.6 hours, so a provider that had already recovered stayed excluded
+ * for days while every delegated spawn queued behind the two survivors.
+ *
+ * The quota cap is the right ceiling: long enough to honour a genuine daily
+ * reset, short enough that a malformed number cannot remove a model for days.
+ * Beyond the cap the value is DISCARDED rather than clamped, so the caller falls
+ * back to the ordinary strike backoff instead of treating "at least 6h" as fact.
+ */
+export const STATED_COOLDOWN_MAX_MS = QUOTA_COOLDOWN_MAX_MS
 
 /**
  * A failure reason that describes a provider quota/allowance rather than a
@@ -175,10 +205,10 @@ export type ModelsSource = { slots: Slot[]; problems: string[]; origin: string }
 // validated on its own: one bad slot is dropped with a warning, the rest still
 // route, unless nothing survives and the built-in defaults take over.
 //
-// Weight is the slot's concurrency ceiling, so a bad one warns and falls back to 1
-// rather than dropping the slot -- losing a model because of a typo in a count would
-// cost real capacity. A slot with no weight at all is weight 1, i.e. one session at
-// a time and one turn in the rotation.
+// Weight is the slot's share of the rotation, and its ceiling is twice that, so a bad
+// one warns and falls back to 1 rather than dropping the slot -- losing a model because
+// of a typo in a count would cost real capacity. A slot with no weight at all is weight
+// 1, i.e. one turn per rotation and a ceiling of two claims.
 export function parseSlots(parsed: unknown, origin: string): SlotFile {
   const problems: string[] = []
   const entries = (parsed as { slots?: unknown })?.slots
@@ -349,10 +379,11 @@ export function ensureUserConfigDir(): boolean {
   }
 }
 
-// `weight` is the soft ceiling on a slot's concurrent claims, and its priority;
-// absent means 1. `tier` is the pre-weight spelling, accepted as a deprecated alias
+// `weight` is the slot's share of the rotation, one turn per unit and a ceiling of
+// twice that; absent means 1. `tier` is the pre-weight spelling, accepted as a
+// deprecated alias
 // (primary -> 2, overflow -> 1) so a host that has not been re-deployed keeps two
-// slots' worth of headroom instead of silently collapsing to one claim each.
+// slots' worth of headroom instead of silently collapsing to one turn each.
 function readWeight(entry: unknown, at: string, model: string, problems: string[]): number {
   const raw = (entry as { weight?: unknown })?.weight
   if (raw === undefined) {
@@ -405,13 +436,26 @@ export const isTransientGatewayText = (text: string) => TRANSIENT_GATEWAY_PATTER
 
 // Providers sometimes state exactly when the window reopens; prefer that over a
 // guessed backoff. Handles "Resets in 35min", "Resets in 2hr 17min", "retry in 90s".
+//
+// Two things this must get right, and both were wrong at once:
+//
+//   * BOUNDED. Every branch is capped at STATED_COOLDOWN_MAX_MS, and a value
+//     past the cap yields undefined rather than a clamped number -- see that
+//     constant. A provider claiming a three-day window is not a source to be
+//     believed, and "at least 6h" would be a guess dressed as a fact.
+//   * LONGEST SPELLING FIRST. The unit alternations are ordered h|hr|hour ->
+//     hour|hr|h, because "2hr 17min" otherwise matches the bare "h", leaves
+//     "r 17min" unparsed, and silently reports 2h00 where the provider said
+//     2h17 -- a window that is too SHORT by exactly the part it dropped.
 export const statedCooldown = (text: string): number | undefined => {
-  const hm = /resets?\s+in\s+(\d+)\s*(?:h|hr|hour)s?\s*(\d+)?\s*(?:m|min|minute)?s?/i.exec(text)
-  if (hm) return (Number(hm[1]) * 60 + (hm[2] ? Number(hm[2]) : 0)) * 60 * 1000
-  const m = /resets?\s+in\s+(\d+)\s*(?:m|min|minute)s?/i.exec(text)
-  if (m) return Number(m[1]) * 60 * 1000
-  const s = /retry[\s-]?in\s+(\d+)\s*(?:s|sec|second)s?/i.exec(text)
-  if (s) return Number(s[1]) * 1000
+  const bounded = (ms: number) =>
+    Number.isFinite(ms) && ms > 0 && ms <= STATED_COOLDOWN_MAX_MS ? ms : undefined
+  const hm = /resets?\s+in\s+(\d+)\s*(?:hour|hr|h)s?\s*(\d+)?\s*(?:minute|min|m)?s?/i.exec(text)
+  if (hm) return bounded((Number(hm[1]) * 60 + (hm[2] ? Number(hm[2]) : 0)) * 60 * 1000)
+  const m = /resets?\s+in\s+(\d+)\s*(?:minute|min|m)s?/i.exec(text)
+  if (m) return bounded(Number(m[1]) * 60 * 1000)
+  const s = /retry[\s-]?in\s+(\d+)\s*(?:second|sec|s)s?/i.exec(text)
+  if (s) return bounded(Number(s[1]) * 1000)
   return undefined
 }
 
@@ -457,6 +501,8 @@ type State = {
   reaped: number
   reaping: boolean
   lastSweep: number
+  /** When the shared state directory was last swept of stale files. */
+  lastDirSweep: number
   id: string
   dir: string
   modelsFile?: string
@@ -495,6 +541,7 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
       reaped: 0,
       reaping: false,
       lastSweep: 0,
+      lastDirSweep: 0,
       id,
       dir,
       modelsFile,
@@ -534,9 +581,151 @@ export function init(s: State, onWarn: (m: string) => void) {
   }
 }
 
+/** How long a stale-file sweep may be deferred.
+ *
+ * Hourly rather than daily because these files are not merely litter: a stale
+ * claims file is re-read on EVERY routing decision, so the window in which one
+ * lingers is a window in which the pool is reasoning about a process that no
+ * longer exists. The cost is one `readdirSync` of a directory holding a handful
+ * of small files, once an hour.
+ *
+ * Deliberately a TIME WINDOW, not its own timer: the plugin already runs a 30s
+ * watchdog, and this rides it as a gate that compares a timestamp and returns.
+ * That is one `Date.now()` per tick instead of a second interval to leak when a
+ * plugin is torn down. Do not "optimise" this into its own setInterval.
+ */
+export const STATE_SWEEP_INTERVAL_MS = 60 * 60 * 1000
+
+/**
+ * Remove stale files from the shared state directory.
+ *
+ * `readSiblings` and `readLimits` already reclaim dead claims and lapsed
+ * cooldowns -- but only as a SIDE EFFECT of being called, and they are called
+ * from `snapshot()`, which only runs when something spawns. So the directory is
+ * only ever cleaned by traffic: an idle machine, or one whose process was killed
+ * before its next spawn, keeps a dead process's claims file and every lapsed
+ * cooldown indefinitely, and those files are read on every routing decision.
+ *
+ * This is the same policy with no activity required, safe to call on a timer.
+ * It deliberately does NOT touch:
+ *   * this process's own claims file -- rewritten on every publish
+ *   * `cursor.json` -- live rotation state, never stale by age
+ *   * a cooldown that is still running
+ *   * a LAPSED cooldown still inside its strike-decay window, because deleting
+ *     that throws the strike count away and restarts the backoff at 1 (the same
+ *     reason `readLimits` keeps it).
+ *
+ * Returns the removed file names so a caller can log them and a test can assert.
+ */
+export function sweepStateDir(s: State): string[] {
+  const removed: string[] = []
+  if (!s.dirReady) return removed
+  let entries: string[]
+  try {
+    entries = readdirSync(s.dir)
+  } catch {
+    return removed
+  }
+  const now = Date.now()
+  const drop = (name: string) => {
+    try {
+      unlinkSync(join(s.dir, name))
+      removed.push(name)
+    } catch {
+      /* another process won the race; nothing to do */
+    }
+  }
+  for (const entry of entries) {
+    let age: number
+    try {
+      age = now - statSync(join(s.dir, entry)).mtimeMs
+    } catch {
+      continue
+    }
+    // A partial write left by a process that died between write and rename.
+    // Nothing ever reads it; it is litter.
+    if (entry.endsWith(".tmp")) {
+      if (age > ORPHAN_TMP_MS) drop(entry)
+      continue
+    }
+    const claim = /^claims\.(.+)\.json$/.exec(entry)
+    if (claim) {
+      if (claim[1] === s.id) continue
+      // A numeric owner is a pid: if it is gone the file holds no work, exactly
+      // as readSiblings decides. Reclaim immediately rather than waiting out
+      // DEAD_FILE_MS, which is what made a crashed process look busy.
+      if (/^\d+$/.test(claim[1]) && !isPidAlive(Number(claim[1]))) {
+        drop(entry)
+        continue
+      }
+      if (age > DEAD_FILE_MS) drop(entry)
+      continue
+    }
+    if (entry.startsWith("limit.") && entry.endsWith(".json")) {
+      try {
+        const strike = JSON.parse(readFileSync(join(s.dir, entry), "utf8")) as Strike
+        if (typeof strike.until !== "number") {
+          drop(entry)
+          continue
+        }
+        if (strike.until > now) continue
+        if (typeof strike.last === "number" && now - strike.last < STRIKE_DECAY_MS) continue
+        drop(entry)
+      } catch {
+        drop(entry) // unreadable or corrupt: the same policy readLimits applies
+      }
+    }
+  }
+  return removed
+}
+
 export function pruneOwn(s: State) {
   const now = Date.now()
   for (const [key, claim] of s.own) if (now - (claim.hb ?? claim.t) > CLAIM_TTL_MS) s.own.delete(key)
+}
+
+// Bound the two per-session maps that would otherwise grow for the life of the
+// process. Nothing ever removed an entry from either one: `activity` was written
+// on EVERY message event (whatever the session) and `children` on every
+// `session.created`, so a long-running server accumulated one entry per session
+// it had ever seen and held them forever.
+//
+// Both are only read inside narrow windows, so anything outside them is dead
+// weight: `activity` is consulted only for a claim's bound target (idleFor), and
+// `children` only for children inside CHILD_MEMORY_MS (backfillChild). An entry
+// that is neither a live target nor recent cannot change a routing decision.
+function pruneActivity(s: State, now: number) {
+  if (s.activity.size === 0) return
+  const live = new Set<string>()
+  for (const claim of s.own.values()) if (claim.g) live.add(claim.g)
+  for (const [id, seen] of s.activity) {
+    if (live.has(id)) continue
+    if (now - seen > CLAIM_TTL_MS) s.activity.delete(id)
+  }
+}
+
+function pruneChildren(s: State, now: number) {
+  if (s.children.size === 0) return
+  for (const [parent, ring] of s.children) {
+    const fresh = ring.filter((child) => now - child.t <= CHILD_MEMORY_MS)
+    if (fresh.length === 0) s.children.delete(parent)
+    else if (fresh.length !== ring.length) s.children.set(parent, fresh)
+  }
+}
+
+/**
+ * The periodic sweep of the two per-session maps, both bounded by AGE rather than
+ * by an explicit release. snapshot() calls it on every spawn and the reaper calls
+ * it on every sweep, so a process stays bounded whether it is busy or idle -- a
+ * server can see thousands of sessions' message events with never a spawn in
+ * between. Deliberately does NOT prune own claims: a TTL-expired claim must be
+ * found and ABORTED by the reaper (its session would otherwise be orphaned), not
+ * dropped here. That is pruneOwn's job, and snapshot() calls it separately.
+ */
+export function pruneSessions(s: State) {
+  const now = Date.now()
+  pruneActivity(s, now)
+  pruneChildren(s, now)
 }
 
 export function publish(s: State) {
@@ -746,6 +935,7 @@ export function isAvailable(s: State, model: string, cooling: Map<string, Strike
 
 export function snapshot(s: State): Snapshot {
   pruneOwn(s)
+  pruneSessions(s)
   const siblings = readSiblings(s)
   const cooling = readLimits(s)
   const counts = new Map<string, number>()
@@ -757,9 +947,10 @@ export function snapshot(s: State): Snapshot {
 
 const loadOf = (counts: Map<string, number>, model: string) => counts.get(model) ?? 0
 
-// True while the slot still has room under its own ceiling, i.e. while its weight
-// can still gate anything. A cooling slot is never picked regardless of this.
-export const underCeiling = (slot: Slot, counts: Map<string, number>) => loadOf(counts, slot.model) < slot.weight
+// True while the slot still has room under its own ceiling (slotCeiling, i.e. twice
+// its rotation share), i.e. while that ceiling can still gate anything. A cooling slot
+// is never picked regardless of this.
+export const underCeiling = (slot: Slot, counts: Map<string, number>) => loadOf(counts, slot.model) < slotCeiling(slot)
 
 /**
  * The weighted round-robin run, expanded from the slot list: every slot occupies one
@@ -825,8 +1016,10 @@ function writeCursor(s: State, seq: number) {
  * is skipped rather than ending the scan, so the rotation keeps turning past a busy or
  * benched slot instead of stalling on it.
  *
- * The ceiling is UNCHANGED: weight is still how many claims a slot may hold at once.
- * Round robin changes which slot is PREFERRED next, never how many a slot may hold.
+ * The ceiling is TWICE a slot's weight (slotCeiling), deliberately larger than its
+ * share of the rotation, so a full weighted rotation can be traversed twice before the
+ * pool is full. Round robin decides which slot is PREFERRED next; the ceiling, not
+ * weight alone, decides how many a slot may hold.
  *
  * Falling off the end of the run is the old overflow path, kept as it was: the least
  * loaded usable slot, or the least loaded slot of all when every one of them is cooling.
@@ -882,8 +1075,8 @@ export function agentFor(base: string, slot: number) {
 // A variant is only ever the OUTPUT of routing: a caller spawns the bare base and
 // the pool picks the slot. Naming a variant is the one way to reach a provider
 // without asking the pool, and it is not a small one: it bypasses the round-robin
-// rotation AND the slot's ceiling, so naming slot 1 six times puts six concurrent
-// claims on a slot whose ceiling is three. Counting such a spawn, as this once
+// rotation AND the slot's ceiling, so naming slot 1 eight times puts eight concurrent
+// claims on a weight-3 slot whose ceiling is six. Counting such a spawn, as this once
 // did, cannot help -- the ceiling is precisely what it evades.
 export function manualVariant(name: string): string | undefined {
   const direct = /^(.*)-([1-9][0-9]*)$/.exec(name)

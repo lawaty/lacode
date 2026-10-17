@@ -37,7 +37,38 @@ const IGNORED_SEGMENTS = new Set([
   ".turbo",
   ".cache",
   ".git",
+  // Generated payloads. These are OUTPUT, not source: a single decoded corpus or
+  // derived report in one of these is routinely tens of megabytes, and an agent
+  // that samples one with `head`/`cat` produces a tool output large enough to
+  // be worth recording on its own.
+  "derived_outputs",
+  "derived",
+  "artifacts",
+  "corpus",
+  "corpora",
 ])
+
+// What the cartographer must NOT read, and why this is stated rather than left
+// to judgement.
+//
+// A tool output is not a local variable: opencode persists it as a
+// `message.part.updated` event carrying the whole payload, and that log is
+// append-only. So one `cat` of a minified bundle or a decoded corpus does not
+// cost a few KB of context -- it costs megabytes of database, permanently, and
+// the process holds that growth in memory. IGNORED_SEGMENTS above cannot prevent
+// it: that set only decides whether an EDIT re-triggers this agent, while the
+// read that does the damage is the agent's own choice, made from its prompt.
+//
+// The rule is therefore in the prompt, and it points at the alternative rather
+// than only the prohibition: the file that PRODUCES the payload is the thing that
+// carries architectural meaning, and it is orders of magnitude smaller.
+const NO_BULK_READS = [
+  "Do not read generated, vendored or corpus payloads: `node_modules/`, `dist/`,",
+  "`build/`, `out/`, `*.min.js`, `derived_outputs/`, `*.bytes`, and large `.json`/`.csv`",
+  "corpora. They are megabytes each and describe no architecture. Read the source",
+  "that PRODUCES or CONSUMES them instead. If a payload must be sampled, use",
+  "`head -c 2000` or `wc -c` — never `cat` or a bare `grep -r` across one.",
+].join(" ")
 
 const toPosix = (value: string) => value.split(path.sep).join("/")
 
@@ -143,6 +174,8 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           "This session touched these paths (starting context, not an exhaustive list):",
           listed(files),
           "",
+          NO_BULK_READS,
+          "",
           "Follow the bootstrap procedure in your system prompt: progressive exploration, then write the five context files within their size targets. When the project already has architecture or decision documentation, link to it instead of duplicating it. Write conclusions, not inventories.",
         ].join("\n")
       : [
@@ -150,6 +183,8 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           "",
           "This session touched these paths (start from these and their immediate architectural neighborhood):",
           listed(files),
+          "",
+          NO_BULK_READS,
           "",
           'Follow the incremental-update procedure in your system prompt. Update a context file only if this work introduced or revealed information that will materially help future agents: a new boundary or module, a new or moved canonical entry point, a changed workflow, a new convention, an architectural decision, a new dependency between subsystems, a renamed or moved subsystem, or a previously undocumented invariant. Do not edit documentation merely because source files changed. If nothing material changed, make no edits and report "no update needed".',
         ].join("\n")

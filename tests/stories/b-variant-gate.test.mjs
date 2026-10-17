@@ -3,7 +3,7 @@
 //
 // This is the hole the counting behaviour left open: naming a variant skips the
 // rotation AND the ceiling, so the damage is not that one slot takes an extra
-// turn, it is that a slot bounded at three concurrent claims takes six. These
+// turn, it is that a slot bounded at twice its weight takes without limit. These
 // tests pin the refusal, and pin the properties it must not break on the way:
 // bare bases still route, a routed spawn still costs exactly one claim, and
 // agents that merely LOOK like a variant are left alone.
@@ -52,12 +52,13 @@ test("[US-5] a hand-named slot variant is refused, and the refusal names the bar
 
 test("[US-5] a refused variant leaves no claim behind, so the ceiling is untouched", async () => {
   const t = await boot("gate-no-claim")
-  // Six refusals against a weight-3 slot. Before the refusal this produced
-  // load=6/3: the ceiling was recorded and then ignored.
+  // Six refusals against a weight-3 slot whose ceiling is now 6 (twice the weight).
+  // Before the refusal this recorded the claims anyway: the ceiling was counted and
+  // then ignored.
   for (let i = 1; i <= 6; i++) await t.trySpawn("explore-1", `n${i}`)
   const status = await t.status()
   assert.match(status, /0 claim\(s\) in flight/, `a refused spawn must claim nothing, got:\n${status}`)
-  assert.match(status, /gate\/a\s+load=0\/3/, `the slot must be untouched, got:\n${status}`)
+  assert.match(status, /gate\/a\s+load=0\/6/, `the slot must be untouched, got:\n${status}`)
   await t.hooks.dispose()
 })
 

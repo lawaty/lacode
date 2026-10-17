@@ -9,6 +9,63 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+### Changed
+
+- **A slot's concurrency ceiling is now twice its weight.** Weight still sets how
+  many turns a slot takes per weighted round-robin rotation, but the ceiling is
+  `2 × weight`, so one full rotation fills only half the pool and the run is walked
+  twice before every slot is full. `pool_status` prints the ceiling as `load=n/2w`,
+  and a weight-3 slot may now hold 6 concurrent sessions.
+
+### Fixed
+
+- **The pool no longer grows without bound.** The per-session `activity` and
+  `children` maps were written on every message event and every `session.created`
+  and never pruned, so a long-running server accumulated an entry per session for
+  the life of the process. Both are now swept by the reaper and on every spawn, and
+  the notifier's per-session bookkeeping (`active` / `titles`) is capped at 500.
+
+- **A provider-stated reset can no longer bench a model for days.** A stated
+  window ("Resets in 35min") is still trusted over the computed backoff, but the
+  parse was unbounded, so one malformed upstream number removed a slot from
+  rotation indefinitely: an `account_rate_limit` carrying `retry in 329917s`
+  (~3.8 days) cooled a model for **91.6 hours**, long past the window it was
+  waiting for, and every delegated spawn queued behind the survivors. A stated
+  window is now discarded past `STATED_COOLDOWN_MAX_MS` (6h, the quota cap) so
+  the caller falls back to the ordinary strike backoff instead of trusting a
+  number it cannot believe. A limit already on disk is unaffected — delete its
+  `limit.<model>.json` to re-admit the model now.
+
+- **`"Resets in 2hr 17min"` is no longer read as 2h00.** The unit alternations
+  were ordered `h|hr|hour`, so `2hr 17min` matched the bare `h`, left `r 17min`
+  unparsed and silently dropped the minutes — a window too *short* by exactly the
+  part it discarded, despite the docstring claiming that spelling was handled.
+  Alternations are now longest-first (`hour|hr|h`, `minute|min|m`, `second|sec|s`).
+
+- **The OmniRoute sticky-assignment table is bounded.** It is keyed by session and
+  only a *failure* deleted an entry, so it grew with every session the process ever
+  served rather than with the sessions in flight. It is now capped at 500,
+  evicting oldest-first, and a `select()` that returns an existing assignment
+  re-inserts it — previously a long-running session kept its original position and
+  was evicted as "oldest" while still actively in use.
+
+- **A pinned agent whose model is cooling now says so.** `basic` and `expert`
+  hard-code a model and are not pooled, so a spawn of either falls through routing
+  with nothing logged: when that provider was benched the escalation agent simply
+  read as "cancelled". The pool now warns once, naming the model, the reason and
+  the fact that only `explore`/`implement`/`context` can fail over.
+
+- **The shared state directory now cleans itself without needing traffic.** Dead
+  claims files and lapsed cooldowns were reclaimed only as a side effect of
+  `snapshot()`, which runs when something spawns — so an idle machine, or one
+  whose process was killed before its next spawn, carried a dead process's claims
+  file and every lapsed cooldown indefinitely, and those files are read on every
+  routing decision. `sweepStateDir` applies the same policy on an hourly clock,
+  and once at startup so the previous run's debris goes immediately. It never
+  touches this process's own claims file, `cursor.json`, a running cooldown, or a
+  lapsed cooldown still inside its strike-decay window (deleting that would reset
+  the strike count and restart the backoff at 1).
+
 ## [0.7.1] — /agent-instructions creates AGENTS.md on first use
 
 ### Changed

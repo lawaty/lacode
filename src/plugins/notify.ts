@@ -62,6 +62,12 @@ import { PACKAGE_ROOT } from "../lib/pool.ts"
 
 const SERVICE = "notify"
 const COOLDOWN_MS = 5_000
+// Hard cap on the per-session bookkeeping (`active` / `titles`). `session.deleted`
+// is the intended cleanup, but a long-running server must not depend on EVERY
+// session being deleted to stay bounded -- an abandoned session may never emit it.
+// Once past the cap the oldest session is forgotten; by then its idle events have
+// long since fired, so forgetting it can only suppress a stale notification.
+const MAX_TRACKED_SESSIONS = 500
 
 // The user's explicit off switch for notification sound. Deliberately NOT
 // exported: this file may export the factory and nothing else (opencode calls
@@ -173,6 +179,17 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   // session announce itself as finished.
   const permissions = new Set<string>()
   let warnedHelper = false
+
+  // The two per-session stores that grow with every session seen; both are capped
+  // so a long-running server cannot let them grow without bound. See MAX_TRACKED_SESSIONS.
+  const rememberActive = (sessionID: string) => {
+    active.add(sessionID)
+    while (active.size > MAX_TRACKED_SESSIONS) active.delete(active.values().next().value as string)
+  }
+  const rememberTitle = (id: string, title: string | undefined) => {
+    titles.set(id, title)
+    while (titles.size > MAX_TRACKED_SESSIONS) titles.delete(titles.keys().next().value as string)
+  }
 
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
     client.app.log({ body: { service: SERVICE, level, message, extra } }).catch(() => {})
@@ -331,7 +348,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           // fires on a title change or a token-count refresh, which would mark a
           // session as active without any work having been done.
           const { sessionID, status } = event.properties
-          if (status.type === "busy" && sessionID) active.add(sessionID)
+          if (status.type === "busy" && sessionID) rememberActive(sessionID)
           return
         }
 
@@ -339,7 +356,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           // A title arrives here, and the notification is named after it, so
           // capture the latest. Not the marker of "work happened" -- see above.
           const info = event.properties.info as SessionInfo | undefined
-          if (info?.id) titles.set(info.id, info.title)
+          if (info?.id) rememberTitle(info.id, info.title)
           return
         }
 
@@ -357,7 +374,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           pending.add(sessionID)
           // A question is also proof of work, so it must not be suppressed by the
           // never-went-busy rule -- and if it was never seen busy, treat it as busy.
-          active.add(sessionID)
+          rememberActive(sessionID)
           const headline = questionHeadline(properties.questions)
           void announce(sessionID, "question", headline || undefined)
           return
@@ -402,7 +419,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           // A permission request is also proof of work, so it must not be
           // suppressed by the never-went-busy rule -- and if it was never seen
           // busy, treat it as busy.
-          active.add(sessionID)
+          rememberActive(sessionID)
           void announce(sessionID, "permission", permissionHeadline(properties) || undefined)
           return
         }

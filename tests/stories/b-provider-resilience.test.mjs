@@ -374,16 +374,18 @@ test("[US-5] equal weights round-robin in declaration order", async () => {
   await hooks.dispose()
 })
 
-test("[US-5] no slot exceeds its weight ceiling except through overflow", async () => {
+test("[US-5] no slot exceeds its ceiling except through overflow", async () => {
   const slots = [
     { model: "prov/heavy", weight: 3 },
     { model: "prov/mid", weight: 2 },
     { model: "prov/light", weight: 1 },
   ]
   const { hooks, cfg } = await bootPool(slots, "us5-ceiling-bound")
-  // Exactly the summed ceilings: the weight gate is still in charge and no slot
-  // may be carrying more than its own number.
-  const capacity = slots.reduce((sum, s) => sum + s.weight, 0)
+  // Exactly the summed CEILINGS -- twice each weight. One rotation would still leave
+  // room (the ceiling is deliberately larger than the rotation share), so the pool has
+  // to be driven all the way to the doubled ceiling for this bound to bite.
+  const ceiling = (s) => s.weight * 2
+  const capacity = slots.reduce((sum, s) => sum + ceiling(s), 0)
   await burst(hooks, cfg, capacity)
 
   const loadsOf = async () => {
@@ -392,15 +394,15 @@ test("[US-5] no slot exceeds its weight ceiling except through overflow", async 
       .split("\n")
       .filter((line) => /^\s*slot \d/.test(line))
       .map((line) => {
-        const [, load, weight] = /load=(\d+)\/(\d+)/.exec(line)
-        return { load: Number(load), weight: Number(weight) }
+        const [, load, limit] = /load=(\d+)\/(\d+)/.exec(line)
+        return { load: Number(load), ceiling: Number(limit) }
       })
   }
 
   const atCapacity = await loadsOf()
   assert.equal(atCapacity.length, slots.length)
-  for (const { load, weight } of atCapacity) {
-    assert.ok(load <= weight, `load ${load} must never exceed the weight ceiling ${weight}`)
+  for (const { load, ceiling: limit } of atCapacity) {
+    assert.ok(load <= limit, `load ${load} must never exceed the ceiling ${limit}`)
   }
   assert.equal(
     atCapacity.reduce((sum, s) => sum + s.load, 0),
@@ -412,7 +414,7 @@ test("[US-5] no slot exceeds its weight ceiling except through overflow", async 
   await burst(hooks, cfg, 1, "implement")
   const after = await loadsOf()
   assert.ok(
-    after.some((s) => s.load > s.weight),
+    after.some((s) => s.load > s.ceiling),
     `one spawn past capacity must be visible as an over-ceiling slot: ${JSON.stringify(after)}`,
   )
   await hooks.dispose()
@@ -443,7 +445,7 @@ test("[US-6] the status view shows every process's claims and the aggregate load
 
   const status = await hooks.tool.pool_status.execute({}, {})
   const slot = status.output.split("\n").find((l) => l.includes("prov/shared"))
-  assert.match(slot, /load=4\/4/, `per-slot load must aggregate across processes:\n${status.output}`)
+  assert.match(slot, /load=4\/8/, `per-slot load must aggregate across processes:\n${status.output}`)
   // Mine contributed 2 explore, the sibling 1 explore + 1 implement.
   assert.match(slot, /explorex3/, `the per-base breakdown must aggregate both processes: ${slot}`)
   assert.match(slot, /implementx1/, `the per-base breakdown must aggregate both processes: ${slot}`)
@@ -491,7 +493,7 @@ test("[US-6] a claim file older than the dead-file threshold is pruned, not coun
   const status = await hooks.tool.pool_status.execute({}, {})
   assert.doesNotMatch(status.output, /ghost/, `a dead process must not appear:\n${status.output}`)
   assert.ok(!existsSync(stale), "the dead file must be pruned from disk, not merely ignored")
-  assert.match(status.output, /load=1\/4/, `only the live claim counts:\n${status.output}`)
+  assert.match(status.output, /load=1\/8/, `only the live claim counts:\n${status.output}`)
   await hooks.dispose()
 })
 
@@ -501,7 +503,9 @@ test("[US-6] the slot the next spawn would take is marked, including when it is 
     { model: "prov/b", weight: 1 },
   ]
   const { hooks, cfg } = await bootPool(slots, "us6-next")
-  await burst(hooks, cfg, 2)
+  // Fill both weight-1 slots to their DOUBLED ceiling of 2, so both are genuinely
+  // full and the next spawn is an overflow decision.
+  await burst(hooks, cfg, 4)
 
   // Both slots are at their ceiling, so the next spawn is an overflow decision.
   const status = await hooks.tool.pool_status.execute({}, {})
