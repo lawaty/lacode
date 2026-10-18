@@ -9,6 +9,34 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [0.8.0] — cooldowns are probed instead of trusted, and the instructions agent can read the map
+
+### Added
+
+- **Benched models are now checked by using them.** A model that rate-limits or runs
+  out of quota is benched until its window ends, and that window is computed
+  backoff rather than a promise from the provider — a quota-shaped one reaches six
+  hours, long enough for a provider that recovered, or whose quota was reset by hand
+  in its own console, to stay excluded while every delegated spawn queues behind the
+  survivors. `pool_recheck` asks instead of guessing: one real request on that exact
+  model, with a one-word prompt and its own system string so the check costs
+  handfuls of tokens rather than shipping a subagent's instructions. A model that
+  answers is re-admitted at once — no restart, no reload, because `readLimits`
+  rebuilds the cooldown state from disk on every routing decision — and one that is
+  still limited keeps exactly the window it had. `src/lib/probe.ts` owns the probe;
+  it runs every fifteen minutes while anything is cooling (`probeMs`, `0` disables)
+  and on demand through the tool, one model at a time, silent when nothing changed
+  and reported as a toast plus a log line when something did.
+
+  Three rules keep a health check from becoming the thing it is checking for. A
+  probe's own failure is never counted as a strike, or repeated checks would drive
+  the window to the six-hour cap and no probe could ever pass; the only window it
+  may change is one the provider itself stated, which is the provider correcting a
+  guess. A probe's 429 never benches a whole provider — one request is evidence
+  about one request. And a probe is a root session like any other, so it is marked
+  in the shared pool state to keep the cartographer's idle trigger from starting a
+  context run on its way past.
+
 ### Changed
 
 - **A finished cartographer run leaves the session list.** opencode's list shows
@@ -30,6 +58,16 @@ commit as the changelog entry it describes.
   `2 × weight`, so one full rotation fills only half the pool and the run is walked
   twice before every slot is full. `pool_status` prints the ceiling as `load=n/2w`,
   and a weight-3 slot may now hold 6 concurrent sessions.
+
+- **The `instructions` agent can read the context map.** Its `read` grant was
+  scoped to `AGENTS.md` alone, so an `/agent-instructions` directive was applied
+  without sight of what the project has already settled — the agent could restate
+  a fact `conventions.md` records, or contradict one it had never read. The map is
+  now readable through both path spellings (`.opencode/context/**` and
+  `*/.opencode/context/**`), declared after the broad deny so the grant is not
+  inert. The **write** grant is unchanged and still reaches `AGENTS.md` only: the
+  map stays read-only to this agent, `context` remains its only writer, and the
+  writer guard — which reads `edit` alone — needs no new exemption.
 
 ### Fixed
 
@@ -333,7 +371,8 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/lawaty/lacode/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/lawaty/lacode/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/lawaty/lacode/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/lawaty/lacode/compare/v0.5.0...v0.6.0

@@ -271,6 +271,12 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           lastRun = Date.now()
           return
         }
+        // A pool probe is a root session like any other, and it goes idle within
+        // seconds — so without this its idleness would start a cartographer run the
+        // user never asked for, borrowing a slot and editing the map on the strength
+        // of a health check. The prober shares this state object precisely so this
+        // check is possible (see State.probes).
+        if (pool.isProbe(state, sessionID)) return
         // A cartographer that never reports back must not disable autoupdate
         // for the rest of the process lifetime.
         const now = Date.now()

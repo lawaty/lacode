@@ -1,5 +1,6 @@
 import { tool, type Hooks, type PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
+import * as probe from "../lib/probe.ts"
 import type { Claim } from "../lib/pool.ts"
 
 // Task routing, limit detection and hang recovery for a shared set of models.
@@ -61,10 +62,33 @@ import type { Claim } from "../lib/pool.ts"
 const SERVICE = "agent-pool"
 const REAP_INTERVAL_MS = 30_000
 const HANG_FALLBACK_MS = 10 * 60 * 1000
+/**
+ * How often the cooled models are checked by actually using them.
+ *
+ * Fifteen minutes is the cadence a probe can afford: each one is a real request on
+ * a provider that has already refused work, so probing more often would spend the
+ * very quota it is waiting on, and less often would leave a model that recovered
+ * sitting out for the sake of a status line. It is a floor on the WAIT, not a
+ * guarantee — a `pool_recheck` call probes immediately, and every probe is one
+ * model at a time.
+ */
+const PROBE_INTERVAL_MS = 15 * 60 * 1000
 // The kill is one POST to our own local server. It gets a deadline because the
 // reaper is the thing that must never wedge: an unbounded fetch would leave
 // s.reaping true and silently disarm the watchdog for the rest of the process.
 const ABORT_TIMEOUT_MS = 10_000
+
+/**
+ * A cooldown window as a person would say it out loud.
+ *
+ * A cooldown is reported to the user as the thing they are being asked to wait out,
+ * and "21600s" is not that. Sub-minute windows keep seconds (the common case: the
+ * 60s re-probe after a transient outage); anything longer rounds UP to the next
+ * whole minute, so a window one second past four minutes is never shown as "4m".
+ * An understated window is worse than no number at all — it is what makes a user
+ * decide the pool is still broken and restart the whole thing by hand.
+ */
+const formatWindow = (seconds: number): string => (seconds < 60 ? `${seconds}s` : `${Math.ceil(seconds / 60)}m`)
 
 type LogFn = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => Promise<void>
 
@@ -75,6 +99,8 @@ export type AgentPoolOptions = {
   dir?: string
   /** Reaper interval; the 30s default is what production runs on. */
   reapMs?: number
+  /** How often cooled models are probed by using them; the 15m default, 0 disables. */
+  probeMs?: number
   /** Explicit slot file. Short-circuits the preset resolution chain. */
   modelsFile?: string
   /** Inline `{ slots: [...] }`, highest priority in the resolution chain. */
@@ -83,7 +109,7 @@ export type AgentPoolOptions = {
 
 // Typed as a factory returning hooks, NOT as a Plugin: only src/index.ts may
 // carry the Plugin type, because only it may be loaded as one.
-export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOptions): Promise<Hooks> => {
+export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?: PluginOptions): Promise<Hooks> => {
   const opts = (options ?? {}) as AgentPoolOptions
   const s = pool.state(opts)
   // Makes ~/.config/lacode/ exist so a user can drop a pool.json into it. Never
@@ -285,6 +311,92 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
     `reaper armed: every ${Math.round(reapMs / 1000)}s, aborts a claim older than ${Math.round(pool.STUCK_MIN_AGE_MS / 60000)}m whose target has been silent ${Math.round(pool.STUCK_IDLE_MS / 60000)}m, or any claim past the ${Math.round(pool.MAX_CLAIM_AGE_MS / 60000)}m ceiling however chatty`,
   )
 
+  // ---------------------------------------------------------------------------
+  // Cooldown probing (src/lib/probe.ts)
+  // ---------------------------------------------------------------------------
+  //
+  // It lives here rather than in a fourth hook factory because a probe is not
+  // self-contained: the event hook above must be able to recognise a probe's
+  // failure and refuse to count it as new evidence, the cartographer's idle trigger
+  // must be able to skip a probe session, and both read the same `s` this factory
+  // already holds. A separate factory would have to publish its probe sessions into
+  // that state to be heard at all, which is the same coupling with more indirection.
+  //
+  // The timer is armed only while something is actually cooling — probeCooling
+  // returns immediately when it is not — so the common case costs one timestamp
+  // comparison every fifteen minutes and no request at all.
+  const EMPTY_REPORT: probe.ProbeReport = { outcomes: [], cleared: [], kept: [], changed: false }
+
+  // The `agent-pool: ` prefix belongs to whoever presents this — pool_status and this
+// tool share it — so it is added there and not baked into the summary.
+const reportTitle = (report: probe.ProbeReport) =>
+  report.outcomes.length === 0
+    ? "nothing cooling to probe"
+    : `probed ${report.outcomes.length} cooling model(s), re-admitted ${report.cleared.length}`
+
+  /** Brief by design: this lands in a toast and in a tool answer, not in a report. */
+  const reportText = (report: probe.ProbeReport): string => {
+    if (report.outcomes.length === 0) return "no models are cooling down, so there was nothing to probe."
+    return [
+      ...report.outcomes.map((outcome) =>
+        outcome.ok
+          ? `${outcome.model}: answered — cooldown cleared (it had ${formatWindow(outcome.hadSeconds)} left), back in the rotation`
+          : `${outcome.model}: still limited (${outcome.reason}) — cooldown kept${
+              outcome.leftSeconds > 0 ? `, ${formatWindow(outcome.leftSeconds)} left` : ""
+            }`,
+      ),
+      report.cleared.length > 0
+        ? `re-admitted: ${report.cleared.join(", ")}. They route again on the next pooled spawn — nothing needs restarting or reloading.`
+        : "nothing was re-admitted; the pool is short exactly as much as it was.",
+    ].join("\n")
+  }
+
+  /**
+   * Surface a change the user would otherwise never learn about.
+   *
+   * A silent pass is the common case and stays silent — a toast every fifteen
+   * minutes saying "nothing happened" is how a useful notification gets ignored. The
+   * toast is best-effort: there is no TUI on a server-only run, and a prober that
+   * cannot report is still a prober.
+   */
+  const announce = async (report: probe.ProbeReport) => {
+    if (!report.changed) return
+    const message =
+      report.cleared.length > 0
+        ? `Re-admitted ${report.cleared.join(", ")} — they answer again.`
+        : `${report.kept.length} cooling model(s) re-checked, still limited.`
+    await log("info", `pool probe: ${message}`, { cleared: report.cleared, kept: report.kept })
+    try {
+      await client.tui?.showToast?.({
+        body: { title: "pool recheck", message, variant: report.cleared.length > 0 ? "success" : "info", duration: 8000 },
+      })
+    } catch {
+      /* no TUI attached; the log line above is the record */
+    }
+  }
+
+  const runProbe = async (models?: string[]): Promise<probe.ProbeReport> => {
+    let report = EMPTY_REPORT
+    try {
+      report = await probe.probeCooling(client as probe.ProbeClient, { state: s, directory, models })
+    } catch (error) {
+      await log("error", `pool probe failed: ${String(error)}`)
+      return EMPTY_REPORT
+    }
+    await announce(report)
+    return report
+  }
+
+  const probeMs = opts.probeMs ?? PROBE_INTERVAL_MS
+  const probeTimer = probeMs > 0 ? setInterval(() => void runProbe(), probeMs) : undefined
+  probeTimer?.unref?.()
+  void log(
+    "info",
+    probeMs > 0
+      ? `cooldown probe armed: every ${Math.round(probeMs / 60000)}m, checks the models that are cooling by using them (one request each, one at a time); 0 to disable`
+      : "cooldown probe disabled (probeMs: 0); use the pool_recheck tool to check on demand",
+  )
+
   return {
     config: async (cfg) => {
       const slots = pool.ensureSlots(s, (m) => void warnOnce(m))
@@ -368,6 +480,14 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
           // reason from any other provider is the same statement, so both count.
           if (status?.type === "retry" && status.action?.provider && (reason === "free_tier_limit" || pool.isLimitText(reason))) {
             const provider = status.action.provider
+            // A probe's own 429 is evidence about one request, not about every slot
+            // on the provider, and letting it bench the whole provider would turn a
+            // health check into a denial of service against the pool running it.
+            // The probe settles its own model's cooldown instead (src/lib/probe.ts).
+            if (sessionID && pool.isProbe(s, sessionID)) {
+              await log("debug", `probe on provider ${provider} was limited (${reason || "rate-limited"}); not cooling the provider`)
+              return
+            }
             const until = typeof status.next === "number" && status.next > Date.now() ? status.next : Date.now() + HANG_FALLBACK_MS
             const cooled = pool.coolProvider(s, provider, until, reason || "rate-limited")
             if (cooled.length > 0) {
@@ -418,6 +538,16 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
         const transientGateway = gateway5xx || pool.isTransientGatewayText(haystack)
         if (!limited && !transientGateway) return
         const model = `${info.providerID ?? "?"}/${info.modelID ?? "?"}`
+        // A probe is a QUESTION about a model, not work on it. Counting its failure
+        // would re-cool the model a little further on every check, until the window
+        // sat at the six-hour cap and no probe could ever pass — the prober would
+        // guarantee the outcome it exists to detect. The probe settles its own
+        // model's cooldown instead (src/lib/probe.ts), so this is only about real
+        // work failing.
+        if (info.sessionID && pool.isProbe(s, info.sessionID)) {
+          await log("debug", `probe of ${model} hit a limit (${pool.isLimitText(haystack) ? "limit" : "transient"}); leaving the cooldown to the probe`)
+          return
+        }
         // A transient upstream outage is not a limit: it lifts on its own, so it
         // gets a short, flat cooldown and is never counted as a strike (which
         // would escalate the cooldown past the outage -- see pool.coolUnavailable).
@@ -524,6 +654,21 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
     },
 
     tool: {
+      pool_recheck: tool({
+        description:
+          "Probe the models the pool has benched and re-admit the ones that answer. Each probe is a real request on that exact model, so it settles what a cooldown can only guess: if the model replies, its cooldown is cleared and it is back in the rotation; if it is still limited, the existing cooldown stands. Call it after resetting a quota in the provider's own console, when the pool feels short of capacity, or to check now instead of waiting for the next automatic pass.",
+        args: {
+          models: tool.schema
+            .array(tool.schema.string())
+            .optional()
+            .describe("Model ids to probe, as provider/model-id. Omit to probe every model that is cooling."),
+        },
+        async execute(args) {
+          const report = await runProbe(args?.models)
+          return { title: `agent-pool: ${reportTitle(report)}`, output: reportText(report) }
+        },
+      }),
+
       pool_status: tool({
         description:
           "Show live pool load across every opencode process, per free model and per agent type, each slot's load against its ceiling, the slot marked <- next that the next spawn would take, and which models are cooling after a rate limit or a stuck task. Check it before launching many parallel subagents.",
@@ -588,6 +733,12 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
               `hung past ${Math.round(pool.STUCK_MIN_AGE_MS / 60000)}min with ${Math.round(pool.STUCK_IDLE_MS / 60000)}min silence: ${hung} (auto-aborted); reaped total: ${s.reaped}.`,
               `overran past ${Math.round(pool.MAX_CLAIM_AGE_MS / 60000)}min: ${overran} (auto-aborted).`,
               `watchdog alive: last sweep ${s.lastSweep ? `${Math.max(0, Math.round((now - s.lastSweep) / 1000))}s ago` : "never"} (every ${Math.round(reapMs / 1000)}s).`,
+              // When the cooled models were last USED rather than inferred, because
+              // "still cooling" and "nobody has actually asked it lately" are
+              // different situations and this is the line that tells them apart.
+              probeMs > 0
+                ? `cooldown probe: last ${s.lastProbe ? `${Math.max(0, Math.round((now - s.lastProbe) / 1000))}s ago` : "never (nothing has been cooling)"}, every ${Math.round(probeMs / 60000)}m; call the pool_recheck tool to ask now.`
+                : "cooldown probe: off (probeMs: 0); call the pool_recheck tool to ask now.",
               coolingNow.length === 0
                 ? "no models cooling down."
                 : `cooling: ${coolingNow.map(([m, st]) => `${m} for ${Math.ceil((st.until - now) / 1000)}s`).join(", ")}`,
@@ -599,6 +750,7 @@ export const agentPoolHooks = (async ({ client, serverUrl }, options?: PluginOpt
 
     dispose: async () => {
       clearInterval(timer)
+      if (probeTimer) clearInterval(probeTimer)
       s.own.clear()
       // Drop the per-session bookkeeping with the claims: nothing can be running
       // once the hooks are gone, and these are the two maps that would otherwise

@@ -56,7 +56,7 @@ const ABS_AGENTS_MD = "some/where/AGENTS.md"
   assert(/AGENTS\.md/.test(def.template), `the template must name the file it maintains, got ${def.template}`)
 }
 
-// --- the instructions agent exists and its grant is scoped to AGENTS.md alone ---
+// --- the instructions agent exists and its WRITE grant is scoped to AGENTS.md alone ---
 {
   const set = buildAgentSet()
   const instr = set[AGENT_INSTRUCTIONS_WRITER]
@@ -75,9 +75,40 @@ const ABS_AGENTS_MD = "some/where/AGENTS.md"
     assert(winner(rule, AGENTS_MD)?.action === "allow", `${tool} must allow the project-root AGENTS.md`)
     assert(winner(rule, ABS_AGENTS_MD)?.action === "allow", `${tool} must allow the AGENTS.md form of a "/"-rooted project`)
     assert(winner(rule, "src/agents.ts")?.action === "deny", `${tool} must NOT reach any other path`)
-    assert(winner(rule, ".opencode/context/architecture.md")?.action === "deny", `${tool} must NOT reach the context map`)
   }
   assert(instr.permission.bash === "deny", "the instructions agent must not run bash")
+}
+
+// --- the context map is readable by it and writable by nobody but `context` ---
+{
+  // The directive is about how work is DONE here; the map is the maintained record
+  // of what the project IS. Reading it is how this agent avoids recording a settled
+  // fact, or contradicting one it has not read. Writing it would make the map a
+  // two-writer file, which is the one rule the whole map depends on.
+  const instr = buildAgentSet()[AGENT_INSTRUCTIONS_WRITER]
+  const read = instr.permission.read
+  const MAP = ".opencode/context/architecture.md"
+  const ABS_MAP = "home/user/project/.opencode/context/conventions.md"
+
+  assert(winner(read, MAP)?.action === "allow", `read must reach the context map, got ${JSON.stringify(read)}`)
+  assert(winner(read, ABS_MAP)?.action === "allow", "read must reach it in the '/'-rooted spelling too")
+  assert(winner(read, ".opencode/context/nested/anything.md")?.action === "allow", "the grant is the whole map directory, not five filenames")
+  // Both spellings must be declared AFTER the broad deny, or the grant is inert:
+  // opencode takes the LAST matching rule.
+  const entries = Object.keys(read)
+  assert(entries.indexOf(".opencode/context/**") > entries.indexOf("*"), "the map allow must sit after the broad deny")
+  assert(entries.indexOf("*/.opencode/context/**") > entries.indexOf("*"), "and so must the '/'-rooted spelling")
+  // Nothing else rode in on the way: the agent still cannot read ordinary source.
+  assert(winner(read, "src/agents.ts")?.action === "deny", "read must still deny ordinary source")
+  assert(winner(read, "/etc/hosts")?.action === "deny", "read must still deny anything outside the two paths")
+
+  assert(winner(instr.permission.edit, MAP)?.action === "deny", "edit must NOT reach the context map")
+  assert(winner(instr.permission.edit, ABS_MAP)?.action === "deny", "nor in the '/'-rooted spelling")
+  assert(winner(instr.permission.edit, "src/agents.ts")?.action === "deny", "and nothing else is writable")
+
+  // The prompt has to say so, or a permitted read is one the agent never takes.
+  assert(/READ-ONLY/i.test(instr.prompt), "the prompt must state the map is read-only to it")
+  assert(/\.opencode\/context\//.test(instr.prompt), "the prompt must point it at the map")
 }
 
 // --- no other agent can spawn the instructions agent ---

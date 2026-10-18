@@ -815,20 +815,46 @@ on that.
   write only what the client asked for.
 - Say plainly in your report that you created the file.
 
+# Before you write
+
+Read \`.opencode/context/\` first when it is there — \`architecture.md\`,
+\`conventions.md\` or \`contexts.md\`, whichever bears on the directive — so you do
+not record a fact the project has already settled, and do not contradict one you
+do not know yet. Read only what is relevant, and carry on if it is missing.
+
+That map is READ-ONLY to you: the \`context\` agent is its only writer. If the
+directive contradicts it, say so plainly in your report and still write what the
+client asked for. Never edit the map to agree with \`AGENTS.md\` — the two are
+different files with different jobs, and this one is yours alone.
+
 # Reporting
 
 Report briefly what you changed and where. Do not edit any other file.`,
   permission: {
-    // Read is scoped to the one file too: the directive is about AGENTS.md, and
-    // nothing else is any of this agent's business.
+    // Read reaches AGENTS.md and the context map, and nothing else.
+    //
+    // The map is here because the directive is about how work is DONE in this
+    // project and the map is the maintained record of what the project IS: reading
+    // it is how this agent avoids recording a fact the code already settles, and
+    // avoids contradicting one it does not know yet. It stays READ-ONLY — `edit`
+    // below still denies the map, so this grant cannot turn the one-writer rule
+    // into a two-writer rule, and the writer guard does not have to care about it
+    // (it reads `edit` alone).
+    //
+    // Both spellings are required, and every allow must sit AFTER the broad deny:
+    // LAST match wins, so an allow written before "*": "deny" is silently inert.
     read: {
       "*": "deny",
       "AGENTS.md": "allow",
       "*/AGENTS.md": "allow",
+      "*/.opencode/context/**": "allow",
+      ".opencode/context/**": "allow",
     },
     glob: "deny",
     grep: "deny",
     list: "deny",
+    // Still exactly one writable path. The map is readable (see above) and stays
+    // unwritable: `context` is its only writer, and this agent is not it.
     edit: {
       "*": "deny",
       "AGENTS.md": "allow",

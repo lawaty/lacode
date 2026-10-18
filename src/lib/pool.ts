@@ -490,6 +490,27 @@ type State = {
   strikes: Map<string, Strike>
   activity: Map<string, number>
   /**
+   * Sessions this process opened to PROBE a cooled model (see ./probe.ts).
+   *
+   * A probe is a health check, not work, and three things must be able to tell the
+   * difference. Limit detection must not count its failure as new evidence about
+   * the provider, or a model that is still limited would be re-cooled a little
+   * further every cycle until it could never come back however long it waited. The
+   * provider-wide cooldown must not fire from it either — a probe that 429s is
+   * evidence about one request, and letting it bench a whole provider turns the
+   * prober into a denial of service against its own pool. And the cartographer's
+   * idle trigger must skip it, because a probe is a root session like any other and
+   * would otherwise start a context run nobody asked for.
+   *
+   * Held here because this is the one state object every plugin in a process
+   * already shares; the probes themselves live in ./probe.ts.
+   */
+  probes: Set<string>
+  /** True while a probe run is in flight, so two runs cannot overlap. */
+  probing: boolean
+  /** When a probe run last did anything, so the status can say when it last checked. */
+  lastProbe: number
+  /**
    * Recently seen `session.created` children, newest last, per parent session.
    * `bindChild` only matches a claim that already exists, so a child that is
    * created before its claim is taken is never bound and the claim can never be
@@ -537,6 +558,9 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
       cooling: new Map(),
       strikes: new Map(),
       activity: new Map(),
+      probes: new Set(),
+      probing: false,
+      lastProbe: 0,
       children: new Map(),
       reaped: 0,
       reaping: false,
@@ -889,6 +913,80 @@ export function coolUnavailable(s: State, model: string) {
   }
   return strike
 }
+
+/** What a re-admission reports back: the model, why it was benched, and how long it had left. */
+export type ClearedCooldown = { model: string; reason: string; strikes: number; secondsLeft: number }
+
+/**
+ * Re-admit cooled models: delete their cooldown files and drop the in-memory record.
+ *
+ * This is the MECHANISM, not a policy. Nothing calls it to un-bench a model on a
+ * schedule or on request — the only caller is a probe that has just watched the
+ * model answer (see ./probe.ts), which is the whole difference between a fact and
+ * the guess the cooldown file was in the first place.
+ *
+ * The whole FILE goes, not just its `until`. The strike count is the pool's memory
+ * of how badly this model misbehaved, and a model that has demonstrably recovered is
+ * not that model any more, so the next failure starts at strike 1 rather than
+ * escalating straight back into a long window it has already been cleared of.
+ *
+ * Deleting the file is also the whole propagation mechanism: `readLimits` rebuilds
+ * `cooling`/`strikes` from the directory on every `snapshot()`, so no running
+ * opencode process needs a restart and none is asked for.
+ *
+ * `models` narrows the re-admission to named models. A file that names no readable
+ * model cannot be matched against that filter, so it is left for `readLimits` to
+ * discard; an unfiltered call takes it with everything else.
+ */
+export function clearCooldowns(s: State, models?: string[]): ClearedCooldown[] {
+  const cleared: ClearedCooldown[] = []
+  const now = Date.now()
+  const wanted = models && models.length > 0 ? new Set(models) : undefined
+  let entries: string[]
+  try {
+    entries = readdirSync(s.dir)
+  } catch {
+    return cleared // no state dir: every cooldown is already in memory only
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith("limit.") || !entry.endsWith(".json")) continue
+    const path = join(s.dir, entry)
+    let strike: Strike | undefined
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as Strike
+      if (parsed && typeof parsed.model === "string") strike = parsed
+    } catch {
+      strike = undefined
+    }
+    if (wanted && (strike === undefined || !wanted.has(strike.model))) continue
+    try {
+      unlinkSync(path)
+    } catch {
+      continue // another process re-read or removed it first; nothing left to do
+    }
+    if (strike === undefined) {
+      cleared.push({ model: entry, reason: "unreadable cooldown file", strikes: 0, secondsLeft: 0 })
+      continue
+    }
+    s.cooling.delete(strike.model)
+    s.strikes.delete(strike.model)
+    cleared.push({
+      model: strike.model,
+      reason: typeof strike.reason === "string" ? strike.reason : "unknown",
+      strikes: typeof strike.strikes === "number" ? strike.strikes : 0,
+      secondsLeft: typeof strike.until === "number" ? Math.max(0, Math.ceil((strike.until - now) / 1000)) : 0,
+    })
+  }
+  return cleared
+}
+
+/** Mark a session as a pool health probe, so the hooks can tell it from real work. */
+export const markProbe = (s: State, sessionID: string) => s.probes.add(sessionID)
+
+export const unmarkProbe = (s: State, sessionID: string) => s.probes.delete(sessionID)
+
+/** True for a session this process opened to probe a cooled model. */
+export const isProbe = (s: State, sessionID: string) => s.probes.has(sessionID)
 
 export function refreshCatalog(s: State, serverUrl?: URL) {
   if (!serverUrl || Date.now() - s.catalogAt < CATALOG_TTL_MS) return
