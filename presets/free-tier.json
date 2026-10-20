@@ -26,10 +26,26 @@
     "  3. once EVERY slot is at its ceiling, the overflow goes to the least loaded slot,",
     "     so a burst past the summed ceilings degrades to even spreading and never blocks",
     "",
-    "With this file: space-bunny takes 3 consecutive turns, then longcat-2.5-preview",
-    "(opencode-go) takes 2, then big-pickle and longcat-2.5-preview (Zen) take 1 each -- sequence 1,1,1,2,2,3,4,...",
+    "With this file: big-pickle takes 3 consecutive turns, then minimax-m3.1-flash-free",
+    "(opencode-go) takes 2, then deepseek-v4.1-flash-free and glm-5.3-flash-free take 1",
+    "each -- sequence 1,1,1,2,2,3,4,...",
     "Equal weights give a plain round robin in list order. 2,2,1,1 reproduces the old",
     "primary/overflow cycle exactly, which is why the old tier values still work.",
+    "",
+    "WEIGHTS DESCEND, AND THAT IS NOT COSMETIC. The rotation is order-first: the run is",
+    "expanded in declaration order, so the heaviest slot must come first for a skip to",
+    "land on the heaviest slot that is LEFT. A heavier slot declared after a lighter one",
+    "is unreachable in the way the pool means.",
+    "",
+    "EVERY SLOT IS A MODEL THAT IS PROBABLY STILL THERE NEXT WEEK, AND NO TWO SLOTS",
+    "SHARE A FAMILY. A free model can be withdrawn by its provider without warning --",
+    "space-bunny-free was pulled from the opencode provider while it was still this",
+    "file's first slot, and every new session then died on 'Model not found'. So the",
+    "slots here are the long-lived free ones (big-pickle has been on the opencode",
+    "provider for years), spread over two providers and four model families, because a",
+    "pool where every slot is one family is one withdrawal away from being empty. If a",
+    "slot does go away, the plugin warns at startup and the rest keep working; the fix",
+    "is a one-line edit here, not a redesign.",
     "",
     "Round-robin rather than heaviest-first because re-prioritising the heaviest slot on",
     "EVERY spawn drained the fastest provider's free-tier window early: one provider",
@@ -67,9 +83,9 @@
     "Changing this file requires restarting every opencode process: plugins are not hot-reloaded."
   ],
   "slots": [
-    { "model": "opencode/space-bunny-free", "weight": 3 },
-    { "model": "opencode-go/longcat-2.5-preview-free", "weight": 2 },
-    { "model": "opencode/big-pickle", "weight": 1 },
-    { "model": "opencode/longcat-2.5-preview-free", "weight": 1 }
+    { "model": "opencode/big-pickle", "weight": 3 },
+    { "model": "opencode-go/minimax-m3.1-flash-free", "weight": 2 },
+    { "model": "opencode/deepseek-v4.1-flash-free", "weight": 1 },
+    { "model": "opencode/glm-5.3-flash-free", "weight": 1 }
   ]
 }

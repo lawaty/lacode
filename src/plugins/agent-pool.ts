@@ -584,12 +584,22 @@ const reportTitle = (report: probe.ProbeReport) =>
       // never chose, above the ceiling that slot was meant to enforce.
       const manual = pool.manualVariant(requested)
       if (manual) {
-        await log("warn", `refused manual spawn of slot variant ${requested}; spawn "${manual}" instead`, {
-          variant: requested,
+        // The variant's NAME is deliberately absent from this line and from the
+        // error below, for the same reason the routing log omits it.
+        //
+        // This error is the TOOL RESULT the model reads at the exact moment it
+        // is choosing what to spawn next. Naming the name it just used puts a
+        // valid-looking agent name back in front of it, in the decision point,
+        // and the refusal becomes the thing that TEACHES the name. The log
+        // alone was enough to take the refusal rate from 100% to 36%; the error
+        // is the stronger channel still, because it arrives without a
+        // deliberate read. The base is named instead, because the base is what
+        // the model should type.
+        await log("warn", `refused manual spawn of a pool slot variant; spawn "${manual}" instead`, {
           base: manual,
         })
         throw new Error(
-          `${requested} is a pool slot variant and cannot be spawned by name. Naming it lets the caller pick the provider: ` +
+          `That agent is a pool slot variant and cannot be spawned by name. Naming it lets the caller pick the provider: ` +
             `it skips the round-robin rotation and the slot's ceiling, so one provider takes every concurrent claim. ` +
             `Spawn "${manual}" and let the pool choose the slot.`,
         )

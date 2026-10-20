@@ -240,7 +240,11 @@ const cooling = (id, dir, models, ms) => {
 
   // And it must not bench the provider: one 429 is evidence about one request.
   pool.coolUnavailable(s, "fixture-provider/other-model")
-  const other = "opencode/longcat-2.5-preview-free"
+  // The other slot on the SAME provider as the one being cooled. Derived from the
+  // preset rather than named, so swapping a pool model is not a test edit -- the
+  // sibling pool tests already work that way.
+  const other = SLOT_MODELS.find((m) => pool.splitModel(m).provider === provider && m !== model)
+  assert(other, `the preset must give "${provider}" a second slot for this to test`)
   await hooks.event({
     event: {
       type: "session.status",

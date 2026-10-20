@@ -24,6 +24,7 @@ const boot = async (id) => {
   await hooks.config(cfg)
   return {
     hooks,
+    cfg,
     /** Route a spawn, reporting a refusal rather than throwing it. */
     async trySpawn(subagent, callID) {
       const out = { args: { subagent_type: subagent, prompt: "x" } }
@@ -38,6 +39,41 @@ const boot = async (id) => {
     text: () => stub.text().join("\n"),
   }
 }
+
+// opencode's own two filters for the "Available agent types" block that goes
+// into the system prompt, modelled exactly as the runtime does it:
+//
+//   1. drop every agent whose `mode` is "primary"
+//   2. drop every agent the CALLING agent's task permission denies
+//
+// `hidden` is NOT one of them. That flag is honoured by the TUI, the @-mention
+// pickers, the "agent not found" message and default-agent resolution -- and by
+// nothing else. A variant that is hidden but still a subagent is therefore
+// listed to the model under its own name, and the model copies that name
+// straight into its next spawn, where the pool refuses it.
+//
+// Permission patterns compile to anchored regexes (* -> .*) and the LAST match
+// wins; a name that matches no rule is "ask", not "deny".
+const wildcard = (input, pattern) =>
+  new RegExp(
+    "^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$",
+    "s",
+  ).test(input)
+
+const taskAction = (caller, name) => {
+  let action
+  for (const [pattern, value] of Object.entries(caller?.permission?.task ?? {})) {
+    if (wildcard(name, pattern)) action = value
+  }
+  return action
+}
+
+/** The agent names the model is shown, as opencode would compute them. */
+const listedTo = (cfg, callerName) =>
+  Object.entries(cfg.agent ?? {})
+    .filter(([, def]) => def.mode !== "primary")
+    .filter(([name]) => taskAction(cfg.agent?.[callerName], name) !== "deny")
+    .map(([name]) => name)
 
 test("[US-5] a hand-named slot variant is refused, and the refusal names the bare base", async () => {
   const t = await boot("gate-refuse")
@@ -93,6 +129,58 @@ test("[US-5] an agent that merely looks like a variant is left alone", async () 
 test("[US-5] the refusal is logged, so a blocked spawn is never silent", async () => {
   const t = await boot("gate-logged")
   await t.trySpawn("implement-1", "log-1")
-  assert.match(t.text(), /refused manual spawn of slot variant implement-1/, `got:\n${t.text()}`)
+  assert.match(t.text(), /refused manual spawn of a pool slot variant/, `got:\n${t.text()}`)
+  await t.hooks.dispose()
+})
+
+test("[US-5] the refusal does not name the variant it refused", async () => {
+  const t = await boot("gate-no-name")
+  // The refusal is the TOOL RESULT the model reads at the moment it chooses
+  // what to spawn next. If it repeats the name the model just used, the
+  // refusal is the thing that TEACHES the name -- and a model that can see a
+  // list of slot names will copy them straight back, which is how the pool
+  // ended up refusing most of its spawns. Naming the BASE is enough to be
+  // actionable, because the base is what the model should type.
+  for (const variant of ["explore-1", "implement-3", "context-2"]) {
+    const r = await t.trySpawn(variant, `n-${variant}`)
+    assert.equal(r.ok, false, `${variant} must be refused`)
+    assert.ok(!r.message.includes(variant), `the refusal must not repeat "${variant}": ${r.message}`)
+    assert.match(r.message, /Spawn "(explore|implement|context)"/, `the refusal must point at the bare base: ${r.message}`)
+  }
+  const log = t.text()
+  for (const variant of ["explore-1", "implement-3", "context-2"]) {
+    assert.ok(!log.includes(variant), `the log must not carry "${variant}", got:\n${log}`)
+  }
+  await t.hooks.dispose()
+})
+
+test("[US-5] a slot variant is not in the agent list the model is shown, and the bare base is", async () => {
+  const t = await boot("gate-invisible")
+  // The refusal above is CORRECT: naming a variant is how a caller would pick
+  // the provider and skip the rotation. But it should almost never happen, and
+  // the reason it happened constantly is a leak, not a bad caller. opencode
+  // builds the system prompt's agent list from the registry without reading
+  // `hidden`, so every variant was listed to the model under its own name --
+  // "explore-1: Hidden pool variant explore-1" -- and the model copied those
+  // names into its next spawn. The variants are the OUTPUT of routing; a model
+  // that can see them will use them, and the pool will refuse every one.
+  //
+  // `mode: "primary"` is the only field that filter respects, and it is safe:
+  // the task tool resolves an agent by name and never reads its mode.
+  const listed = listedTo(t.cfg, "build")
+  const variants = Object.keys(t.cfg.agent ?? {}).filter((n) => /^(explore|implement|context)-\d+$/.test(n))
+  assert.ok(variants.length > 0, "the config must carry the pooled variants, or this proves nothing")
+  for (const variant of variants) {
+    assert.ok(!listed.includes(variant), `${variant} must not be visible to the model, but it is`)
+  }
+  // The bases must remain visible, or nothing can be spawned at all.
+  for (const base of ["explore", "implement"]) {
+    assert.ok(listed.includes(base), `${base} must stay in the agent list the model is shown`)
+  }
+  // And the variant must stay hidden as well: `mode` alone would put it in the
+  // TUI's primary picker and the @-mention list.
+  for (const variant of variants) {
+    assert.equal(t.cfg.agent[variant].hidden, true, `${variant} must stay hidden for the TUI and the mention pickers`)
+  }
   await t.hooks.dispose()
 })

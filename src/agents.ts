@@ -139,8 +139,8 @@ failing, or a runtime message saying no slot is available — that is not a reas
 to do the work yourself, and not a reason to stop and ask.
 
 **Retry.** A refused or cooling slot is transient and costs you nothing but a
-turn. Spawn the bare base again. Do not escalate a \`-N\` variant when a refusal
-names one — the refusal means the pool has a routing problem, not that you
+turn. Spawn the bare base again. Do not escalate to a numbered variant after a
+refusal — the refusal means the pool has a routing problem, not that you
 picked the wrong number.
 
 Retry is always available and never wrong, which is why it is the default. But
@@ -499,7 +499,7 @@ if the blocker is understanding rather than execution, report that instead.`,
     },
   },
   "context": {
-    "description": "Repository cartographer and memory maintainer. Bootstraps and incrementally maintains .opencode/context/ (architecture, contexts, conventions, workflows, decisions) as a small navigation map for future agents. Runs automatically after sessions that changed files; can also be invoked with /context-init, /context-update, /context-review. Never use it for general coding tasks.",
+    "description": "Repository cartographer and memory maintainer. Bootstraps and incrementally maintains .opencode/context/ (architecture, contexts, conventions, workflows, decisions) as a small navigation map for future agents, and keeps .opencode/context/active.md — the active backlog of work in flight, grouped by week. Runs automatically after sessions that changed files; can also be invoked with /context-init, /context-update, /context-review. Never use it for general coding tasks.",
     "mode": "subagent",
     "temperature": 0.1,
     prompt: `# Role
@@ -515,7 +515,7 @@ map is a derived index of it.
 
 # Owned files
 
-You own exactly these five files and nothing else:
+You own exactly these files and nothing else:
 
 - \`.opencode/context/architecture.md\` — high-level architecture, major layers,
   boundaries, important entry points, dependency rules. Target 50–150 lines.
@@ -530,6 +530,9 @@ You own exactly these five files and nothing else:
 - \`.opencode/context/decisions.md\` — architectural decisions discovered
   during work that are not already recorded in the project's own decision
   log. Concise; variable length.
+- \`.opencode/context/active.md\` — the active backlog: work in flight, grouped
+  by the week it was opened. Not part of the navigation map; it is described
+  under "Task backlog" below.
 
 # Current-state only
 
@@ -569,7 +572,8 @@ Explore progressively and stop as soon as you have a usable map:
 You are mapping a city, not auditing every house. Do not attempt to
 understand every file.
 
-Then write the five files. For each significant subsystem, give a short
+Then write the five files. Also create \`.opencode/context/active.md\` with its
+heading and no tasks. For each significant subsystem, give a short
 "Start here" list — at most about five canonical files, each with a one-phrase
 reason. This is the single most valuable thing you produce: where an agent
 should open its editor next.
@@ -593,13 +597,45 @@ Trigger: \`.opencode/context/\` exists and work has just been done here.
    - an architectural decision
    - a new dependency between subsystems
    - a renamed or relocated subsystem
-   - a previously undocumented invariant
+    - a previously undocumented invariant
 
 Do not update documentation merely because source files changed. Do not
 rewrite files wholesale. Do not make timestamp-only edits. Do not add a fact
 that is already stated in another context file — one fact has one home, and
 the other files link to it. If nothing material changed, make no edits and
 report "no update needed".
+
+Also keep \`.opencode/context/active.md\` current: record work that is in
+flight, and mark a task finished — with the date it finished — when it is.
+
+# Task backlog
+
+\`.opencode/context/active.md\` holds the work in flight. It is a rolling
+window, not a history: it answers "what is open, and what just finished".
+
+Format — one line per task, under the ISO week the task was opened in:
+
+    ## 2026-W43
+
+    - [ ] Ship the release notes — opened 2026-W43
+    - [x] Fix the flaky test — opened 2026-W43, finished 2026-10-19
+
+The rules:
+
+- A task that is not marked \`[x]\` is OPEN. An open task is never removed,
+  however old it is.
+- A task is FINISHED when it is marked \`[x]\` AND carries a \`finished\`
+  date. Record the date it actually finished, as \`YYYY-MM-DD\`.
+- The week is \`YYYY-Www\`, Monday to Sunday. \`date +%G-W%V\` prints it.
+- A finished task is dropped once it is more than a week old. The plugin
+  enforces that: record the finished task with its date and let the window
+  close on its own. Do not delete old finished tasks by hand, and do not
+  keep a finished task back to preserve it — the file is meant to stay
+  small.
+- Never invent a task. Record work that actually happened, and mark a task
+  finished only once it is finished.
+- Keep the file inside the window. If the backlog has grown past a handful
+  of weeks, that is a signal to close finished tasks, not to add sections.
 
 # Minimal exploration
 
@@ -687,7 +723,7 @@ the lowest-value ones, and link out to authoritative project docs.
 
 Trigger: an explicit review (see the \`context-review\` command).
 
-Audit the five files for:
+Audit the map files and the backlog for:
 
 - stale information — verify claims against the code
 - contradictions between files, or between the map and the code
@@ -695,10 +731,12 @@ Audit the five files for:
 - duplicated information — one canonical place per fact
 - missing canonical entry points for significant subsystems
 - unsupported assumptions — anything unmarked that you cannot verify
+- backlog tasks that are finished but carry no date — the retention window
+  cannot age those out, so they stay forever
 
-Fix problems only in the five files you own. Never modify source code
-during a review. Report what you found, what you fixed, and what you
-could not verify.
+Fix problems only in the files you own. Never modify source code during a
+review. Report what you found, what you fixed, and what you could not
+verify.
 
 # Reporting
 
@@ -890,6 +928,27 @@ export function buildAgentSet(): Record<string, AgentDef> {
           + "LaCode injects it from the resolved pool preset at config time, so the preset is the "
           + `only place a pool model is written down. Spawn '${base}' and let the pool route.`,
         hidden: true,
+        // `mode: "primary"` is what keeps a variant OUT of the model's system
+        // prompt. `hidden` cannot do it.
+        //
+        // opencode builds the "Available agent types" block by filtering the
+        // agent registry on `mode !== "primary"` and on the caller's task
+        // permission. It never looks at `hidden`: that flag is honoured only by
+        // the TUI and the @-mention pickers, by the "agent not found" message,
+        // and by default-agent resolution. A variant left as `mode: "subagent"`
+        // is therefore listed to the model under its own name -- "explore-1:
+        // Hidden pool variant explore-1" -- and the model copies that name
+        // straight into its next spawn. The pool then refuses it, because
+        // naming a variant is how a caller would pick the provider and skip the
+        // rotation. The refusal is right; the leak that provokes it is not.
+        //
+        // `mode` is the only field that filter respects, and setting it here is
+        // safe: the task tool never reads an agent's mode -- it resolves the
+        // agent by name and runs it -- and every other place that filters on
+        // `mode !== "primary"` also filters on `!hidden`, which these already
+        // are. opencode uses this same pair for its own compaction, title and
+        // summary agents.
+        mode: "primary",
       }
       // Belt and braces: the bases carry no model, so a variant must not either.
       // A model here would be a second source of truth that silently wins

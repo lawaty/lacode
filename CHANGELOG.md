@@ -6,8 +6,101 @@ All notable changes to LaCode are recorded here. The format follows
 
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
-
 ## [Unreleased]
+
+## [0.9.0] — the cartographer keeps an active backlog, and the model stops naming slot variants
+
+### Added
+
+- **The cartographer keeps an active backlog, and the plugin enforces its
+  window.** `.opencode/context/active.md` is a sixth file in the map directory:
+  the work in flight, grouped by the ISO week each task was opened in. A task
+  that is not marked `[x]` is open, and an open task is never removed however
+  old it is; a task that is finished and dated is kept for a week after it was
+  finished and is then dropped. The file is therefore a rolling window rather
+  than a history — the question it answers is "what is open, and what just
+  closed", not "what has ever been done". A backlog that only grows is a
+  backlog nobody reads.
+
+  The window is applied by `src/lib/active-backlog.ts` and by the plugin, not
+  by the cartographer's prompt. Deciding when a task has aged out is
+  arithmetic, and arithmetic belongs where a test can pin the boundary: a rule
+  a model applies is a rule the model applies when it feels like it — one run
+  prunes and the next does not, and nothing anywhere reports the difference,
+  so the failure is silent and the backlog just grows. The plugin normalizes
+  the file on every edit of it and once when the session starts, so a hand
+  edit is grouped and pruned whether the cartographer ran or not, and the file
+  is rewritten only when its canonical form differs from what is on disk, so
+  the write cannot loop. The boundary is strict: a task finished exactly seven
+  days ago is still that week's news, and is kept.
+
+### Fixed
+
+- **A slot variant is no longer in the agent list the model is shown, so the model
+  stops naming slots by hand.** opencode builds the system prompt's "Available
+  agent types" block by filtering the agent registry on `mode !== "primary"` and on
+  the caller's task permission. It never reads `hidden`: that flag is honoured only
+  by the TUI, the @-mention pickers, the "agent not found" message and default-agent
+  resolution. Every pooled variant was therefore listed to the model under its own
+  name — "explore-1: Hidden pool variant explore-1" — and a model that can see
+  twelve concrete slot names reaches for them, so the root agent kept spawning
+  `explore-1` and `implement-4` instead of the bare base, and the pool refused
+  every one. The refusal was right and the leak that provoked it was not: naming a
+  variant is how a caller would pick the provider and skip the rotation and the
+  slot's ceiling, so it cannot be allowed to succeed. The variants now carry
+  `mode: "primary"`, the one field that filter respects, which takes them out of
+  the agent list while leaving them spawnable by name — the task tool resolves an
+  agent by name and never reads its mode — and out of the TUI, where `hidden`
+  already kept them. The bare bases are untouched and stay in the list, so the
+  model has nothing but the bases to choose from.
+
+- **A refusal no longer names the variant it refused, and the instructions no
+  longer list the names they forbid.** The refusal was the strongest remaining
+  channel. It is the tool result the model reads at the exact moment it is
+  choosing what to spawn next, and it used to repeat the name that had just been
+  denied — so the denial was the thing that taught the name, and the model copied
+  it back. It now names the base instead, which is what the model should type.
+  The same reasoning applies to the rules themselves: "never name a `-N` variant
+  (`explore-1`..`explore-4`, `implement-1`..)" put eight concrete agent names in
+  front of the model in the sentence that told it what to spawn. A rule that
+  lists the names it forbids teaches the names; the rule now states the rule
+  without an example, in the shipped agent prompts, the project prompts and the
+  global delegation rules.
+
+- **The cartographer no longer leaves empty sessions in the session list.** The
+  session was created before the run started, and only the turn's own success
+  and failure paths retired it. Anything that threw in between — a slot that
+  could not be picked, a claim that could not be written, a prompt that failed
+  before it returned — stranded a session with no messages in it: an entry in
+  the user's list that opens as nothing at all. Retirement now covers the whole
+  gap between the create and the prompt, and the delete is *verified* rather
+  than assumed — it is read back afterwards, retried once, and a failure is
+  logged instead of swallowed. (Archiving is not a way out: opencode's list is
+  served from the session rows themselves, so a session with `time_archived` set
+  is still listed. Only a delete removes an entry.)
+- **A finished cartographer run retires its session and keeps the transcript**
+  was already true, and stays true: the transcript is written first and the
+  session deleted second, because the transcript is the only record of what the
+  run did. The plugin's own last 20 runs are kept in full.
+
+### Changed
+
+- **The bundled default pool no longer ships a model its provider has withdrawn.**
+  `presets/free-tier.json` named `opencode/space-bunny-free` as its first slot at
+  weight 3 — the slot that took the most turns. The opencode provider withdrew that
+  model, and because it was the default, every new session then died at step 0 with
+  `ProviderModelNotFoundError: Model not found: opencode/space-bunny-free`. Nothing
+  in the package could tell: the pool warns about a slot that is missing from the
+  config, not about a slot whose model the provider no longer serves, and the root
+  agent's own model lives in the user's config rather than here.
+
+- **`scripts/retire-cartographer-sessions.mjs` clears the sessions the feature
+  did not reach.** Retirement landed after 250 runs had already piled up across
+  the machine's projects, and those were never cleaned. The tool talks to the
+  opencode server over its HTTP API — the same interface the plugin uses — and
+  writes a compact record of each retired session to
+  `~/.local/share/opencode/lacode/cartographer-archive/` before deleting it, so
+  nothing is lost. `--dry-run` shows what it would do.
 
 ## [0.8.0] — cooldowns are probed instead of trusted, and the instructions agent can read the map
 
@@ -371,12 +464,14 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/lawaty/lacode/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/lawaty/lacode/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/lawaty/lacode/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/lawaty/lacode/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/lawaty/lacode/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/lawaty/lacode/compare/v0.4.2...v0.5.0
+[0.4.2]: https://github.com/lawaty/lacode/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/lawaty/lacode/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/lawaty/lacode/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lawaty/lacode/compare/v0.2.2...v0.3.0

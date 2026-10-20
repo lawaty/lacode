@@ -60,10 +60,10 @@ Edit `presets/free-tier.json` (or drop a `pool.txt` — `model [weight]` per lin
 
 ```json
 { "slots": [
-  { "model": "opencode-go/longcat-2.5-preview-free", "weight": 3 },
-  { "model": "opencode/space-bunny-free", "weight": 2 },
-  { "model": "opencode/big-pickle", "weight": 1 },
-  { "model": "opencode/longcat-2.5-preview-free", "weight": 1 }
+  { "model": "opencode/big-pickle", "weight": 3 },
+  { "model": "opencode-go/minimax-m3.1-flash-free", "weight": 2 },
+  { "model": "opencode/deepseek-v4.1-flash-free", "weight": 1 },
+  { "model": "opencode/glm-5.3-flash-free", "weight": 1 }
 ] }
 ```
 
@@ -401,7 +401,7 @@ the next sync.
 
 ## The context map
 
-`context-autoupdate` maintains a five-file map per project at `.opencode/context/`,
+`context-autoupdate` maintains a map per project at `.opencode/context/`,
 resolved from the session's own directory (`path.resolve(directory)`). So
 `/home/yourname` gets `~/.opencode/context/`, and a different project gets its own.
 
@@ -415,11 +415,38 @@ to the remotes; `AGENTS.md`, `commands/context-*.md` and `rules/browser.md` are 
 personal config dir, ship to the remotes, and are in no repository at all. The map
 itself is rebuilt on demand by the next cartographer run.
 
+### The cartographer's own sessions
+
+Every cartographer run creates a session, writes its transcript to
+`~/.local/share/opencode/lacode/cartographer/` (the last 20 in full) and then
+deletes the session, so the run does not sit in your session list. The transcript
+is written first on purpose: it is the only record of what the run did, and
+the delete is what keeps the list clean.
+
+If a run dies between creating the session and starting the turn, the session
+would otherwise be left behind with nothing in it — an entry that opens as
+blank. Retirement now covers that whole gap, and a delete that does not take is
+retried once and then logged as `the cartographer's session could not be
+removed from the session list`.
+
+To clear sessions the retirement never reached — the runs from before it
+existed, which are hundreds on a long-lived machine:
+
+```sh
+node scripts/retire-cartographer-sessions.mjs --dry-run
+node scripts/retire-cartographer-sessions.mjs
+```
+
+It talks to the opencode server over its HTTP API, needs
+`OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`, and writes a compact
+record of everything it removed to
+`~/.local/share/opencode/lacode/cartographer-archive/`.
+
 There is no `rules/context-protocol.md`; the global `AGENTS.md` covers it. What the
 personal config dir does carry is `rules/browser.md`, whose Playwright anti-loop rules
 exist nowhere else and are loaded through the `instructions`
 key in the personal `opencode.jsonc`. The context map is deliberately **not** in
-`instructions` — that would inject all five files into every session and every pooled
+`instructions` — that would inject all the files into every session and every pooled
 subagent, defeating the read-one-file rule `AGENTS.md` states.
 
 Trigger: a root session goes idle after editing files outside the map. It borrows a pool
@@ -445,6 +472,17 @@ Two operational rules:
   `opencode.jsonc`.
 
 Force a run with `/context-update` rather than waiting for the idle trigger.
+
+The map directory holds a sixth file, `active.md`: the active backlog of work in
+flight, grouped by the ISO week each task was opened in. A task that is not marked
+`[x]` is open and is never removed, however old it is; a task that is finished and
+dated is kept for a week after it was finished and is then dropped. The window is
+enforced by the plugin, not by the cartographer: `src/lib/active-backlog.ts` owns
+the arithmetic, and `context-autoupdate` normalizes the file on every edit of it
+and once at session start. A line that vanishes from `active.md` was aged out by
+that rule, not lost — the boundary is strict, so a task finished exactly seven
+days ago is still kept. A task that is finished but carries no date cannot age
+out at all, and stays until it is dated or removed.
 
 ## Version control
 

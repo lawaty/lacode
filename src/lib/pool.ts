@@ -189,10 +189,10 @@ export const USER_MODELS_PATH = join(USER_CONFIG_DIR, "pool.json")
 export const USER_MODELS_TXT = join(USER_CONFIG_DIR, "pool.txt")
 
 export const FALLBACK_SLOTS: Slot[] = [
-  { index: 1, model: "opencode/space-bunny-free", weight: 3 },
-  { index: 2, model: "opencode-go/longcat-2.5-preview-free", weight: 2 },
-  { index: 3, model: "opencode/big-pickle", weight: 1 },
-  { index: 4, model: "opencode/longcat-2.5-preview-free", weight: 1 },
+  { index: 1, model: "opencode/big-pickle", weight: 3 },
+  { index: 2, model: "opencode-go/minimax-m3.1-flash-free", weight: 2 },
+  { index: 3, model: "opencode/deepseek-v4.1-flash-free", weight: 1 },
+  { index: 4, model: "opencode/glm-5.3-flash-free", weight: 1 },
 ]
 
 export type SlotFile = { slots: Slot[]; problems: string[] }

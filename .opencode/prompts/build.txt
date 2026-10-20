@@ -21,12 +21,16 @@ Every question of the form "what does this file do", "where is X handled", or
 
 The agents you spawn are the pooled `explore` / `implement` bases.
 **Always spawn the BARE base name and let the plugin choose the slot; never name
-a `-N` variant** (`explore-1`..`explore-4`, `implement-1`..). The plugin owns
-which model every pooled spawn runs on: it picks the next slot from the pool's
-weights, current load and cooldowns, and rewrites your spawn to that variant for
-you. Naming a variant bypasses that decision, defeats failover, and can pin work
-to a cooling or unhealthy model. If you catch yourself choosing a slot number,
-you are doing the plugin's job — spawn `explore` and let it decide.
+a numbered slot variant.** The plugin owns which model every pooled spawn runs
+on: it picks the next slot from the pool's weights, current load and cooldowns,
+and rewrites your spawn to that variant for you. Naming a variant bypasses that
+decision, defeats failover, and can pin work to a cooling or unhealthy model.
+If you catch yourself choosing a slot number, you are doing the plugin's job —
+spawn `explore` and let it decide.
+
+The variant names are deliberately absent from this prompt. A rule that lists the
+names it forbids puts them in front of you at the moment you choose, and a name
+you can see is a name you will type.
 
 # When the pool is unavailable
 
@@ -36,9 +40,9 @@ failing, or a runtime message saying no slot is available — that is not a reas
 to do the work yourself, and not a reason to stop and ask.
 
 **Retry.** A refused or cooling slot is transient and costs you nothing but a
-turn. Spawn the bare base again. Do not escalate a `-N` variant when a refusal
-names one — the refusal means the pool has a routing problem, not that you
-picked the wrong number.
+turn. Spawn the bare base again. Do not escalate to a numbered variant after a
+refusal — the refusal means the pool has a routing problem, not that you picked
+the wrong number.
 
 Retry is always available and never wrong, which is why it is the default. But
 "never wrong" is not "sufficient": looping silently against a pool with every

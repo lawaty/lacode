@@ -1,21 +1,7 @@
 {
   "_source": "https://models.dev/api.json",
-  "_fetched": "2026-10-13",
+  "_fetched": "2026-10-19",
   "models": {
-    "opencode/space-bunny-free": {
-      "cost_input": 0,
-      "cost_output": 0,
-      "context": 1048576,
-      "tool_call": true,
-      "reasoning": true
-    },
-    "opencode-go/longcat-2.5-preview-free": {
-      "cost_input": 0,
-      "cost_output": 0,
-      "context": 1000000,
-      "tool_call": true,
-      "reasoning": true
-    },
     "opencode/big-pickle": {
       "cost_input": 0,
       "cost_output": 0,
@@ -23,10 +9,24 @@
       "tool_call": true,
       "reasoning": true
     },
-    "opencode/longcat-2.5-preview-free": {
+    "opencode-go/minimax-m3.1-flash-free": {
       "cost_input": 0,
       "cost_output": 0,
       "context": 1000000,
+      "tool_call": true,
+      "reasoning": true
+    },
+    "opencode/deepseek-v4.1-flash-free": {
+      "cost_input": 0,
+      "cost_output": 0,
+      "context": 200000,
+      "tool_call": true,
+      "reasoning": true
+    },
+    "opencode/glm-5.3-flash-free": {
+      "cost_input": 0,
+      "cost_output": 0,
+      "context": 200000,
       "tool_call": true,
       "reasoning": true
     }

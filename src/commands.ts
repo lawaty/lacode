@@ -44,7 +44,8 @@ your system prompt.
 Otherwise follow the bootstrap procedure in your system prompt: progressive
 exploration (README → existing docs → manifests → top-level structure → build
 and framework config → entry points → selective source), then write the five
-context files inside their size targets.
+context files inside their size targets. Also create
+\`.opencode/context/active.md\` with its heading and no tasks.
 
 Remember: write conclusions, not inventories. Link to the project's existing
 documentation instead of duplicating it.
@@ -85,10 +86,10 @@ timestamp-only edits. If nothing material changed, make no edits and report
     subtask: true,
     template: `Context review.
 
-Everything outside the five context files is read-only for this run. Do not
+Everything outside \`.opencode/context/\` is read-only for this run. Do not
 modify source code under any circumstances.
 
-Audit the five context files for:
+Audit the context files and the backlog for:
 
 - stale information — verify claims against the actual code
 - contradictions between context files, or between the map and the code
@@ -99,6 +100,8 @@ Audit the five context files for:
 - missing canonical entry points for significant subsystems
 - unsupported assumptions — anything stated as fact that you cannot verify,
   or that lacks a confidence marker
+- backlog tasks that are finished but carry no date — the retention window
+  cannot age those out, so they stay forever
 
 Fix what you find in \`.opencode/context/\` only, then report: findings, fixes,
 and anything you could not verify.`,

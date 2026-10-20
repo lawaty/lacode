@@ -93,6 +93,27 @@ shipped.slots.forEach((slot, i) => {
 const providers = new Set(shipped.slots.map((s) => pool.providerOf(s.model)))
 assert(providers.size >= 2, `the pool must span at least two providers, got ${[...providers].join(", ")}`)
 
+// no two slots share a model family, so one withdrawal cannot empty the pool.
+// Two slots of the same model on two providers is not diversity: the model is
+// withdrawn once, both slots go, and the pool is half a pool.
+const familyOf = (model) => model.split("/")[1].replace(/-free$/, "").split(/-\d/)[0]
+const families = new Set()
+for (const slot of shipped.slots) {
+  const family = familyOf(slot.model)
+  assert(!families.has(family), `two slots share the "${family}" family; one withdrawal would empty the pool`)
+  families.add(family)
+}
+
+// The built-in fallback is the SAME slot table as the shipped preset. It only
+// fires when no pool source is readable, but "the bundled preset is what you
+// get" stops being true the moment the two drift -- and they have drifted once
+// already (36a3bdd, Longcat -> Step 5 Preview). It is also where a withdrawn
+// model hides longest: the fallback is what a user with no pool file and an
+// unreadable preset gets, so a dead model there is a pool of one dead model.
+const fallback = pool.FALLBACK_SLOTS.map((s) => `${s.model} ${s.weight}`).join(" | ")
+const preset = shipped.slots.map((s) => `${s.model} ${s.weight}`).join(" | ")
+assert(fallback === preset, `FALLBACK_SLOTS must be the shipped preset's slot table.\n  fallback: ${fallback}\n  preset:   ${preset}`)
+
 // 2. a different file rewrites every variant agent, even against a config that
 //    names different models and carries no whitelist entry for the new ones.
 //    The fixture must name models the injected config has never heard of (that is
@@ -343,11 +364,11 @@ for (let i = 1; i <= shipped.slots.length; i++) {
 // 8. the flat pool.txt format: `model [weight]` per line, comments/blanks ignored
 {
   const parsed = pool.parseTextSlots(
-    "# my pool\nopencode-go/longcat-2.5-preview-free 3\n\nopencode/space-bunny-free 2   # the fast one\nopencode/big-pickle\n",
+    "# my pool\nopencode-go/minimax-m3.1-flash-free 3\n\nopencode/deepseek-v4.1-flash-free 2   # the fast one\nopencode/big-pickle\n",
     "pool.txt",
   )
   assert(parsed.slots.length === 3, `flat file: expected 3 slots, got ${parsed.slots.length}`)
-  assert(parsed.slots[0].model === "opencode-go/longcat-2.5-preview-free" && parsed.slots[0].weight === 3, `slot 1: ${JSON.stringify(parsed.slots[0])}`)
+  assert(parsed.slots[0].model === "opencode-go/minimax-m3.1-flash-free" && parsed.slots[0].weight === 3, `slot 1: ${JSON.stringify(parsed.slots[0])}`)
   assert(parsed.slots[1].weight === 2, `a trailing comment must not break the weight: ${JSON.stringify(parsed.slots[1])}`)
   assert(parsed.slots[2].weight === 1, `an absent weight must default to 1: ${JSON.stringify(parsed.slots[2])}`)
   assert(parsed.slots.every((s, i) => s.index === i + 1), "indices are array position")

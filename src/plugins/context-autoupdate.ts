@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import * as path from "node:path"
 import type { Hooks, PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
+import { ACTIVE_BACKLOG_FILE, normalizeBacklog } from "../lib/active-backlog.ts"
 import { verifyWriterRule } from "../lib/writer-rule.ts"
 
 // Auto-maintains .opencode/context/ in every project.
@@ -148,10 +149,17 @@ const transcriptDir = () =>
  * fail the autoupdate run that triggered it.
  */
 const retireSession = async (
-  client: { session: { messages: (o: unknown) => Promise<unknown>; delete: (o: unknown) => Promise<unknown> } },
+  client: {
+    session: {
+      messages: (o: unknown) => Promise<unknown>
+      delete: (o: unknown) => Promise<unknown>
+      get: (o: unknown) => Promise<unknown>
+    }
+  },
   directory: string,
   sessionID: string,
   mode: string,
+  log?: (level: "warn" | "error", message: string, extra?: Record<string, unknown>) => Promise<void> | void,
 ) => {
   try {
     const transcript = await client.session
@@ -164,9 +172,35 @@ const retireSession = async (
     const file = path.join(dir, `${stamp}-${mode}.json`)
     writeFileSync(file, JSON.stringify({ sessionID, mode, messages: transcript ?? null }, null, 2))
     pruneTranscripts(dir)
+
+    // The delete is the whole point of this function: without it the session
+    // stays in the user's list. It is VERIFIED rather than assumed, because a
+    // delete that fails used to be swallowed and left an empty entry behind
+    // that the user could open and find nothing in.
+    //
+    // The session is read back rather than trusting the delete's return value,
+    // because what matters is whether the row is gone, not what the endpoint
+    // said. opencode's list is served from the rows themselves: an archived
+    // session is still listed (archiving sets `time.archived` and changes
+    // nothing about the list), so only a delete removes an entry.
+    const gone = async () =>
+      (await client.session
+        .get({ path: { id: sessionID }, query: { directory } })
+        .then((r) => (r as { data?: unknown }).data)
+        .catch(() => undefined)) === undefined
     await client.session.delete({ path: { id: sessionID }, query: { directory } }).catch(() => undefined)
-  } catch {
-    /* an unreadable or undeletable session stays in the list; that is survivable */
+    if (await gone()) return
+    // One retry: the turn has just ended and the server may still be
+    // persisting it, so a delete that lands a moment too early loses the race.
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    await client.session.delete({ path: { id: sessionID }, query: { directory } }).catch(() => undefined)
+    if (await gone()) return
+    await log?.("warn", "the cartographer's session could not be removed from the session list; it stays as an empty entry", {
+      sessionID,
+      mode,
+    })
+  } catch (error) {
+    await log?.("warn", `could not retire the cartographer's session: ${String(error)}`, { sessionID, mode })
   }
 }
 
@@ -207,6 +241,7 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
 
   const root = path.resolve(directory)
   const contextAbs = path.join(root, CONTEXT_DIR)
+  const activeBacklogPath = path.join(contextAbs, ACTIVE_BACKLOG_FILE)
 
   // Fail loudly and immediately rather than weeks later as a silently stale map.
   const config = findProjectConfig()
@@ -223,6 +258,47 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
       .split("/")
       .some((segment) => IGNORED_SEGMENTS.has(segment))
   }
+
+  /**
+   * Apply the backlog's rolling window to the file on disk.
+   *
+   * The cartographer records what happened; this decides what is still worth
+   * keeping. That split is deliberate: deciding when a task has aged out is
+   * arithmetic, and arithmetic belongs in code where a test can pin the
+   * boundary, not in a prompt where a model applies it when it feels like it.
+   *
+   * The file is rewritten only when the canonical form differs from what is
+   * on disk, which is what makes this safe to run on every edit: a second
+   * pass over a clean file changes nothing, so the write cannot loop.
+   *
+   * A drop is reported, never silent. A task that vanishes from the file is
+   * the one change a reader of the backlog cannot reconstruct, and "it aged
+   * out" is the whole explanation it needs.
+   *
+   * Never throws. Housekeeping must not be able to fail the run that
+   * triggered it.
+   */
+  const normalizeActiveBacklog = async () => {
+    try {
+      if (!existsSync(activeBacklogPath)) return { removed: 0 }
+      const before = readFileSync(activeBacklogPath, "utf8")
+      const { text, removed } = normalizeBacklog(before)
+      if (text !== before) writeFileSync(activeBacklogPath, text)
+      if (removed.length > 0) {
+        await log("info", `active backlog: dropped ${removed.length} task(s) finished more than a week ago`, {
+          removed: removed.length,
+        })
+      }
+      return { removed: removed.length }
+    } catch {
+      return { removed: 0 }
+    }
+  }
+
+  // The window applies from the moment the session starts, not only after
+  // somebody edits the file: a task that aged out while the project was
+  // closed is still a task that aged out.
+  void normalizeActiveBacklog()
 
   const listed = (files: string[]) => {
     const shown = files.slice(0, MAX_FILES_LISTED)
@@ -243,7 +319,7 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           "",
           NO_BULK_READS,
           "",
-          "Follow the bootstrap procedure in your system prompt: progressive exploration, then write the five context files within their size targets. When the project already has architecture or decision documentation, link to it instead of duplicating it. Write conclusions, not inventories.",
+          "Follow the bootstrap procedure in your system prompt: progressive exploration, then write the five context files within their size targets. Also create `.opencode/context/active.md` with its heading and no tasks. When the project already has architecture or decision documentation, link to it instead of duplicating it. Write conclusions, not inventories.",
         ].join("\n")
       : [
           "Incremental context update. Project root: " + directory,
@@ -253,14 +329,24 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           "",
           NO_BULK_READS,
           "",
-          'Follow the incremental-update procedure in your system prompt. Update a context file only if this work introduced or revealed information that will materially help future agents: a new boundary or module, a new or moved canonical entry point, a changed workflow, a new convention, an architectural decision, a new dependency between subsystems, a renamed or moved subsystem, or a previously undocumented invariant. Do not edit documentation merely because source files changed. If nothing material changed, make no edits and report "no update needed".',
+          'Follow the incremental-update procedure in your system prompt. Update a context file only if this work introduced or revealed information that will materially help future agents: a new boundary or module, a new or moved canonical entry point, a changed workflow, a new convention, an architectural decision, a new dependency between subsystems, a renamed or moved subsystem, or a previously undocumented invariant. Do not edit documentation merely because source files changed. If nothing material changed, make no edits and report "no update needed". Also keep `.opencode/context/active.md` current: record work that is in flight, and mark a task finished — with the date it finished — when it is.',
         ].join("\n")
 
   return {
     event: async ({ event }) => {
       try {
         if (event.type === "file.edited") {
-          if (isTracked(event.properties.file)) pending.add(event.properties.file)
+          const file = event.properties.file
+          // The active backlog is the one file in the map the PLUGIN maintains:
+          // the cartographer records what happened, and the window below decides
+          // what is still worth keeping. A hand edit is normalized on the spot,
+          // so the file is grouped and pruned whether the cartographer ran or
+          // not.
+          if (path.resolve(root, file) === activeBacklogPath) {
+            await normalizeActiveBacklog()
+            return
+          }
+          if (isTracked(file)) pending.add(file)
           return
         }
 
@@ -330,31 +416,57 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
         // Claim the slot against the session that does the work, so pool_status
         // counts it and the pool's hang reaper can abort this session directly.
         const claimKey = pool.claimKey(target, "context-autoupdate")
-        pool.acquire(state, "context", slot, target, claimKey, target)
-        await log("info", `borrowed pool slot ${slot.index} (${slot.model}, w${slot.weight}) for auto ${mode}`, {
-          slot: slot.index,
-          weight: slot.weight,
-          model: slot.model,
-        })
+        let claimed = false
+        let before: Map<string, string>
+        let started: Promise<unknown>
+        // From here the session EXISTS and the user can see it in their list.
+        // Everything that follows must end in retiring it, or an empty session
+        // is left behind forever: anything that threw between the create and
+        // the prompt used to strand one, and a stranded session opens as an
+        // empty entry with nothing in it. See retireSession for why the
+        // cartographer cannot simply be nested away instead.
+        try {
+          pool.acquire(state, "context", slot, target, claimKey, target)
+          claimed = true
+          await log("info", `borrowed pool slot ${slot.index} (${slot.model}, w${slot.weight}) for auto ${mode}`, {
+            slot: slot.index,
+            weight: slot.weight,
+            model: slot.model,
+          })
 
-        // Only now is a run genuinely under way, so this is where the cooldown
-        // starts. Nothing before this point should delay a retry.
-        lastRun = Date.now()
-        owned.set(target, Date.now())
-        const before = snapshotMap(contextAbs)
-        client.session
-          .prompt({
+          // Only now is a run genuinely under way, so this is where the cooldown
+          // starts. Nothing before this point should delay a retry.
+          lastRun = Date.now()
+          owned.set(target, Date.now())
+          before = snapshotMap(contextAbs)
+          // The CALL is inside the try, not just its handlers: a synchronous
+          // throw here would escape the handler entirely and leave the session
+          // behind, because nothing below would ever retire it.
+          started = client.session.prompt({
             path: { id: target },
             query: { directory },
             body: { agent, parts: [{ type: "text", text: compose(mode, files) }] },
           })
+        } catch (error) {
+          // The session was created but the run never started. Retire it, or it
+          // sits in the user's list as an empty entry they cannot explain; and
+          // release the claim, or the slot is held by a run that never ran.
+          if (claimed) pool.release(state, claimKey)
+          owned.delete(target)
+          await retireSession(client, directory, target, mode, log)
+          requeue()
+          await log("error", `auto ${mode} could not start: ${String(error)}`)
+          return
+        }
+        started
           .then(async (result) => {
             pool.release(state, claimKey)
             // Retire the session from the list as soon as it is done with, and
             // only AFTER writing its transcript somewhere the user can still read
             // it. See retireSession for why it cannot simply be nested away.
-            await retireSession(client, directory, target, mode)
-            // prompt() resolves when the turn ends — including when it ends in
+              await retireSession(client, directory, target, mode, log)
+              // prompt() resolves when the turn ends — including when it ends in
+
             // an abort (host shutting down) or an error. Only report success
             // when the assistant message actually completed.
             const failure = result.error ?? result.data?.info?.error
@@ -384,9 +496,10 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           })
           .catch(async (error) => {
             pool.release(state, claimKey)
-            await retireSession(client, directory, target, mode)
-            requeue()
-            await log("error", `auto ${mode} failed: ${String(error)}`)
+              await retireSession(client, directory, target, mode, log)
+              requeue()
+              await log("error", `auto ${mode} failed: ${String(error)}`)
+
           })
       } catch (error) {
         await log("error", `handler failed: ${String(error)}`)

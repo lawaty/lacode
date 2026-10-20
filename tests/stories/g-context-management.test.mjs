@@ -5,7 +5,7 @@
 //   US-21  one writer keeps the map coherent
 //   US-22  on-demand map operations: /context-init, /context-update, /context-review
 //
-// The feature under test is the codemap at `.opencode/context/`: five files, one
+// The feature under test is the codemap at `.opencode/context/`: five navigation files, one
 // writing agent, an automatic refresh, and three slash commands.
 //
 // Two things are asserted here that no other suite asserts, and both are worth
@@ -36,8 +36,12 @@ import { ROOT, PRESET, bootLaCode, cleanupAll, emptyConfig, fakeClock, presetMod
 
 test.after(cleanupAll)
 
-/** The five files the cartographer owns, and the map is exactly these. */
+/** The five navigation files the cartographer owns, and the map is exactly these. */
 const MAP_FILES = ["architecture.md", "contexts.md", "conventions.md", "workflows.md", "decisions.md"]
+
+// The map is not only these five: the cartographer also owns `active.md`, the
+// active backlog, which is a work list rather than a navigation file and is
+// therefore not part of the map.
 
 /** A file inside the map, in the form opencode evaluates it from a normal root. */
 const MAP_FILE = ".opencode/context/architecture.md"
@@ -463,6 +467,24 @@ test("[US-20] a cartographer run that fails is retired too, so a failing loop ca
   // A failing cartographer is the case that matters most: it retries on every
   // window, so leaving its sessions behind is exactly what fills the list.
   assert.deepEqual(stub.deleted, ["created-1"], "a failed run must be retired as well")
+})
+
+test("[US-20] a run that never starts is retired too, so no empty session is left behind", async () => {
+  const { stub, hooks } = await bootAutoupdate()
+  // The session is created BEFORE the run starts, so anything that throws
+  // between the two used to strand a session with no messages in it -- an
+  // entry in the user's list that opens as nothing at all. The retirement has
+  // to cover the whole gap, not just the turn.
+  stub.client.session.prompt = () => {
+    throw new Error("could not reach the server")
+  }
+  await withTranscriptDir(async () => {
+    await hooks.event({ event: { type: "file.edited", properties: { file: "src/tunnel/index.ts" } } })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  })
+
+  assert.deepEqual(stub.deleted, ["created-1"], "a run that never started must still be retired")
 })
 
 // ---------------------------------------------------------------------------

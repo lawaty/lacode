@@ -104,7 +104,7 @@ test("[US-28] an omniroute slot listed in the pool routes through the gateway", 
       models: {
         slots: [
           { model: "omniroute/auto", weight: 3 },
-          { model: "opencode/space-bunny-free", weight: 2 },
+          { model: "opencode/big-pickle", weight: 2 },
         ],
       },
     })
@@ -229,7 +229,7 @@ test("[US-28] a down gateway with an omniroute slot warns once, keeps the slot b
       models: {
         slots: [
           { model: "omniroute/auto", weight: 3 },
-          { model: "opencode/space-bunny-free", weight: 2 },
+          { model: "opencode/big-pickle", weight: 2 },
         ],
       },
     })
@@ -251,7 +251,7 @@ test("[US-28] a down gateway with an omniroute slot warns once, keeps the slot b
     // ...but the slot the user chose is still bound to it.
     assert.equal(cfg.agent["explore-1"].model, "omniroute/auto")
     // Every other slot keeps working exactly as written.
-    assert.equal(cfg.agent["explore-2"].model, "opencode/space-bunny-free")
+    assert.equal(cfg.agent["explore-2"].model, "opencode/big-pickle")
     await hooks.dispose?.()
   } finally {
     gw.restore()

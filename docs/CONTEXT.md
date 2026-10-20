@@ -29,10 +29,11 @@ the exploration it replaces is worse than no map:
   for order mutations", not "there is a file called OrderService in
   `src/orders/`". The cartographer is forbidden by name from writing directory
   listings, copying source, or restating what the README already says.
-- **One file per question.** Five files, each with a defined scope, so an agent
-  reads one of them rather than all of them.
+- **One file per question.** Five navigation files, each with a defined scope, so
+  an agent reads one of them rather than all of them. A sixth file,
+  `active.md`, holds the work in flight rather than a map of the repository.
 - **Canonical entry points.** The highest-value thing in the map is a short
-  "Start here" list per subsystem: the five files an agent should open, each
+  "Start here" list per subsystem: the canonical files an agent should open, each
   with a one-phrase reason.
 - **It links out.** Your project's own README, ADRs and docs are authoritative
   and are not duplicated here.
@@ -47,7 +48,8 @@ harness that produces a number for your own workload.
 
 ## The files in the map
 
-`.opencode/context/` holds the five generated files below:
+`.opencode/context/` holds the five navigation files below, plus one file that is
+a work list rather than a map:
 
 | File | What belongs in it |
 | --- | --- |
@@ -56,6 +58,7 @@ harness that produces a number for your own workload.
 | `conventions.md` | Repository-specific rules: naming, module layout, error handling, testing, persistence. Read this before writing code, not after. |
 | `workflows.md` | The few runtime flows worth tracing end to end — how a request becomes a mutation, how a plugin hook reaches the thing it hooks. Read this when you need to know what actually happens at runtime. |
 | `decisions.md` | Architectural decisions that the repository's own decision log does not already record. Concise, variable length. |
+| `active.md` | The active backlog: work in flight, grouped by the ISO week each task was opened in. A task that is not marked `[x]` is open and is never removed; a task that is finished and dated is kept for a week after it was finished, then dropped. The plugin enforces that window — see [How it stays current](#how-it-stays-current). Not a navigation file: there is no question it is the answer to. |
 
 The project's root `AGENTS.md` is the standing-instructions home: the client's
 own statement of intent, what they want worked on and how they want it
@@ -135,6 +138,18 @@ your source.
 If you have defined a command of the same name, yours wins and is left exactly
 as you wrote it — the same merge-without-clobber rule the agents follow.
 
+`active.md` is the one file in the directory the plugin maintains rather than
+the cartographer. The cartographer records what happened — work in flight, and a
+task marked finished with the date it finished — and the plugin decides what is
+still worth keeping: the file is regrouped by week and a task that was finished
+more than a week ago is dropped. The arithmetic lives in
+`src/lib/active-backlog.ts`, not in the cartographer's prompt, because a rule a
+model applies is a rule the model applies when it feels like it, and the failure
+is silent — the backlog just grows. The plugin normalizes the file on every
+edit of it and once when the session starts, so a hand edit is grouped and
+pruned whether the cartographer ran or not, and the file is rewritten only when
+its canonical form differs from what is on disk, so the write cannot loop.
+
 ## One writer
 
 Only `context` writes the map. Every other agent is told never to edit
@@ -152,7 +167,7 @@ naming the one writer, and the permission rule — a permission denial tells an
 agent nothing about what it should have done instead.
 
 This exists because two writers produce a map that is neither current nor
-trustworthy. Concurrent sessions rewriting the same five files produce
+trustworthy. Concurrent sessions rewriting the same files produce
 contradictions that no later reader can resolve, and the reader has no way to
 tell which version is newer.
 
@@ -193,7 +208,7 @@ startup check has no way to see a worktree it was not told about.
 
 How to detect it: open opencode from the repository root, not from a
 subdirectory of it. If `ls .opencode/context` from your shell's current
-directory does not list the five files, your shell is not at the root and
+directory does not list the map files, your shell is not at the root and
 neither is opencode's worktree. The cost of getting it wrong is not a crash —
 it is a map maintained only by prompt, with no mechanism enforcing who writes it.
 
