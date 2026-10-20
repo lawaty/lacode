@@ -8,6 +8,17 @@ Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 ## [Unreleased]
 
+### Documented
+
+- **The npm publish notice does not say which dist-tag a release lands on.** npm
+  12 prints "Publishing to https://registry.npmjs.org/ with tag latest" for every
+  publish, including one whose `publishConfig.tag` sends it to `beta`: the
+  message reports the CLI's default, not the resolved tag. 0.9.0 was published
+  that way and landed on `beta`, with `latest` still at 0.4.2. The registry is
+  the authority, not the notice — after publishing, read
+  `npm view @lawaty/lacode dist-tags` before assuming anything about where the
+  release went.
+
 ## [0.9.0] — the cartographer keeps an active backlog, and the model stops naming slot variants
 
 ### Added
