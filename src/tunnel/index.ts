@@ -73,9 +73,15 @@ export type NotifyRequest = {
   urgency?: string
   icon?: string
   sound?: string
+  /**
+   * The opaque id of the request this notification answers. It is never passed
+   * to a command and never shown: it only decides whether the notification
+   * carries buttons.
+   */
+  requestID?: string
 }
 
-export type Result = { ok: boolean; detail?: string; transport: "local" | "remote" | "none" }
+export type Result = { ok: boolean; detail?: string; transport: "local" | "remote" | "none"; action?: string }
 
 export type TunnelConfig = {
   /** The desktop user the direct ssh hop authenticates as. */
@@ -139,11 +145,29 @@ const safeText = (raw: string, fallback: string, max: number) => {
 export const safeTitle = (raw: string | undefined) => safeText(raw ?? "", "LaCode", 120)
 export const safeMessage = (raw: string | undefined) => safeText(raw ?? "", "", 400)
 
+/**
+ * The request id, sanitized.
+ *
+ * Opaque and never handed to a command: it decides only whether the
+ * notification carries buttons. It is stripped of control characters and
+ * capped like every other field, so it can never contain the newline the
+ * payload is delimited with -- an id that could smuggle a delimiter would
+ * split the payload and let a sender forge a field.
+ *
+ * An absent or empty id yields undefined, which is what "no request id" means:
+ * a notification without one is not actionable.
+ */
+export const safeRequestId = (raw: string | undefined): string | undefined => {
+  const clean = (raw ?? "").replace(/[\u0000-\u001f\u007f]/g, "").trim()
+  if (!clean) return undefined
+  return clean.length > 128 ? clean.slice(0, 128) : clean
+}
+
 /** The delimiter `encodePayload` joins fields with. Also what the receiver splits on. */
 export const FIELD_SEPARATOR = "\n"
 
 /**
- * One argument, five newline-delimited fields: `title\nmessage\nurgency\nicon\nsound`.
+ * One argument, six newline-delimited fields: `title\nmessage\nurgency\nicon\nsound\nrequestID`.
  *
  * The single-argument shape is not a style choice, it is what the transport
  * actually provides. ssh concatenates everything after the host into ONE command
@@ -154,9 +178,10 @@ export const FIELD_SEPARATOR = "\n"
  * field fell back to its default and the popup was blank.
  *
  * Newline is the delimiter because `safeText` above strips every control
- * character (including \n) from both free-text fields, and the icon, urgency
- * and sound are whitelisted values. No field can contain the delimiter, so the
- * split is lossless for a body containing spaces, quotes or glob characters.
+ * character (including \n) from both free-text fields, the icon, urgency
+ * and sound are whitelisted values, and `safeRequestId` strips them from the
+ * request id. No field can contain the delimiter, so the split is lossless for
+ * a body containing spaces, quotes or glob characters.
  */
 /**
  * The inverse of `encodePayload`: the newline-delimited payload a forced command
@@ -164,13 +189,14 @@ export const FIELD_SEPARATOR = "\n"
  * boundary, rather than assumed from the sender.
  */
 export function parsePayload(raw: string): NotifyRequest {
-  const [title, message, urgency, icon, sound] = raw.split(FIELD_SEPARATOR)
+  const [title, message, urgency, icon, sound, requestID] = raw.split(FIELD_SEPARATOR)
   return {
     title: safeTitle(title),
     message: safeMessage(message),
     urgency: normalizeUrgency(urgency),
     icon: normalizeIcon(icon),
     sound: normalizeSound(sound),
+    requestID: safeRequestId(requestID),
   }
 }
 
@@ -181,6 +207,9 @@ export const encodePayload = (request: NotifyRequest): string =>
     normalizeUrgency(request.urgency),
     normalizeIcon(request.icon),
     normalizeSound(request.sound),
+    // The sixth field, empty when there is no request id: an absent id and an
+    // empty one mean the same thing, and the field count never changes.
+    safeRequestId(request.requestID) ?? "",
   ].join(FIELD_SEPARATOR)
 
 /**
@@ -331,6 +360,31 @@ const NO_CHANNEL: Record<string, string> = {
 }
 
 /**
+ * The freedesktop "never expire" timeout. A notification is not dismissed by a
+ * timer: it stays on the desktop until the user closes it. Without it the
+ * daemon's own timeout takes the popup away, which is the difference between a
+ * notice the user can still act on and one they missed.
+ */
+const NEVER_EXPIRE_FLAG = "--expire-time=0"
+
+/**
+ * The buttons an actionable notification offers. The names are opencode's own
+ * permission-reply values, so a clicked button is already a valid answer; the
+ * labels are what the user reads.
+ */
+export const NOTIFICATION_ACTIONS: ReadonlyArray<readonly [string, string]> = [
+  ["once", "Allow once"],
+  ["always", "Always allow"],
+  ["reject", "Deny"],
+]
+
+/**
+ * How long an actionable notification waits for the user. `--action` implies
+ * `--wait`, so the notifier blocks; a prompt nobody answers must still end.
+ */
+const ACTION_WAIT_MS = 10 * 60_000
+
+/**
  * Deliver straight to the local desktop session. Never throws, never blocks
  * longer than the notifier timeout.
  *
@@ -379,16 +433,33 @@ export function sendLocal(request: NotifyRequest, platform: string = process.pla
   }
   const title = safeTitle(request.title)
   const body = safeMessage(request.message)
+  // A notification is actionable only when it carries a request id, and only on
+  // the channel that can offer buttons: macOS has no `--action`, so its branches
+  // keep exactly the behaviour they have today.
+  const requestID = safeRequestId(request.requestID)
+  const actionable = channel === "notify-send" && requestID !== undefined
+  const actionArgs = actionable ? NOTIFICATION_ACTIONS.map(([name, label]) => `--action=${name}=${label}`) : []
   const args =
     channel === "osascript"
       ? ["-e", DARWIN_SCRIPT, DARWIN_ARGV_MARKER, title, body]
       : channel === "terminal-notifier"
         ? ["-title", title, "-message", body, "-appName", "LaCode", "-priority", normalizeUrgency(request.urgency)]
-        : // Byte-identical to the notify-send call this package has always made.
-          [title, body, `--urgency=${normalizeUrgency(request.urgency)}`, `--icon=${normalizeIcon(request.icon)}`]
-  const result = run(CHANNEL_BINARY[channel], args, 5000)
+        : // Never auto-dismissed: the notification waits for the user to close it.
+          [title, body, `--urgency=${normalizeUrgency(request.urgency)}`, `--icon=${normalizeIcon(request.icon)}`, NEVER_EXPIRE_FLAG, ...actionArgs]
+  // `--action` implies `--wait`: the notifier blocks until the user clicks, so
+  // the fire-and-forget timeout would kill the prompt before it could be
+  // answered. An actionable send waits for the answer instead.
+  const result = run(CHANNEL_BINARY[channel], args, actionable ? ACTION_WAIT_MS : 5000)
   playSound()
-  return { ok: result.ok, detail: result.ok ? undefined : result.stderr || result.detail, transport: "local" }
+  // notify-send prints the NAME of the clicked button on stdout. Empty stdout
+  // means the user dismissed the popup without choosing: no action at all.
+  const action = actionable ? result.stdout.trim() : ""
+  return {
+    ok: result.ok,
+    detail: result.ok ? undefined : result.stderr || result.detail,
+    transport: "local",
+    ...(action ? { action } : {}),
+  }
 }
 
 /**
@@ -405,24 +476,56 @@ export function sendLocal(request: NotifyRequest, platform: string = process.pla
 export function sendRemote(request: NotifyRequest, tunnel: TunnelConfig): Result {
   if (!tunnel.user) return { ok: false, detail: "OC_LOCAL_USER is unset; the desktop user for the tunnel is unknown", transport: "remote" }
   const connect = ["-o", `ConnectTimeout=${Math.max(1, Math.round(tunnel.connectTimeoutMs / 1000))}`]
+  // Only an actionable request can come back with an answer, and the far end
+  // waits for the user to click -- so the hop's own deadline has to outlast
+  // that wait, or the answer is cut off before it can arrive. A notification
+  // that asks nothing keeps the short, fire-and-forget deadline it has always
+  // had: a sleeping laptop must never hold an agent open.
+  const actionable = safeRequestId(request.requestID) !== undefined
+  const timeoutMs = actionable
+    ? Math.max(tunnel.connectTimeoutMs + 2000, ACTION_WAIT_MS + 2000)
+    : tunnel.connectTimeoutMs + 2000
+  const deliver = (args: string[]): Result => {
+    const result = run("ssh", args, timeoutMs)
+    // The forced command prints the NAME of the clicked button on its stdout,
+    // and ssh carries that back: it is the whole answer to an actionable
+    // request. Empty stdout means the user dismissed the popup without
+    // choosing.
+    const action = actionable ? result.stdout.trim() : ""
+    return {
+      ok: result.ok,
+      detail: result.ok ? undefined : result.stderr || result.detail,
+      transport: "remote",
+      ...(action ? { action } : {}),
+    }
+  }
   // Direct ssh (default when OC_LOCAL_HOST is set): the caller owns the transport
   // and ControlPersist keeps one connection warm. There is no reverse forward, no
   // listening port and no systemd unit -- nothing to sync and nothing to manage.
   if (tunnel.host) {
-    const result = run(
-      "ssh",
-      [...SSH_OPTS, ...CONTROL_OPTS, ...connect, "-i", tunnel.key, `${tunnel.user}@${tunnel.host}`, "--", encodePayload(request)],
-      tunnel.connectTimeoutMs + 2000,
-    )
-    return { ok: result.ok, detail: result.ok ? undefined : result.stderr || result.detail, transport: "remote" }
+    return deliver([
+      ...SSH_OPTS,
+      ...CONTROL_OPTS,
+      ...connect,
+      "-i",
+      tunnel.key,
+      `${tunnel.user}@${tunnel.host}`,
+      "--",
+      encodePayload(request),
+    ])
   }
   // Legacy reverse-forward fallback, kept until every host sets OC_LOCAL_HOST.
-  const result = run(
-    "ssh",
-    [...SSH_OPTS, ...connect, "-i", tunnel.key, "-p", String(tunnel.port), `${tunnel.user}@localhost`, "--", encodePayload(request)],
-    tunnel.connectTimeoutMs + 2000,
-  )
-  return { ok: result.ok, detail: result.ok ? undefined : result.stderr || result.detail, transport: "remote" }
+  return deliver([
+    ...SSH_OPTS,
+    ...connect,
+    "-i",
+    tunnel.key,
+    "-p",
+    String(tunnel.port),
+    `${tunnel.user}@localhost`,
+    "--",
+    encodePayload(request),
+  ])
 }
 
 /**
@@ -433,7 +536,10 @@ export function sendRemote(request: NotifyRequest, tunnel: TunnelConfig): Result
  */
 export function notify(request: NotifyRequest, env: NodeJS.ProcessEnv = process.env, platform: string = process.platform): Result {
   try {
-    return isRemote(env) ? sendRemote(request, resolveTunnel(env)) : sendLocal(request, platform)
+    const result = isRemote(env) ? sendRemote(request, resolveTunnel(env)) : sendLocal(request, platform)
+    // The chosen action travels with the result: a clicked button is already a
+    // valid answer, so it must not be dropped on the way back to the caller.
+    return result.action ? { ...result, action: result.action } : result
   } catch (error) {
     return { ok: false, detail: String(error), transport: "none" }
   }

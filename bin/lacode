@@ -63,6 +63,8 @@ const USAGE = `lacode — portable notifications and remote exec for LaCode
       permission | error; an omitted or unrecognised SOUND is none, so a
       four-argument caller simply gets no sound. Fire-and-forget: always
       exits 0.
+      With LACODE_REQUEST_ID set, the notification carries buttons and the
+      name of the clicked one is printed on stdout.
 
   lacode forward HOST -- COMMAND [ARG...]
       Run COMMAND on HOST over ssh. Exits with the remote's status.
@@ -90,7 +92,9 @@ Environment:
   OC_LOCAL_USER        desktop user the tunnel authenticates as
   OC_TUNNEL_PORT       reverse-forward listener port (default 10022)
   OC_NOTIFY_KEY        dedicated key (default ~/.ssh/lacode_notify)
-  OC_CONNECT_TIMEOUT_MS / OC_SSH_TIMEOUT_MS`
+  OC_CONNECT_TIMEOUT_MS / OC_SSH_TIMEOUT_MS
+  LACODE_REQUEST_ID    makes a notification actionable: it carries buttons, and
+                        the clicked one is printed on stdout`
 
 const argv = process.argv.slice(2)
 const command = argv.shift()
@@ -119,8 +123,23 @@ switch (command) {
     // ICON leaves it undefined, and normalizeSound maps undefined -- like every
     // other unrecognised name -- to "none", so back-compat and validation are
     // the same call rather than a default here and a check there.
-    const result = notify({ title: rawTitle, message, urgency, icon, sound: normalizeSound(sound) })
+    //
+    // LACODE_REQUEST_ID is read from the environment, not from argv: it is the
+    // plugin's request id, it is opaque, and it is never a positional argument.
+    // It is only ever the LAST field on the wire, and it decides whether the
+    // notification carries buttons at all.
+    const result = notify({
+      title: rawTitle,
+      message,
+      urgency,
+      icon,
+      sound: normalizeSound(sound),
+      requestID: process.env.LACODE_REQUEST_ID,
+    })
     if (!result.ok) console.error(`lacode: notification not delivered via ${result.transport}: ${result.detail ?? "unknown reason"}`)
+    // The name of the button the user clicked, on its own line, so the caller
+    // can read it. Nothing is printed when there was nothing to click.
+    if (result.action) console.log(result.action)
     process.exit(0)
     break
   }
@@ -209,6 +228,9 @@ switch (command) {
     const request = parsePayload(process.env.SSH_ORIGINAL_COMMAND ?? "")
     const result = sendLocal(request)
     if (!result.ok) console.error(`lacode receive: ${result.detail ?? "not delivered"}`)
+    // The name of the clicked button is this process's ONLY stdout: the hop
+    // carries it back to the sender, which prints it to its own caller.
+    if (result.action) console.log(result.action)
     process.exit(result.ok ? 0 : 1)
     break
   }

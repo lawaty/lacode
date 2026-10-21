@@ -193,7 +193,7 @@ does not.
 
 **Story ID(s) for tests:** US-11
 **Acceptance criteria:**
-- [ ] Given a session went busy and is now idle, When the idle event fires, Then a `done` notification is delivered.
+- [ ] Given a session went busy and is now idle, When the idle event fires, Then a `done` notification is delivered and stays on the desktop until the user closes it.
 - [ ] Given a session ends with an unrecognized error, When the error event fires, Then an `error` notification is delivered, it bypasses the duplicate-suppression cooldown, and it carries the error's own message.
 - [ ] Given a recognized rate-limit or quota error, or a user abort, When a session error event fires, Then no failure notification is raised — the pool already handles the former and the user already knows the latter.
 - [ ] Given a session that never went busy, When it goes idle, Then no notification is sent.
@@ -211,7 +211,7 @@ does not.
 - [ ] Given a question and a completion occur inside the same cooldown window, When both are evaluated, Then they are not deduplicated against each other.
 
 ### US-25: Notification when opencode asks for permission
-**As a** user, **I want** to be notified when opencode is blocked asking me for permission — including permission to reach a directory outside the worktree — **so that** a silent permission prompt is never mistaken for a hung agent.
+**As a** user, **I want** to be notified when opencode is blocked asking me for permission — including permission to reach a directory outside the worktree — **so that** a silent permission prompt is never mistaken for a hung agent, and so that I can allow or deny it where the notification reaches me instead of going back to the terminal.
 
 **Story ID(s) for tests:** US-25
 **Acceptance criteria:**
@@ -219,8 +219,14 @@ does not.
 - [ ] Given opencode asks to reach a directory outside the worktree, When the prompt fires, Then the notification names that directory, resolved from `metadata.parentDir`/`metadata.filepath` and with the trailing glob trimmed, because a glob is not something the user can judge.
 - [ ] Given the permission is granted, denied, or dismissed, When `permission.replied` fires, Then no notification is sent — the prompt was the thing worth interrupting for, not the answer — and only the parked-session block is cleared.
 - [ ] Given a session is parked on a permission prompt, When the idle event fires, Then no "finished" notification is sent, because nothing finished.
-- [ ] Given the plugin observes a permission prompt, When it handles the event, Then it is a read-only observer: the payload is not mutated and no `permission.ask` hook is registered, because that hook's `output.status` is the permission decision itself.
+- [ ] Given the plugin observes a permission prompt, When it handles the event, Then it registers no `permission.ask` hook and mutates nothing in the payload — that hook's `output.status` is the permission decision itself, and deciding a prompt inside a handler is not the same as answering the one the user was asked for. A permission is answered through the server's own reply route, and only when the user says which answer they meant.
 - [ ] Given a `permission` notification is raised, When it is evaluated against the cooldown, Then it bypasses it, since an unannounced block is the failure this story exists to remove.
+- [ ] Given a permission prompt on Linux, When the notification is delivered, Then it is exactly one notification carrying three buttons — **Allow once**, **Always allow** and **Deny** — and the click raises no second notification.
+- [ ] Given one of those buttons is clicked, When the answer comes back over the hop the notification came up, Then the permission is answered with that button's meaning through the server's reply route; the button names are opencode's own reply values (`once`, `always` and `reject` — the server's word for deny), so a click needs no translation to become an answer.
+- [ ] Given the popup is dismissed without a button being chosen, When the notification returns, Then nothing is answered and the permission is left exactly as it was.
+- [ ] Given the permission was already answered in the terminal, When a button is clicked, Then the reply is a no-op and is not reported as a failure.
+- [ ] Given the desktop is a macOS one, When the same prompt is delivered, Then it is a plain notice with no buttons, because `osascript` and `terminal-notifier` have no action support and the answer still has to be given in the terminal there.
+- [ ] Given a question is asked, When its notification is delivered, Then it carries no buttons and answers nothing, because a question is not a permission: the v1 client this plugin has has no question API at all, and the v2 routes need a bound socket the default TUI does not have.
 
 ### US-29: Notification sounds distinguish outcomes and can be switched off
 **As a** user running many parallel sessions, **I want** each notification to arrive with its own sound, **so that** I can tell a finished session from a question or a permission prompt without looking at the popup.

@@ -122,10 +122,26 @@ normalize_icon() {
 # Send one notification to the local desktop.
 #   $1 title  $2 message  $3 urgency  $4 icon
 #
-# Returns non-zero if it could not be delivered. No output on success, because
-# these run inside command substitution and would otherwise pollute callers.
+# The request id is NOT an argument: it arrives in the LACODE_REQUEST_ID
+# environment variable, which the plugin sets on the helper process. The
+# helper's argv is a published contract, and the request id is not part of it.
+#
+# The request id is opaque. It is never passed to a command, never printed and
+# never used to build an argument: it only decides whether the notification is
+# ACTIONABLE, i.e. whether it carries buttons the user can click. When it does,
+# the chosen button's NAME ("once", "always" or "reject") comes back on this
+# function's stdout -- the desktop end is an ssh forced command, so its stdout
+# is the only way an answer can travel home.
+#
+# Returns non-zero if it could not be delivered. Silent on success, because
+# these run inside command substitution and would otherwise pollute callers --
+# except for an actionable notification, which prints the chosen name.
 send_notify() {
   local title="${1:-OpenCode}" msg="${2:-}" urgency="${3:-normal}" icon
+  # The request id rides in the ENVIRONMENT, not in the argument list: the
+  # plugin sets LACODE_REQUEST_ID on the helper process. It is read here, so
+  # every caller of this function gets the same one.
+  local request_id="${LACODE_REQUEST_ID:-}"
   icon="$(normalize_icon "${4:-}")"
 
   # Control characters are stripped from both free-text fields before anything is
@@ -134,6 +150,10 @@ send_notify() {
   # delimiter unambiguous. It also keeps stray escapes off the desktop.
   title="${title//[[:cntrl:]]/ }"
   msg="${msg//[[:cntrl:]]/ }"
+  # The request id rides in the payload as a field of its own, so it gets the
+  # same treatment: a newline in it would forge a field. It is data, never a
+  # command, and it is only ever tested for emptiness.
+  request_id="${request_id//[[:cntrl:]]/ }"
 
   # The port is per-host, so it must be resolved from the same place as the user
   # name. An explicit OC_TUNNEL_PORT still wins.
@@ -162,22 +182,34 @@ send_notify() {
     local -a target=(-p "$TUNNEL_PORT" "${hop_user}@localhost")
 
     if [[ -f "$HOME/.ssh/oc_notify" ]]; then
-      # ONE argument, not four. ssh concatenates everything after the host into
+      # ONE argument, not six. ssh concatenates everything after the host into
       # the single command string that reaches the forced command as
-      # $SSH_ORIGINAL_COMMAND, with no positional parameters at all -- four
+      # $SSH_ORIGINAL_COMMAND, with no positional parameters at all -- separate
       # arguments arrive as one space-joined blob the receiver cannot split, and
       # the popup comes out empty. Newline-delimited fields survive that hop.
       # oc-notify-receiver splits on exactly this; update the two together.
-      local payload="${title}"$'\n'"${msg}"$'\n'"${urgency}"$'\n'"${icon}"
+      #
+      # Six fields, the same shape the published sender uses:
+      # title\nmessage\nurgency\nicon\nsound\nrequestID. The fifth is the
+      # sound, and it is empty here -- this path has no sounds directory to
+      # play it from, but the field is still there, so both wires agree. The
+      # sixth is the request id, empty when there is none: a non-empty one is
+      # what makes the notification actionable on the other end.
+      local payload="${title}"$'\n'"${msg}"$'\n'"${urgency}"$'\n'"${icon}"$'\n'$'\n'"${request_id}"
 
-      if ssh "${target[@]}" \
+      # The desktop end is a forced command, so its stdout comes back down this
+      # same ssh connection. Capture it and print it: that is how the user's
+      # click travels home. An empty answer means the popup was dismissed.
+      local answer
+      if answer="$(ssh "${target[@]}" \
            -i "$HOME/.ssh/oc_notify" \
            -o IdentitiesOnly=yes \
            -o StrictHostKeyChecking=accept-new \
            -o BatchMode=yes \
            -o ConnectTimeout=5 \
            -o LogLevel=ERROR \
-           -- "$payload" 2>/dev/null; then
+           -- "$payload" 2>/dev/null)"; then
+        printf '%s\n' "$answer"
         return 0
       fi
     else
@@ -186,7 +218,18 @@ send_notify() {
   else
     # Local: notify straight to the desktop session.
     if command -v notify-send >/dev/null 2>&1; then
-      notify-send "$title" "$msg" --urgency="$urgency" --icon="$icon" >/dev/null 2>&1 && return 0
+      if [[ -n "$request_id" ]]; then
+        # Actionable: the popup carries buttons, so notify-send waits for the
+        # user to click one and prints the chosen button's NAME on stdout.
+        # Capture it and print it -- that is the answer reaching the caller.
+        # An empty answer means the popup was dismissed without choosing.
+        local action
+        action="$(notify-send "$title" "$msg" --urgency="$urgency" --icon="$icon" --expire-time=0 --action=once='Allow once' --action=always='Always allow' --action=reject='Deny' 2>/dev/null)" || return 1
+        printf '%s\n' "$action"
+        return 0
+      fi
+      # --expire-time=0: never auto-dismissed — the notification waits for the user to close it.
+      notify-send "$title" "$msg" --urgency="$urgency" --icon="$icon" --expire-time=0 >/dev/null 2>&1 && return 0
     fi
   fi
 
@@ -210,6 +253,7 @@ send_notify() {
 # the delivery signal, and swallowing it is what let five notifications be logged
 # as sent while nothing reached the desktop.
 if [[ -n "${OC_NOTIFY_ONLY:-}" ]]; then
+  # The request id arrives in the LACODE_REQUEST_ID environment variable, not as an argument.
   send_notify "${1:-OpenCode}" "${2:-}" "${3:-normal}" "${4:-}"
   exit $?
 fi

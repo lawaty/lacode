@@ -28,22 +28,34 @@ const { notifyHooks } = await import(join(ROOT, "src", "plugins", "notify.ts"))
  *
  * `sent` is the list a real desktop would have received; `result` controls what
  * the sender reports back, so the "delivery failed vs delivered" bookkeeping is
- * observable too.
+ * observable too. The fifth argument is the permission request id (US-25),
+ * present only when the notification is actionable.
+ *
+ * `replies` records every call to the server's permission reply route, stubbed
+ * onto the shared client, so "the permission was answered" is an assertion
+ * about exact arguments rather than about a log line. `respond` replaces the
+ * stub's outcome for the failure shapes (a 404, a rejection); the call is
+ * recorded either way.
  */
-const notifier = async ({ sessions = {}, result = { ok: true } } = {}) => {
+const notifier = async ({ sessions = {}, result = { ok: true }, respond } = {}) => {
   const stub = stubInput({ sessions })
   const sent = []
+  const replies = []
+  stub.client.postSessionIdPermissionsPermissionId = async (call) => {
+    replies.push(call)
+    return respond ? respond(call) : { response: { status: 200 } }
+  }
   const hooks = await notifyHooks(
     stub.input,
     undefined,
     {
-      deliver: async (title, message, urgency, sound) => {
-        sent.push({ title, message, urgency, sound })
+      deliver: async (title, message, urgency, sound, requestID) => {
+        sent.push({ title, message, urgency, sound, requestID })
         return typeof result === "function" ? result() : result
       },
     },
   )
-  return { stub, sent, hooks, emit: (type, properties) => hooks.event({ event: { type, properties } }) }
+  return { stub, sent, replies, hooks, emit: (type, properties) => hooks.event({ event: { type, properties } }) }
 }
 
 const busy = (emit, sessionID) => emit("session.status", { sessionID, status: { type: "busy" } })
@@ -664,5 +676,175 @@ test("[US-25] the notification goes through the injected seam, never a real desk
   assert.ok(
     !stub.text().some((line) => line.includes("no oc-notify helper found")),
     "the helper lookup must never run when a seam is supplied, or this test would be touching the real transport",
+  )
+})
+
+// The answerable half of US-25. The notification carries the permission's
+// request id, the transport turns a click into that id's answer, and the
+// plugin forwards the clicked name -- opencode's own reply value, so no
+// translation -- through the server's reply route. Everything below drives
+// the seam, so a "click" is simply the sender reporting an action.
+
+test("[US-25] a permission notification carries the request id for the transport to act on", async () => {
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+  await busy(emit, "s1")
+  await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+  await settle()
+
+  assert.equal(sent.length, 1, `exactly one notification, got ${JSON.stringify(sent)}`)
+  assert.equal(sent[0].requestID, "p1", `the seam's fifth argument must be the request id: ${JSON.stringify(sent[0])}`)
+})
+
+test("[US-25] a permission event with no id delivers a notice that answers nothing", async () => {
+  // The id is what a reply is addressed to. Without one there is nothing to
+  // answer, so the popup must be a plain notice -- and the reply route must
+  // never be touched, because an addressless reply can only land somewhere.
+  const { sent, emit, replies } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+  await busy(emit, "s1")
+  await emit("permission.asked", { sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+  await settle()
+
+  assert.equal(sent.length, 1, `the prompt itself must still notify, got ${JSON.stringify(sent)}`)
+  assert.equal(sent[0].requestID, undefined, `no id, no request id on the seam: ${JSON.stringify(sent[0])}`)
+  assert.deepEqual(replies, [], `the reply route must not be called: ${JSON.stringify(replies)}`)
+})
+
+test("[US-25] clicking a button answers the permission exactly once, addressed to the request id", async () => {
+  // The clicked name is already one of opencode's reply values, so the body
+  // must be EXACTLY what was clicked -- no mapping, no wrapping. And the
+  // reply is addressed by the request id the event carried, which is the
+  // only thing the server can match an answer against.
+  for (const action of ["once", "always", "reject"]) {
+    const { sent, emit, replies } = await notifier({
+      sessions: { s1: { id: "s1", title: "Read the config" } },
+      result: { ok: true, action },
+    })
+    await busy(emit, "s1")
+    await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+    await settle()
+
+    assert.equal(sent.length, 1, `${action}: the notification was delivered, got ${JSON.stringify(sent)}`)
+    assert.deepEqual(
+      replies,
+      [{ path: { id: "s1", permissionID: "p1" }, body: { response: action } }],
+      `${action}: exactly one reply, with the clicked name as the response: ${JSON.stringify(replies)}`,
+    )
+  }
+})
+
+test("[US-25] an action that is not a permission reply is ignored, never forwarded", async () => {
+  // The action is the transport's raw stdout -- untrusted text. Only the
+  // server's own vocabulary may reach the reply route; anything else would
+  // let a noisy hop answer a permission with a word nobody clicked.
+  const { emit, replies } = await notifier({
+    sessions: { s1: { id: "s1", title: "Read the config" } },
+    result: { ok: true, action: "maybe" },
+  })
+  await busy(emit, "s1")
+  await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+  await settle()
+
+  assert.deepEqual(replies, [], `an unrecognised name must never reach the server: ${JSON.stringify(replies)}`)
+})
+
+test("[US-25] dismissing the popup answers nothing and still reports the delivery", async () => {
+  // Empty stdout is the dismissed popup: a delivery, not an answer. The
+  // permission stays exactly as it was, and the notification is still
+  // accounted for as delivered -- the user was told, which is what the
+  // notification was for.
+  const { stub, sent, emit, replies } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+  await busy(emit, "s1")
+  await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+  await settle()
+
+  assert.equal(sent.length, 1, `the popup was raised, got ${JSON.stringify(sent)}`)
+  assert.deepEqual(replies, [], `a dismissal must not answer anything: ${JSON.stringify(replies)}`)
+  assert.ok(
+    stub.text().some((line) => line.startsWith("info notified")),
+    `the delivery must still be reported as delivered:\n${stub.text().join("\n")}`,
+  )
+})
+
+test("[US-25] a non-permission outcome never answers anything", async () => {
+  // The reply route exists for permissions. A done notification has no
+  // request id to answer with, so even a sender that reports an action must
+  // not be able to turn a completion into a permission reply.
+  const { emit, replies } = await notifier({
+    sessions: { s1: { id: "s1", title: "Read the config" } },
+    result: { ok: true, action: "once" },
+  })
+  await busy(emit, "s1")
+  await idle(emit, "s1")
+  await settle()
+
+  assert.deepEqual(replies, [], `a done notification must never touch the reply route: ${JSON.stringify(replies)}`)
+})
+
+test("[US-25] a permission already answered elsewhere is not a failure", async () => {
+  // The terminal answered first; the click arrives late. The 404 that comes
+  // back is the good outcome -- the permission IS answered -- whichever
+  // shape it arrives in: a resolved response or a rejected error carrying
+  // the status. Neither may be logged as a failure, and nothing may throw
+  // out of the event handler.
+  for (const [label, respond] of [
+    ["a resolved 404", async () => ({ response: { status: 404 } })],
+    [
+      "a rejected 404",
+      async () => {
+        const error = new Error("HTTP 404")
+        error.response = { status: 404 }
+        throw error
+      },
+    ],
+  ]) {
+    const { stub, emit, replies } = await notifier({
+      sessions: { s1: { id: "s1", title: "Read the config" } },
+      result: { ok: true, action: "once" },
+      respond,
+    })
+    await busy(emit, "s1")
+    await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+    await settle()
+
+    assert.equal(replies.length, 1, `${label}: the reply route was still addressed: ${JSON.stringify(replies)}`)
+    const text = stub.text()
+    assert.ok(text.some((line) => line.includes("permission already answered")), `${label}: the outcome must be named:\n${text.join("\n")}`)
+    assert.ok(!text.some((line) => line.startsWith("warn permission reply failed")), `${label}: a 404 is not a failure:\n${text.join("\n")}`)
+    assert.ok(!text.some((line) => line.startsWith("error")), `${label}: nothing may be logged as an error:\n${text.join("\n")}`)
+    assert.ok(!text.some((line) => /handler failed|notify failed/.test(line)), `${label}: nothing may throw out of the handler:\n${text.join("\n")}`)
+  }
+})
+
+test("[US-25] a stale click for a permission the server no longer has is a no-op, not an answer", async () => {
+  // The request was withdrawn or answered while the popup sat there. The
+  // click must not crash anything -- the next prompt must still notify and
+  // answer normally -- and it must not be recorded as an answer: no log
+  // line may claim the response was delivered, because it was not.
+  const { stub, sent, emit, replies } = await notifier({
+    sessions: { s1: { id: "s1", title: "Read the config" } },
+    result: { ok: true, action: "once" },
+    respond: async () => ({ response: { status: 404 } }),
+  })
+  await busy(emit, "s1")
+  await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+  await settle()
+
+  assert.equal(replies.length, 1, `the stale click still reached the reply route: ${JSON.stringify(replies)}`)
+  const answered = stub.lines.filter((line) => line.extra?.response === "once")
+  assert.deepEqual(answered, [], `the stale click must not be recorded as an answer: ${JSON.stringify(stub.lines)}`)
+  assert.ok(
+    stub.text().some((line) => line.includes("permission already answered")),
+    `the no-op must be said in plain words:\n${stub.text().join("\n")}`,
+  )
+  assert.ok(!stub.text().some((line) => /handler failed|notify failed/.test(line)), `nothing may crash:\n${stub.text().join("\n")}`)
+
+  // And the plugin is unharmed: the next prompt notifies and answers as ever.
+  await emit("permission.asked", { id: "p2", sessionID: "s1", permission: "read", patterns: ["*.key"], metadata: {} })
+  await settle()
+  assert.equal(sent.length, 2, `the next prompt must still notify, got ${JSON.stringify(sent)}`)
+  assert.deepEqual(
+    replies[1],
+    { path: { id: "s1", permissionID: "p2" }, body: { response: "once" } },
+    `the next click must answer its own request id: ${JSON.stringify(replies)}`,
   )
 })

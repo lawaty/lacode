@@ -14,11 +14,24 @@
 # pops up an empty notification -- which is exactly what this script used to do.
 # The sender therefore passes a SINGLE argument of the form:
 #
-#     title\nmessage\nurgency\nicon
+#     title\nmessage\nurgency\nicon\nsound\nrequestID
 #
 # NEWLINE is the delimiter because both senders strip control characters from the
 # title and the message before assembling the payload, so no field can contain
 # one. The sender and this receiver are versioned together; oc-sync installs both.
+#
+# The request id -- the SIXTH field -- is what makes the notification
+# ACTIONABLE: with one, the popup carries buttons and the chosen button's name
+# comes back on stdout; without one, it is a plain notice. It is opaque -- it
+# is never passed to a command, never echoed, and never used to build an
+# argument. Only its emptiness is ever tested.
+#
+# The FIFTH field is the sound, and it is ignored here: this receiver has no
+# sounds directory to play it from. The field is still carried, so the legacy
+# sender and the published one put the same thing on the wire.
+#
+# A payload with fewer than six fields carries no request id, and therefore no
+# buttons -- so an older sender still works against this receiver.
 #
 # $SSH_ORIGINAL_COMMAND is ATTACKER-CONTROLLED: it is whatever the remote host's
 # user typed on the ssh command line, and this script runs as the desktop user.
@@ -35,8 +48,8 @@
 set -uo pipefail
 
 # Split on newlines only: no word splitting, so a message full of spaces survives
-# intact, and no globbing, so a message full of `*` does too. Fields past the
-# fourth are ignored -- not merged, not executed.
+# intact, and no globbing, so a message full of `*` does too. The fields this
+# receiver does not use are ignored -- not merged, not executed.
 #
 # A `while read` loop rather than `mapfile -t`, and the two are equivalent here:
 # checked against empty input, a trailing newline, blank lines and a field full
@@ -57,11 +70,16 @@ TITLE="${fields[0]:-LaCode}"
 MSG="${fields[1]:-}"
 URGENCY="${fields[2]:-normal}"
 ICON="${fields[3]:-utilities-terminal}"
+REQUEST_ID="${fields[5]:-}"
 
 # Both senders already strip control characters; this is the trust boundary, so
 # the check is repeated here rather than assumed from the other end.
 TITLE="${TITLE//[[:cntrl:]]/ }"
 MSG="${MSG//[[:cntrl:]]/ }"
+# The request id is stripped for the same reason: it is a field in a payload
+# that arrives from an attacker-controlled environment. It is never used to
+# build an argument -- only its emptiness is ever tested.
+REQUEST_ID="${REQUEST_ID//[[:cntrl:]]/ }"
 
 # A payload with no newline at all is the OLD sender's argument list, already
 # flattened by ssh into one space-joined string. That is the bug this receiver
@@ -111,4 +129,21 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
 fi
 
-exec notify-send "$TITLE" "$MSG" --urgency="$URGENCY" --icon="$ICON"
+# An actionable notification carries buttons, so the user can answer without
+# opening a terminal. notify-send then waits for the click and prints the
+# chosen button's NAME on stdout; that stdout travels back down the ssh
+# connection to the sender, which is how the answer reaches the caller. An
+# empty answer means the popup was dismissed without choosing.
+#
+# The request id itself is not passed to notify-send and is not part of the
+# output: it decided only that this notification has buttons. The notifier's
+# stderr is left alone -- this runs as a forced command, so its stderr reaches
+# whoever opened the ssh connection and nobody else.
+if [[ -n "$REQUEST_ID" ]]; then
+  action="$(notify-send "$TITLE" "$MSG" --urgency="$URGENCY" --icon="$ICON" --expire-time=0 --action=once='Allow once' --action=always='Always allow' --action=reject='Deny')" || exit 1
+  printf '%s\n' "$action"
+  exit 0
+fi
+
+# --expire-time=0: the notification waits for the user to close it; without it the desktop's own timeout takes it away, and a notice they missed is no notice.
+exec notify-send "$TITLE" "$MSG" --urgency="$URGENCY" --icon="$ICON" --expire-time=0

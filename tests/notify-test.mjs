@@ -184,6 +184,38 @@ await check("an unanswered question suppresses the redundant 'finished'", () => 
 })
 
 // ---------------------------------------------------------------------------
+// Permissions: the one notification that can be answered where it sits
+// ---------------------------------------------------------------------------
+
+await check("[US-25] a permission decision carries the request id; nothing else does", () => {
+  // The request id is what a reply is addressed to, so it is carried exactly
+  // when the notification can act on it: a permission outcome with an id is
+  // actionable, the same outcome without one is a plain notice, and no other
+  // outcome ever grows the key -- a done or a question has nothing to answer.
+  const actionable = shouldNotify({ info: { id: "s1", title: "Deploy" }, outcome: "permission", requestID: "p1" })
+  assert(actionable.notify, "a permission prompt should notify")
+  assert(
+    JSON.stringify(actionable.actionable) === JSON.stringify({ requestID: "p1" }),
+    `the id must be carried as actionable, got ${JSON.stringify(actionable)}`,
+  )
+
+  const plain = shouldNotify({ info: { id: "s1", title: "Deploy" }, outcome: "permission" })
+  assert(plain.notify, "a permission without an id is still worth announcing")
+  assert(!("actionable" in plain), `without an id there is nothing to answer: ${JSON.stringify(plain)}`)
+
+  for (const outcome of ["done", "question", "error"]) {
+    const decision = shouldNotify({
+      info: { id: "s1", title: "Deploy" },
+      outcome,
+      ...(outcome === "done" ? { sawMessage: true } : {}),
+      ...(outcome === "error" ? { detail: "boom" } : {}),
+    })
+    assert(decision.notify, `${outcome} should notify`)
+    assert(!("actionable" in decision), `${outcome} must never carry actionable: ${JSON.stringify(decision)}`)
+  }
+})
+
+// ---------------------------------------------------------------------------
 // Title hygiene: session titles are user text that lands in a notification
 // ---------------------------------------------------------------------------
 
@@ -664,6 +696,91 @@ await check("the handler swallows a session.get failure", async () => {
   await hooks.event({ event: { type: "session.idle", properties: { sessionID: "nope" } } })
   assert(true, "a failed lookup must not throw out of the handler")
   rmSync(dir, { recursive: true, force: true })
+})
+
+// The request id travels in the ENVIRONMENT, not the argv. The helper's argv is
+// a published contract shared by two CLIs and every sender; the request id is
+// plugin bookkeeping no other caller knows about, so it must not cost the argv
+// a field -- and a notification that answers nothing must not set it at all.
+
+await check("[US-25] the request id reaches the helper as LACODE_REQUEST_ID, and the argv is unchanged", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  // Each helper records its argv NUL-separated and the request-id variable it
+  // was handed, so both channels the id could travel through are observable
+  // at once. Two helpers, because the plain path must be a different spawn,
+  // not a second line in the same log.
+  const record = (argvLog, envLog) =>
+    `#!/usr/bin/env bash\nprintf '%s\\0' "$@" > ${JSON.stringify(argvLog)}\nprintf '%s' "\${LACODE_REQUEST_ID-}" > ${JSON.stringify(envLog)}\n`
+  const argvLog = join(dir, "argv.log")
+  const envLog = join(dir, "env.log")
+  const helper = join(dir, "oc-notify")
+  writeFileSync(helper, record(argvLog, envLog), { mode: 0o755 })
+  const plainArgvLog = join(dir, "plain-argv.log")
+  const plainEnvLog = join(dir, "plain-env.log")
+  const plainHelper = join(dir, "oc-notify-plain")
+  writeFileSync(plainHelper, record(plainArgvLog, plainEnvLog), { mode: 0o755 })
+
+  const client = makeClient({
+    root: { id: "root", title: "Deploy" },
+    other: { id: "other", title: "Other work" },
+  })
+  const hooks = await Notify({ client, directory: dir })
+  const waitFor = async (file) => {
+    for (let i = 0; i < 50 && !existsSync(file); i++) await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  const argvOf = (file) => {
+    const raw = readFileSync(file, "utf8")
+    return raw.endsWith("\0") ? raw.slice(0, -1).split("\0") : raw.split("\0")
+  }
+
+  // Deterministic wording: the remote suffix depends on this process's own
+  // environment, and the assertions below are byte-exact.
+  const previous = {
+    sound: process.env.LACODE_SOUND,
+    sshClient: process.env.SSH_CLIENT,
+    sshTty: process.env.SSH_TTY,
+    helper: process.env.OC_NOTIFY_HELPER,
+  }
+  delete process.env.LACODE_SOUND
+  delete process.env.SSH_CLIENT
+  delete process.env.SSH_TTY
+  try {
+    // The actionable path: a permission with an id.
+    process.env.OC_NOTIFY_HELPER = helper
+    await hooks.event({
+      event: { type: "permission.asked", properties: { id: "p1", sessionID: "root", permission: "bash", patterns: ["*"], metadata: { command: "ls" } } },
+    })
+    await waitFor(argvLog)
+
+    assert(
+      JSON.stringify(argvOf(argvLog)) === JSON.stringify(["opencode — Deploy", "Awaiting your permission — run `ls`", "normal", "utilities-terminal", "permission"]),
+      `the argv must stay the five published fields, got ${JSON.stringify(argvOf(argvLog))}`,
+    )
+    assert(readFileSync(envLog, "utf8") === "p1", `the request id must travel in the environment: ${JSON.stringify(readFileSync(envLog, "utf8"))}`)
+
+    // The plain path: a question for another session, same helper contract.
+    process.env.OC_NOTIFY_HELPER = plainHelper
+    await hooks.event({
+      event: { type: "question.asked", properties: { sessionID: "other", questions: [{ question: "A or B?" }] } },
+    })
+    await waitFor(plainArgvLog)
+
+    assert(
+      JSON.stringify(argvOf(plainArgvLog)) === JSON.stringify(["opencode — Other work", "Awaiting your response — A or B?", "normal", "utilities-terminal", "question"]),
+      `a notification that asks nothing keeps the same argv shape, got ${JSON.stringify(argvOf(plainArgvLog))}`,
+    )
+    assert(readFileSync(plainEnvLog, "utf8") === "", "no request id may be set for a notification that answers nothing")
+  } finally {
+    if (previous.sound === undefined) delete process.env.LACODE_SOUND
+    else process.env.LACODE_SOUND = previous.sound
+    if (previous.sshClient === undefined) delete process.env.SSH_CLIENT
+    else process.env.SSH_CLIENT = previous.sshClient
+    if (previous.sshTty === undefined) delete process.env.SSH_TTY
+    else process.env.SSH_TTY = previous.sshTty
+    if (previous.helper === undefined) delete process.env.OC_NOTIFY_HELPER
+    else process.env.OC_NOTIFY_HELPER = previous.helper
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // The two spawn bounds. Both live on the TRANSPORT, not on which notifications

@@ -135,8 +135,21 @@ const lacode = async (args, { transports, env = {} } = {}) => {
  * helper stubs rather than skipping on darwin. What it pins here is the parse,
  * and the parse is portable.
  */
-const runReceiver = async ({ command, args = [] } = {}) => {
+const runReceiver = async ({ command, args = [], click } = {}) => {
   const transports = stubTransport()
+  // `click` makes the stubbed notifier behave like a user who chose a button:
+  // libnotify prints the chosen action's NAME on stdout when --action is used,
+  // and that stdout is the whole answer an actionable notification produces.
+  // The argv is still recorded, so one run can assert both what the notifier
+  // was handed and what it "clicked".
+  if (click !== undefined) {
+    const log = join(transports.bin, "notify-send.log")
+    writeFileSync(
+      join(transports.bin, "notify-send"),
+      `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done\nprintf '%s\\n' ${JSON.stringify(click)}\nexit 0\n`,
+    )
+    chmodSync(join(transports.bin, "notify-send"), 0o755)
+  }
   const home = scratch("receiver-home-")
   const result = await exec("bash", [join(ROOT, "bin", "oc-notify-receiver"), ...args], {
     env: {
@@ -150,6 +163,7 @@ const runReceiver = async ({ command, args = [] } = {}) => {
   return {
     code: result.code ?? 0,
     stderr: result.stderr ?? "",
+    stdout: result.stdout ?? "",
     notifyArgv: transports.notifyArgv(),
   }
 }
@@ -198,6 +212,11 @@ test("[US-13] a notification raised on a remote host is delivered to the local d
   assert.equal(landed.notifyArgv[1], "Task finished", `the body must arrive at the desktop intact: ${JSON.stringify(landed.notifyArgv)}`)
   assert.ok(landed.notifyArgv.includes("--urgency=normal"), "the urgency must arrive too")
   assert.ok(landed.notifyArgv.includes("--icon=utilities-terminal"), "the icon must arrive too")
+  // The same delivery, and the requirement is not about errors only: a
+  // normal-urgency notification is not auto-dismissed either. Urgency decides
+  // how loudly it announces itself, never how long it stays -- the desktop's
+  // own timeout must never take away a notice the user has not read yet.
+  assert.ok(landed.notifyArgv.includes("--expire-time=0"), "a normal notification is never auto-dismissed either: it stays until the user closes it")
 
   // And with the tunnel down, the SAME title reaches a desktop channel locally,
   // which is what "the local desktop shows it" means in the end.
@@ -305,19 +324,27 @@ test("[US-13] the notification crosses the hop as ONE delimited argument, never 
     env: { SSH_CLIENT: "10.0.0.1 51000 10.0.0.2 22", OC_LOCAL_USER: "desktop-user" },
   })
 
-  // Exactly ONE argument follows the host, carrying all four fields. Four
+  // Exactly ONE argument follows the host, carrying all six fields. Four
   // separate arguments looked equivalent on this side and delivered nothing: ssh
   // concatenates them into a single command string for the forced command.
+  //
+  // Updated from five fields to six when the permission buttons landed (US-25):
+  // the fifth field is the sound and the sixth is the permission request id,
+  // which decides whether the popup carries buttons. A CLI caller that passes
+  // no LACODE_REQUEST_ID answers nothing, so its id field is empty -- but the
+  // field itself is always there, because a wire whose field count changes
+  // between senders is not a contract.
   const hop = transports.sshArgv()
   const after = hop.slice(hop.indexOf("--") + 1)
   assert.equal(after.length, 1, `the hop must carry a single payload argument: ${JSON.stringify(hop)}`)
   const fields = after[0].split("\n")
-  assert.equal(fields.length, 5, `the payload must be newline-delimited into five fields: ${JSON.stringify(fields)}`)
+  assert.equal(fields.length, 6, `the payload must be newline-delimited into six fields: ${JSON.stringify(fields)}`)
   assert.ok(fields[0].includes(payload), `the payload must cross verbatim in field 1: ${JSON.stringify(fields)}`)
   assert.ok(fields[1].includes(`Message; touch ${marker}`), `field 2 must cross verbatim: ${JSON.stringify(fields)}`)
   assert.equal(fields[2], "normal")
   assert.equal(fields[3], "utilities-terminal")
   assert.equal(fields[4], "none", "a four-argument caller still gets a valid payload with sound: 'none'")
+  assert.equal(fields[5], "", "a notification that answers nothing carries an empty request id field")
   // ...and nothing was ever executed. A second command smuggled through the hop
   // would own the local desktop, which is why the receiver parses rather than
   // evaluates.
@@ -374,7 +401,7 @@ test("[US-18] the forced command reads the payload from the environment, never f
   const delivered = await runReceiver({ command: ["From the environment", "Body", "critical", "dialog-error"].join("\n") })
   assert.deepEqual(
     delivered.notifyArgv,
-    ["From the environment", "Body", "--urgency=critical", "--icon=dialog-error"],
+    ["From the environment", "Body", "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
     `the payload must drive every field: ${JSON.stringify(delivered.notifyArgv)}`,
   )
 })
@@ -395,7 +422,7 @@ test("[US-18] a body with spaces, punctuation and glob characters crosses the ho
   const landed = await runReceiver({ command: hop[hop.length - 1] })
   assert.deepEqual(
     landed.notifyArgv,
-    [title, body, "--urgency=critical", "--icon=dialog-error"],
+    [title, body, "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
     `the notification must arrive whole, not split on whitespace: ${JSON.stringify(landed.notifyArgv)}`,
   )
 })
@@ -413,12 +440,13 @@ test("[US-18] a hostile payload is parsed as data: nothing runs and no argument 
   })
 
   assert.ok(!existsSync(marker), "nothing in the payload may ever be executed")
-  // Exactly four arguments: the two text fields verbatim, the two flags from
-  // whitelisted values. The fifth field is dropped, and the injected
-  // `--icon=dialog-error` inside the urgency field is replaced, not concatenated.
+  // Exactly five arguments: the two text fields verbatim, the two flags from
+  // whitelisted values, and the never-expire flag. The fifth payload field is
+  // dropped, and the injected `--icon=dialog-error` inside the urgency field is
+  // replaced, not concatenated.
   assert.deepEqual(
     landed.notifyArgv,
-    [hostileTitle, hostileBody, "--urgency=normal", "--icon=dialog-warning"],
+    [hostileTitle, hostileBody, "--urgency=normal", "--icon=dialog-warning", "--expire-time=0"],
     `a hostile payload must reach notify-send as inert text: ${JSON.stringify(landed.notifyArgv)}`,
   )
   assert.equal(landed.code, 0)
@@ -438,7 +466,7 @@ test("[US-14] a payload that cannot be understood degrades to a LaCode popup ins
   ]) {
     const landed = await runReceiver({ command })
     assert.equal(landed.code, 0, `${label}: the receiver must exit 0, got ${landed.code}: ${landed.stderr}`)
-    assert.equal(landed.notifyArgv.length, 4, `${label}: it must still pop up exactly one notification: ${JSON.stringify(landed.notifyArgv)}`)
+    assert.equal(landed.notifyArgv.length, 5, `${label}: it must still pop up exactly one notification: ${JSON.stringify(landed.notifyArgv)}`)
     assert.equal(landed.notifyArgv[0], label === "empty" ? "LaCode" : "Some Title Some Message normal utilities-terminal",
       `${label}: an unreadable payload must show its own content, not an empty popup`)
   }
@@ -590,7 +618,7 @@ test("[US-14] doctor reports what the environment resolves to without failing wh
   assert.match(remote.stdout, /OC_LOCAL_USER is unset/, "doctor must say what is missing")
 })
 
-const { describe: describeEnv, localChannel, safeMessage, safeTitle, sendLocal, soundChannel } =
+const { describe: describeEnv, localChannel, safeMessage, safeTitle, sendLocal, sendRemote, soundChannel } =
   await import(join(ROOT, "src", "tunnel", "index.ts"))
 
 /**
@@ -762,15 +790,15 @@ test("[US-26] a Mac with no notifier degrades to a reported failure, and never h
   })
 })
 
-test("[US-26] Linux still delivers through notify-send, argument for argument unchanged", () => {
+test("[US-26] Linux still delivers through notify-send, argument for argument, and never auto-dismisses", () => {
   withStubs(["osascript", "notify-send", "terminal-notifier"], ({ argv }) => {
     const result = sendLocal(REQUEST, "linux")
 
     assert.equal(result.ok, true, `the send must succeed: ${result.detail}`)
     assert.deepEqual(
       argv("notify-send"),
-      ["opencode — Fix the login", "Task finished", "--urgency=critical", "--icon=dialog-error"],
-      `the Linux call must be exactly what it always was: ${JSON.stringify(argv("notify-send"))}`,
+      ["opencode — Fix the login", "Task finished", "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
+      `the Linux call must carry exactly these arguments: ${JSON.stringify(argv("notify-send"))}`,
     )
     assert.deepEqual(argv("osascript"), [], "macOS must not change what Linux does")
     assert.deepEqual(argv("terminal-notifier"), [], "macOS must not change what Linux does")
@@ -796,6 +824,23 @@ test("[US-26] Linux still delivers through notify-send, argument for argument un
     // Whatever the channel is, the title is an argument to it -- never spliced
     // into a command line.
     assert.ok(argv(expected).includes(REQUEST.title), `${expected} must have received the title as an argument: ${JSON.stringify(argv(expected))}`)
+  })
+})
+
+test("[US-26] a normal-urgency notification is not auto-dismissed either", () => {
+  // The requirement is not about errors only: urgency decides how loudly a
+  // notification announces itself, never how long it stays. The ordinary
+  // "task finished" kind must wait for the user too, or the desktop's own
+  // timeout would take away a notice the user had not read yet.
+  withStubs(["notify-send"], ({ argv }) => {
+    const result = sendLocal({ ...REQUEST, urgency: "normal", icon: "emblem-default" }, "linux")
+
+    assert.equal(result.ok, true, `the send must succeed: ${result.detail}`)
+    assert.deepEqual(
+      argv("notify-send"),
+      ["opencode — Fix the login", "Task finished", "--urgency=normal", "--icon=emblem-default", "--expire-time=0"],
+      `a notification that is not an error is still only manually closable: ${JSON.stringify(argv("notify-send"))}`,
+    )
   })
 })
 
@@ -936,5 +981,110 @@ test("[US-29] the sound still plays on a desktop with no notification channel at
     assert.equal(result.ok, false, "the popup is still reported as undelivered -- the sound does not fake a success")
     assert.equal(played.length, 1, `the sound must still play: ${JSON.stringify(played)}`)
     assert.match(played[0], /sounds[/\\]error\.wav$/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// US-25 -- the permission buttons ride the same hop
+// ---------------------------------------------------------------------------
+//
+// A permission notification is the one notification the user can answer where
+// it sits. The answer is the clicked button's NAME, and the names are
+// opencode's own reply values, so a click needs no translation on the way
+// back. These pin both ends of that round trip on the real receiver and the
+// real sender, with the transports stubbed exactly as the US-13/US-18 tests
+// stub them.
+
+test("[US-25] the receiver offers the three permission buttons only when the payload carries a request id", async () => {
+  // The sixth field is what makes a notification actionable. With it, the
+  // popup carries one button per reply value opencode accepts -- and the
+  // button names ARE the reply values, so a click is already an answer.
+  // Without it, no button may be attached: a popup that looks answerable but
+  // answers nothing is worse than one that never offered.
+  const actionable = await runReceiver({
+    command: ["opencode — Fix the login", "Awaiting your permission — run `ls`", "normal", "utilities-terminal", "permission", "p1"].join("\n"),
+  })
+  assert.equal(actionable.code, 0, `the receiver must succeed: ${actionable.stderr}`)
+  assert.deepEqual(
+    actionable.notifyArgv,
+    [
+      "opencode — Fix the login",
+      "Awaiting your permission — run `ls`",
+      "--urgency=normal",
+      "--icon=utilities-terminal",
+      "--expire-time=0",
+      "--action=once=Allow once",
+      "--action=always=Always allow",
+      "--action=reject=Deny",
+    ],
+    `an actionable payload must carry exactly the three reply buttons: ${JSON.stringify(actionable.notifyArgv)}`,
+  )
+
+  const plain = await runReceiver({
+    command: ["opencode — Fix the login", "Task finished", "normal", "utilities-terminal", "none"].join("\n"),
+  })
+  assert.equal(plain.code, 0, `the receiver must succeed: ${plain.stderr}`)
+  assert.deepEqual(
+    plain.notifyArgv,
+    ["opencode — Fix the login", "Task finished", "--urgency=normal", "--icon=utilities-terminal", "--expire-time=0"],
+    `a payload with no request id must carry no buttons: ${JSON.stringify(plain.notifyArgv)}`,
+  )
+})
+
+test("[US-25] a payload with fewer than six fields carries no request id, so an old sender still works", async () => {
+  // Back-compat is a property of the RECEIVER, not the sender: oc-sync
+  // installs the two halves at different times, so a receiver must accept
+  // every payload its own sender ever emitted -- the four-field shape from
+  // before sounds, and the five-field shape sounds introduced -- and attach
+  // no buttons to either, because a missing field is "no request id", not an
+  // error.
+  for (const [label, fields] of [
+    ["five fields (the sound-era sender)", ["Old sender", "Body", "critical", "dialog-error", "none"]],
+    ["four fields (the pre-sound sender)", ["Older sender", "Body", "critical", "dialog-error"]],
+  ]) {
+    const landed = await runReceiver({ command: fields.join("\n") })
+    assert.equal(landed.code, 0, `${label}: the receiver must succeed: ${landed.stderr}`)
+    assert.deepEqual(
+      landed.notifyArgv,
+      [fields[0], fields[1], "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
+      `${label}: an old payload must still deliver, with no buttons attached: ${JSON.stringify(landed.notifyArgv)}`,
+    )
+  }
+})
+
+test("[US-25] the clicked button's name comes back over the hop as the sender's action", async () => {
+  // The answer's route: notify-send prints the CHOSEN NAME on stdout, the
+  // receiver passes its own stdout through, ssh carries that back down the
+  // connection it came up, and the sender returns it as Result.action. Every
+  // half is real here except the transport itself, which is stubbed the same
+  // way the US-13 tests stub it.
+  const clicked = await runReceiver({
+    command: ["opencode — Fix the login", "Awaiting your permission", "critical", "dialog-error", "permission", "p1"].join("\n"),
+    click: "once",
+  })
+  assert.equal(clicked.code, 0, `the receiver must succeed: ${clicked.stderr}`)
+  assert.equal(clicked.stdout.trim(), "once", `the receiver must print the chosen name on stdout: ${JSON.stringify(clicked.stdout)}`)
+
+  // The sender half: ssh's stdout IS the answer -- and only an actionable
+  // request may read it. A plain notification whose hop prints anything at
+  // all must never grow an action out of that noise.
+  withStubs(["ssh"], ({ bin }) => {
+    writeFileSync(join(bin, "ssh"), "#!/bin/sh\nprintf 'once\\n'\nexit 0\n")
+    chmodSync(join(bin, "ssh"), 0o755)
+    const tunnel = { user: "desktop-user", host: "", port: 10022, key: join(scratch("hop-key-"), "k"), connectTimeoutMs: 1000 }
+
+    const actionable = sendRemote(
+      { title: "opencode — Fix the login", message: "Awaiting your permission", urgency: "critical", icon: "dialog-error", sound: "permission", requestID: "p1" },
+      tunnel,
+    )
+    assert.equal(actionable.ok, true, `the hop must succeed: ${actionable.detail}`)
+    assert.equal(actionable.action, "once", `the clicked name must come back as the action: ${JSON.stringify(actionable)}`)
+
+    const plain = sendRemote(
+      { title: "opencode — Fix the login", message: "Task finished", urgency: "normal", icon: "utilities-terminal", sound: "none" },
+      tunnel,
+    )
+    assert.equal(plain.ok, true)
+    assert.equal(plain.action, undefined, `a notification that asked nothing must return no action: ${JSON.stringify(plain)}`)
   })
 })

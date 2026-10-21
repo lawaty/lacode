@@ -62,6 +62,20 @@ export const helperArgv = (helper: string, title: string, message: string, urgen
   return name === "lacode" || name === "lacode.js" ? ["notify", title, message, urgency, icon, sound] : [title, message, urgency, icon, sound]
 }
 
+/**
+ * The replies opencode accepts for a permission request. "reject" is deny --
+ * that is the server's word for it, not ours.
+ */
+export const PERMISSION_REPLIES = ["once", "always", "reject"] as const
+export type PermissionReply = (typeof PERMISSION_REPLIES)[number]
+
+/**
+ * The environment variable the request id travels in. It is not an argument:
+ * the helper's argv is a published contract, and the request id is not the
+ * user-facing part of a notification.
+ */
+export const REQUEST_ID_ENV = "LACODE_REQUEST_ID"
+
 // ---------------------------------------------------------------------------
 // Terminal errors: what the notification says, and whether it says anything
 // ---------------------------------------------------------------------------
@@ -155,7 +169,9 @@ export type SessionInfo = {
   time?: { compacting?: number }
 }
 
-export type Decision = { notify: true; title: string; message: string; urgency: "normal" | "critical" } | { notify: false; reason: string }
+export type Decision =
+  | { notify: true; title: string; message: string; urgency: "normal" | "critical"; actionable?: { requestID: string } }
+  | { notify: false; reason: string }
 
 // A session title is user-visible text that lands in a notification, so it is
 // stripped of control characters and length-capped rather than trusted.
@@ -177,6 +193,9 @@ export const shouldNotify = (input: {
   // An unanswered question is outstanding in this session. Suppresses the
   // redundant "finished" that the idle event raises right after a question.
   awaitingResponse?: boolean
+  // The runtime's permission request id. Carried only when the notification can
+  // answer the permission itself.
+  requestID?: string
 }): Decision => {
   const { info, outcome, detail } = input
 
@@ -214,12 +233,20 @@ export const shouldNotify = (input: {
   // A question is a request for the user, not a failure, so it is not critical:
   // critical urgency escalates to a modal on most desktops, and this is a routine
   // part of working with an agent.
-  return {
+  const notification = {
     notify: true,
     title: `opencode — ${title}`,
     message: notifyMessage(outcome, detail),
     urgency: outcome === "error" ? "critical" : "normal",
+  } as const
+
+  // A permission prompt is the one notification the user can answer where it is,
+  // so the answer does not need a second trip to the terminal.
+  if (outcome === "permission" && input.requestID) {
+    return { ...notification, actionable: { requestID: input.requestID } }
   }
+
+  return notification
 }
 
 // A question can span several entries, and the notification should name the one
@@ -263,6 +290,11 @@ export const questionHeadline = (questions: Array<{ question?: string }> | undef
  * still produces a named notification instead of the word "undefined".
  */
 export type PermissionRequest = {
+  /**
+   * The runtime's permission REQUEST id; it is what a reply is addressed to,
+   * and it is never shown to the user.
+   */
+  id?: string
   sessionID?: string
   /** The RUNTIME's field: the permission kind, e.g. `external_directory`. */
   permission?: string

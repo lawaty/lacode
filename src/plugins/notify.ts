@@ -4,6 +4,8 @@ import * as path from "node:path"
 import type { Hooks } from "@opencode-ai/plugin"
 import {
   NOTIFY_OUTCOMES,
+  PERMISSION_REPLIES,
+  REQUEST_ID_ENV,
   Notifier,
   errorDetail,
   helperArgv,
@@ -12,6 +14,7 @@ import {
   questionHeadline,
   shouldNotify,
   type Outcome,
+  type PermissionReply,
   type PermissionRequest,
   type SessionInfo,
 } from "../lib/notify.ts"
@@ -69,8 +72,8 @@ const COOLDOWN_MS = 5_000
 // prompt the user was never told about is the exact silent stall this plugin
 // exists to prevent. What that permits is an unbounded number of helper
 // PROCESSES: each delivery spawns `bin/oc-notify` -> `bin/oc` -> an ssh attempt,
-// detached and unref'd, so a failure storm can start one per event with nothing
-// reaping them.
+// so a failure storm can start one per event. A fire-and-forget helper is
+// detached and unref'd, so nothing reaps it.
 //
 // So the bound goes here, on the transport, where it cannot suppress a decision
 // the plugin already made. A delivery dropped by the cap is still logged, and the
@@ -80,6 +83,10 @@ const MAX_INFLIGHT_HELPERS = 4
 // generous enough for a slow but working tunnel, and short enough that a dead
 // one is not held for the life of the server.
 const HELPER_TIMEOUT_MS = 30_000
+// An actionable notification waits for the user, not for a timeout: the
+// transport's own wait is ten minutes, so this must outlive it and the
+// inner wait ends first, cleanly.
+const ACTION_TIMEOUT_MS = 10 * 60_000 + 30_000
 // Hard cap on the per-session bookkeeping (`active` / `titles`). `session.deleted`
 // is the intended cleanup, but a long-running server must not depend on EVERY
 // session being deleted to stay bounded -- an abandoned session may never emit it.
@@ -136,16 +143,27 @@ const findHelper = (): string | undefined => {
  * sent, without a desktop daemon, an SSH hop, or a child process per assertion
  * (US-11/US-12). It is also how a caller can substitute a different transport.
  *
- * Omit it and nothing changes: the default spawns `bin/oc-notify` detached and
- * unref'd, exactly as before. This parameter is additive and last, so every
- * existing call site keeps its current behaviour.
+ * Omit it and nothing changes: the default spawns `bin/oc-notify` -- detached
+ * and unref'd, unless the notification waits for a click. This parameter is
+ * additive and last, so every existing call site keeps its current behaviour.
  *
  * The fourth argument is the sound name -- an outcome, or "none" when the user
  * has switched sound off. It is appended last and typed as `string` so a sender
  * written before sounds existed still satisfies the type; an unknown name is the
  * receiver's to normalize, not this file's.
+ *
+ * The fifth argument is the permission request id, present only when the
+ * notification is actionable. The returned `action` is the raw string the
+ * transport read off the helper's stdout. It is untrusted: the plugin validates
+ * it against PERMISSION_REPLIES before using it.
  */
-export type Delivery = (title: string, message: string, urgency: string, sound: string) => Promise<{ ok: boolean; detail?: string }>
+export type Delivery = (
+  title: string,
+  message: string,
+  urgency: string,
+  sound: string,
+  requestID?: string,
+) => Promise<{ ok: boolean; detail?: string; action?: string }>
 
 export type NotifyDeps = { deliver?: Delivery; maxInflightHelpers?: number; helperTimeoutMs?: number }
 
@@ -219,6 +237,56 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
     client.app.log({ body: { service: SERVICE, level, message, extra } }).catch(() => {})
 
+  // Answer a permission from a notification click. The action is the raw string
+  // the helper printed, so it is validated against the server's vocabulary before
+  // it is forwarded. Every outcome is logged and none is thrown: a failed reply
+  // must never escape the event handler.
+  const answerPermission = async (sessionID: string, requestID: string, action: string) => {
+    const response = PERMISSION_REPLIES.find((candidate) => candidate === action) as PermissionReply | undefined
+    if (!response) {
+      void log("warn", `notification action ignored: ${JSON.stringify(action)} is not a permission reply`, {
+        sessionID,
+        requestID,
+      })
+      return
+    }
+    // A thrown error carries the status under `.cause` (the SDK's wrapper) or,
+    // for a caller that threw the response itself, under `.response`/`.status`.
+    const errorStatus = (error: unknown): number | undefined => {
+      const candidate = error as { status?: unknown; response?: { status?: unknown }; cause?: { status?: unknown } } | null | undefined
+      const status = candidate?.response?.status ?? candidate?.cause?.status ?? candidate?.status
+      return typeof status === "number" ? status : undefined
+    }
+    const reply = await client
+      .postSessionIdPermissionsPermissionId({
+        path: { id: sessionID, permissionID: requestID },
+        body: { response },
+      })
+      .then((result) => ({ result }))
+      .catch((error: unknown) => ({ error }))
+    const status = "result" in reply ? reply.result.response?.status : errorStatus(reply.error)
+    if (status === 404) {
+      // Already answered elsewhere -- most often in the terminal. Not a failure.
+      void log("debug", "permission already answered", { sessionID, requestID })
+      return
+    }
+    if ("error" in reply) {
+      void log("warn", `permission reply failed: ${errorDetail(reply.error) ?? String(reply.error)}`, {
+        sessionID,
+        requestID,
+      })
+      return
+    }
+    if (reply.result.error) {
+      void log("warn", `permission reply failed: ${errorDetail(reply.result.error) ?? String(reply.result.error)}`, {
+        sessionID,
+        requestID,
+      })
+      return
+    }
+    void log("info", "permission answered from the notification", { sessionID, requestID, response })
+  }
+
   const fetchInfo = async (sessionID: string) => {
     const info = await client.session
       .get({ path: { id: sessionID }, query: { directory } })
@@ -231,8 +299,8 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   // user believes the agent finished and stops watching. So delivery is verified,
   // not assumed -- the helper's exit status and stderr are captured and logged, and
   // "notified" is only claimed when the helper actually succeeded.
-  const deliverViaHelper = (title: string, message: string, urgency: string, sound: string) =>
-    new Promise<{ ok: boolean; detail?: string }>((resolve) => {
+  const deliverViaHelper = (title: string, message: string, urgency: string, sound: string, requestID?: string) =>
+    new Promise<{ ok: boolean; detail?: string; action?: string }>((resolve) => {
       // The cap, before anything is spawned. Settled exactly once on every path
       // below, so the count can never drift upward and wedge the transport shut.
       if (inflight >= maxInflight) {
@@ -249,22 +317,35 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         resolve({ ok: false, detail: "no oc-notify helper found" })
         return
       }
-      // Detached and unref'd: a notification must never hold the server open.
-      // stdio pipes (not ignore) because the helper's own diagnostics are the only
-      // way a remote tunnel failure is ever visible -- oc-notify prints to stderr
-      // and exits 0, so its output is the entire signal.
+      // Without a request id the notification is fire-and-forget: detached and
+      // unref'd, so it can never hold the server open. stdio pipes (not ignore)
+      // because the helper's own diagnostics are the only way a remote tunnel
+      // failure is ever visible -- oc-notify prints to stderr and exits 0, so its
+      // output is the entire signal.
+      //
+      // With a request id it is actionable: the transport waits for the user to
+      // click, so the child stays attached, its stdout is read for the chosen
+      // button, and it must not be unref'd -- the plugin is waiting on it.
       //
       // Sound last, matching the payload's own field order (TITLE, MESSAGE,
       // URGENCY, ICON, SOUND) -- helperArgv puts it in the same slot for both
       // helper CLIs, so there is no per-transport decision left to make here.
-      const child = spawn(helper, helperArgv(helper, title, message, urgency, "utilities-terminal", sound), {
-        stdio: ["ignore", "ignore", "pipe"],
-        detached: true,
-      })
+      const actionable = Boolean(requestID)
+      const timeoutMs = actionable ? ACTION_TIMEOUT_MS : helperTimeoutMs
+      const child = actionable
+        ? spawn(helper, helperArgv(helper, title, message, urgency, "utilities-terminal", sound), {
+            stdio: ["ignore", "pipe", "pipe"],
+            detached: false,
+            env: { ...process.env, [REQUEST_ID_ENV]: requestID },
+          })
+        : spawn(helper, helperArgv(helper, title, message, urgency, "utilities-terminal", sound), {
+            stdio: ["ignore", "ignore", "pipe"],
+            detached: true,
+          })
       inflight++
       let settled = false
       let timer: ReturnType<typeof setTimeout> | undefined
-      const finish = (result: { ok: boolean; detail?: string }) => {
+      const finish = (result: { ok: boolean; detail?: string; action?: string }) => {
         if (settled) return
         settled = true
         inflight--
@@ -272,15 +353,20 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         resolve(result)
       }
       // A hop to a machine that is gone must not hold its slot forever. Killed,
-      // not merely abandoned: the process is already detached, so leaving it
-      // running is what the timeout exists to prevent.
+      // not merely abandoned: the helper is its own process, so leaving it
+      // running is what the timeout exists to prevent. An actionable helper gets
+      // the longer bound, because it is waiting on a human decision.
       timer = setTimeout(() => {
         try { child.kill("SIGKILL") } catch {}
-        void log("warn", `notification helper timed out after ${helperTimeoutMs}ms`, { title })
-        finish({ ok: false, detail: `helper timed out after ${helperTimeoutMs}ms` })
-      }, helperTimeoutMs)
+        void log("warn", `notification helper timed out after ${timeoutMs}ms`, { title })
+        finish({ ok: false, detail: `helper timed out after ${timeoutMs}ms` })
+      }, timeoutMs)
       timer.unref?.()
+      let stdout = ""
       let stderr = ""
+      child.stdout?.on("data", (chunk) => {
+        if (stdout.length < 400) stdout += String(chunk)
+      })
       child.stderr?.on("data", (chunk) => {
         if (stderr.length < 400) stderr += String(chunk)
       })
@@ -306,9 +392,11 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
             message,
           })
         }
-        finish({ ok, detail: noise || undefined })
+        // An empty stdout means the user dismissed the popup without choosing.
+        const action = actionable ? stdout.trim() : ""
+        finish({ ok, detail: noise || undefined, ...(action ? { action } : {}) })
       })
-      child.unref()
+      if (!actionable) child.unref()
     })
 
   // The injected sender, when given, replaces the spawn above entirely. The
@@ -317,7 +405,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   // notifications a real desktop would have received -- nothing more, nothing less.
   const deliver: Delivery = deps.deliver ?? deliverViaHelper
 
-  const announce = async (sessionID: string, outcome: Outcome, detail?: string) => {
+  const announce = async (sessionID: string, outcome: Outcome, detail?: string, requestID?: string) => {
     try {
       const info = await fetchInfo(sessionID)
       if (!info) {
@@ -339,6 +427,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         // Either kind of block suppresses the idle event's "finished": a session
         // parked on a permission prompt has not finished, it is waiting.
         awaitingResponse: pending.has(sessionID) || permissions.has(sessionID),
+        requestID,
       })
       if (!decision.notify) {
         void log("debug", `suppressed: ${decision.reason}`, { sessionID })
@@ -376,11 +465,17 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       // receiver would have to reject. With the toggle off the sound is "none",
       // which is the whitelist's own word for play nothing.
       const sound = soundOn && NOTIFY_OUTCOMES.includes(outcome) ? outcome : "none"
-      const sent = await deliver(decision.title, message, decision.urgency, sound)
+      const sent = await deliver(decision.title, message, decision.urgency, sound, requestID)
+      // An actionable notification only returns once the user clicks or the wait
+      // ends, so an action means the click answered the permission. With no action
+      // the popup was raised and dismissed without a choice, which is still a
+      // delivery.
+      if (sent.action && requestID) await answerPermission(sessionID, requestID, sent.action)
       // Claiming "notified" on a failed delivery is how this bug survived: the log
       // said notified five times while nothing reached the desktop. Only say it when
       // the helper confirmed, and say what failed when it did not.
-      void log(sent.ok ? "info" : "error", sent.ok ? "notified" : "notification failed", {
+      const answered = Boolean(sent.action)
+      void log(answered || sent.ok ? "info" : "error", answered ? "permission answered from the notification" : sent.ok ? "notified" : "notification failed", {
         sessionID,
         outcome,
         title: decision.title,
@@ -449,19 +544,19 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         // on a permission decision and says nothing, which is why a directory
         // prompt used to look like a hung agent.
         //
-        // The event is `permission.asked`, read off the wire deliberately, for
-        // the same reason as question.asked: the pinned SDK types describe a
-        // different thing. They offer `permission.updated` carrying a
-        // `Permission` with `type`/`pattern`; this runtime emits
-        // `permission.asked` carrying `permission`/`patterns`. `type` and
-        // `pattern` appear nowhere in the binary, and the `permission.ask` HOOK
-        // the SDK also declares is never triggered -- wiring a handler to it
-        // would be dead code that reads as live coverage. See the field-by-field
-        // derivation on PermissionRequest.
+        // The event is `permission.asked`, read off the wire deliberately: the
+        // pinned SDK types offer `permission.updated` with `type`/`pattern`
+        // (neither appears in the binary), while this runtime emits
+        // `permission.asked` with `permission`/`patterns`, and the
+        // `permission.ask` HOOK is never triggered, so a handler on it would be
+        // dead code that reads as live coverage.
         //
-        // This is a bus event, not that hook, which is also the security property:
-        // there is no `output.status` here to perturb, so observing a prompt
-        // cannot approve or deny it. The payload is only read.
+        // A bus event, not that hook, so the payload is only read: the hook's
+        // `output.status` IS the decision, and deciding a prompt in a handler
+        // is not answering the one the user was asked for. The answer is the
+        // user's: the request id rides on the notification, a click is
+        // forwarded to the server's own reply route, the plugin never picks
+        // one, and a dismissed popup answers nothing.
         if (event.type === "permission.asked") {
           const properties = event.properties as PermissionRequest
           const sessionID = properties?.sessionID
@@ -471,7 +566,10 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           // suppressed by the never-went-busy rule -- and if it was never seen
           // busy, treat it as busy.
           rememberActive(sessionID)
-          void announce(sessionID, "permission", permissionHeadline(properties) || undefined)
+          // The request id is what a reply is addressed to, so it is carried on
+          // the notification rather than shown to the user.
+          const requestID = typeof properties?.id === "string" && properties.id ? properties.id : undefined
+          void announce(sessionID, "permission", permissionHeadline(properties) || undefined, requestID)
           return
         }
 

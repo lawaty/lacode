@@ -8,6 +8,61 @@ Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 ## [Unreleased]
 
+## [0.10.0] — a notification waits for you instead of timing out, and a permission can be answered from the popup
+
+### Added
+
+- **A permission prompt can be answered from the notification itself.** The
+  plugin reads the permission request id off opencode's `permission.asked`
+  event and puts it in the helper's environment (`LACODE_REQUEST_ID`), so the
+  notification carries three buttons: **Allow once**, **Always allow** and
+  **Deny**. Their names are opencode's own reply values — `once`, `always` and
+  `reject` ("reject" is the server's word for deny) — so a click is already a
+  valid answer and nothing has to be translated on the way.
+
+  The answer travels back over the same path the notification came. The desktop
+  end is an ssh forced command, so its stdout comes back down the ssh
+  connection and the plugin reads the chosen button's name off the helper's
+  stdout — no new key, no listener, no HTTP server. The hop was one-way until
+  now, and what made it two-way was a channel that was already there: the
+  forced command's stdout is carried to whoever opened the connection, so the
+  answer rides home on the connection that is already open. The plugin then
+  answers the permission through opencode's own API, and a permission that was
+  already answered in the terminal is recognised rather than reported as a
+  failure.
+
+  The wire payload is six newline-delimited fields on both wires —
+  `title\nmessage\nurgency\nicon\nsound\nrequestID`, the request id last — and a
+  payload with fewer than six fields carries no request id, so an older sender
+  still works.
+
+  Two limits, stated plainly. The scope is **permissions only**: a question is
+  not answerable this way, because opencode's v1 SDK client — the one this
+  plugin has — has no question API at all, and the v2 routes need a bound TCP
+  socket that the default opencode TUI does not have. And the buttons are
+  **Linux only**: `osascript` and `terminal-notifier` have no action support,
+  so a macOS desktop still gets a plain notice, and the answer there still has
+  to be given in the terminal.
+
+### Changed
+
+- **A desktop notification now waits for you instead of timing out on its own.**
+  `notify-send` is called with `--expire-time=0` — the freedesktop "never
+  expire" timeout — at all three call sites: `sendLocal` in
+  `src/tunnel/index.ts`, the tunnel's forced command
+  (`bin/oc-notify-receiver`), and `send_notify` in `bin/oc`. Without it the
+  desktop daemon's own timer dismissed the popup by itself: measured on KDE
+  Plasma 6.7.4, a normal-urgency notification is closed with reason 1
+  ("expired") after about five seconds, so a notice the user had not acted on
+  within that window was simply gone — the difference between a notice you can
+  still act on and one you missed. A notification now stays on the desktop
+  until you close it.
+
+  Nothing else about it changed: the `--urgency` values are untouched (a
+  question or a permission prompt is deliberately not `critical`, so it does
+  not escalate to a modal on most desktops), and the whitelists and the
+  cooldown behaviour are exactly as they were.
+
 ### Documented
 
 - **The npm publish notice does not say which dist-tag a release lands on.** npm
@@ -475,7 +530,8 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/lawaty/lacode/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/lawaty/lacode/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/lawaty/lacode/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/lawaty/lacode/compare/v0.7.0...v0.7.1

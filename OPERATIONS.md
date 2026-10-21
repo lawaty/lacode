@@ -351,6 +351,15 @@ helper gets the `notify` subcommand and an `oc-notify` helper does not — and l
 `notified` only when the helper exits zero with empty stderr. On a remote host the
 hop is a direct ssh (`ControlMaster`), configured once with `lacode tunnel setup`.
 
+A **permission** notification is the one that is not fire-and-forget. It carries
+buttons — **Allow once**, **Always allow** and **Deny** — so the helper stays
+attached and waits for the click; the chosen button's name comes back on its
+stdout, and the plugin answers the permission with it through opencode's own API.
+A permission already answered in the terminal is recognised rather than reported
+as a failure, and a popup dismissed without a choice answers nothing. The wait is
+bounded, and the buttons are Linux-only: `notify-send --action` is the only
+channel that can offer one.
+
 Restart opencode to load a plugin change; plugins are not hot-reloaded. A long-running
 session on a host keeps the old plugin until it is restarted.
 

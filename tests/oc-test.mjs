@@ -501,6 +501,12 @@ check("receiver actually splits the payload, on this machine's bash", () => {
     assert(argv[1] === body, `the body must arrive as ONE argument, got ${JSON.stringify(argv)}`)
     assert(argv[2] === "--urgency=critical", `urgency must survive, got ${JSON.stringify(argv)}`)
     assert(argv[3] === "--icon=dialog-error", `icon must survive, got ${JSON.stringify(argv)}`)
+    // --expire-time=0 is the freedesktop "never expire" timeout: the popup waits
+    // for the user to close it instead of being taken away by the desktop's own
+    // timer, and a notice the user missed is no notice. It is the last argument,
+    // and nothing else is added after it.
+    assert(argv[4] === "--expire-time=0", `the notification must never be auto-dismissed, got ${JSON.stringify(argv)}`)
+    assert(argv.length === 5, `the never-expire flag must be the last argument, got ${JSON.stringify(argv)}`)
   } finally {
     rmSync(home, { recursive: true, force: true })
   }
@@ -535,6 +541,24 @@ check("receiver validates the icon against a whitelist", () => {
 check("receiver uses notify-send with quoted arguments", () => {
   const src = read("oc-notify-receiver")
   assert(/exec notify-send "\$TITLE" "\$MSG"/.test(src), "title and message must be quoted")
+})
+
+check("a notification is never auto-dismissed: the receiver asks for no expiry", () => {
+  // --expire-time=0 is the freedesktop "never expire" timeout. Without it the
+  // desktop daemon's own timer dismisses the popup, and a notice the user
+  // missed is no notice.
+  const src = read("oc-notify-receiver")
+  assert(/exec notify-send "\$TITLE" "\$MSG" --urgency="\$URGENCY" --icon="\$ICON" --expire-time=0/.test(src),
+    "the receiver must pass --expire-time=0 to notify-send")
+})
+
+check("a notification is never auto-dismissed: oc asks for no expiry", () => {
+  // The local branch of send_notify must carry the same never-expire flag the
+  // receiver does: a notification raised on this host stays until the user
+  // closes it too.
+  const src = read("oc")
+  assert(/notify-send "\$title" "\$msg" --urgency="\$urgency" --icon="\$icon" --expire-time=0/.test(src),
+    "the local branch must pass --expire-time=0 to notify-send")
 })
 
 check("receiver fails cleanly, with a way out, where notify-send does not exist", () => {
