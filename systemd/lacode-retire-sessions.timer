@@ -1,0 +1,19 @@
+# The daily sweep that runs the retention service.
+#
+# RandomizedDelaySec=2h keeps the sweep off the top of the hour, when every
+# other timer on a machine fires. Persistent=true means a run missed while the
+# machine was off happens on the next start.
+#
+# The timer belongs to the user who enables it, and %h in the service resolves
+# to that user's home directory.
+
+[Unit]
+Description=Daily opencode session retention sweep
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

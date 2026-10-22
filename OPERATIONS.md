@@ -493,6 +493,172 @@ that rule, not lost — the boundary is strict, so a task finished exactly seven
 days ago is still kept. A task that is finished but carries no date cannot age
 out at all, and stays until it is dated or removed.
 
+## Session retention
+
+opencode has no session retention of its own — no age prune, no TTL, no bulk
+delete — so every session a machine has ever had sits in the list with its
+messages, parts, todos and event rows behind it, and the database grows until
+it is unwieldy. `scripts/retire-old-sessions.mjs` is the sweep that takes them
+out: every session past the window, and every row that belongs to it. It is
+the general case of what `scripts/retire-cartographer-sessions.mjs` does for
+the cartographer's own runs.
+
+```bash
+node scripts/retire-old-sessions.mjs --dry-run
+node scripts/retire-old-sessions.mjs --days 60 --grace-hours 6
+node scripts/retire-old-sessions.mjs --directory /path/to/project --limit 100
+```
+
+`--dry-run` reports what would go and changes nothing. `--days N` sets the
+window by creation time (default 30). `--grace-hours N` skips anything touched
+more recently than that (default 24). `--directory D` selects the sessions
+rooted in that project directory and is repeatable; a child always goes with
+its parent, so the run can reach a session in another directory. `--limit N`
+caps how many top-level sessions go in one run (default 0, no limit); a session
+brings its children with it, so the number of retired sessions can be higher.
+`--vacuum` rewrites the database afterwards so the freed pages go back to the
+filesystem.
+`--no-events` keeps the event rows of the sessions it removes.
+
+**A session in use is never a candidate.** The grace window is what says so: a
+session touched within the last hours is left alone however old it is, so an
+open tab or a long run keeps its history while the sweep takes what nobody has
+come back to.
+
+Every statement goes through opencode's own CLI (`opencode db --format json
+"<sql>"`), so there is no sqlite module to install and nothing to import. The
+tool stays inside ES2019 on purpose, and that is what lets the same file run
+on the remote host's node 12.22.9 and on this machine's node 26.
+
+**What is kept is a compact record, not the transcript.** Each retired session
+leaves one entry under `~/.local/share/opencode/lacode/session-archive/` — the
+id, the title, the directory, the project, and when it was created and last
+updated. The transcript itself is not kept: the record tells you what used to
+be in your list, and the messages are gone.
+
+**The file does not shrink on its own.** `auto_vacuum` is 0 in these
+databases, so the pages a deleted session frees stay in the file and the
+database keeps the size it had. `--vacuum` rewrites it and gives the space
+back, and it needs free disk roughly the size of the database to do it — the
+rewrite writes a second copy before it replaces the first.
+
+**The daily timer** is two systemd user units in `systemd/`:
+`lacode-retire-sessions.service` and `lacode-retire-sessions.timer`. Install
+them per machine:
+
+```bash
+mkdir -p ~/.local/lib/lacode ~/.config/systemd/user
+cp scripts/retire-old-sessions.mjs ~/.local/lib/lacode/retire-old-sessions.mjs
+cp systemd/lacode-retire-sessions.service ~/.config/systemd/user/
+cp systemd/lacode-retire-sessions.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now lacode-retire-sessions.timer
+```
+
+The script lives under `~/.local/`, beside where the repo's other personal
+helpers live (`~/.local/bin/`), and outside `~/.config/opencode/` — so the
+opencode config tree stays exactly what the sync writes.
+
+The units are per-user: `%h` in the service is the home directory of the user
+who enabled it, so one unit file serves every user. `/usr/bin/node` is spelled
+out because a systemd unit has no PATH worth trusting, and the same absolute
+path works here and on the remote host for the reason above.
+
+`OnCalendar=daily` with `RandomizedDelaySec=2h` puts the sweep somewhere in
+the first two hours after midnight, off the top of the hour where every other
+timer on a machine fires. `Persistent=true` means a run missed while the
+machine was off happens on the next start.
+
+**A timer only fires while the user manager is alive.** On a host where the
+manager does not survive the last logout, the timer never runs and nothing
+says so:
+
+```bash
+loginctl enable-linger <user>
+```
+
+That is what keeps the sweep firing on a machine nobody is logged into.
+
+## Event log retention
+
+The `event` table is not telemetry. It is a second copy of every session
+transcript opencode has ever recorded — the prompts, the tool output, whole
+file contents and diffs — in rows of up to 30 MiB. It is 68% of the local
+database and 86% of the host's, it grows around 289 MB a day locally, and
+opencode has no age prune, no TTL and no bulk delete for it: without a sweep of
+its own it only ever grows.
+
+`scripts/prune-old-events.mjs` is that sweep. It deletes the event rows older
+than the window, for the sessions that are not protected.
+
+**The age is read out of the row id.** The `event` table has no timestamp
+column at all — its columns are `id`, `aggregate_id`, `seq`, `type` and `data`.
+The id is `evt_` plus 12 hex characters plus 14 random base62 characters, and
+those 12 hex characters are a big-endian 48-bit block whose top 36 bits carry
+the row's epoch millis. The tool turns the cutoff into an id prefix and
+compares id strings, which the primary key index answers as a range scan.
+
+**Three protections, and each one is there for a reason.** A session that takes
+part in opencode's session sync — its `event_sequence.owner_id` is set — is
+never touched: its log is replayed to other machines, and a hole in it makes
+the replay fail hard. A session that belongs to a workspace is never touched:
+its log is warped to a remote. A session touched inside the grace window is
+skipped, so a session in active use keeps its whole log.
+
+**The `event_sequence` cursor rows are never deleted and never reset.** They
+are the client's position in the stream, and resetting one would make the
+client believe it is behind and replay the session from the start.
+
+```bash
+node scripts/prune-old-events.mjs --dry-run
+node scripts/prune-old-events.mjs --days 14 --grace-hours 3
+node scripts/prune-old-events.mjs --limit 1000 --vacuum
+```
+
+`--dry-run` reports what would go and changes nothing. `--days N` sets the
+window by the age of the row (default 7). `--grace-hours N` skips anything
+touched more recently than that (default 1). `--limit N` caps how many rows go
+in one run (default 0, no limit). `--vacuum` rewrites the database afterwards
+so the freed pages go back to the filesystem.
+
+**The daily timer does not vacuum.** `auto_vacuum` is 0 in these databases, so
+the pages a deleted row frees stay in the file and are reused: the database
+stops growing at the size it had reached, and a vacuum is what actually hands
+the space back to the filesystem.
+
+Every run appends one JSON line to
+`~/.local/share/opencode/lacode/event-prune.jsonl`.
+
+**The daily timer** is two systemd user units in `systemd/`:
+`lacode-prune-events.service` and `lacode-prune-events.timer`. Install them per
+machine:
+
+```bash
+mkdir -p ~/.local/lib/lacode ~/.config/systemd/user
+cp scripts/prune-old-events.mjs ~/.local/lib/lacode/prune-old-events.mjs
+cp systemd/lacode-prune-events.service ~/.config/systemd/user/
+cp systemd/lacode-prune-events.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now lacode-prune-events.timer
+```
+
+The timer fires at 03:00 with an hour of random delay on top of it. The slot
+is deliberate: the session-retention sweep runs in the 00:00-02:00 window, and
+both tools write to the same SQLite database through the `opencode db` CLI —
+two concurrent writers would collide on the database lock.
+
+**The transcript itself is not touched.** It lives in the `message` and `part`
+tables, and the TUI reads it from there, so pruning the event log does not
+lose the conversation; the history rendering does not read the event table at
+all. A client that rebuilds a session from the event stream alone will see a
+shortened log, and so will a replay of a session that none of the protections
+above covers.
+
+The id encoding only tells times apart within 795 days of each other, because
+the millis it carries are truncated to 36 bits. That does not matter here:
+the session-retention sweep takes a session out well inside that window, so
+its event rows are gone long before their age could be misread.
+
 ## Version control
 
 This repo (`~/Projects/lacode`) is a git repository, public at

@@ -1,0 +1,24 @@
+# The daily sweep that runs the event prune.
+#
+# RandomizedDelaySec=1h keeps the sweep off the top of the hour, when every
+# other timer on a machine fires. Persistent=true means a run missed while the
+# machine was off happens on the next start.
+#
+# The 03:00 slot is deliberate. The session-retention sweep runs in the
+# 00:00-02:00 window, and both tools write to the same SQLite database through
+# the opencode db CLI -- two concurrent writers would collide on the database
+# lock.
+#
+# The timer belongs to the user who enables it, and %h in the service resolves
+# to that user's home directory.
+
+[Unit]
+Description=Daily opencode event log prune
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

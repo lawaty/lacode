@@ -1,0 +1,29 @@
+# The event prune for one user: it removes the opencode event rows that are
+# past the window, for the sessions that are not protected. The event table
+# holds a second copy of every session transcript -- prompts, tool output,
+# whole files and diffs -- and opencode never prunes it, so without this it
+# only grows.
+#
+# /usr/bin/node is spelled out because a systemd unit has no PATH worth
+# trusting. The same absolute path works on the author's machine (node 26) and
+# on the remote host (node 12.22.9), because the tool stays inside ES2019 on
+# purpose.
+#
+# %h is the home directory of the user the unit runs as, so one unit file
+# serves every user.
+#
+# The script lives in ~/.local/lib/lacode/ -- beside where the repo's other
+# personal helpers live (~/.local/bin/) and outside ~/.config/opencode/, so the
+# opencode config tree stays exactly what the sync writes.
+#
+# The service needs nothing else: the tool reaches the database through
+# opencode's own CLI and finds the binary itself (~/.opencode/bin/opencode),
+# and it needs no server, no network and no credentials.
+
+[Unit]
+Description=Prune opencode event rows past the retention window
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/node %h/.local/lib/lacode/prune-old-events.mjs
