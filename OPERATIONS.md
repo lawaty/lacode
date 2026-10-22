@@ -131,10 +131,17 @@ plugin is loading before debugging a wrong model.
 
 ## Restarts
 
-**Plugins are not hot-reloaded.** Any change to `presets/free-tier.json`, the personal
-`opencode.jsonc`, `src/lib/`, or `plugins/` requires restarting every opencode process.
+**Plugin CODE is not hot-reloaded.** Any change to `src/lib/`, `plugins/`, or the
+`plugin` array in `opencode.jsonc` requires restarting every opencode process.
 Servers are foreground processes with no systemd unit or tmux session, so each is
 restarted from its own terminal.
+
+**The pool's slot files are the exception.** Editing `presets/free-tier.json`,
+`~/.config/lacode/pool.txt` or `~/.config/lacode/pool.json` is picked up by the
+running process: the table reloads, the variant agents re-bind, and every slot is
+validated with one real request. Swapping a pool model no longer needs a restart;
+a model the provider does not serve is benched and named in the log and toast.
+(`opencode.jsonc` itself — providers, agents, permissions — still needs one.)
 
 On **this machine** there is a step in front of that: the config loads
 `dist/index.js`, so a change under `src/` needs `npm run build` before a restart means
@@ -142,10 +149,12 @@ anything. Editing `src/`, restarting, and concluding the change did not take is 
 likely failure. The hosts have no build step — they load the `plugins/` shims — but they
 do need a sync.
 
-This bites in a specific way: a config change is invisible until restart, so a fix can
-look applied and still not be running. Swapping a pool model is where it matters most:
-the file says one thing, a long-running server keeps routing to the old one. Always check `ps -eo pid,lstart,comm | grep opencode`
-against the file mtime before concluding a change is live.
+This bites in a specific way: a plugin or `opencode.jsonc` change is invisible
+until restart, so a fix can look applied and still not be running. A pool edit is
+different — the running process watches it — so check the log for
+`pool changed (...)` before assuming a restart is needed. Always check
+`ps -eo pid,lstart,comm | grep opencode` against the file mtime before concluding
+a plugin change is live.
 
 ## What opencode.jsonc holds now
 
@@ -314,14 +323,19 @@ there. A change to `src/` therefore does nothing on this machine until it is bot
 built and restarted, and on a host until it is synced and restarted.
 
 ```
-opencode — Fix the login redirect     Task finished, waiting for your review
-opencode — Deploy run                  Awaiting your response — Which option?
-opencode — Deploy run                  Failed                        (critical)
+Fix the login redirect                Task finished, waiting for your review
+Deploy run                             Awaiting your response — Which option?
+Deploy run                             Failed                        (critical)
 ```
 
 Both are about what *you* must do, not about what opencode did. The wording is
 "Task finished, waiting for your review" — accurate about both halves: the session
 is still open, and the name on the notification is the session's.
+
+The popup is raised under the app name **LaCode**, so the header says LaCode and
+the title is the session's own name. `notify-send` reports its own name when a
+notification carries none, and the popup would then claim to be from a program
+the user never ran.
 
 What is deliberately **not** notified:
 
@@ -711,4 +725,6 @@ the process — the timer is not running.
 
 **A plugin change appears to have no effect.** It is almost certainly not reloaded. Check
 process start time against file mtime — and on this machine check that `dist/` is newer
-than `src/`, because that is the copy the config loads.
+than `src/`, because that is the copy the config loads. A POOL edit is the exception:
+look for `pool changed (...)`, `pool config watch armed`, and the validation pass in
+the log instead.

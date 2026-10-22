@@ -47,6 +47,18 @@ export const cleanupAll = () => {
   for (const fn of cleanup.splice(0)) fn()
 }
 
+// The notification plugin claims the (session, kind) pair before it raises a
+// popup, so that two processes never raise the same one. The claim lives in
+// the notification state directory, and a suite must not write into the
+// developer's own data directory -- so the directory is redirected into a
+// scratch one, per suite, before anything loads the plugin.
+//
+// It is also what keeps two suites from colliding: the claim is CROSS-PROCESS,
+// and `node --test` runs the files in parallel processes. Two files sharing a
+// state directory would fight over the same session ids, and one of them would
+// lose a notification it was supposed to raise.
+process.env.LACODE_NOTIFY_DIR = scratch("lacode-notify-")
+
 /**
  * A controllable clock.
  *

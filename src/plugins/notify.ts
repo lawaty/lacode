@@ -3,15 +3,19 @@ import { existsSync } from "node:fs"
 import * as path from "node:path"
 import type { Hooks } from "@opencode-ai/plugin"
 import {
+  NOTIFY_CLOSE_ENV,
   NOTIFY_OUTCOMES,
+  NOTIFY_SESSION_ENV,
   PERMISSION_REPLIES,
   REQUEST_ID_ENV,
   Notifier,
+  claimNotification,
   errorDetail,
   helperArgv,
   isUnrecognizedError,
   permissionHeadline,
   questionHeadline,
+  releaseNotificationClaim,
   shouldNotify,
   type Outcome,
   type PermissionReply,
@@ -60,6 +64,38 @@ import { PACKAGE_ROOT } from "../lib/pool.ts"
 // happened even when the popup is out of sight, and nothing has to be translated
 // per outcome here: the name goes out as the outcome.
 //
+// A popup the user is already looking past fades on its own. Once they answer a
+// permission, answer a question, or type into that session's chat, the popup has
+// said everything it is going to say -- the answer is on their screen already --
+// so it closes itself instead of waiting for the X button. It never closes
+// sooner than five seconds after it was raised, so it is always readable, and a
+// popup nobody touched still waits for them (see --expire-time=0 in the helper).
+//
+// The close is the HELPER's job, never this file's: the popup lives on the
+// desktop, and only the desktop knows the notification id. The helper already
+// knows how to reach the desktop from wherever the plugin runs -- locally, or
+// over the ssh tunnel -- so it is asked to close and it closes there. One code
+// path, two topologies.
+//
+// ONE POPUP PER SESSION PER KIND, because the same thing used to arrive
+// twice. Two independent causes, both real:
+//
+//   * opencode raises ONE `permission.asked` per pattern it wants, and they
+//     arrive together -- four file reads inside 300ms. A popup per request is
+//     four identical popups, and clicking one of them answered one request
+//     while the other three were answered by a 404 or not at all. So the
+//     requests of a session are tracked as a SET: the first one raises the
+//     popup, the ones that join it are covered by that popup, and the click
+//     answers every one of them. The popup waits a moment for the batch to
+//     form, so it can say how many requests it covers.
+//
+//   * opencode publishes its events through a shared store, so EVERY opencode
+//     process on the machine sees the same event and would raise the same
+//     popup. The cooldown is per PROCESS, so it never caught that. The claim
+//     is the one-winner file that says "this process is the one raising it";
+//     a process that loses it stays quiet. Our own claim never changes our
+//     own behaviour, so one process does exactly what it did before.
+//
 // This module is a HOOK FACTORY, not a plugin -- see the note at the top of
 // ./agent-pool.ts. It must export the factory and nothing else.
 
@@ -87,12 +123,43 @@ const HELPER_TIMEOUT_MS = 30_000
 // transport's own wait is ten minutes, so this must outlive it and the
 // inner wait ends first, cleanly.
 const ACTION_TIMEOUT_MS = 10 * 60_000 + 30_000
-// Hard cap on the per-session bookkeeping (`active` / `titles`). `session.deleted`
-// is the intended cleanup, but a long-running server must not depend on EVERY
-// session being deleted to stay bounded -- an abandoned session may never emit it.
-// Once past the cap the oldest session is forgotten; by then its idle events have
-// long since fired, so forgetting it can only suppress a stale notification.
+// Hard cap on the per-session bookkeeping (`active` / `titles` / `live`).
+// `session.deleted` is the intended cleanup, but a long-running server must not
+// depend on EVERY session being deleted to stay bounded -- an abandoned session
+// may never emit it. Once past the cap the oldest session is forgotten; by then
+// its idle events have long since fired, so forgetting it can only suppress a
+// stale notification.
 const MAX_TRACKED_SESSIONS = 500
+// How long a popup must have been up before it may fade. The user is working in
+// the chat, so the popup has said what it says -- but it still has to have been
+// readable, so the floor is on the popup's OWN life, never on the moment the
+// user answered.
+const MIN_VISIBLE_MS = 5_000
+// How long the plugin waits for a session's permission requests to pile up
+// before it raises the popup.
+//
+// opencode raises ONE `permission.asked` per pattern it wants, and a single
+// turn can raise four of them inside 300ms. A popup per request is four
+// identical popups, and clicking one of them answered one request while the
+// other three were answered by a 404 or not at all.
+//
+// So the first request of a session waits a moment for its siblings to arrive.
+// The wait is short enough that a single prompt still feels immediate, and long
+// enough that a burst is one popup: the popup then says how many requests it
+// covers, and the click answers every one of them.
+//
+// The delay applies to the PERMISSION outcome only. Every other outcome is
+// already a single event, and delaying it would delay a finished task for no
+// reason.
+const PERMISSION_SETTLE_MS = 250
+// The placeholder a permission request without an id is tracked under.
+//
+// The request id is what a reply is addressed to, so a request that carries
+// none cannot be answered -- but it is still an OUTSTANDING request: the user
+// is being asked something, and the popup must still say so. It is tracked
+// under this placeholder so the size of the set stays the number of asks, and
+// it is skipped when the click answers the session's requests.
+const UNANSWERABLE_REQUEST = ""
 
 // The user's explicit off switch for notification sound. Deliberately NOT
 // exported: this file may export the factory and nothing else (opencode calls
@@ -156,6 +223,12 @@ const findHelper = (): string | undefined => {
  * notification is actionable. The returned `action` is the raw string the
  * transport read off the helper's stdout. It is untrusted: the plugin validates
  * it against PERMISSION_REPLIES before using it.
+ *
+ * The sixth argument is the session id -- the correlation key that says WHICH
+ * popup this is. It is opaque: never shown to the user, never used to build a
+ * command argument, and it travels to the helper in the environment. It is
+ * optional and additive, so a sender written before it existed still satisfies
+ * the type.
  */
 export type Delivery = (
   title: string,
@@ -163,9 +236,26 @@ export type Delivery = (
   urgency: string,
   sound: string,
   requestID?: string,
+  sessionID?: string,
 ) => Promise<{ ok: boolean; detail?: string; action?: string }>
 
-export type NotifyDeps = { deliver?: Delivery; maxInflightHelpers?: number; helperTimeoutMs?: number }
+export type NotifyDeps = {
+  deliver?: Delivery
+  /**
+   * Asks the desktop to close one session's popup. Omit it and the helper is
+   * spawned with the session id in its environment; supply it and the
+   * dismissal is observable without a desktop, a helper or a D-Bus session.
+   */
+  close?: (sessionID: string) => void
+  maxInflightHelpers?: number
+  helperTimeoutMs?: number
+}
+
+/**
+ * One live popup: when it was raised, whether the user has shown they are
+ * working in that session's chat, and the dismissal waiting to fire.
+ */
+type LivePopup = { raisedAt: number; interacted: boolean; timer?: NodeJS.Timeout }
 
 /**
  * The plugin options this factory reads, narrowed from the loose value opencode
@@ -212,18 +302,31 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   // (and more urgent) reason to look than "finished". Tracked so the idle event
   // that follows a question does not also claim the task finished.
   const pending = new Set<string>()
-  // Sessions with an unanswered PERMISSION request outstanding. Tracked
-  // separately from `pending` rather than sharing the set, because the two have
-  // independent lifecycles: a question can be answered while a permission is
-  // still open, and one set would drop the other's block and let a parked
-  // session announce itself as finished.
-  const permissions = new Set<string>()
+  // Sessions with an unanswered PERMISSION request outstanding, and the ids of
+  // those requests. Tracked separately from `pending` rather than sharing the
+  // set, because the two have independent lifecycles: a question can be
+  // answered while a permission is still open, and one set would drop the
+  // other's block and let a parked session announce itself as finished.
+  //
+  // A MAP, not a set of session ids: one session can have SEVERAL requests
+  // outstanding at once, and the set of ids is what makes the batch visible.
+  // The first request of a session raises the popup, the ones that join it are
+  // covered by that popup, and the click answers all of them.
+  const permissions = new Map<string, Set<string>>()
+  // The popup a session's first permission request is waiting to raise. One per
+  // session: a session with a request outstanding already has a popup coming,
+  // so a second one is never scheduled.
+  const pendingPermissionPopups = new Map<string, NodeJS.Timeout>()
+  // The live popup per session: when it was raised, whether the user has shown
+  // they are working in that session's chat, and the dismissal waiting to
+  // fire. Per-session like `active` and `titles`, and bounded the same way.
+  const live = new Map<string, LivePopup>()
   let warnedHelper = false
   // Helpers currently running. Bounded by MAX_INFLIGHT_HELPERS; see that constant
   // for why the bound is on the spawn and not on the notification decision.
   let inflight = 0
 
-  // The two per-session stores that grow with every session seen; both are capped
+  // The per-session stores that grow with every session seen; they are capped
   // so a long-running server cannot let them grow without bound. See MAX_TRACKED_SESSIONS.
   const rememberActive = (sessionID: string) => {
     active.add(sessionID)
@@ -233,23 +336,72 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
     titles.set(id, title)
     while (titles.size > MAX_TRACKED_SESSIONS) titles.delete(titles.keys().next().value as string)
   }
+  // The live popup is written through here too, never straight into the map,
+  // so the bound AND the timer bookkeeping cannot be forgotten at a call site.
+  const rememberLive = (sessionID: string, popup: LivePopup) => {
+    // A dismissal still pending was armed against the PREVIOUS popup's
+    // raisedAt, so it goes with the popup it belonged to: a stale timer would
+    // hide the new one before it had its own five seconds.
+    const previous = live.get(sessionID)
+    if (previous?.timer) clearTimeout(previous.timer)
+    live.set(sessionID, popup)
+    while (live.size > MAX_TRACKED_SESSIONS) {
+      const oldest = live.keys().next().value as string
+      const forgotten = live.get(oldest)
+      // Same for a forgotten session: its timer goes with it.
+      if (forgotten?.timer) clearTimeout(forgotten.timer)
+      live.delete(oldest)
+    }
+  }
+  // A deleted session takes its popup with it, and its pending dismissal with
+  // it too: a timer that fires for a session that is gone closes nothing.
+  const forgetLive = (sessionID: string) => {
+    const popup = live.get(sessionID)
+    if (popup?.timer) clearTimeout(popup.timer)
+    live.delete(sessionID)
+  }
+  // The outstanding permission requests of a session, written through here so
+  // the bound cannot be forgotten at a call site -- exactly like `active`,
+  // `titles` and `live`.
+  const rememberPermissions = (sessionID: string, requests: Set<string>) => {
+    permissions.set(sessionID, requests)
+    while (permissions.size > MAX_TRACKED_SESSIONS) {
+      const oldest = permissions.keys().next().value as string
+      permissions.delete(oldest)
+    }
+  }
+  // Drop ONE answered request from a session's outstanding set, and the
+  // session itself when nothing is outstanding any more.
+  //
+  // The map entry goes when the set empties: `shouldNotify` asks whether the
+  // session has something outstanding with `.has`, so a session left in the
+  // map with an empty set would look parked for ever -- and a parked session's
+  // completion is swallowed.
+  const forgetPermission = (sessionID: string, requestID: string) => {
+    const outstanding = permissions.get(sessionID)
+    if (!outstanding) return
+    outstanding.delete(requestID)
+    if (outstanding.size === 0) permissions.delete(sessionID)
+  }
+  // The popup a session's permission batch is waiting to raise is cancelled
+  // with the session: a popup about a session that is gone is a popup about
+  // nothing.
+  const forgetPermissionPopup = (sessionID: string) => {
+    const timer = pendingPermissionPopups.get(sessionID)
+    if (timer) clearTimeout(timer)
+    pendingPermissionPopups.delete(sessionID)
+  }
 
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
     client.app.log({ body: { service: SERVICE, level, message, extra } }).catch(() => {})
 
-  // Answer a permission from a notification click. The action is the raw string
-  // the helper printed, so it is validated against the server's vocabulary before
-  // it is forwarded. Every outcome is logged and none is thrown: a failed reply
-  // must never escape the event handler.
-  const answerPermission = async (sessionID: string, requestID: string, action: string) => {
-    const response = PERMISSION_REPLIES.find((candidate) => candidate === action) as PermissionReply | undefined
-    if (!response) {
-      void log("warn", `notification action ignored: ${JSON.stringify(action)} is not a permission reply`, {
-        sessionID,
-        requestID,
-      })
-      return
-    }
+  // Answer ONE permission request from a notification click.
+  //
+  // The action is the raw string the helper printed, so it is validated
+  // against the server's vocabulary before it is forwarded. Every outcome is
+  // logged and none is thrown: a failed reply must never escape the event
+  // handler.
+  const replyPermission = async (sessionID: string, requestID: string, response: PermissionReply) => {
     // A thrown error carries the status under `.cause` (the SDK's wrapper) or,
     // for a caller that threw the response itself, under `.response`/`.status`.
     const errorStatus = (error: unknown): number | undefined => {
@@ -268,6 +420,8 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
     if (status === 404) {
       // Already answered elsewhere -- most often in the terminal. Not a failure.
       void log("debug", "permission already answered", { sessionID, requestID })
+      // It IS answered, though, so it is not outstanding any more.
+      forgetPermission(sessionID, requestID)
       return
     }
     if ("error" in reply) {
@@ -284,7 +438,36 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       })
       return
     }
+    // The request is answered, so it is not outstanding any more. The runtime
+    // says so as well, with `permission.replied`, but a set that waits for
+    // that event keeps a session looking parked when the event never comes --
+    // and a parked session's completion is swallowed.
+    forgetPermission(sessionID, requestID)
     void log("info", "permission answered from the notification", { sessionID, requestID, response })
+  }
+
+  // Answer the permissions of a session from a notification click.
+  //
+  // EVERY outstanding request of the session is answered, not only the one the
+  // popup carries: the popup covers the whole batch -- that is why it says how
+  // many requests it covers -- so the click answers the batch. `once` allows
+  // each of them once, `always` allows each pattern permanently, `reject`
+  // denies each. The values are the server's own; the plugin invents none.
+  //
+  // A request already answered in the terminal comes back as a 404, which is a
+  // debug line and not a failure.
+  const answerPermission = async (sessionID: string, requestIDs: string[], action: string) => {
+    const response = PERMISSION_REPLIES.find((candidate) => candidate === action) as PermissionReply | undefined
+    if (!response) {
+      void log("warn", `notification action ignored: ${JSON.stringify(action)} is not a permission reply`, {
+        sessionID,
+        requestIDs,
+      })
+      return
+    }
+    for (const requestID of requestIDs) {
+      await replyPermission(sessionID, requestID, response)
+    }
   }
 
   const fetchInfo = async (sessionID: string) => {
@@ -299,7 +482,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   // user believes the agent finished and stops watching. So delivery is verified,
   // not assumed -- the helper's exit status and stderr are captured and logged, and
   // "notified" is only claimed when the helper actually succeeded.
-  const deliverViaHelper = (title: string, message: string, urgency: string, sound: string, requestID?: string) =>
+  const deliverViaHelper = (title: string, message: string, urgency: string, sound: string, requestID?: string, sessionID?: string) =>
     new Promise<{ ok: boolean; detail?: string; action?: string }>((resolve) => {
       // The cap, before anything is spawned. Settled exactly once on every path
       // below, so the count can never drift upward and wedge the transport shut.
@@ -330,17 +513,26 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       // Sound last, matching the payload's own field order (TITLE, MESSAGE,
       // URGENCY, ICON, SOUND) -- helperArgv puts it in the same slot for both
       // helper CLIs, so there is no per-transport decision left to make here.
+      //
+      // The correlation key travels in the ENVIRONMENT, never in the argv: the
+      // helper's argv is a published contract (five fields, two CLIs) and the
+      // session id is plugin bookkeeping that must not cost it one. It is
+      // ABSENT, not empty, when there is no session -- an empty value would be
+      // a different thing, and the helper must be able to tell "no session"
+      // from a session whose id is the empty string, which does not exist.
+      const childEnv = { ...process.env, ...(sessionID ? { [NOTIFY_SESSION_ENV]: sessionID } : {}) }
       const actionable = Boolean(requestID)
       const timeoutMs = actionable ? ACTION_TIMEOUT_MS : helperTimeoutMs
       const child = actionable
         ? spawn(helper, helperArgv(helper, title, message, urgency, "utilities-terminal", sound), {
             stdio: ["ignore", "pipe", "pipe"],
             detached: false,
-            env: { ...process.env, [REQUEST_ID_ENV]: requestID },
+            env: { ...childEnv, [REQUEST_ID_ENV]: requestID },
           })
         : spawn(helper, helperArgv(helper, title, message, urgency, "utilities-terminal", sound), {
             stdio: ["ignore", "ignore", "pipe"],
             detached: true,
+            env: childEnv,
           })
       inflight++
       let settled = false
@@ -405,6 +597,175 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   // notifications a real desktop would have received -- nothing more, nothing less.
   const deliver: Delivery = deps.deliver ?? deliverViaHelper
 
+  // The dismissal goes through the HELPER, never through D-Bus from here: the
+  // popup lives on the desktop -- locally, or on the desktop at the far end of
+  // the ssh tunnel -- and only the desktop knows the notification id. The helper
+  // already knows how to reach the desktop from wherever this plugin runs, so
+  // it is asked to close and it closes there.
+  //
+  // Fire-and-forget: detached and unref'd, so a dismissal can never hold the
+  // server open. It is NOT counted against the in-flight helper cap -- it is not
+  // a notification, and dropping one would leave a popup on screen for good.
+  //
+  // The correlation key travels in the ENVIRONMENT. It is opaque: never shown,
+  // never used to build an argument.
+  //
+  // The argv below carries no information: the helper answers the close
+  // request from the environment and sends nothing. It is still a well-formed
+  // notification argv -- the `lacode` CLI refuses an empty title outright, and
+  // a close that never reaches the helper closes nothing -- so the title is a
+  // placeholder and the rest is empty.
+  const closeViaHelper = (sessionID: string) => {
+    try {
+      const helper = findHelper()
+      if (!helper) {
+        if (!warnedHelper) {
+          warnedHelper = true
+          void log("warn", "no oc-notify helper found; run 'bin/oc-sync' to install one")
+        }
+        return
+      }
+      const child = spawn(helper, helperArgv(helper, "opencode", "", "normal", "utilities-terminal", "none"), {
+        stdio: ["ignore", "ignore", "pipe"],
+        detached: true,
+        env: { ...process.env, [NOTIFY_CLOSE_ENV]: sessionID },
+      })
+      child.on("error", (error) => {
+        void log("warn", `notification close failed: ${String(error)}`, { sessionID })
+      })
+      child.on("exit", (code) => {
+        // A close that fails is not an error the user needs to see: the popup
+        // stays, and nothing else changes.
+        if (code !== 0) void log("warn", `notification not closed: helper exit ${code}`, { sessionID })
+      })
+      child.unref()
+    } catch (error) {
+      void log("warn", `notification close failed: ${String(error)}`, { sessionID })
+    }
+  }
+
+  // The injected closer, when given, replaces the spawn above entirely -- the
+  // same seam shape as `deliver`, so a test can watch a dismissal happen
+  // without a desktop, a helper or a D-Bus session.
+  const close: (sessionID: string) => void = deps.close ?? closeViaHelper
+
+  // Fade one session's popup. The plugin only asks; the helper closes, locally
+  // or over the hop.
+  const dismiss = (sessionID: string) => {
+    const popup = live.get(sessionID)
+    if (!popup) return
+    if (popup.timer) {
+      clearTimeout(popup.timer)
+      popup.timer = undefined
+    }
+    // The popup's five seconds are spent, so the clock restarts here. The
+    // `interacted` flag stays: the user is still in the TUI, so the NEXT popup
+    // for this session fades as well.
+    popup.raisedAt = Date.now()
+    const failed = (error: unknown) => void log("warn", `notification dismiss failed: ${String(error)}`, { sessionID })
+    try {
+      // The closer is typed as void, but an injected one may be async -- and a
+      // rejected promise must never escape as an unhandled rejection, which
+      // would take the server down with it.
+      const outcome = close(sessionID) as unknown as Promise<void> | undefined
+      if (outcome && typeof outcome.catch === "function") void outcome.catch(failed)
+    } catch (error) {
+      failed(error)
+    }
+  }
+
+  // Arm the dismissal for a session's popup.
+  //
+  // The five-second rule: the popup hides at max(now, raisedAt + MIN_VISIBLE_MS)
+  // -- five seconds after it was shown, or immediately if that moment has
+  // already passed. `raisedAt` is the LATEST notification's time for that
+  // session, so no popup is ever hidden before five seconds of its own life.
+  //
+  // Nothing happens for a session with no popup, and nothing happens for one
+  // whose dismissal is already armed: a second signal must not push the popup
+  // earlier.
+  const scheduleDismiss = (sessionID: string) => {
+    const popup = live.get(sessionID)
+    if (!popup) return
+    if (popup.timer) return
+    const delay = Math.max(0, popup.raisedAt + MIN_VISIBLE_MS - Date.now())
+    const timer = setTimeout(() => dismiss(sessionID), delay)
+    // Unref'd, like every other timer in this file: a popup's lifetime is
+    // never a reason to hold the server open.
+    timer.unref?.()
+    popup.timer = timer
+  }
+
+  // The user is working in this session's chat directly: they answered a
+  // permission, they answered or dropped a question, or they typed. The popup
+  // has said everything it is going to say -- they are looking at the answer --
+  // so it may fade.
+  //
+  // The session merely going busy is NOT one of those signals: the runtime
+  // raises `busy` when the session starts executing, so a retry or an
+  // automatic continuation would close a popup the user never read.
+  const noteInteraction = (sessionID: string) => {
+    const popup = live.get(sessionID)
+    if (!popup) return
+    popup.interacted = true
+    scheduleDismiss(sessionID)
+  }
+
+  // The claim's release, one timer per (session, kind).
+  //
+  // The window is the same five seconds the cooldown uses, so the claim is
+  // never held longer than the thing it mirrors. The timer is unref'd, like
+  // every other timer in this file: a claim's lifetime is never a reason to
+  // hold the server open.
+  //
+  // ONE timer per claim, not one per notification: the claim is a single file,
+  // and a second timer would delete a claim this process has since taken
+  // again.
+  const claimReleases = new Map<string, NodeJS.Timeout>()
+  const scheduleClaimRelease = (sessionID: string, kind: string) => {
+    const key = `${kind}:${sessionID}`
+    if (claimReleases.has(key)) return
+    const timer = setTimeout(() => {
+      claimReleases.delete(key)
+      releaseNotificationClaim(sessionID, kind)
+    }, COOLDOWN_MS)
+    timer.unref?.()
+    claimReleases.set(key, timer)
+  }
+
+  // Raise the popup for a session's permission requests, once the batch has had
+  // a moment to form.
+  //
+  // The request id that travels on the notification is the FIRST request's: it
+  // is what makes the popup actionable, and the click answers every
+  // outstanding request of that session -- not only that one.
+  //
+  // If the session's outstanding set is empty by the time the wait is over,
+  // nothing is raised at all: the user answered in the terminal, and a popup
+  // about a request that is no longer open is noise.
+  const raisePermissionPopup = (sessionID: string, requestID: string | undefined, headline: string) => {
+    // Any earlier wait for this session is cancelled first. It was waiting for
+    // a batch that is gone, and letting it fire as well would raise the popup
+    // twice for the same session.
+    forgetPermissionPopup(sessionID)
+    const timer = setTimeout(() => {
+      // A wait that was superseded never raises anything.
+      if (pendingPermissionPopups.get(sessionID) !== timer) return
+      pendingPermissionPopups.delete(sessionID)
+      const outstanding = permissions.get(sessionID)
+      if (!outstanding || outstanding.size === 0) return
+      // One request says WHAT is being asked for. Several say HOW MANY there
+      // are: the popup covers the batch, and naming one of several asks would
+      // misdescribe the others.
+      const detail = outstanding.size > 1 ? `${outstanding.size} requests` : headline
+      void announce(sessionID, "permission", detail || undefined, requestID)
+    }, PERMISSION_SETTLE_MS)
+    // Unref'd, like every other timer in this file: a popup's lifetime is
+    // never a reason to hold the server open.
+    timer.unref?.()
+    pendingPermissionPopups.set(sessionID, timer)
+  }
+
   const announce = async (sessionID: string, outcome: Outcome, detail?: string, requestID?: string) => {
     try {
       const info = await fetchInfo(sessionID)
@@ -458,6 +819,25 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         void log("debug", "suppressed: cooldown", { sessionID })
         return
       }
+      // The cross-process claim.
+      //
+      // opencode publishes its events through a shared store, so EVERY
+      // opencode process on this machine that has this plugin loaded sees the
+      // same event and would raise the same popup: two processes, one event,
+      // the identical popup twice, seconds apart. The cooldown above cannot
+      // catch that -- it is per process.
+      //
+      // The claim is the one-winner file that says "this process is the one
+      // raising it". It is taken AFTER the cooldown and BEFORE the popup is
+      // recorded and delivered: a process that lost the claim must not record
+      // a popup it never raised, and must not deliver one.
+      //
+      // Our own claim never changes our own behaviour, so a single process
+      // does exactly what it did before.
+      if (!claimNotification(sessionID, kind)) {
+        void log("debug", "suppressed: another process is raising this", { sessionID, kind })
+        return
+      }
       const message = isRemote ? `${decision.message} (remote)` : decision.message
       // The outcome IS the sound name: four outcomes, four bundled WAVs, one each,
       // so there is nothing to translate. The membership test is the guard for a
@@ -465,12 +845,50 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       // receiver would have to reject. With the toggle off the sound is "none",
       // which is the whitelist's own word for play nothing.
       const sound = soundOn && NOTIFY_OUTCOMES.includes(outcome) ? outcome : "none"
-      const sent = await deliver(decision.title, message, decision.urgency, sound, requestID)
+      // The popup this notification raises is live from here on. Recorded
+      // BEFORE the delivery, because the delivery is what puts it on the
+      // screen, and the record is what lets a later interaction in the TUI
+      // fade it.
+      //
+      // `interacted` sticks: the user answered something in this session's
+      // chat, so they are watching it, and the NEXT popup for this session
+      // fades as well.
+      const previous = live.get(sessionID)
+      const popup: LivePopup = { raisedAt: Date.now(), interacted: previous?.interacted ?? false }
+      rememberLive(sessionID, popup)
+      // A session the user is working in directly does not need its popups to
+      // wait for the X button. This one still gets its own five seconds, so the
+      // dismissal is armed against THIS notification's raisedAt -- which is why
+      // the previous one was dropped when the record was replaced.
+      if (popup.interacted) scheduleDismiss(sessionID)
+      // The initial value is for the compiler only: a delivery that throws
+      // never reaches the lines below it.
+      let sent: { ok: boolean; detail?: string; action?: string } = { ok: false }
+      try {
+        sent = await deliver(decision.title, message, decision.urgency, sound, requestID, sessionID)
+      } finally {
+        // The claim is released once the popup is on its way. The window is the
+        // same five seconds the cooldown uses, so the claim is never held
+        // longer than the thing it mirrors, and the state directory stays
+        // bounded: the release removes the file only while it still holds
+        // THIS process's pid, so a claim another process has since taken is
+        // never removed by the previous holder.
+        scheduleClaimRelease(sessionID, kind)
+      }
       // An actionable notification only returns once the user clicks or the wait
       // ends, so an action means the click answered the permission. With no action
       // the popup was raised and dismissed without a choice, which is still a
       // delivery.
-      if (sent.action && requestID) await answerPermission(sessionID, requestID, sent.action)
+      if (sent.action && requestID) {
+        // The click answers EVERY outstanding request of this session, not only
+        // the one the popup carries: the popup covers the whole batch -- that
+        // is why it says how many requests it covers -- so the batch is what
+        // the user answered. A request without an id cannot be addressed, and
+        // is left out.
+        const outstanding = permissions.get(sessionID)
+        const ids = outstanding ? [...outstanding].filter((id) => id !== UNANSWERABLE_REQUEST) : []
+        await answerPermission(sessionID, ids.length > 0 ? ids : [requestID], sent.action)
+      }
       // Claiming "notified" on a failed delivery is how this bug survived: the log
       // said notified five times while nothing reached the desktop. Only say it when
       // the helper confirmed, and say what failed when it did not.
@@ -494,7 +912,29 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           // fires on a title change or a token-count refresh, which would mark a
           // session as active without any work having been done.
           const { sessionID, status } = event.properties
-          if (status.type === "busy" && sessionID) rememberActive(sessionID)
+          if (status.type === "busy" && sessionID) {
+            rememberActive(sessionID)
+            // NOT an interaction. The runtime raises `busy` whenever the
+            // session STARTS EXECUTING -- a retry, a resumption, an automatic
+            // continuation -- so it says the machine is working, not that
+            // the user is in the chat. Reading it as "the user typed" let a
+            // machine-driven retry close a popup nobody had read; the
+            // signal that means the user is there is their own message
+            // (below).
+          }
+          return
+        }
+
+        // The user typed in this session's chat.
+        //
+        // The runtime publishes every message with its role, so a USER
+        // message is the signal that the user is in that chat -- and the
+        // only one that says so. `session.status: busy` is not: it says the
+        // session started executing, which a retry or an automatic
+        // continuation does without the user.
+        if (event.type === "message.updated") {
+          const info = event.properties.info
+          if (info?.role === "user" && info.sessionID) noteInteraction(info.sessionID)
           return
         }
 
@@ -535,7 +975,12 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         // reason as question.asked: the SDK types here predate these events.
         if (event.type === "question.replied" || event.type === "question.rejected") {
           const sessionID = (event.properties as { sessionID?: string })?.sessionID
-          if (sessionID) pending.delete(sessionID)
+          if (sessionID) {
+            pending.delete(sessionID)
+            // The question was answered (or dropped) in the TUI: the user is
+            // looking at the answer, so the popup may fade.
+            noteInteraction(sessionID)
+          }
           return
         }
 
@@ -557,19 +1002,37 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         // user's: the request id rides on the notification, a click is
         // forwarded to the server's own reply route, the plugin never picks
         // one, and a dismissed popup answers nothing.
+        //
+        // opencode raises ONE request per pattern it wants, and they arrive
+        // together -- four file reads inside 300ms. So the requests of a
+        // session are tracked as a SET, and only the first one raises a popup:
+        // the popup that is up (or on its way) covers the ones that join it,
+        // and the click answers every one of them.
         if (event.type === "permission.asked") {
           const properties = event.properties as PermissionRequest
           const sessionID = properties?.sessionID
           if (!sessionID) return
-          permissions.add(sessionID)
+          // The request id is what a reply is addressed to, so it is carried on
+          // the notification rather than shown to the user.
+          const requestID = typeof properties?.id === "string" && properties.id ? properties.id : undefined
+          const outstanding = permissions.get(sessionID) ?? new Set<string>()
+          // The first request of this session: nothing was outstanding before.
+          const first = outstanding.size === 0
+          // A request without an id cannot be replied to, but it is still an
+          // outstanding request, so it is tracked under the placeholder.
+          outstanding.add(requestID ?? UNANSWERABLE_REQUEST)
+          rememberPermissions(sessionID, outstanding)
           // A permission request is also proof of work, so it must not be
           // suppressed by the never-went-busy rule -- and if it was never seen
           // busy, treat it as busy.
           rememberActive(sessionID)
-          // The request id is what a reply is addressed to, so it is carried on
-          // the notification rather than shown to the user.
-          const requestID = typeof properties?.id === "string" && properties.id ? properties.id : undefined
-          void announce(sessionID, "permission", permissionHeadline(properties) || undefined, requestID)
+          // The popup that is already up -- or already on its way -- covers
+          // this request. The user is told once, and the click answers them
+          // all.
+          if (!first) return
+          // The first request waits a moment for its siblings, so the popup
+          // can say how many requests it covers.
+          raisePermissionPopup(sessionID, requestID, permissionHeadline(properties))
           return
         }
 
@@ -579,7 +1042,26 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         // event that follows is allowed to report real work as finished again.
         if (event.type === "permission.replied") {
           const sessionID = (event.properties as { sessionID?: string })?.sessionID
-          if (sessionID) permissions.delete(sessionID)
+          if (sessionID) {
+            // The request id is read off the wire with a narrow cast, like
+            // question.asked -- and the FIELD NAME follows the runtime, not
+            // the typing. The runtime publishes `requestID` (the package's
+            // own v2 types say so), while the pinned v1 SDK typing still
+            // calls that field `permissionID`. The stale typing is why the
+            // cast is here; the runtime is why the name is `requestID`.
+            const requestID = (event.properties as { requestID?: string })?.requestID
+            // Only THAT request is answered. The others of the batch are still
+            // outstanding, so the session stays parked until they are answered
+            // too. An event without an id cannot say which one it was, so the
+            // whole batch is cleared -- that is the old behaviour, and it is
+            // the safe direction: a session that looks parked swallows its own
+            // completion.
+            if (requestID) forgetPermission(sessionID, requestID)
+            else permissions.delete(sessionID)
+            // The prompt was answered in the TUI, so the popup is no longer
+            // needed and may fade.
+            noteInteraction(sessionID)
+          }
           return
         }
 
@@ -615,6 +1097,13 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
             titles.delete(sessionID)
             pending.delete(sessionID)
             permissions.delete(sessionID)
+            // Its popup goes with it, and so does the dismissal waiting to
+            // close it: the session is gone, so there is nothing to fade.
+            forgetLive(sessionID)
+            // And so does the permission popup still waiting to be raised: a
+            // popup about a session that no longer exists is a popup about
+            // nothing.
+            forgetPermissionPopup(sessionID)
           }
           return
         }

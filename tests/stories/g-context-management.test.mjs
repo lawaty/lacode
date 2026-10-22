@@ -196,6 +196,38 @@ test("[US-19] the cartographer is injected as a pooled subagent, with no model o
   assert.ok(models.includes(cfg.agent["context-1"].model), `variant model ${cfg.agent["context-1"].model} is not a declared slot`)
 })
 
+test("[US-19] the injected cartographer carries no model of its own, so the pool alone binds one", async () => {
+  const stub = stubInput()
+  const hooks = await bootLaCode(stub, { id: "us19-no-model", dir: scratch() })
+  const cfg = emptyConfig()
+  await hooks.config(cfg)
+  await hooks.dispose()
+
+  const cm = cfg.agent["context"]
+  assert.ok(cm, "the config hook must inject the cartographer")
+
+  // The CONFIG object is what opencode reads, not the exported definition. A
+  // model here is a second source of truth that silently wins whenever routing
+  // falls through, so it must be absent after every config hook has run — not
+  // merely once on the AGENTS table the test above inspects.
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(cm, "model"),
+    false,
+    `the injected context agent must not carry a model key; got ${cm.model}`,
+  )
+  assert.equal(cm.model, undefined, "no model value may be reachable through the injected agent either")
+
+  // The pool supplies models to the slot variants, and to nothing else. If it
+  // bound the base too, the injected agent would be pinning a model of its own
+  // — exactly the regression this test exists to catch.
+  const models = presetModels()
+  for (let slot = 1; slot <= MAX_SLOTS; slot++) {
+    const variant = cfg.agent[`context-${slot}`]
+    assert.ok(variant, `context-${slot} must exist`)
+    assert.ok(models.includes(variant.model), `context-${slot} must be bound to a declared slot, got ${variant.model}`)
+  }
+})
+
 test("[US-19] every slot the pool can hand out has a hidden cartographer variant", async () => {
   const stub = stubInput()
   const hooks = await bootLaCode(stub, { id: "us19-variants", dir: scratch() })
@@ -740,6 +772,45 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
     undefined,
     "an agent that never configured `edit` is not a writer",
   )
+})
+
+test("[US-21] every non-cartographer agent is told to report map changes, not only that the map is off-limits", async () => {
+  const stub = stubInput()
+  const hooks = await bootLaCode(stub, { id: "us21-report-rule", dir: scratch() })
+  const cfg = emptyConfig()
+  await hooks.config(cfg)
+  await hooks.dispose()
+
+  // The agents that do work and report back. Hidden slot variants carry the
+  // same prompts, and `instructions` edits AGENTS.md rather than the map, so it
+  // is not one of the workers this criterion is about.
+  const workers = Object.entries(cfg.agent)
+    .filter(([name, def]) => !name.startsWith("context") && !def.hidden)
+    .map(([name, def]) => [name, def.prompt])
+
+  assert.ok(workers.length > 0, "the config hook must inject the working agents")
+
+  for (const [name, prompt] of workers) {
+    assert.equal(typeof prompt, "string", `${name} must carry a prompt`)
+
+    // Find the paragraph carrying the map rule rather than matching across the
+    // whole prompt: a report instruction elsewhere must not stand in for the one
+    // that belongs beside the prohibition.
+    const rule = prompt
+      .split(/\n\s*\n/)
+      .find((paragraph) => /(?:Never edit|Do NOT edit) `\.opencode\/context\/`/.test(paragraph))
+    assert.ok(rule, `${name} must be told never to edit the map`)
+
+    // Both halves are the point. A permission deny tells the agent that it may
+    // not write the map; only the instruction can tell it what to do with the
+    // finding instead. A paragraph that says "never edit" and stops is the
+    // regression this test catches.
+    assert.match(
+      rule,
+      /(?:say so|report|note it)[^.]*?instead/i,
+      `${name} must be told to report map-relevant findings instead of editing the map`,
+    )
+  }
 })
 
 // ---------------------------------------------------------------------------

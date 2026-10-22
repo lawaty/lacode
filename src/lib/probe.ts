@@ -1,7 +1,11 @@
 import {
   clearCooldowns,
   isLimitText,
+  isModelMissingText,
+  limitReason,
   markProbe,
+  MODEL_MISSING_COOLDOWN_MS,
+  MODEL_MISSING_REASON,
   readLimits,
   recordStrike,
   splitModel,
@@ -39,16 +43,20 @@ import {
 //     So the strike recorder ignores probe sessions (see State.probes), and a
 //     failed probe leaves the existing window alone. The ONE thing it may update is
 //     a window the provider itself stated ("resets in 12min"), because that is the
-//     provider correcting us rather than us guessing again.
+//     provider correcting us rather than us guessing again. The exception is a
+//     model the provider does not serve at all ("Model not found"): that is not a
+//     guess about recovery, it is the provider saying the id is gone, so it is
+//     benched for the quota cap instead of being re-probed every cycle.
 //   * bench a whole provider. One 429 from one probe request says nothing about the
 //     other slots on that provider, so the provider-wide path is skipped for probe
 //     sessions too (see the note on State.probes).
 //   * hold a slot. A probe is not work: it acquires no claim, never counts as load,
 //     and is deleted as soon as it answers. It is a question, not a task.
 //
-// Probes run ONE AT A TIME and only against models that are actually cooling.
-// Probing a healthy model would spend its quota to learn nothing, and firing four
-// requests at once is how a pool gets itself rate-limited in the first place.
+// Probes run ONE AT A TIME. probeCooling() asks only about models that are
+// actually cooling; probeModels() is the validation path and asks about explicit
+// slots, cooling or not. Firing several requests at once is how a pool gets
+// itself rate-limited in the first place.
 
 // The prompt is the cheapest honest probe there is, and `system` REPLACES the
 // agent's own rather than appending to it — the point is to pay a handful of tokens
@@ -90,6 +98,8 @@ export type ProbeReport = {
   cleared: string[]
   /** Models still limited after the probe, with the window they kept. */
   kept: string[]
+  /** Models the provider says it does not serve; benched for the quota cap. */
+  missing: string[]
   /** True when anything at all changed — what a report is worth sending for. */
   changed: boolean
 }
@@ -137,8 +147,8 @@ const failureText = (error: unknown): string => {
  */
 const shortReason = (text: string): string => {
   if (!text) return "failed"
-  const matched = text.match(/rate[\s_-]?limit|usage limit|too many requests|quota|freelimiterror|overloaded/i)?.[0]
-  return matched ? matched.toLowerCase().replace(/[\s_]/g, "-") : isLimitText(text) ? "limit" : "failed"
+  if (isModelMissingText(text)) return MODEL_MISSING_REASON
+  return limitReason(text) ?? (isLimitText(text) ? "limit" : "failed")
 }
 
 /** Probe one model and settle its cooldown. Never throws. */
@@ -216,12 +226,19 @@ const probeOne = async (client: ProbeClient, opts: ProbeOptions, model: string, 
     }
 
     const text = failureText(failure)
-    // A window the provider STATED is the provider correcting a guess, so it is
-    // worth recording. Anything else leaves the existing window exactly as it was:
-    // a probe must never lengthen a cooldown, or the model it is checking could
-    // never pass the check.
-    const stated = statedCooldown(text)
-    if (stated !== undefined) recordStrike(s, model, shortReason(text), stated)
+    if (isModelMissingText(text)) {
+      // The provider does not serve this model id. Unlike a quota this does not
+      // lift on its own, so bench it for the quota cap instead of leaving a dead
+      // slot in the rotation; a later probe re-admits it if it comes back.
+      recordStrike(s, model, MODEL_MISSING_REASON, MODEL_MISSING_COOLDOWN_MS)
+    } else {
+      // A window the provider STATED is the provider correcting a guess, so it is
+      // worth recording. Anything else leaves the existing window exactly as it was:
+      // a probe must never lengthen a cooldown, or the model it is checking could
+      // never pass the check.
+      const stated = statedCooldown(text)
+      if (stated !== undefined) recordStrike(s, model, shortReason(text), stated)
+    }
     const still = readLimits(s).get(model)
     return settle(
       false,
@@ -252,6 +269,54 @@ const probeOne = async (client: ProbeClient, opts: ProbeOptions, model: string, 
 }
 
 /**
+ * Probe the given models whether or not they are cooling: the slot VALIDATION
+ * path.
+ *
+ * probeCooling() asks "has this benched model recovered?". This asks "does this
+ * slot's model still exist?", which is the question a changed slot table poses.
+ * A healthy model answers and nothing changes; a cooling one is re-admitted; a
+ * model the provider does not serve is benched (see probeOne). It shares the
+ * `s.probing` guard with probeCooling, so the two can never run together.
+ */
+export async function probeModels(client: ProbeClient, opts: ProbeOptions & { models: string[] }): Promise<ProbeReport> {
+  const s = opts.state
+  const now = opts.now ?? Date.now
+  const empty: ProbeReport = { outcomes: [], cleared: [], kept: [], missing: [], changed: false }
+  if (s.probing) return empty
+  const models = [...new Set(opts.models)]
+  if (models.length === 0) return empty
+
+  const cooling = readLimits(s)
+  const at = now()
+  const wasCooling = new Set([...cooling.values()].filter((strike) => strike.until > at).map((strike) => strike.model))
+
+  s.probing = true
+  const outcomes: ProbeOutcome[] = []
+  try {
+    for (const model of models) {
+      const strike = cooling.get(model)
+      outcomes.push(await probeOne(client, opts, model, strike && strike.until > at ? Math.ceil((strike.until - at) / 1000) : 0))
+    }
+  } finally {
+    s.probing = false
+    s.lastProbe = Date.now()
+  }
+
+  // `cleared` is only the models that were ACTUALLY benched before the run: a
+  // healthy model answering is not a change, so it must not be reported as one.
+  const reAdmitted = outcomes.filter((o) => o.ok && wasCooling.has(o.model)).map((o) => o.model)
+  const missing = outcomes.filter((o) => o.reason === MODEL_MISSING_REASON).map((o) => o.model)
+  const stillLimited = outcomes.filter((o) => !o.ok && o.reason !== MODEL_MISSING_REASON)
+  return {
+    outcomes,
+    cleared: reAdmitted,
+    kept: stillLimited.map((o) => o.model),
+    missing,
+    changed: reAdmitted.length > 0 || missing.length > 0 || stillLimited.some((o) => o.leftSeconds !== o.hadSeconds),
+  }
+}
+
+/**
  * Probe every cooled model, one at a time, and report what changed.
  *
  * Returns an empty report — no probes, no change — when nothing is cooling, which
@@ -261,7 +326,7 @@ const probeOne = async (client: ProbeClient, opts: ProbeOptions, model: string, 
 export async function probeCooling(client: ProbeClient, opts: ProbeOptions): Promise<ProbeReport> {
   const s = opts.state
   const now = opts.now ?? Date.now
-  const empty: ProbeReport = { outcomes: [], cleared: [], kept: [], changed: false }
+  const empty: ProbeReport = { outcomes: [], cleared: [], kept: [], missing: [], changed: false }
   if (s.probing) return empty
   const cooling = readLimits(s)
   const at = now()
@@ -286,13 +351,15 @@ export async function probeCooling(client: ProbeClient, opts: ProbeOptions): Pro
   }
 
   const reAdmitted = outcomes.filter((o) => o.ok).map((o) => o.model)
-  const stillLimited = outcomes.filter((o) => !o.ok)
+  const missing = outcomes.filter((o) => o.reason === MODEL_MISSING_REASON).map((o) => o.model)
+  const stillLimited = outcomes.filter((o) => !o.ok && o.reason !== MODEL_MISSING_REASON)
   return {
     outcomes,
     cleared: reAdmitted,
     kept: stillLimited.map((o) => o.model),
+    missing,
     // A window the provider restated is a change too: the pool now waits a
     // different length than it did, and the user is the one who set that.
-    changed: reAdmitted.length > 0 || stillLimited.some((o) => o.leftSeconds !== o.hadSeconds),
+    changed: reAdmitted.length > 0 || missing.length > 0 || stillLimited.some((o) => o.leftSeconds !== o.hadSeconds),
   }
 }

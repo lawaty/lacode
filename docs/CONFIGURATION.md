@@ -7,13 +7,16 @@ The plugin options, where the model pool gets its slots, and exactly what LaCode
 The slot list is the first of these that yields usable slots:
 
 1. plugin options — `models` in the [tuple](../README.md#configure)
-2. `~/.config/lacode/pool.json` (its parent directory is created for you)
-3. the bundled `presets/free-tier.json`
-4. a built-in fallback, so routing always works
+2. `~/.config/lacode/pool.txt` — flat `model [weight]` per line, preferred
+3. `~/.config/lacode/pool.json` (its parent directory is created for you)
+4. the bundled `presets/free-tier.json`
+5. a built-in fallback, so routing always works
 
 A missing, unreadable or structurally broken source falls through to the next and
-logs one warning; nothing here throws into opencode. Nothing hot-reloads —
-change a preset, then restart every opencode process.
+logs one warning; nothing here throws into opencode. Sources 2–4 are watched: a
+change reloads the slot table, re-binds the variant agents and validates every
+slot (one real request per model) without a restart. Only a change to the
+plugin's own code needs one.
 
 **Any model list is accepted, including paid ones** (US-7). There is no free-tier
 allowlist anywhere in the package, and no cost check of any kind: only the
@@ -69,8 +72,19 @@ Note that you cannot *spawn* a variant by name: the pool refuses
 `explore-1` and friends and points you at the bare base, so per-variant
 permissions only ever apply to a spawn the plugin routed itself.
 
-Nothing hot-reloads: after editing your config, restart every running opencode
-process.
+The pool files are the exception to the restart rule: editing `pool.txt`,
+`pool.json` or the bundled preset is picked up live — the table reloads, the
+variant agents re-bind and every slot is validated. A change to `opencode.jsonc`
+itself, or to the plugin's code, still needs a restart.
+
+**The delegation path matters.** The pool routes `task` tool calls whose
+`subagent_type` is `explore`, `implement` or `context`. A spawn with no
+`subagent_type`, an `@explore`/`@implement` mention, or a direct session prompt
+naming a base agent does not pass through that hook: it runs opencode's
+default/subagent path and inherits the caller's model. Spawn the bare base
+through the task tool (`subagent_type: "explore"`), not by mention or variant
+name. The plugin logs a warning for the no-`subagent_type` case; the
+mention/direct-session case cannot be detected before it runs.
 
 
 ## What gets injected

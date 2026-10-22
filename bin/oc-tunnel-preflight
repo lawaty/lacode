@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# oc-tunnel-preflight — free a tunnel port that a DEAD session still holds.
+#
+# WHY THIS EXISTS:
+# The notification tunnel is a REMOTE forward. The desktop runs
+# `ssh -N -T -R PORT:localhost:22 HOST` under the systemd --user unit
+# oc-tunnel@HOST.service, and the remote's `oc` notifies the desktop by
+# connecting back to PORT.
+#
+# When the desktop's network address changes, that ssh connection is gone -- but
+# the REMOTE's sshd keeps PORT bound for as long as its own TCP keepalive takes
+# to notice the dead peer (hours). The unit then fails forever with "remote
+# port forwarding failed for listen port PORT", restarting every 10s, and every
+# notification from that host dies SILENTLY: the remote's helper reports "could
+# not reach the local desktop over tunnel port PORT" into the REMOTE's journal,
+# which the desktop user never reads.
+#
+# So this runs ON THE DESKTOP, as the unit's ExecStartPre, and asks the remote
+# whether the port it is about to claim is still held by a live forward.
+#
+# THE PROBE IS THE POINT. A live forward delivers the desktop's own sshd banner
+# to whoever connects to PORT; a dead one accepts the TCP connection and then
+# says nothing, because the channel to the desktop is gone. So the remote is
+# asked to read the first bytes of that banner: "SSH" means the forward is
+# ALIVE and nothing is touched, and no banner means the forward is provably
+# dead, so the stale listener is killed. A live tunnel is never touched.
+#
+# Only an sshd is ever killed: it is the only process that can hold a
+# remote-forward listener, and anything else on that port belongs to somebody
+# else.
+#
+# Usage: oc-tunnel-preflight HOST PORT
+#
+# THIS ALWAYS EXITS 0. A preflight must never be the reason a unit fails to
+# start: an unreachable remote, a missing `ss`, an inconclusive probe -- all of
+# them mean "do nothing", and the unit starts and retries exactly as before.
+
+set -uo pipefail
+
+HOST="${1:-}"
+PORT="${2:-}"
+
+# Nothing to do without a host and a numeric port. Silent, and successful: the
+# unit's ExecStartPre must never be the reason the unit fails.
+if [[ -z "$HOST" || -z "$PORT" ]]; then
+  exit 0
+fi
+case "$PORT" in
+  ''|*[!0-9]*) exit 0 ;;
+esac
+
+# ONE ssh call, with the remote-side script fed on stdin.
+#
+# NO -n: -n redirects ssh's stdin from /dev/null, and the script arrives there.
+# ClearAllForwardings=yes is not optional either: without it this preflight's
+# own ssh would try to claim the tunnel port itself (from a RemoteForward in
+# ~/.ssh/config) and could become the next stale holder -- exactly the failure
+# this script exists to clear.
+#
+# The remote script is quoted (<<'REMOTE'), so nothing in it expands locally,
+# and the port travels as an ARGUMENT (bash -s -- "$PORT"), never interpolated
+# into the script text.
+out="$(ssh -T \
+  -o ClearAllForwardings=yes \
+  -o BatchMode=yes \
+  -o ConnectTimeout=10 \
+  -o StrictHostKeyChecking=accept-new \
+  "$HOST" bash -s -- "$PORT" 2>/dev/null <<'REMOTE'
+set -u
+PORT="${1:-}"
+
+case "$PORT" in
+  ''|*[!0-9]*) exit 0 ;;
+esac
+
+# 1. Who is listening on PORT? `ss -p` names the process only for a privileged
+#    caller, and the preflight connects with the same account the tunnel does.
+pid="$(ss -ltnpH "sport = :$PORT" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)"
+[ -n "$pid" ] || exit 0
+
+# 2. Only an sshd holds a remote-forward listener. Anything else on that port
+#    belongs to somebody else and is left alone.
+[ -r "/proc/$pid/comm" ] || exit 0
+[ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "sshd" ] || exit 0
+
+# 3. Is the forward still ALIVE? A live forward answers with the desktop's sshd
+#    banner. Connect, send a probe line, read the answer.
+#
+#    NO GNU timeout here: the remote may not have it, so bash's own `read -t`
+#    does the waiting (6s). `read` keeps whatever it managed to read when the
+#    timeout expires, so a banner that arrives without a newline is still seen.
+banner=""
+if exec 3<>/dev/tcp/127.0.0.1/"$PORT" 2>/dev/null; then
+  printf 'SSH-2.0-probe\r\n' >&3 2>/dev/null || true
+  read -r -t 6 -u 3 banner 2>/dev/null || true
+  exec 3<&- 3>&- 2>/dev/null || true
+fi
+
+case "$banner" in
+  SSH*) exit 0 ;;   # the forward is alive: touch nothing
+esac
+
+# 4. No banner, so the forward is provably dead and the listener is stale. The
+#    comm is re-read immediately before the kill: the pid could have exited and
+#    been recycled between the two checks, and a recycled pid must not be hit.
+[ -r "/proc/$pid/comm" ] || exit 0
+[ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "sshd" ] || exit 0
+kill "$pid" 2>/dev/null || true
+
+echo "oc-tunnel-preflight: freed a dead listener on port $PORT"
+exit 0
+REMOTE
+)" || out=""
+
+# One line, and only when a port was actually freed: the systemd journal
+# records the recovery and stays quiet the rest of the time.
+if [[ "$out" == "oc-tunnel-preflight: freed a dead listener on port $PORT" ]]; then
+  printf '%s\n' "$out"
+fi
+
+exit 0

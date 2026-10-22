@@ -6,7 +6,180 @@ All notable changes to LaCode are recorded here. The format follows
 
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
-## [Unreleased]
+## [0.11.0] — the old sessions and the old event rows are swept away on their own, and a pool edit takes effect without a restart
+
+### Added
+
+- **A pool edit is picked up live, and a model the provider has withdrawn no
+  longer takes its slot down with it.** The slot table used to be read once per
+  process, so editing `pool.txt`, `pool.json` or the bundled preset did nothing
+  until a restart — and a slot whose model id had been retired failed every
+  spawn routed to it. The plugin now watches the three file sources (`watchMs`,
+  default 1s; `watchDebounceMs`, default 250ms; both configurable, `watchMs: 0`
+  disables). When the resolved table actually changes it reassigns `s.slots`,
+  re-binds the variant agents and provider whitelists from the same config
+  object, and validates every slot with one real request — cooling or not. A
+  provider answering "Model not found" is now a first-class outcome:
+  `pool_recheck` benches that model for the quota cap (`model-missing`) so
+  routing stops choosing it, and names it in the report. Given `models`,
+  `pool_recheck` validates those even when they are not cooling; omitting
+  `models` keeps the old, cheap "probe what is cooling" contract. The watcher is
+  closed in `dispose`, so a torn-down plugin stops polling.
+
+### Fixed
+
+- **The bundled preset and the built-in fallback no longer name a withdrawn
+  model.** `opencode-go/minimax-m3.1-flash-free` is `deprecated` on models.dev
+  and is hidden from `opencode models`; it is replaced by
+  `opencode-go/beam-free`, which is active, free and in a different model family.
+  `tests/models-snapshot.json` was refreshed for the new slot.
+
+- **A build no longer unloads the pool from a process that starts during it.**
+  `npm run build` deleted `dist/` before rebuilding, so an opencode process that
+  imported `file://…/dist/index.js` in that window failed to load LaCode at all
+  and ran every `task` spawn on the caller's own model — `explore` appeared to
+  ignore the pool. Each entry is now staged and renamed into place, and stale
+  files are removed only after the live ones are in place.
+
+- **A task spawn with no `subagent_type` is reported instead of silently
+  bypassing the pool.** opencode runs the default subagent, which carries no
+  pool model, so it inherits the caller's model; the hook cannot route it after
+  the fact, but it now logs a warning naming the fix (`subagent_type: "explore"`
+  or `"implement"`). An `@explore` mention or a direct session prompt has the
+  same limitation: the plugin API exposes the model read-only, so it cannot be
+  re-routed there either.
+
+- **A provider limit the pool did not recognise left the task hanging until the
+  watchdog found it.** opencode reports a limit in two shapes: an `action` block
+  naming the provider and a reason, or — for every provider whose error body
+  opencode does not know — a retry status carrying nothing but the provider's
+  own words. The pool only read the first shape, and only when the reason
+  happened to be one of its own, so a limit that said "limit reached" was not a
+  limit to it: nothing was cooled, the session kept retrying the refused model,
+  and the task waited out the watchdog's minutes before anything killed it.
+  Worse, the retry went back to the same slot, because nothing had been put on
+  cooldown for the pool to route around.
+
+  The limit vocabulary now reads the provider's own phrasing — "limit reached",
+  "daily limit reached", "usage limit exceeded" — and a retry status is read for
+  its message as well as for its reason. The context family is deliberately
+  excluded: "context limit reached" is a prompt that is too long, not a
+  provider that has run out of allowance, and benching a model for it would take
+  a healthy provider out of rotation over the user's own prompt.
+
+  A limit that names its provider still benches the whole provider. A limit that
+  does not name a provider cools only the model the session was running on — the
+  one the refusal is evidence about — and either way the stalled session is
+  aborted at once, so the caller retries onto a slot that answers instead of
+  waiting for the watchdog.
+
+- **A transient outage no longer benches a model as if it had run out of
+  allowance.** "Endpoint is unavailable" is a provider that is briefly down, not
+  one that has spent its quota: it lifts on its own. Reported in a retry
+  status, it took the quota path — fifteen minutes off the rotation, filed
+  under "rate-limited" — and it counted as a strike, so the next real limit on
+  that model started at strike two and got a thirty-minute window. An outage now
+  takes the flat one-minute window the assistant-error path has always given
+  it, and it is never counted as a strike: the model is benched, the session is
+  still killed, and the quota window that follows starts where it should.
+
+- **Two processes could raise the same notification.** A notification is claimed
+  with an exclusive create, so only the process that wins the claim raises it,
+  and a claim older than its window may be taken over so a holder that died
+  mid-popup cannot silence every later one. The takeover deleted the stale claim
+  and then created its own — but the delete was unconditional and never
+  re-checked that the file it removed was still the stale claim it had judged a
+  moment earlier. Two processes that both saw the same stale claim both reached
+  the takeover: the first replaced it with a fresh claim, the second deleted
+  that fresh claim and made its own, and both returned "won", so both notified.
+  The takeover is now a compare-and-swap: an exclusive takeover lock, an
+  immediate refusal for whoever did not get it, and a re-read of the claim
+  inside the lock, so the loser leaves a live holder's fresh claim untouched.
+  The staleness rule itself is unchanged — a fresh claim is never stolen and a
+  stale one is still reclaimed.
+
+- **A `busy` session counted as you answering a prompt.** The five-second floor
+  before a notification is raised exists so it does not land while you are
+  already at the keyboard, and it is meant to be reset by real interaction.
+  `session.status: busy` was counted as that interaction — but `busy` is raised
+  whenever the session starts working, including when opencode resumes on its
+  own, so the floor was refreshed without you touching anything and the popup
+  you were owed could be suppressed. The signal is now a `message.updated` with
+  the user's own role on it, plus the reply events for permissions and
+  questions; `busy` no longer counts.
+
+- **A tunnel unit could be installed with a preflight it cannot run.** The unit
+  writer put `ExecStartPre=<preflight>` in unconditionally, so on a host where
+  the preflight was never installed systemd failed the unit and the tunnel never
+  came up — and the up-to-date check kept the broken unit because it demanded
+  the line. The line is now written only when the preflight is installed, which
+  degrades to "no preflight" rather than "no tunnel", and an already-broken unit
+  is repaired on the next run. The up-to-date check no longer requires the line.
+
+- **A strike for an unavailable provider is filed where it belongs.** An outage
+  reported through the strike path could still be counted as a quota strike and
+  handed the long window, because only one of the two call sites delegated to
+  the outage handler. Both now do, and a strike never counts an outage. A limit
+  that names a provider is also no longer overridden by the model the session
+  happened to be running on.
+
+- **Two acceptance criteria were corrected to match the shipped behaviour.**
+  US-6 criterion 4 stated the "a full slot is not the next one" rule without its
+  exception, so it contradicted the overflow path; it now says a full slot is
+  next only when no other slot is available and under its ceiling. US-19
+  criterion 3 stated a standing rule as if the product injected it, when it now
+  lives in the repo-level `AGENTS.md`.
+
+### Added
+
+- **The limit vocabulary is read from one place.** `pool.limitReason()` names
+  the limit a text reports, and the pool, the prober and the fail-over path all
+  take the reason from it, so a log line and a cooldown file never spell the
+  same fault two ways.
+
+- **US-31 — a limit that hangs is killed, and the retry lands on a slot that
+  answers.** The contract is written down as a user story with acceptance
+  criteria in `docs/USER-STORIES.md`, and every criterion has a test in
+  `tests/stories/`.
+
+- **Two retention sweeps take the old rows away before they become the whole
+  database.** `scripts/retire-old-sessions.mjs` archives then removes sessions
+  past a window (30 days, 24 hours of grace) and
+  `scripts/prune-old-events.mjs` deletes old transcript rows from `event`
+  (7 days, 1 hour of grace), in chunks, ordering by id — the id carries the
+  timestamp, so the primary-key index turns "older than" into a range scan
+  instead of a full table walk. Both refuse to touch a row that something still
+  depends on: a session an `event_sequence` cursor owns, a session bound to a
+  workspace, and anything inside the grace window. Neither ever removes or
+  resets a cursor. A session is written to a JSON archive before it is deleted,
+  and the archive is the recovery path if the window was wrong.
+
+  Both run by hand with `--dry-run`, support `--limit`, and the event prune also
+  takes `--vacuum`; a window larger than the id's own era is clamped, so a
+  mistyped number cannot be read as "delete everything". Each ships a systemd
+  service and timer (daily; `Persistent=true`, with a randomized delay on the
+  event prune so it does not run inside the session sweep's write window) and
+  appends one JSONL line per real run to a log under the state directory.
+
+- **US-32 and US-33 document the sweeps, and the coverage guard reads the root
+  suites.** Both have acceptance criteria in `docs/USER-STORIES.md` and story
+  markers on their tests. The guard now scans the root-level `tests/*-test.mjs`
+  suites as well as `tests/stories/`, so a story whose tests legitimately live
+  outside the story directory is counted instead of reported uncovered.
+
+- **Every acceptance criterion that could not be falsified now has a test that
+  fails when the behaviour regresses.** The audit found criteria whose tests
+  would have passed for the opposite behaviour: the least-loaded slot under a
+  full cooldown, a ceiling turn being skipped rather than consumed, a full slot
+  left unmarked, a macOS prompt carrying no buttons, a question carrying none,
+  a missing sound player costing only the sound, the bus path coming from the
+  local user rather than the remote, the sound playing where the notice is
+  rendered and never on the headless host, the self-update CLI, its argv and its
+  state file, cost control with no price information, the cartographer carrying
+  no model of its own, the map being reported rather than edited, an OmniRoute
+  gateway leaving a user's pool alone, and the notification doc leading with the
+  shipped path. Each new test was shown to fail by breaking the behaviour it
+  covers.
 
 ## [0.10.0] — a notification waits for you instead of timing out, and a permission can be answered from the popup
 

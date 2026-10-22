@@ -155,7 +155,7 @@ Change nothing. Print a final one-line summary of failures.`,
 
   "pool": {
     description:
-      "Modify this machine's LaCode pool from a short instruction — the shared free-model slot table in ~/.config/lacode/pool.txt. Restarts opencode afterwards.",
+      "Modify this machine's LaCode pool from a short instruction — the shared free-model slot table in ~/.config/lacode/pool.txt. Picked up live; no restart.",
     template: `Apply this change to the LaCode pool on this machine:
 
 $ARGUMENTS
@@ -173,17 +173,30 @@ The pool is ONE global slot table shared by every pooled base (explore, implemen
 
 3. Write the WHOLE file, not a patch. This file is an override, not an edit target: any slot you drop disappears, and slot numbers are line positions, so a partial write silently renumbers the rotation. Keep the existing comment header. If the write fails on a missing directory, create \`~/.config/lacode\` first and retry.
 
-4. Report the before → after slot table, the resolved path, and this reminder in substance: nothing hot-reloads, so every running opencode process must be restarted before the new pool takes effect.
+4. Report the before → after slot table and the resolved path. The running process watches the pool files: it reloads the table, re-binds the variant agents and validates every slot, so no restart is needed. If a slot names a model the provider does not serve, it will be benched and named in the log and toast — report that instead of claiming the swap succeeded.
 
 Two traps that fail silently, so check and state them explicitly:
 - A slot's provider must already exist in the user's opencode config, or that slot cannot resolve at all. If the instruction adds a model on a provider that is not configured, say so.
 - If a slot model is \`omniroute/<id>\`, that id must also appear in the plugin's \`omniroute.models\` allowlist (or be the \`combo\` id, which needs no entry) — otherwise the pool resolves and every spawn fails with \`ProviderModelNotFoundError\`.
 - A provider \`whitelist\` is an allowlist, and the plugin appends your model to it at config time. Nothing for you to do there.
 
-If the instruction is to RESET or REVERT rather than to change models, delete \`${USER_MODELS_TXT}\` instead, and report that the pool falls back to the bundled preset — with the same restart reminder.
+If the instruction is to RESET or REVERT rather than to change models, delete \`${USER_MODELS_TXT}\` instead, and report that the pool falls back to the bundled preset — the running process picks that up automatically too.
 
 Change nothing else. In particular do not touch \`presets/free-tier.json\`, \`~/.config/lacode/pool.json\`, \`FALLBACK_SLOTS\` in \`src/lib/pool.ts\`, or \`tests/models-snapshot.json\`: this command owns the per-machine override and nothing else.`,
   },
+  "pool-recheck": {
+    description:
+      "Probe the pool now — re-admit benched models that answer, keep the ones still limited, and bench a model the provider no longer serves.",
+    template: `Probe the LaCode pool now and report the result. Run inline; do not spawn a subagent and do not edit the pool.
+
+$ARGUMENTS
+
+- If the text above names one or more models, call the \`pool_recheck\` tool with those ids in \`models\` (provider/model-id).
+- Otherwise call \`pool_recheck\` with no arguments; it probes every model that is currently cooling.
+
+Report the tool's output as it came back, then add one short line naming what changed: re-admitted, still limited, or benched because the provider does not serve the model. If a model was benched as \`model-missing\`, say so and name the replacement in \`~/.config/lacode/pool.txt\` — but change nothing yourself.`,
+  },
+
 }
 
 /** Add every command the user's config does not already define (US-16). */

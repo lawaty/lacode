@@ -230,12 +230,29 @@ const declarations = (source) => {
   return found
 }
 
-/** Every test file in the guard's directory, as { name, source }. */
-const testFiles = () =>
-  readdirSync(STORIES_DIR)
-    .filter((name) => name.endsWith(".test.mjs"))
-    .sort()
-    .map((name) => ({ name, source: readFileSync(join(STORIES_DIR, name), "utf8") }))
+/**
+ * Every test file the guard scans, as { name, source }.
+ *
+ * Story suites live in tests/stories/*.test.mjs. The root-level suites
+ * (tests/*-test.mjs) also carry product stories as tagged test() calls
+ * (US-32, US-33), so they are scanned too. Only the TOP LEVEL of tests/ is
+ * included: subdirectories such as tests/benchmark and tests/fixtures are
+ * tooling, not product stories, and recursing into them would pull in harness
+ * and fixture files that are not suites. Root suites are allowed to be untagged
+ * (conventions: root-level suites need no [US-N] marker), so the untagged-name
+ * check below applies to the story suites only.
+ */
+const testFiles = () => {
+  const files = []
+  for (const name of readdirSync(STORIES_DIR).filter((n) => n.endsWith(".test.mjs")).sort()) {
+    files.push({ name, source: readFileSync(join(STORIES_DIR, name), "utf8"), story: true })
+  }
+  const TESTS_DIR = join(ROOT, "tests")
+  for (const name of readdirSync(TESTS_DIR).filter((n) => n.endsWith("-test.mjs")).sort()) {
+    files.push({ name, source: readFileSync(join(TESTS_DIR, name), "utf8"), story: false })
+  }
+  return files
+}
 
 /**
  * Story id -> { cases: number, files: string[] }.
@@ -347,7 +364,9 @@ test("[coverage] every test name that claims a story carries the id in brackets"
   // The mapping is greppable only if the marker is in the NAME. A test that
   // covers US-9 without saying so would silently drop out of this report.
   const offenders = []
-  for (const { name, source } of testFiles()) {
+  // Root-level suites are exempt from the tagging rule (conventions: they need
+  // no [US-N] marker), so only story suites are checked here.
+  for (const { name, source, story } of testFiles().filter((f) => f.story)) {
     for (const { name: testName } of declarations(source)) {
       if (!/^\[(US-\d+)\]/.test(testName)) offenders.push(`${name}: ${testName}`)
     }

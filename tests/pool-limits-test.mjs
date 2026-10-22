@@ -408,6 +408,34 @@ const dirB = scratch()
   assert(readFileSync(join(dir, "claims.p17.json"), "utf8") !== "{}", "the unrelated error must leave the claim in flight")
 }
 
+// 18. the limit MATCHER and the limit NAMES must agree. isLimitText() decides
+//     what counts as a limit, and limitReason() names it; a text the matcher
+//     excludes on purpose must get no reason at all, or a cooldown file and a
+//     log line would call a limit something the pool has decided is not one.
+//     "context limit reached" is a prompt that is too long, not a provider
+//     that has run out of allowance.
+{
+  const cases = [
+    ["limit reached", true],
+    ["daily limit reached", true],
+    ["usage limit exceeded", true],
+    ["context limit reached", false],
+  ]
+  for (const [text, isLimit] of cases) {
+    assert(pool.isLimitText(text) === isLimit, `"${text}" must ${isLimit ? "" : "not "}be a limit`)
+    assert(
+      (pool.limitReason(text) !== undefined) === isLimit,
+      `"${text}" must ${isLimit ? "" : "not "}be given a limit reason, got ${pool.limitReason(text)}`,
+    )
+  }
+  // And the names themselves are unchanged: a cooldown file spells the fault
+  // the way it always has.
+  assert(pool.limitReason("limit reached") === "limit-reached", `got ${pool.limitReason("limit reached")}`)
+  assert(pool.limitReason("daily limit reached") === "limit-reached", `got ${pool.limitReason("daily limit reached")}`)
+  assert(pool.limitReason("usage limit exceeded") === "usage-limit", `got ${pool.limitReason("usage limit exceeded")}`)
+  assert(pool.limitReason("context limit reached") === undefined, `got ${pool.limitReason("context limit reached")}`)
+}
+
 globalThis.fetch = realFetch
 for (const dir of made) rmSync(dir, { recursive: true, force: true })
 if (failures === 0) console.log("\nALL LIMIT CHECKS PASSED")

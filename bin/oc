@@ -50,6 +50,29 @@ set -uo pipefail
 #   OC_LOCAL_USER     your local username, if it differs from the remote one
 #   OC_NOTIFY         0 disables notifications entirely
 #
+#   LACODE_NOTIFY_SESSION
+#                     the correlation key of a notification: the session the
+#                     popup belongs to. The helper records the notification's id
+#                     under that key, so that a later close request can find the
+#                     popup again. It is DATA: never shown, never passed to a
+#                     command, never used to build an argument.
+#   LACODE_NOTIFY_CLOSE
+#                     set to a correlation key, this run is a CLOSE REQUEST and
+#                     not a notification: the popups of that key are closed --
+#                     here, or on the desktop over the hop -- and nothing is sent.
+#   LACODE_NOTIFY_DIR
+#                     where the notification ids are recorded. Defaults to
+#                     ~/.local/share/opencode/lacode/notify.
+#
+# A notification can also be taken back down.
+#
+# The plugin asks for that when the user starts working in that session's chat:
+# the popup has said everything it is going to say, so it fades instead of
+# waiting for the X button. Only the desktop that RAISED a popup knows the id
+# the notification daemon gave it, so the close is done by this helper -- here,
+# or on the desktop over the hop -- and never by the plugin. One code path, two
+# topologies.
+#
 # Notification failures print a one-line warning to stderr at most once per
 # session, and never change the exit code.
 
@@ -95,6 +118,21 @@ resolve_local_user() {
   read_notify_env OC_LOCAL_USER
 }
 
+# The tunnel port for this host.
+#
+# The port is per-host, so it must be resolved from the same place as the user
+# name: an explicit OC_TUNNEL_PORT still wins, and the marker file is the
+# fallback. Resolved on every call and never cached -- the same value can be
+# read for the notification path and for the close path, and they must agree.
+resolve_tunnel_port() {
+  if [[ -z "${OC_TUNNEL_PORT:-}" ]]; then
+    local from_file
+    if from_file="$(read_notify_env OC_TUNNEL_PORT)"; then
+      TUNNEL_PORT="$from_file"
+    fi
+  fi
+}
+
 # An icon that actually exists on the local desktop. Anything else here shows up
 # as a generic placeholder, so keep this list to shipped icon-theme names.
 DEFAULT_ICON=utilities-terminal
@@ -119,6 +157,179 @@ normalize_icon() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# The correlation key and the notification ids
+#
+# A popup belongs to one session, and only that session may take it down: the
+# user answers the permission in the TUI and THAT session's popup fades, while
+# every other popup stays.
+#
+# So a notification has to be findable again after it was raised -- and only
+# the desktop that raised it knows the id the notification daemon assigned. The
+# raiser records that id in a file named after the correlation key, and the
+# closer reads the file, closes every id in it, and deletes the file.
+#
+# The correlation key is the session id. It is DATA: it is never shown, never
+# passed to a command and never used to build an argument. Only two things are
+# ever tested about it -- whether it is empty, and whether it begins with the
+# literal "close:".
+# ---------------------------------------------------------------------------
+
+# The directory where the notification ids are recorded.
+#
+# Resolved LAZILY, at call time, and never cached: a test that redirects HOME
+# must get its own directory, and a cached value would keep writing into
+# whichever directory the first call happened to see.
+notify_state_dir() {
+  printf '%s' "${LACODE_NOTIFY_DIR:-${HOME:-}/.local/share/opencode/lacode/notify}"
+}
+
+# The file name a correlation key maps to.
+#
+# THE CONTRACT WITH THE TYPESCRIPT SIDE: every character outside
+# [A-Za-z0-9._-] becomes "_", and the result is truncated to 64 characters.
+# src/tunnel/index.ts applies the same rule, and the two must produce the SAME
+# name -- the raiser writes <safe key>.ids and the closer reads it back, so a
+# difference of one character would mean the closer never finds the file and
+# the popup never fades.
+#
+# The key never reaches a command argument: only this file NAME comes from it,
+# and "/" cannot survive the replacement, so the name can never point outside
+# the state directory.
+notify_safe_key() {
+  local key="${1:-}"
+  key="${key//[^A-Za-z0-9._-]/_}"
+  printf '%s' "${key:0:64}"
+}
+
+# The file that holds the notification ids of one correlation key.
+#
+# One id per line: a session can have more than one popup up at a time, and
+# each of them is closed by its own id.
+notify_id_file() {
+  printf '%s/%s.ids' "$(notify_state_dir)" "$(notify_safe_key "${1:-}")"
+}
+
+# Record a notification id under a correlation key.
+#
+# APPENDED to here, and read then DELETED by the closer: the ids are spent
+# once they have been closed, and a file that outlived them would make the
+# next close try to close ids the daemon has forgotten.
+#
+# The id is validated as a decimal integer before it is written: it is read
+# back later and handed to a command, and a file that anything on this machine
+# can write is not a file to trust.
+record_notification_id() {
+  local key="${1:-}" id="${2:-}"
+  [[ -n "$key" ]] || return 0
+  [[ "$id" =~ ^[0-9]+$ ]] || return 0
+  local dir file
+  dir="$(notify_state_dir)"
+  file="$(notify_id_file "$key")"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  printf '%s\n' "$id" >> "$file" 2>/dev/null || return 0
+  return 0
+}
+
+# Close one notification by its id, over the session bus.
+#
+# gdbus first, dbus-send second: both are verified to work on the desktop this
+# ships to, and the second is the fallback for a machine without the first.
+#
+# The id is validated as a decimal integer FIRST: it comes out of a file that
+# anything on this machine can write, and an id that is not a number must
+# never reach a command argument.
+close_notification() {
+  local id="${1:-}"
+  [[ "$id" =~ ^[0-9]+$ ]] || return 0
+  if command -v gdbus >/dev/null 2>&1; then
+    if gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.CloseNotification "$id" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  if command -v dbus-send >/dev/null 2>&1; then
+    dbus-send --session --dest=org.freedesktop.Notifications --type=method_call /org/freedesktop/Notifications org.freedesktop.Notifications.CloseNotification "uint32:$id" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+# Close every popup recorded for a correlation key.
+#
+# The file holds one id per line and is read then DELETED here. A close that
+# fails is not an error the user needs to see: the popup stays, and nothing
+# else changes -- so one id that cannot be closed does not stop the ones
+# after it.
+close_session_popups() {
+  local key="${1:-}" file line
+  [[ -n "$key" ]] || return 0
+  file="$(notify_id_file "$key")"
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Whitespace goes: an id is a number, and a number with a space in it is
+    # not one.
+    line="${line//[[:space:]]/}"
+    [[ -n "$line" ]] || continue
+    close_notification "$line" || true
+  done < "$file"
+  rm -f "$file" 2>/dev/null || true
+  return 0
+}
+
+# A CLOSE REQUEST: take down the popups of one correlation key, and send
+# nothing at all.
+#
+# The popups live where they were raised -- on the desktop -- so that is where
+# they are closed. Remote means the desktop is elsewhere: the request hops
+# home and the desktop's receiver does the closing there. Local means the
+# desktop is here, and the ids are closed here over the session bus.
+#
+# Nothing is sent: a close request must never raise a popup of its own, and
+# the dismissal it answers is the user already looking at the answer.
+close_notify() {
+  local key="${1:-}"
+  [[ -n "$key" ]] || return 0
+  # The key is data that crosses the wire, so it is stripped of control
+  # characters for the same reason the title and the message are: a key
+  # carrying a newline would forge a field of the payload.
+  key="${key//[[:cntrl:]]/ }"
+
+  if [[ -n "${SSH_CLIENT:-}" || -n "${SSH_TTY:-}" ]]; then
+    # Remote: hop home, exactly as a notification does. The SEVENTH field
+    # carries the request -- "close:<correlation key>" -- and the desktop's
+    # receiver closes that key's popups there. It is a RECOGNISED VALUE, not
+    # a command: nothing about it is ever executed.
+    resolve_tunnel_port
+    local hop_user
+    if ! hop_user="$(resolve_local_user)"; then
+      warn_once "OC_LOCAL_USER is unset and could not be read from the marker file."
+      warn_once "  the hop would try to authenticate as $(id -un), which the desktop does not accept."
+      warn_once "  fix: run 'bin/oc-sync' on this host (it writes both), or export OC_LOCAL_USER=<your desktop user>"
+      return 1
+    fi
+    local -a target=(-p "$TUNNEL_PORT" "${hop_user}@localhost")
+    if [[ ! -f "$HOME/.ssh/oc_notify" ]]; then
+      warn_once "no tunnel key at ~/.ssh/oc_notify — run 'bin/oc-sync --with-config' on this host"
+      return 1
+    fi
+    # The first six fields are empty: a close request carries no title and no
+    # message. It is not a notification, and it must never raise one -- but the
+    # field count stays seven, so the receiver reads the seventh as the key.
+    local payload=$'\n\n\n\n\n\n'"close:${key}"
+    ssh "${target[@]}" \
+      -i "$HOME/.ssh/oc_notify" \
+      -o IdentitiesOnly=yes \
+      -o StrictHostKeyChecking=accept-new \
+      -o BatchMode=yes \
+      -o ConnectTimeout=5 \
+      -o LogLevel=ERROR \
+      -- "$payload" >/dev/null 2>&1
+    return $?
+  fi
+
+  close_session_popups "$key"
+  return 0
+}
+
 # Send one notification to the local desktop.
 #   $1 title  $2 message  $3 urgency  $4 icon
 #
@@ -133,15 +344,40 @@ normalize_icon() {
 # function's stdout -- the desktop end is an ssh forced command, so its stdout
 # is the only way an answer can travel home.
 #
+# The correlation key is NOT an argument either: it arrives in the
+# LACODE_NOTIFY_SESSION environment variable, and it names the session the
+# popup belongs to, so the popup can be found again and closed later. It is
+# opaque in the same way the request id is: never shown, never passed to a
+# command, never used to build an argument.
+#
 # Returns non-zero if it could not be delivered. Silent on success, because
 # these run inside command substitution and would otherwise pollute callers --
 # except for an actionable notification, which prints the chosen name.
 send_notify() {
+  # A CLOSE REQUEST is not a notification.
+  #
+  # The plugin sets LACODE_NOTIFY_CLOSE when the user starts working in that
+  # session's chat: the popup has said everything it is going to say, so it
+  # fades instead of waiting for the X button. The helper closes the popups of
+  # that correlation key -- where they were raised -- and sends NOTHING.
+  #
+  # The check is FIRST, before anything is assembled: a close request carries
+  # no title and no message, and it must never turn into one.
+  if [[ -n "${LACODE_NOTIFY_CLOSE:-}" ]]; then
+    close_notify "${LACODE_NOTIFY_CLOSE}"
+    return $?
+  fi
+
   local title="${1:-OpenCode}" msg="${2:-}" urgency="${3:-normal}" icon
   # The request id rides in the ENVIRONMENT, not in the argument list: the
   # plugin sets LACODE_REQUEST_ID on the helper process. It is read here, so
   # every caller of this function gets the same one.
   local request_id="${LACODE_REQUEST_ID:-}"
+  # The correlation key rides in the ENVIRONMENT too: LACODE_NOTIFY_SESSION
+  # names the session this popup belongs to, so the popup can be found again
+  # and closed later. It is DATA: never shown, never passed to a command, and
+  # only its emptiness is ever tested here.
+  local correlation_key="${LACODE_NOTIFY_SESSION:-}"
   icon="$(normalize_icon "${4:-}")"
 
   # Control characters are stripped from both free-text fields before anything is
@@ -154,15 +390,12 @@ send_notify() {
   # same treatment: a newline in it would forge a field. It is data, never a
   # command, and it is only ever tested for emptiness.
   request_id="${request_id//[[:cntrl:]]/ }"
+  # The correlation key is a field of the payload too, so it gets the same
+  # treatment: a newline in it would forge a field. It is data, never a
+  # command, and only its emptiness is ever tested here.
+  correlation_key="${correlation_key//[[:cntrl:]]/ }"
 
-  # The port is per-host, so it must be resolved from the same place as the user
-  # name. An explicit OC_TUNNEL_PORT still wins.
-  if [[ -z "${OC_TUNNEL_PORT:-}" ]]; then
-    local from_file
-    if from_file="$(read_notify_env OC_TUNNEL_PORT)"; then
-      TUNNEL_PORT="$from_file"
-    fi
-  fi
+  resolve_tunnel_port
 
   case "$urgency" in
     low|normal|critical) ;;
@@ -182,20 +415,23 @@ send_notify() {
     local -a target=(-p "$TUNNEL_PORT" "${hop_user}@localhost")
 
     if [[ -f "$HOME/.ssh/oc_notify" ]]; then
-      # ONE argument, not six. ssh concatenates everything after the host into
+      # ONE argument, not seven. ssh concatenates everything after the host into
       # the single command string that reaches the forced command as
       # $SSH_ORIGINAL_COMMAND, with no positional parameters at all -- separate
       # arguments arrive as one space-joined blob the receiver cannot split, and
       # the popup comes out empty. Newline-delimited fields survive that hop.
       # oc-notify-receiver splits on exactly this; update the two together.
       #
-      # Six fields, the same shape the published sender uses:
-      # title\nmessage\nurgency\nicon\nsound\nrequestID. The fifth is the
-      # sound, and it is empty here -- this path has no sounds directory to
-      # play it from, but the field is still there, so both wires agree. The
-      # sixth is the request id, empty when there is none: a non-empty one is
-      # what makes the notification actionable on the other end.
-      local payload="${title}"$'\n'"${msg}"$'\n'"${urgency}"$'\n'"${icon}"$'\n'$'\n'"${request_id}"
+      # Seven fields, the same shape the published sender uses:
+      # title\nmessage\nurgency\nicon\nsound\nrequestID\ncorrelationKey. The
+      # fifth is the sound, and it is empty here -- this path has no sounds
+      # directory to play it from, but the field is still there, so both wires
+      # agree. The sixth is the request id, empty when there is none: a
+      # non-empty one is what makes the notification actionable on the other
+      # end. The seventh is the correlation key, empty when there is none: an
+      # absent key and an empty one mean the same thing, and the field count
+      # never changes, so an older receiver still works.
+      local payload="${title}"$'\n'"${msg}"$'\n'"${urgency}"$'\n'"${icon}"$'\n'$'\n'"${request_id}"$'\n'"${correlation_key}"
 
       # The desktop end is a forced command, so its stdout comes back down this
       # same ssh connection. Capture it and print it: that is how the user's
@@ -217,19 +453,48 @@ send_notify() {
     fi
   else
     # Local: notify straight to the desktop session.
+    #
+    # Every send below carries --app-name=LaCode: the popup's header IS the
+    # notification's app name, and notify-send reports its OWN name when none is
+    # given -- so without it the popup claimed to be from a program the user
+    # never ran.
     if command -v notify-send >/dev/null 2>&1; then
       if [[ -n "$request_id" ]]; then
         # Actionable: the popup carries buttons, so notify-send waits for the
         # user to click one and prints the chosen button's NAME on stdout.
         # Capture it and print it -- that is the answer reaching the caller.
         # An empty answer means the popup was dismissed without choosing.
+        #
+        # With a correlation key the id is captured as well, because only the
+        # desktop knows it and it is what closes this popup later. notify-send
+        # prints the id on its FIRST line and the action's name after it, so
+        # the two are split apart: the id is recorded, the action is printed.
+        # The id NEVER reaches stdout -- stdout is the published answer
+        # channel, and the answer is the action.
         local action
-        action="$(notify-send "$title" "$msg" --urgency="$urgency" --icon="$icon" --expire-time=0 --action=once='Allow once' --action=always='Always allow' --action=reject='Deny' 2>/dev/null)" || return 1
+        if [[ -n "$correlation_key" ]]; then
+          local output
+          output="$(notify-send "$title" "$msg" --app-name=LaCode --urgency="$urgency" --icon="$icon" --expire-time=0 --print-id --action=once='Allow once' --action=always='Always allow' --action=reject='Deny' 2>/dev/null)" || return 1
+          record_notification_id "$correlation_key" "${output%%$'\n'*}"
+          action=""
+          [[ "$output" == *$'\n'* ]] && action="${output#*$'\n'}"
+        else
+          action="$(notify-send "$title" "$msg" --app-name=LaCode --urgency="$urgency" --icon="$icon" --expire-time=0 --action=once='Allow once' --action=always='Always allow' --action=reject='Deny' 2>/dev/null)" || return 1
+        fi
         printf '%s\n' "$action"
         return 0
       fi
+      if [[ -n "$correlation_key" ]]; then
+        # A plain popup with a correlation key: the id is captured and
+        # recorded, so this popup can be closed later, and NOTHING is printed
+        # -- there is no answer to publish, and the id is not one.
+        local output
+        output="$(notify-send "$title" "$msg" --app-name=LaCode --urgency="$urgency" --icon="$icon" --expire-time=0 --print-id 2>/dev/null)" || return 1
+        record_notification_id "$correlation_key" "${output%%$'\n'*}"
+        return 0
+      fi
       # --expire-time=0: never auto-dismissed — the notification waits for the user to close it.
-      notify-send "$title" "$msg" --urgency="$urgency" --icon="$icon" --expire-time=0 >/dev/null 2>&1 && return 0
+      notify-send "$title" "$msg" --app-name=LaCode --urgency="$urgency" --icon="$icon" --expire-time=0 >/dev/null 2>&1 && return 0
     fi
   fi
 
@@ -254,6 +519,9 @@ send_notify() {
 # as sent while nothing reached the desktop.
 if [[ -n "${OC_NOTIFY_ONLY:-}" ]]; then
   # The request id arrives in the LACODE_REQUEST_ID environment variable, not as an argument.
+  # So does the correlation key (LACODE_NOTIFY_SESSION), and so does a close
+  # request (LACODE_NOTIFY_CLOSE): a run with that variable set closes that
+  # key's popups and sends nothing, and the arguments below are ignored.
   send_notify "${1:-OpenCode}" "${2:-}" "${3:-normal}" "${4:-}"
   exit $?
 fi

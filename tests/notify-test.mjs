@@ -1,7 +1,10 @@
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from "node:fs"
+import { spawn } from "node:child_process"
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, utimesSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
+import { test } from "node:test"
+import nodeAssert from "node:assert/strict"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 // The source of truth. plugins/notify.ts is a dev-only re-export shim so
@@ -47,7 +50,16 @@ const fakeHelper = (dir, sent = join(dir, "sent.log")) => {
   return helper
 }
 
-const { Notifier, helperArgv, notifyMessage, questionHeadline, safeTitle, shouldNotify } = await import(LIB)
+const {
+  Notifier,
+  claimNotification,
+  helperArgv,
+  notifyMessage,
+  questionHeadline,
+  safeCorrelationKey,
+  safeTitle,
+  shouldNotify,
+} = await import(LIB)
 const { notifyHooks: Notify } = await import(PLUGIN)
 
 // The plugin claims the (session, kind) pair before it raises a popup, so that
@@ -891,3 +903,149 @@ if (failures.length > 0) {
   for (const failure of failures) console.error(`  - ${failure}`)
   process.exit(1)
 }
+
+// ---------------------------------------------------------------------------
+// The cross-process claim: one winner, and only for a stale claim
+// ---------------------------------------------------------------------------
+//
+// The claim is a file, so the guarantee is only real across processes. These
+// tests spawn real ones; a test that calls claimNotification twice in one
+// process would prove nothing about the bug, which is two processes judging
+// the same stale claim at once.
+
+const claimPath = (dir, sessionID, kind) =>
+  join(dir, `claim.${safeCorrelationKey(`${sessionID}.${kind}`)}`)
+
+const writeStaleClaim = (dir, sessionID, kind) => {
+  const path = claimPath(dir, sessionID, kind)
+  // A pid that cannot be running, and a timestamp older than the window: both
+  // rules the claim uses to call a claim stale, independent of the clock.
+  writeFileSync(path, "999999999")
+  const old = new Date(Date.now() - 60_000)
+  utimesSync(path, old, old)
+  return path
+}
+
+const withClaimDir = async (dir, fn) => {
+  const previous = process.env.LACODE_NOTIFY_DIR
+  process.env.LACODE_NOTIFY_DIR = dir
+  try {
+    return await fn()
+  } finally {
+    if (previous === undefined) delete process.env.LACODE_NOTIFY_DIR
+    else process.env.LACODE_NOTIFY_DIR = previous
+  }
+}
+
+// The helper is written into the test's temp dir, never checked in: the repo
+// should not grow a script whose only caller is this test.
+const writeClaimHelper = (dir) => {
+  const helper = join(dir, "claim-helper.mjs")
+  writeFileSync(
+    helper,
+    `import { existsSync, writeFileSync } from "node:fs"
+import { pathToFileURL } from "node:url"
+
+const [library, sessionID, kind, ready, go] = process.argv.slice(2)
+const { claimNotification } = await import(pathToFileURL(library).href)
+writeFileSync(ready, "")
+const deadline = Date.now() + 10_000
+const slice = new Int32Array(new SharedArrayBuffer(4))
+while (!existsSync(go)) {
+  if (Date.now() > deadline) process.exit(2)
+  Atomics.wait(slice, 0, 0, 1)
+}
+process.stdout.write(claimNotification(sessionID, kind) ? "won" : "lost")
+`,
+  )
+  return helper
+}
+
+const startClaimer = (helper, dir, sessionID, kind, tag, go) => {
+  const child = spawn(process.execPath, [helper, LIB, sessionID, kind, join(dir, `ready-${tag}`), go], {
+    env: { ...process.env, LACODE_NOTIFY_DIR: dir },
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  let stdout = ""
+  let stderr = ""
+  child.stdout.on("data", (chunk) => (stdout += chunk))
+  child.stderr.on("data", (chunk) => (stderr += chunk))
+  const done = new Promise((resolve, reject) => {
+    child.once("error", reject)
+    child.once("exit", (code) => resolve({ code, stdout, stderr }))
+  })
+  return { child, done }
+}
+
+const waitForFile = async (path, timeout = 10_000) => {
+  const deadline = Date.now() + timeout
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${path}`)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
+test("two processes claiming one stale notification produce exactly one winner", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-claim-race-"))
+  const sessionID = `race-${process.pid}-${Date.now()}`
+  const kind = "done"
+  const go = join(dir, "go")
+  writeStaleClaim(dir, sessionID, kind)
+  const helper = writeClaimHelper(dir)
+  const first = startClaimer(helper, dir, sessionID, kind, "a", go)
+  const second = startClaimer(helper, dir, sessionID, kind, "b", go)
+  try {
+    // Both processes are parked on the barrier, so they reach the takeover at
+    // the same moment rather than whenever spawn happened to schedule them.
+    await Promise.all([waitForFile(join(dir, "ready-a")), waitForFile(join(dir, "ready-b"))])
+    writeFileSync(go, "")
+
+    const results = await Promise.all([first.done, second.done])
+    for (const result of results) {
+      nodeAssert.equal(result.code, 0, `claimer failed: ${result.stderr}`)
+    }
+    const winners = results.filter((result) => result.stdout === "won")
+    nodeAssert.equal(
+      winners.length,
+      1,
+      `exactly one process may win the stale claim, got ${winners.length}: ${JSON.stringify(results.map((r) => r.stdout))}`,
+    )
+  } finally {
+    first.child.kill()
+    second.child.kill()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a fresh claim held by another live process is never taken over", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-claim-fresh-"))
+  const sessionID = `fresh-${process.pid}-${Date.now()}`
+  const kind = "permission"
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" })
+  try {
+    await new Promise((resolve) => holder.once("spawn", resolve))
+    const path = claimPath(dir, sessionID, kind)
+    writeFileSync(path, String(holder.pid))
+
+    const won = await withClaimDir(dir, () => claimNotification(sessionID, kind))
+    nodeAssert.equal(won, false, "a fresh claim belongs to the other process")
+    nodeAssert.equal(readFileSync(path, "utf8"), String(holder.pid), "the fresh claim must be left untouched")
+  } finally {
+    holder.kill()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a stale claim is taken over", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-claim-stale-"))
+  const sessionID = `stale-${process.pid}-${Date.now()}`
+  const kind = "done"
+  const path = writeStaleClaim(dir, sessionID, kind)
+  try {
+    const won = await withClaimDir(dir, () => claimNotification(sessionID, kind))
+    nodeAssert.equal(won, true, "an abandoned claim must not stop the notification")
+    nodeAssert.equal(readFileSync(path, "utf8"), String(process.pid), "the takeover must install the winner's pid")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

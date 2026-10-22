@@ -63,6 +63,22 @@ const assert = (cond, msg) => {
   assert(template.includes("omniroute"), "template must include omniroute allowlist trap")
 }
 
+// --- /pool-recheck: the manual trigger for the probe tool ---
+{
+  assert(COMMANDS["pool-recheck"], "COMMANDS['pool-recheck'] must exist")
+  const cfg = { agent: {}, command: {} }
+  applyCommands(cfg)
+  const def = cfg.command["pool-recheck"]
+  assert(def, "the recheck command must be injected")
+  assert(def.agent === undefined, `it must run inline, not borrow a pool slot, got agent: ${def.agent}`)
+  assert(def.subtask === undefined, `it must not spawn a subagent, got subtask: ${def.subtask}`)
+  assert(/\$ARGUMENTS/.test(def.template), "it must accept an optional model list")
+  assert(/pool_recheck/.test(def.template), "it must name the tool it calls")
+  assert(/models/.test(def.template), "it must say the arguments become the tool's models filter")
+  assert(/change nothing/i.test(def.template), "it must report, not edit the pool")
+  assert(/currently cooling/i.test(def.template), "it must state the no-argument meaning")
+}
+
 // --- refusal to clobber ---
 {
   const sentinel = { template: "sentinel-pool-def", description: "do-not-clobber" }

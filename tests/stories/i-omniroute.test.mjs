@@ -216,6 +216,38 @@ test("[US-28] the trivial client recipe exposes the combo alone and writes the p
   }
 })
 
+// US-28 criterion 2, on a pool source the user supplied: enabling a healthy
+// gateway must not add, drop, reorder or rebind a slot. Registering a provider
+// is the whole integration -- opting in means listing omniroute/<model> in this
+// list yourself.
+test("[US-28] a healthy gateway leaves a user-supplied pool exactly as written", async () => {
+  const gw = gateway(["model-a", "model-b"])
+  const stub = stubInput()
+  try {
+    // The user's own pool source (options.models), deliberately naming no
+    // omniroute model at all.
+    const declared = presetModels().slice(0, 2)
+    const hooks = await boot(stub, {
+      omniroute: { enabled: true, combo: "auto" },
+      models: { slots: declared.map((model, i) => ({ model, weight: i === 0 ? 3 : 2 })) },
+    })
+    const cfg = emptyConfig()
+    await hooks.config(cfg)
+
+    // The gateway is really up and registered, so "unchanged" is a fact about
+    // a live integration rather than one that quietly did nothing.
+    assert.equal(cfg.provider.omniroute.models.auto.name, "auto")
+
+    // Same models, same order, same count: no omniroute slot was prepended,
+    // substituted for a user slot, or appended to fill an empty position.
+    assert.deepEqual(poolModels(cfg), [declared[0], declared[1], undefined, undefined])
+    await hooks.dispose?.()
+  } finally {
+    gw.restore()
+    cleanupAll()
+  }
+})
+
 // US-28 criterion 5, the positive half: the gateway is DOWN and the user has
 // already listed omniroute/auto as slot 1. The decided behaviour is warning-only
 // -- the slot is kept exactly as the user wrote it, so nothing here silently

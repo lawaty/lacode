@@ -64,6 +64,34 @@ test("[US-1] the root agent cannot read, grep or glob, and is pointed at an expl
   await hooks.dispose()
 })
 
+test("[US-1] build's read-family tools are denied while the exploration base it points at can still read", async () => {
+  const stub = stubInput()
+  const hooks = await bootLaCode(stub, { id: "us1-redirect", dir: scratch() })
+  const cfg = emptyConfig()
+  await hooks.config(cfg)
+
+  const build = cfg.agent.build
+  assert.ok(build, "LaCode must inject the build root agent")
+  // The whole read family is a tool-level deny, not an "ask" and not a path rule
+  // a broader allow could win over.
+  for (const tool of ["read", "glob", "grep", "list"]) {
+    assert.equal(build.permission?.[tool], "deny", `${tool} must be denied to build`)
+  }
+  // The base build is pointed at must be able to do the reading build cannot,
+  // or the redirect is to an agent as blind as the one that was denied.
+  const explore = cfg.agent.explore
+  assert.ok(explore, "LaCode must inject the exploration base")
+  for (const tool of ["read", "glob", "grep", "list"]) {
+    assert.equal(explore.permission?.[tool], "allow", `@explore must be able to ${tool}, because build delegates it`)
+  }
+  // A permission denial tells the model nothing about what to do instead, so the
+  // prompt has to name the redirect and rule out doing it inline with bash.
+  assert.match(build.prompt, /Investigation → @explore/, "build's prompt must route investigation to @explore")
+  assert.match(build.prompt, /You CANNOT read files/i, "build's prompt must state the read tools are denied")
+  assert.match(build.prompt, /Do NOT use bash to inspect/i, "build's prompt must not leave bash as an inline reading route")
+  await hooks.dispose()
+})
+
 test("[US-1] a pooled spawn is rewritten to a variant whose model is a declared slot", async () => {
   const models = presetModels()
   const stub = stubInput()
@@ -376,6 +404,52 @@ test("[US-23] every slot in the shipped preset is free, and any slot the snapsho
   if (unknown.length > 0) {
     console.log(`    (snapshot cannot price: ${unknown.join(", ")} — reported as unknown, not assumed free)`)
   }
+})
+
+test("[US-23] a preset slot the snapshot cannot price is named unknown, never counted as free", () => {
+  const prices = snapshotModels()
+  const slots = preset().slots
+  const priced = (price) =>
+    price && typeof price.cost_input === "number" && typeof price.cost_output === "number"
+
+  // The existing audit logs an unpriceable slot and moves on, so a preset that
+  // added one would still pass: unknown would be silently not-counted, which is
+  // indistinguishable from being treated as free. Here it is a failure that
+  // names the model, so "we could not price it" can never read as "it is free".
+  const unpriced = slots.map((slot) => slot.model).filter((model) => !priced(prices[model]))
+  assert.deepEqual(
+    unpriced,
+    [],
+    `the snapshot has no price for ${unpriced.join(", ")} — that is unknown, NOT free; run tests/refresh-models-snapshot.mjs`,
+  )
+
+  for (const { model } of slots) {
+    assert.equal(prices[model].cost_input, 0, `${model} is priced — the shipped preset is the free default (US-23)`)
+    assert.equal(prices[model].cost_output, 0, `${model} is priced — the shipped preset is the free default (US-23)`)
+  }
+})
+
+test("[US-23] an unpriced configured model boots and routes with no warning at all", async () => {
+  const model = "some-vendor-nobody-has-heard-of/a-model-with-no-price"
+  assert.equal(snapshotModels()[model], undefined, "control: the pinned snapshot must have no price for this model")
+
+  const stub = stubInput()
+  const hooks = await bootLaCode(stub, { id: "us23-unpriced-silent", dir: scratch(), models: { slots: [{ model, weight: 1 }] } })
+  const cfg = configFor([model])
+  await hooks.config(cfg)
+
+  // The boot got far enough to bind the model, so any silence below is the
+  // plugin choosing not to comment, not a factory that failed before it ran.
+  assert.equal(cfg.agent["explore-1"].model, model, "the configured unpriced model must bind verbatim")
+  const warnings = () => stub.lines.filter((line) => line.level === "warn" || line.level === "error").map((line) => line.message)
+  assert.deepEqual(warnings(), [], `no price information must be silent, not a warning: ${warnings().join(" | ")}`)
+
+  // And it runs, so "no warning" is not the silence of a plugin that did nothing.
+  const { routed, model: routedModel } = await spawn(hooks, cfg, {})
+  assert.match(routed, /^explore-[1-9]$/, `the spawn must route to a slot variant, got ${routed}`)
+  assert.equal(routedModel, model, "the spawn must run on the configured unpriced model")
+  assert.deepEqual(warnings(), [], `routing must not warn about the missing price: ${warnings().join(" | ")}`)
+  await hooks.dispose()
 })
 
 test("[US-23] the pool has no model whitelist: an arbitrary exotic model binds verbatim, with no warning and no special-casing", async () => {

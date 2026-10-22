@@ -28,10 +28,17 @@
 // TunnelConfig; there is no discovery, no system probing, and no writes.
 
 import { spawn, spawnSync } from "node:child_process"
-import { existsSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { NOTIFY_CLOSE_ENV, NOTIFY_SESSION_ENV, notificationIdFile, notificationStateDir, safeCorrelationKey } from "../lib/notify.ts"
 import { PACKAGE_ROOT } from "../lib/package-root.ts"
+
+// The notification state directory and the safe-key rule live in lib/notify.ts
+// now: the plugin needs them too, and `src/plugins/*` may import `src/lib/*`
+// only. They are re-exported here because this module's published surface has
+// always carried them, and `dist/tunnel.js` is a published entry point.
+export { notificationIdFile, notificationStateDir, safeCorrelationKey }
 
 export type Urgency = "low" | "normal" | "critical"
 
@@ -79,6 +86,13 @@ export type NotifyRequest = {
    * carries buttons.
    */
   requestID?: string
+  /**
+   * The opaque key of the session this popup belongs to. It is never shown to
+   * the user and never used to build a command argument: it only says which
+   * session a popup belongs to, so that a later request can find the popup
+   * again and close it.
+   */
+  correlationKey?: string
 }
 
 export type Result = { ok: boolean; detail?: string; transport: "local" | "remote" | "none"; action?: string }
@@ -163,11 +177,66 @@ export const safeRequestId = (raw: string | undefined): string | undefined => {
   return clean.length > 128 ? clean.slice(0, 128) : clean
 }
 
+/**
+ * The marker that turns a correlation key into a CLOSE request.
+ *
+ * It travels as a prefix of the payload's seventh field, so the far end can
+ * tell "raise a popup for this session" from "take the popups of this session
+ * down" without a second field and without changing the field count.
+ */
+export const CLOSE_REQUEST_PREFIX = "close:"
+
+/**
+ * The correlation key, sanitized for the wire.
+ *
+ * Opaque like the request id: it says which session a popup belongs to, it is
+ * never shown to the user and it never builds a command argument. It is
+ * stripped of control characters exactly like the free-text fields, so it can
+ * never contain the newline the payload is delimited with -- a key that could
+ * smuggle a delimiter would split the payload and let a sender forge a field.
+ *
+ * The `close:` marker is part of this field and survives the sanitizing
+ * unchanged, so a close request is still recognizable on the other end.
+ */
+const wireCorrelationKey = (raw: string | undefined): string => safeText(raw ?? "", "", 200)
+
+/**
+ * The correlation key of a request, or undefined when it carries none.
+ *
+ * An absent key and an empty one mean the same thing: the notification is not
+ * tracked, no id is captured, and nothing is written to disk.
+ */
+const presentCorrelationKey = (raw: string | undefined): string | undefined => {
+  const clean = wireCorrelationKey(raw)
+  return clean ? clean : undefined
+}
+
+/**
+ * Whether a correlation key is a close request rather than a session.
+ *
+ * One rule, shared: the sender marks a close request in the payload's seventh
+ * field and the receiver reads that same field with this same test. Both ends
+ * have to agree on it, so it lives in one place.
+ */
+export const isCloseRequest = (correlationKey: string | undefined): boolean =>
+  typeof correlationKey === "string" && correlationKey.startsWith(CLOSE_REQUEST_PREFIX)
+
+/**
+ * The session a close request names, or undefined when the field is not a
+ * close request.
+ */
+export const closeRequestTarget = (correlationKey: string | undefined): string | undefined => {
+  if (!isCloseRequest(correlationKey)) return undefined
+  const target = correlationKey?.slice(CLOSE_REQUEST_PREFIX.length).trim() ?? ""
+  return target ? target : undefined
+}
+
 /** The delimiter `encodePayload` joins fields with. Also what the receiver splits on. */
 export const FIELD_SEPARATOR = "\n"
 
 /**
- * One argument, six newline-delimited fields: `title\nmessage\nurgency\nicon\nsound\nrequestID`.
+ * One argument, seven newline-delimited fields:
+ * `title\nmessage\nurgency\nicon\nsound\nrequestID\ncorrelationKey`.
  *
  * The single-argument shape is not a style choice, it is what the transport
  * actually provides. ssh concatenates everything after the host into ONE command
@@ -182,6 +251,11 @@ export const FIELD_SEPARATOR = "\n"
  * and sound are whitelisted values, and `safeRequestId` strips them from the
  * request id. No field can contain the delimiter, so the split is lossless for
  * a body containing spaces, quotes or glob characters.
+ *
+ * The seventh field is the correlation key and it is EMPTY when there is none,
+ * so the field count never changes: a six-field payload from an older sender
+ * still parses, and a seven-field payload still reaches an older receiver,
+ * which ignores the field it does not know.
  */
 /**
  * The inverse of `encodePayload`: the newline-delimited payload a forced command
@@ -189,7 +263,8 @@ export const FIELD_SEPARATOR = "\n"
  * boundary, rather than assumed from the sender.
  */
 export function parsePayload(raw: string): NotifyRequest {
-  const [title, message, urgency, icon, sound, requestID] = raw.split(FIELD_SEPARATOR)
+  const [title, message, urgency, icon, sound, requestID, correlationKey] = raw.split(FIELD_SEPARATOR)
+  const key = wireCorrelationKey(correlationKey)
   return {
     title: safeTitle(title),
     message: safeMessage(message),
@@ -197,6 +272,9 @@ export function parsePayload(raw: string): NotifyRequest {
     icon: normalizeIcon(icon),
     sound: normalizeSound(sound),
     requestID: safeRequestId(requestID),
+    // The seventh field, empty when there is none. A close request keeps its
+    // marker here, so the receiver can still tell it apart from a session.
+    ...(key ? { correlationKey: key } : {}),
   }
 }
 
@@ -210,6 +288,10 @@ export const encodePayload = (request: NotifyRequest): string =>
     // The sixth field, empty when there is no request id: an absent id and an
     // empty one mean the same thing, and the field count never changes.
     safeRequestId(request.requestID) ?? "",
+    // The seventh field, the correlation key, empty when there is none. The
+    // `close:` marker of a close request is part of the key and travels with
+    // it, so the far end closes instead of raising.
+    wireCorrelationKey(request.correlationKey),
   ].join(FIELD_SEPARATOR)
 
 /**
@@ -239,9 +321,16 @@ const CONTROL_OPTS = [
   "-o", `ControlPath=${join(homedir(), ".ssh", "lacode-cm-%C")}`,
 ]
 
-const run = (command: string, args: string[], timeout: number) => {
+// The extra environment a command needs, on top of the inherited one. Absent
+// means "inherit unchanged", which is what every other call wants.
+const run = (command: string, args: string[], timeout: number, extraEnv?: NodeJS.ProcessEnv) => {
   try {
-    const result = spawnSync(command, args, { timeout, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+    const result = spawnSync(command, args, {
+      timeout,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}),
+    })
     return {
       ok: result.status === 0,
       stdout: result.stdout ?? "",
@@ -368,6 +457,19 @@ const NO_CHANNEL: Record<string, string> = {
 const NEVER_EXPIRE_FLAG = "--expire-time=0"
 
 /**
+ * The app name the popup is raised under.
+ *
+ * On KDE Plasma the popup's header IS the notification's app name, and
+ * notify-send reports its OWN name when none is given -- so the popup used to
+ * say "notify-send" at the top, claiming to be a program the user never ran.
+ * Naming the app is what makes the header say "LaCode".
+ *
+ * The macOS branch does not need it: terminal-notifier takes `-appName`, and
+ * it already says LaCode.
+ */
+const APP_NAME_FLAG = "--app-name=LaCode"
+
+/**
  * The buttons an actionable notification offers. The names are opencode's own
  * permission-reply values, so a clicked button is already a valid answer; the
  * labels are what the user reads.
@@ -384,6 +486,152 @@ export const NOTIFICATION_ACTIONS: ReadonlyArray<readonly [string, string]> = [
  */
 const ACTION_WAIT_MS = 10 * 60_000
 
+// ---------------------------------------------------------------------------
+// The notification id: how a popup is found again so it can be closed
+// ---------------------------------------------------------------------------
+
+/**
+ * A notification id is a decimal integer and nothing else.
+ *
+ * The ids come out of a file on disk, so a malformed line must never reach a
+ * command argument: it is ignored instead, and the rest of the file still
+ * closes.
+ */
+export const isNotificationId = (id: string): boolean => /^\d+$/.test(id)
+
+/**
+ * Append one notification id to its correlation key's file.
+ *
+ * One id per line, because a session can have more than one popup up. The file
+ * is appended to by the raiser and read then deleted by the closer.
+ *
+ * Only a decimal integer is recorded: anything else in the daemon's output is
+ * not an id, and a line that is not an id must never become a command argument
+ * later.
+ */
+const recordNotificationId = (correlationKey: string, id: string): boolean => {
+  if (!isNotificationId(id)) return false
+  try {
+    mkdirSync(notificationStateDir(), { recursive: true })
+    appendFileSync(notificationIdFile(correlationKey), `${id}\n`, "utf8")
+    return true
+  } catch {
+    // A popup that cannot be tracked cannot be closed later. The popup itself
+    // is up, and that is the part the user sees.
+    return false
+  }
+}
+
+/**
+ * The session bus to talk to the notification daemon over.
+ *
+ * The daemon is on the SESSION bus, and the address is usually already in the
+ * environment. It is not always: an ssh forced command -- which is exactly how
+ * the desktop end of the hop runs -- inherits no session bus, and the common
+ * systemd layout has one at a predictable path. Without this a close would
+ * work from a terminal and fail from the hop, which is the harder half.
+ */
+const sessionBusEnv = (): NodeJS.ProcessEnv => {
+  if (process.env.DBUS_SESSION_BUS_ADDRESS) return {}
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined
+  return uid === undefined ? {} : { DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${uid}/bus` }
+}
+
+/**
+ * How long a close may take. It is a message to a local daemon, not a
+ * network call, so it is either instant or the daemon is not there.
+ */
+const CLOSE_TIMEOUT_MS = 5_000
+
+/**
+ * Close one popup by its notification id, over the session bus.
+ *
+ * Two tools, because neither is everywhere: `gdbus` first and `dbus-send` as
+ * the fallback. The id is a validated decimal integer, so it can only ever be
+ * a number in a command argument.
+ *
+ * A close that fails returns false and never throws: the popup stays, and
+ * nothing else changes. That is not an error the user needs to hear about.
+ */
+export function closeNotification(id: string): boolean {
+  if (!isNotificationId(id)) return false
+  const env = sessionBusEnv()
+  const viaGdbus = run(
+    "gdbus",
+    [
+      "call",
+      "--session",
+      "--dest", "org.freedesktop.Notifications",
+      "--object-path", "/org/freedesktop/Notifications",
+      "--method", "org.freedesktop.Notifications.CloseNotification",
+      id,
+    ],
+    CLOSE_TIMEOUT_MS,
+    env,
+  )
+  if (viaGdbus.ok) return true
+  const viaDbusSend = run(
+    "dbus-send",
+    [
+      "--session",
+      "--dest=org.freedesktop.Notifications",
+      "--type=method_call",
+      "/org/freedesktop/Notifications",
+      "org.freedesktop.Notifications.CloseNotification",
+      `uint32:${id}`,
+    ],
+    CLOSE_TIMEOUT_MS,
+    env,
+  )
+  return viaDbusSend.ok
+}
+
+/**
+ * Close every popup of one correlation key, and forget them.
+ *
+ * The ids are read from the key's file and the file is deleted: the ids are
+ * consumed by the close. A file that does not exist means nothing was raised
+ * under that key, which is not a failure -- there is nothing to take down.
+ */
+export function closeCorrelationKey(correlationKey: string): boolean {
+  const file = notificationIdFile(correlationKey)
+  let content = ""
+  try {
+    content = readFileSync(file, "utf8")
+  } catch {
+    return true
+  }
+  let closed = true
+  for (const line of content.split("\n")) {
+    const id = line.trim()
+    // A line that is not a decimal integer is not an id: it is ignored, and
+    // the rest of the file still closes.
+    if (!isNotificationId(id)) continue
+    if (!closeNotification(id)) closed = false
+  }
+  try {
+    unlinkSync(file)
+  } catch {
+    // The popups are down; a file that will not delete is a leftover, not
+    // something the user has to hear about.
+  }
+  return closed
+}
+
+/**
+ * Split what notify-send printed into the notification id and the action.
+ *
+ * `--print-id` prints the id on the FIRST line and the clicked action's name
+ * after it -- the name only when the popup was actionable and the user
+ * clicked. The id is the daemon's handle on the popup and the action is the
+ * user's answer; mixing them up would answer a permission with a number.
+ */
+const splitNotifyOutput = (stdout: string): { id: string; action: string } => {
+  const newline = stdout.indexOf("\n")
+  if (newline === -1) return { id: stdout.trim(), action: "" }
+  return { id: stdout.slice(0, newline).trim(), action: stdout.slice(newline + 1).trim() }
+}
+
 /**
  * Deliver straight to the local desktop session. Never throws, never blocks
  * longer than the notifier timeout.
@@ -397,6 +645,15 @@ const ACTION_WAIT_MS = 10 * 60_000
  * same reason `notifyHooks` takes a `deliver` seam.
  */
 export function sendLocal(request: NotifyRequest, platform: string = process.platform): Result {
+  // A close request is not a notification. The popup lives on the desktop and
+  // only the desktop can take it down, so this is where the far end of the hop
+  // lands: a payload that names a session to close closes that session's
+  // popups and raises nothing at all.
+  const closing = closeRequestTarget(request.correlationKey)
+  if (closing !== undefined) {
+    const closed = closeCorrelationKey(closing)
+    return { ok: closed, detail: closed ? undefined : "a popup could not be closed", transport: "local" }
+  }
   // Play an alert sound, if available.
   //
   // This is spawned here because `sendLocal` is the only function that
@@ -439,13 +696,20 @@ export function sendLocal(request: NotifyRequest, platform: string = process.pla
   const requestID = safeRequestId(request.requestID)
   const actionable = channel === "notify-send" && requestID !== undefined
   const actionArgs = actionable ? NOTIFICATION_ACTIONS.map(([name, label]) => `--action=${name}=${label}`) : []
+  // The correlation key, when there is one, is what makes the popup closable:
+  // notify-send is asked for the id the daemon gave it, and that id is
+  // recorded next to the key, so a later close request can find the popup
+  // again. No key means no id is captured and nothing is written -- exactly
+  // the behaviour a notification has always had.
+  const correlationKey = presentCorrelationKey(request.correlationKey)
+  const trackable = channel === "notify-send" && correlationKey !== undefined
   const args =
     channel === "osascript"
       ? ["-e", DARWIN_SCRIPT, DARWIN_ARGV_MARKER, title, body]
       : channel === "terminal-notifier"
         ? ["-title", title, "-message", body, "-appName", "LaCode", "-priority", normalizeUrgency(request.urgency)]
         : // Never auto-dismissed: the notification waits for the user to close it.
-          [title, body, `--urgency=${normalizeUrgency(request.urgency)}`, `--icon=${normalizeIcon(request.icon)}`, NEVER_EXPIRE_FLAG, ...actionArgs]
+          [title, body, APP_NAME_FLAG, `--urgency=${normalizeUrgency(request.urgency)}`, `--icon=${normalizeIcon(request.icon)}`, NEVER_EXPIRE_FLAG, ...(trackable ? ["--print-id"] : []), ...actionArgs]
   // `--action` implies `--wait`: the notifier blocks until the user clicks, so
   // the fire-and-forget timeout would kill the prompt before it could be
   // answered. An actionable send waits for the answer instead.
@@ -453,7 +717,16 @@ export function sendLocal(request: NotifyRequest, platform: string = process.pla
   playSound()
   // notify-send prints the NAME of the clicked button on stdout. Empty stdout
   // means the user dismissed the popup without choosing: no action at all.
-  const action = actionable ? result.stdout.trim() : ""
+  //
+  // With `--print-id` the stdout carries the notification id FIRST and the
+  // action after it, so the two are split apart: the id is the daemon's handle
+  // on the popup, the action is the user's answer, and they must never be
+  // confused with each other.
+  const printed = trackable ? splitNotifyOutput(result.stdout) : { id: "", action: result.stdout.trim() }
+  const action = actionable ? printed.action : ""
+  // The id is recorded, never printed: the helper's stdout carries the action
+  // name and nothing else, and that contract is published.
+  if (correlationKey !== undefined && printed.id) recordNotificationId(correlationKey, printed.id)
   return {
     ok: result.ok,
     detail: result.ok ? undefined : result.stderr || result.detail,
@@ -536,7 +809,27 @@ export function sendRemote(request: NotifyRequest, tunnel: TunnelConfig): Result
  */
 export function notify(request: NotifyRequest, env: NodeJS.ProcessEnv = process.env, platform: string = process.platform): Result {
   try {
-    const result = isRemote(env) ? sendRemote(request, resolveTunnel(env)) : sendLocal(request, platform)
+    // A close request is not a notification: the plugin asks the helper to
+    // take a popup down, and nothing is raised. The helper is the one that
+    // talks to the desktop in both topologies, so this is the only place that
+    // knows which end can actually close a popup.
+    const closeKey = (env[NOTIFY_CLOSE_ENV] ?? "").trim()
+    if (closeKey) {
+      if (!isRemote(env)) {
+        const closed = closeCorrelationKey(closeKey)
+        return { ok: closed, detail: closed ? undefined : "a popup could not be closed", transport: "local" }
+      }
+      // The desktop owns the popup, so the request hops there: the payload's
+      // seventh field names the session to close, and nothing is sent.
+      return sendRemote({ ...request, correlationKey: `${CLOSE_REQUEST_PREFIX}${closeKey}` }, resolveTunnel(env))
+    }
+    // The correlation key rides in the environment, not in the argv: the
+    // helper's argv is a published contract and the key is opaque. It says
+    // which session the popup belongs to, so that a later request can find the
+    // popup again and close it.
+    const sessionKey = presentCorrelationKey(env[NOTIFY_SESSION_ENV])
+    const tracked = sessionKey ? { ...request, correlationKey: request.correlationKey ?? sessionKey } : request
+    const result = isRemote(env) ? sendRemote(tracked, resolveTunnel(env)) : sendLocal(tracked, platform)
     // The chosen action travels with the result: a clicked button is already a
     // valid answer, so it must not be dropped on the way back to the caller.
     return result.action ? { ...result, action: result.action } : result

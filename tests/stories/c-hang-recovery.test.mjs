@@ -3,6 +3,7 @@
 //   US-8  a wedged subagent is detected and aborted
 //   US-9  the aborted slot returns to the pool without a restart
 //   US-10 hangs are surfaced, never silent
+//   US-31 a stall with no limit signal is killed, cooled and re-routed
 //
 // No suite here sleeps for real time. A hang is defined by two elapsed
 // durations (STUCK_MIN_AGE_MS, STUCK_IDLE_MS) and both are read from Date.now(),
@@ -59,11 +60,33 @@ const stubFetch = () => {
  * Route one spawn and bind it to a child session, exactly as opencode does:
  * the task hook claims a slot, then session.created binds the child to it.
  * Without the bind, the claim has no target and can never be judged idle.
+ *
+ * The routing decision is returned: a test that wants to know WHICH slot the
+ * work went to needs it, and reading it back off the log would be a guess.
  */
 const spawnChild = async (hooks, cfg, { callID, sessionID = "parent", childID }) => {
-  await spawn(hooks, cfg, { subagent: "explore", callID, sessionID })
+  const routed = await spawn(hooks, cfg, { subagent: "explore", callID, sessionID })
   await emit(hooks, "session.created", { info: { id: childID, parentID: sessionID } })
+  return routed
 }
+
+/**
+ * A config whose variant agents EXIST, so the config hook binds the pool's
+ * models to them and a routing decision can be read back as a model and not
+ * only as a slot name. The pool numbers its slots by position, so the Nth
+ * model is slot N.
+ */
+const configWithVariants = (models) => {
+  const cfg = configFor(models)
+  cfg.agent = {}
+  models.forEach((_, index) => {
+    for (const base of pool.BASES) cfg.agent[pool.agentFor(base, index + 1)] = {}
+  })
+  return cfg
+}
+
+/** The cooldown file a model is benched under, in the pool's own naming. */
+const limitFile = (dir, model) => join(dir, `limit.${model.replace(/[^a-zA-Z0-9._-]/g, "__")}.json`)
 
 /**
  * One message event for a child session. That is the whole of "proof of life":
@@ -552,5 +575,70 @@ test("[US-10] a failure before the sweep's try block still never escapes the hoo
     stub.text().some((line) => line.startsWith("error") && line.includes("clock exploded early")),
     `the failure must reach the app log:\n${stub.text().join("\n")}`,
   )
+  await hooks.dispose()
+})
+
+// ---------------------------------------------------------------------------
+// US-31 -- a stall with no limit signal at all
+// ---------------------------------------------------------------------------
+
+test("[US-31] a session that stalls with no limit signal is killed, cooled and re-routed", async () => {
+  // The Epic C half of US-31. A provider that has run out of allowance does not
+  // always say so: sometimes it accepts the request and then says nothing, and
+  // opencode keeps retrying the refused model. No error, no limit status, no log
+  // line -- so the limit paths have nothing to act on and only the watchdog can
+  // end the wait. It has to end it itself: abort the session, cool the model,
+  // and let the next spawn land on a slot that still answers.
+  //
+  // Two slots on DIFFERENT providers, so cooling one model cannot bench the
+  // other. prov/one carries weight 2, which makes the rotation's run [1,1,2]:
+  // the turn after the first spawn comes BACK to prov/one, so only the
+  // cooldown can move the retry off it. With equal weights the retry would
+  // land on the other slot anyway, and the cooldown would prove nothing.
+  const clock = fakeClock()
+  const net = stubFetch()
+  const slots = [
+    { model: "prov/one", weight: 2 },
+    { model: "other/two", weight: 1 },
+  ]
+  const { hooks, dir, stub } = await bootPool("us31-silent", { reapMs: 40, models: { slots } })
+  const cfg = configWithVariants(slots.map((s) => s.model))
+  await hooks.config(cfg)
+
+  // The spawn that wedges: routed to prov/one, and bound to a child session so
+  // the reaper has a session to aim at.
+  const first = await spawnChild(hooks, cfg, { callID: "c1", childID: "child-silent" })
+  assert.equal(first.model, "prov/one", `control: the first spawn must land on prov/one, got ${first.model}`)
+
+  // No limit signal ever arrives: the provider simply stops answering. The
+  // claim is now older than STUCK_MIN_AGE and silent for longer than
+  // STUCK_IDLE, which is the whole condemn rule.
+  clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
+  // The one real timer in the suite: reapMs=40, and a 150ms wait is long
+  // enough for the reaper to sweep on its own.
+  await new Promise((resolve) => setTimeout(resolve, 150))
+
+  assert.deepEqual(
+    net.aborted,
+    ["child-silent"],
+    `the silent session must be aborted, got ${JSON.stringify(net.aborted)}`,
+  )
+  // Silence is the fault here: the reaper must report it as a hang, and name
+  // the model it benched.
+  assert.ok(
+    stub.text().some((line) => /^warn hung explore on prov\/one after \d+s with \d+s of silence/.test(line)),
+    `the stall must be reported as silence on the model:\n${stub.text().join("\n")}`,
+  )
+
+  // The model is cooled, so the cooldown file is written and the slot benched.
+  const cooled = limitFile(dir, "prov/one")
+  assert.ok(existsSync(cooled), `a cooldown file must be written, got: ${readdirSync(dir).join(", ")}`)
+
+  // And the retry lands on the OTHER slot: the rotation's next turn was
+  // prov/one again, so only the cooldown moved it.
+  const retry = await spawn(hooks, cfg, { subagent: "explore", callID: "next", sessionID: "next" })
+  assert.notEqual(retry.routed, first.routed, `the retry must leave the cooled slot, got ${retry.routed}`)
+  assert.notEqual(retry.model, first.model, `the retry must not use the cooled model ${first.model}, got ${retry.model}`)
+  net.restore()
   await hooks.dispose()
 })

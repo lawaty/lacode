@@ -1,6 +1,6 @@
 {
   "_source": "https://models.dev/api.json",
-  "_fetched": "2026-10-19",
+  "_fetched": "2026-10-22",
   "models": {
     "opencode/big-pickle": {
       "cost_input": 0,
@@ -9,10 +9,10 @@
       "tool_call": true,
       "reasoning": true
     },
-    "opencode-go/minimax-m3.1-flash-free": {
+    "opencode-go/beam-free": {
       "cost_input": 0,
       "cost_output": 0,
-      "context": 1000000,
+      "context": 1048576,
       "tool_call": true,
       "reasoning": true
     },

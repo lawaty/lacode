@@ -115,7 +115,7 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given claims are held by several processes, When the status view is requested, Then it shows every process's claims and the aggregate load per slot.
 - [ ] Given a model is cooling with a stated reason, When the status view is requested, Then the model is listed as cooling together with that reason.
 - [ ] Given a claim file is older than the dead-file threshold, When the status view is computed, Then the stale claim is pruned rather than counted.
-- [ ] Given a slot is at its ceiling, When the status view is requested, Then it is not marked as the slot the next spawn would take, because the rotation's turns are skipped for a full slot until it frees a claim.
+- [ ] Given a slot is at its ceiling, When the status view is requested, Then it is not marked as the slot the next spawn would take, because the rotation's turns are skipped for a full slot until it frees a claim — unless no other slot is available and under its ceiling, in which case that full slot is the next one.
 
 ### US-7: Non-free models still work
 **As a** user who wants a paid model in the pool, **I want** to supply any model list, **so that** the pool is not restricted to free tiers.
@@ -150,6 +150,23 @@ does not.
 - [ ] Given a pool slot naming an `omniroute/<model>`, When the pool resolves and binds, Then that slot routes as an ordinary slot, and the pool does not warn the provider is missing, because OmniRoute registers the provider before the pool's config hook runs.
 - [ ] Given OmniRoute is disabled, enabled with an invalid block, unhealthy, or returns no usable models, When the config hook runs, Then no provider is registered, no pool slot changes, and a failure is warned about once.
 - [ ] Given the gateway is unreachable, When pooled work runs, Then the only thing affected is a slot that names `omniroute/<model>`; every other slot keeps working, because the plugin never put an `omniroute` slot in the pool.
+
+### US-31: A limit that hangs is killed, and the retry lands on a slot that answers
+**As a** user whose provider has run out of allowance, **I want** the stalled task killed and the retry sent to a slot that is not on cooldown, **so that** one exhausted provider does not strand the session.
+
+A limit does not always arrive as an error. Sometimes the provider accepts the request and then says nothing, and opencode keeps retrying the refused model — so the task is neither done nor failed, and the session waits on a provider that has already said no. The plugin has to end that wait itself: abort the stalled session, cool the model that was refused, and let the retry pick a slot that answers. When the provider names itself, the whole provider is benched; when it does not, only the model the session was running on is cooled — that is the one the refusal is evidence about.
+
+**Story ID(s) for tests:** US-31
+**Acceptance criteria:**
+- [ ] Given a pooled session's provider reports a limit in a retry status that names no provider, When the status is handled, Then the model that session is running on is cooled and a cooldown file is written for it.
+- [ ] Given a pooled session reports a limit and then goes silent, When the limit is handled, Then that session is aborted and its claim is released, so the slot is not held by a task that will never answer.
+- [ ] Given the refused model is cooling, When the caller retries the spawn, Then the retry is routed to a different slot whose model is not on cooldown.
+- [ ] Given a limit names its provider, When the limit is handled, Then every slot on that provider is cooled and a slot on another provider is not.
+- [ ] Given a limit-shaped error whose text is exactly `limit reached` and which carries no status code, When the error is matched, Then the model is cooled and the in-flight session is aborted.
+- [ ] Given an error whose text is `context limit reached`, When the error is matched, Then nothing is cooled and nothing is aborted, because a prompt that is too long is not a provider quota.
+- [ ] Given a session stalls with no limit signal at all, When the reaper sweeps, Then the session is aborted, its model cooled, and the next spawn routes to a slot that is not on cooldown.
+- [ ] Given a provider reports a transient upstream outage rather than a limit, When the status is handled, Then the model is cooled for one short flat window instead of the quota window, and the session is still aborted, because an outage lifts on its own and must not bench a healthy model.
+- [ ] Given a transient outage was cooled, When the same model later fails with a real limit, Then the cooldown starts at the first strike rather than an escalated one, because an outage lifts on its own and must not make the next quota window longer.
 
 ---
 
@@ -239,6 +256,22 @@ does not.
 - [ ] Given a machine with no notification channel at all, When a notification is raised, Then its sound still plays, because on such a desktop the tone is the only alert there is.
 - [ ] Given the plugin option `sound` is `false`, or `LACODE_SOUND` is `0`, `false`, `off` or `no`, When a notification is delivered, Then its sound is `none`; when both are set the environment wins over the option, and any other value — a typo included — leaves sound on, because a misspelt variable must not be how you get silence.
 - [ ] Given a sound name that is not one of `none`, `done`, `question`, `permission` or `error`, When it arrives, Then it is treated as `none` and never becomes a path or a command, because the hop carries data only (see US-18).
+
+### US-30: A notification fades once you are working in that chat
+**As a** user with several sessions open, **I want** the popup of the session I am working in to close itself, **so that** a notice I have already dealt with stops sitting on my screen waiting for an X I was never going to press.
+
+A popup the user is already looking past has said everything it is going to say: once they answer the permission, answer the question, or type into that session's chat, the answer is on their screen already. So the popup fades on its own — but never sooner than five seconds after it was raised, because a notice nobody could read is no notice, and a popup nobody touched still waits for them, exactly as before.
+
+The popup belongs to its session: working in one chat closes that chat's popup and no other. The close is the **helper's** job, never the plugin's, because the popup lives on the desktop and only the desktop knows the notification id the daemon gave it. One code path, two topologies: the helper closes locally, or over the hop where the popup was actually raised.
+
+**Story ID(s) for tests:** US-30
+**Acceptance criteria:**
+- [ ] Given a notification has been delivered, When the user answers a permission, answers a question, or types into that session's chat, Then that session's notification closes by itself, without the user clicking the popup's close button.
+- [ ] Given a notification was delivered less than five seconds ago, When the user works in that chat, Then the notification stays until five seconds have passed, because a notice nobody could read is no notice.
+- [ ] Given the user works in one session's chat, When another session still has a popup up, Then that popup stays: a notification belongs to its session, and only that session's user is looking at it.
+- [ ] Given the user never works in that chat, When the notification was delivered, Then it stays until the user closes it, exactly as before.
+- [ ] Given a permission popup is closed this way, When the permission was already answered in the terminal, Then nothing is answered twice: the close takes the popup down and answers nothing.
+- [ ] Given the notification was delivered by a session on a remote host and reached the desktop over the tunnel, When the user works in that chat, Then the popup on the desktop closes too, because the popup lives on the desktop and only the desktop knows its notification id.
 
 ---
 
@@ -380,7 +413,7 @@ agents read it before they explore, then keeps it current on its own.
 **Acceptance criteria:**
 - [ ] Given a config that defines none of LaCode's agents, When the config hook runs, Then a `context` subagent is injected, and it carries no model of its own, because the pool is the only thing that decides which model runs it.
 - [ ] Given the injected agent set, When the slot variants are built, Then a hidden `context-<slot>` variant exists for every slot the pool can hand out, so a cartography run borrows shared capacity instead of a dedicated model.
-- [ ] Given a user config with no `instructions` array, When the config hook runs, Then the standing context-map rule is injected, naming all five map files, telling the agent to check with `ls` and never the `glob` tool, to read only the file relevant to the task, and to start from the canonical entry points the map lists.
+- [ ] Given the shipped agent prompts and the context agent, When they are inspected, Then they carry the standing context-map rule — naming all five map files, checking with `ls` and never the `glob` tool, reading only the file relevant to the task, and starting from the canonical entry points the map lists — because that rule now lives in the repo-level `AGENTS.md` rather than being injected into the user's `instructions` array.
 - [ ] Given the injected `context`, When its prompt is inspected, Then it names the five files it owns, requires a short "Start here" list of canonical files per significant subsystem, and forbids file inventories — the map answers "what should I look at first?", never "tell me everything".
 
 ### US-20: The map stays current without being asked
@@ -424,10 +457,49 @@ Enforcement is split deliberately, and the split matters: **what the permission 
 
 ---
 
+## Epic H — Retention (sweeps)
+
+### US-32: Retire old sessions
+**As an** opencode user whose session list only ever grows, **I want** a sweep that retires sessions past a retention window together with everything that belongs to them, **so that** the database stays usable and I keep a compact record of what went.
+
+**Story ID(s) for tests:** US-32
+**Acceptance criteria:**
+- [ ] Given sessions whose `time_created` is older than `--days` (default 30) and whose `time_updated` is older than `--grace-hours` (default 24), When the sweep runs, Then those sessions are retired together with their messages, parts, todos, shares, inputs, context epochs and event rows.
+- [ ] Given a session that is old but was touched inside the grace window, When the sweep runs, Then it is left alone, because the grace window is a stop, not a speed.
+- [ ] Given an old parent session with a child, When the sweep runs, Then the child is retired together with the parent, so no orphan remains.
+- [ ] Given `--directory D`, When the sweep runs, Then only sessions rooted in that directory are selected, and a child in another directory goes with its parent.
+- [ ] Given `--limit N`, When the sweep runs, Then at most N top-level sessions (with their descendants) are retired.
+- [ ] Given `--dry-run`, When the sweep runs, Then it reports what would go and changes nothing on disk.
+- [ ] Given `--no-events`, When the sweep runs, Then the event rows of the retired sessions are kept.
+- [ ] Given `--vacuum`, When the sweep runs, Then the database is rewritten afterwards so the freed pages go back to the filesystem.
+- [ ] Given sessions are retired, When the sweep completes, Then a compact record (id, title, directory, project, created, updated) is written under the session archive, which is the recovery path.
+
+### US-33: Prune the event log
+**As an** opencode user whose `event` table grows without bound, **I want** a sweep that deletes event rows older than a window except those belonging to protected sessions, **so that** the database stops growing while the transcript and sync stay intact.
+
+**Story ID(s) for tests:** US-33
+**Acceptance criteria:**
+- [ ] Given event rows whose id is older than `--days` (default 7), When the sweep runs, Then those rows are candidates and newer rows are not, because the id carries the row's creation time.
+- [ ] Given a session that takes part in session sync (`event_sequence.owner_id` set), When the sweep runs, Then none of its event rows are pruned.
+- [ ] Given a session that belongs to a workspace, When the sweep runs, Then none of its event rows are pruned.
+- [ ] Given a session touched inside the grace window (`--grace-hours`, default 1), When the sweep runs, Then all of its event rows are kept.
+- [ ] Given an event whose session row is gone, When the sweep runs, Then that event is pruned, because it is garbage.
+- [ ] Given `--dry-run`, When the sweep runs, Then it reports the counts and deletes nothing, and still writes one JSON line to the run log.
+- [ ] Given `--limit N`, When the sweep runs, Then at most N rows are deleted, oldest first, and the remainder is reported for a later run.
+- [ ] Given a window longer than the id era, When the sweep runs, Then the window is clamped to the era and the table is not wiped, and the operator is warned.
+- [ ] Given candidate rows, When they are deleted, Then deletion happens in chunks and a failure mid-run leaves the rest for a later run.
+- [ ] Given `--vacuum` (and not `--dry-run`), When the sweep runs, Then the database is rewritten afterwards.
+- [ ] Given the sweep runs, When it completes, Then the `event_sequence` and `session` tables are never changed.
+- [ ] Given a run, When it completes, Then one JSON line is appended to `~/.local/share/opencode/lacode/event-prune.jsonl` carrying ts, days, graceHours, cutoff, rows, bytes, aggregates, dryRun and elapsedMs.
+
+---
+
 ## Coverage
 
-Every story below has at least one behavioural test in `tests/stories/`, and
-`tests/stories/coverage.test.mjs` enforces that mechanically in both directions:
+Every story below has at least one behavioural test. The story suites live in
+`tests/stories/`, and the root-level suites `tests/*-test.mjs` are scanned too
+(US-32, US-33), so `tests/stories/coverage.test.mjs` enforces coverage in both
+directions:
 it fails if a story here has no test, and it fails if a test names a story this
 document does not define. The acceptance criteria above are unchanged; only this
 table was filled in.
@@ -443,6 +515,7 @@ table was filled in.
 | US-6 | B | `tests/stories/b-provider-resilience.test.mjs` |
 | US-7 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/pool-models-test.mjs` |
 | US-28 | B | `tests/stories/i-omniroute.test.mjs` |
+| US-31 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/stories/c-hang-recovery.test.mjs` |
 | US-8 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs` |
 | US-9 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs`, `tests/pool-shared-test.mjs` |
 | US-10 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs`, `tests/pool-timer-test.mjs` |
@@ -450,6 +523,7 @@ table was filled in.
 | US-12 | D | `tests/stories/d-notifications.test.mjs`, `tests/notify-test.mjs` |
 | US-25 | D | `tests/stories/d-notifications.test.mjs` |
 | US-29 | D | `tests/stories/d-notifications.test.mjs` |
+| US-30 | D | `tests/stories/d-notifications.test.mjs`, `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |
 | US-13 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/notify-test.mjs`, `tests/oc-test.mjs` |
 | US-14 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |
 | US-18 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |
@@ -463,10 +537,15 @@ table was filled in.
 | US-20 | G | `tests/stories/g-context-management.test.mjs` |
 | US-21 | G | `tests/stories/g-context-management.test.mjs`, `tests/permission-test.mjs` |
 | US-22 | G | `tests/stories/g-context-management.test.mjs` |
+| US-32 | H | `tests/retire-old-sessions-test.mjs` |
+| US-33 | H | `tests/prune-old-events-test.mjs` |
 
 The nine suites under `tests/` are unit-style; the `tests/stories/` suites are
 the behavioural layer, written one epic per file with every test name carrying
 its story id. Run everything with `npm test`.
 
-**No story is uncovered.** US-1, US-2, US-3, US-6, and all of epic F have tests,
-and the coverage guard fails the build if any of them loses one.
+**No story is uncovered.** The guard reports 33 stories, 325 test cases, and
+33/33 stories with at least one behavioural test; US-1, US-2, US-3, US-6, and
+all of epic F have tests, and the coverage guard fails the build if any of them
+loses one. The scan covers the `tests/stories/` suites and the root-level
+`tests/*-test.mjs` suites.

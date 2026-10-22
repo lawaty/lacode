@@ -26,7 +26,7 @@
     "  3. once EVERY slot is at its ceiling, the overflow goes to the least loaded slot,",
     "     so a burst past the summed ceilings degrades to even spreading and never blocks",
     "",
-    "With this file: big-pickle takes 3 consecutive turns, then minimax-m3.1-flash-free",
+    "With this file: big-pickle takes 3 consecutive turns, then beam-free",
     "(opencode-go) takes 2, then deepseek-v4.1-flash-free and glm-5.3-flash-free take 1",
     "each -- sequence 1,1,1,2,2,3,4,...",
     "Equal weights give a plain round robin in list order. 2,2,1,1 reproduces the old",
@@ -80,11 +80,11 @@
     "Re-check any model you substitute against models.dev; this project does not look prices",
     "up at runtime and will not guess at them for you.",
     "",
-    "Changing this file requires restarting every opencode process: plugins are not hot-reloaded."
+    "Changing this file is picked up live: the pool watches its sources, reloads the slot table and validates every slot. A restart is only needed for plugin CODE, not for a pool edit."
   ],
   "slots": [
     { "model": "opencode/big-pickle", "weight": 3 },
-    { "model": "opencode-go/minimax-m3.1-flash-free", "weight": 2 },
+    { "model": "opencode-go/beam-free", "weight": 2 },
     { "model": "opencode/deepseek-v4.1-flash-free", "weight": 1 },
     { "model": "opencode/glm-5.3-flash-free", "weight": 1 }
   ]

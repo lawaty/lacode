@@ -2,6 +2,9 @@
 //
 //   US-11  a desktop notification when a session finishes or errors
 //   US-12  a notification when a question is asked
+//   US-25  a notification when opencode asks for permission
+//   US-29  notification sounds distinguish outcomes and can be switched off
+//   US-30  a popup the user is already looking past fades by itself
 //
 // Delivery is INJECTED. src/plugins/notify.ts takes an optional third argument,
 // a `deliver` seam, and this suite supplies a recording sender. Nothing here
@@ -9,19 +12,32 @@
 // tests observe that a notification WOULD be delivered, which is the only part
 // of the contract that is a decision rather than a pipe.
 //
+// Where the contract is about a CHANNEL rather than about a decision -- which
+// buttons a notifier gets, what a missing sound player costs -- the channel is
+// stubbed: the PATH is replaced with recording binaries, so the answer is read
+// off the stub's argv instead of off a desktop that is not there. Nothing here
+// reaches a real notifier, a real speaker or a GUI session.
+//
 // One test deliberately does NOT use the seam (US-11, delivery failure): it
 // points OC_NOTIFY_HELPER at a script that exits non-zero, so the real spawn
 // path and its exit-code handling are exercised for real.
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { chmodSync, readFileSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { ROOT, cleanupAll, scratch, settle, stubInput } from "./_harness.mjs"
+import { ROOT, cleanupAll, fakeClock, scratch, settle, stubInput } from "./_harness.mjs"
 
 test.after(cleanupAll)
 
 const { notifyHooks } = await import(join(ROOT, "src", "plugins", "notify.ts"))
+// The transport, for the contracts that are about a CHANNEL rather than about
+// a decision: which buttons a notifier is given, and what a missing sound
+// player costs. `sendLocal` takes the platform as an argument, so a Mac's
+// channel is a parameter here rather than a different computer.
+const { NOTIFICATION_ACTIONS, safeMessage, safeTitle, sendLocal, soundChannel } = await import(
+  join(ROOT, "src", "tunnel", "index.ts")
+)
 
 /**
  * A notifier wired to a recording sender.
@@ -29,18 +45,24 @@ const { notifyHooks } = await import(join(ROOT, "src", "plugins", "notify.ts"))
  * `sent` is the list a real desktop would have received; `result` controls what
  * the sender reports back, so the "delivery failed vs delivered" bookkeeping is
  * observable too. The fifth argument is the permission request id (US-25),
- * present only when the notification is actionable.
+ * present only when the notification is actionable, and the sixth is the
+ * correlation key that says WHICH popup this is (US-30).
  *
  * `replies` records every call to the server's permission reply route, stubbed
  * onto the shared client, so "the permission was answered" is an assertion
  * about exact arguments rather than about a log line. `respond` replaces the
  * stub's outcome for the failure shapes (a 404, a rejection); the call is
  * recorded either way.
+ *
+ * `closed` records the dismissals (US-30): the `close` seam is what the plugin
+ * asks the helper to do when the user works in that session's chat. It is a
+ * recorder, not a spawn -- no helper, no desktop, no D-Bus.
  */
 const notifier = async ({ sessions = {}, result = { ok: true }, respond } = {}) => {
   const stub = stubInput({ sessions })
   const sent = []
   const replies = []
+  const closed = []
   stub.client.postSessionIdPermissionsPermissionId = async (call) => {
     replies.push(call)
     return respond ? respond(call) : { response: { status: 200 } }
@@ -49,27 +71,126 @@ const notifier = async ({ sessions = {}, result = { ok: true }, respond } = {}) 
     stub.input,
     undefined,
     {
-      deliver: async (title, message, urgency, sound, requestID) => {
-        sent.push({ title, message, urgency, sound, requestID })
+      deliver: async (title, message, urgency, sound, requestID, sessionID) => {
+        sent.push({ title, message, urgency, sound, requestID, sessionID })
         return typeof result === "function" ? result() : result
+      },
+      close: (sessionID) => {
+        closed.push({ sessionID, at: Date.now() })
       },
     },
   )
-  return { stub, sent, replies, hooks, emit: (type, properties) => hooks.event({ event: { type, properties } }) }
+  return { stub, sent, replies, closed, hooks, emit: (type, properties) => hooks.event({ event: { type, properties } }) }
 }
 
 const busy = (emit, sessionID) => emit("session.status", { sessionID, status: { type: "busy" } })
 const idle = (emit, sessionID) => emit("session.idle", { sessionID })
+// The user typed in this chat.
+//
+// The runtime publishes every message with its role, so a USER message is
+// how it says "the user is in this session's chat". `session.status: busy` is
+// a DIFFERENT signal: the runtime raises it whenever the session starts
+// executing, so a retry or an automatic continuation looks exactly like it.
+const typed = (emit, sessionID) =>
+  emit("message.updated", { info: { id: `m_${sessionID}`, sessionID, role: "user", time: { created: Date.now() } } })
+
+/**
+ * How long a suite waits for a PERMISSION popup.
+ *
+ * The plugin waits a quarter of a second for a session's permission requests
+ * to pile up before it raises the popup, so the popup can say how many
+ * requests it covers. A suite that waits for a permission popup has to wait
+ * for that too -- and every other outcome raises its popup at once, which is
+ * why only the permission paths need this.
+ */
+const PERMISSION_SETTLE_MS = 350
+
+/**
+ * Stub desktop channels on the PATH of THIS process, for the duration of one
+ * callback.
+ *
+ * The PATH is REPLACED, not prepended, and carries only the stubs plus `sh`.
+ * That is what makes "nothing is installed here" expressible at all: this
+ * machine has a real notify-send in /usr/bin, so a prepended temp directory
+ * could never say "there is no notifier" -- the probe would find the real one
+ * and the test would quietly prove nothing.
+ *
+ * Each stub records its argv, one NUL-terminated record per argument, so a
+ * body containing a newline stays one argument. `prints` is what the stub
+ * writes on stdout: a channel reporting an answer, the way notify-send reports
+ * the name of the button that was clicked.
+ *
+ * The body is awaited, so the PATH is still in place while a detached sound
+ * player starts up.
+ */
+const withStubbedChannels = async (names, fn, { prints = "" } = {}) => {
+  const bin = scratch("stub-bin-")
+  const logs = {}
+  for (const name of names) {
+    const log = join(bin, `${name}.log`)
+    logs[name] = log
+    const answer = prints ? `printf '%s\\n' ${JSON.stringify(prints)}\n` : ""
+    writeFileSync(
+      join(bin, name),
+      `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done\n${answer}exit 0\n`,
+    )
+    chmodSync(join(bin, name), 0o755)
+  }
+  // `command -v` is a shell builtin, so the probe needs a shell to run in.
+  symlinkSync("/bin/sh", join(bin, "sh"))
+
+  const argvOf = (name) => {
+    const log = logs[name]
+    if (!log || !existsSync(log)) return []
+    const parts = readFileSync(log, "utf8").split("\0")
+    if (parts[parts.length - 1] === "") parts.pop()
+    return parts
+  }
+
+  const previous = process.env.PATH
+  process.env.PATH = bin
+  try {
+    await fn({ bin, argv: argvOf })
+  } finally {
+    if (previous === undefined) delete process.env.PATH
+    else process.env.PATH = previous
+  }
+}
+
+/**
+ * The argv a notification with NO buttons gets on the notify-send channel.
+ *
+ * Built from the notification itself rather than written out, so the assertion
+ * is about the SHAPE -- whether a button is among the arguments -- and not
+ * about the wording of a message.
+ */
+const plainNotifyArgv = (notice) => [
+  safeTitle(notice.title),
+  safeMessage(notice.message),
+  "--app-name=LaCode",
+  `--urgency=${notice.urgency}`,
+  "--icon=utilities-terminal",
+  "--expire-time=0",
+]
+
+/** The three buttons a permission popup carries, in the order they are offered. */
+const PERMISSION_BUTTONS = ["--action=once=Allow once", "--action=always=Always allow", "--action=reject=Deny"]
 
 test("[US-29] notification sounds distinguish outcomes", async () => {
   const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Work" } } })
   await busy(emit, "s1")
   // done
   await idle(emit, "s1")
+  await settle()
   // question
   await emit("question.asked", { sessionID: "s1", questions: [{ question: "Q?" }] })
+  await settle()
   // permission
   await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*"], metadata: {} })
+  // The permission popup waits a moment for the session's requests to pile up,
+  // and an error clears them -- so the error waits for the popup, or it would
+  // overtake the prompt it belongs to.
+  await settle(PERMISSION_SETTLE_MS)
   // error
   await emit("session.error", { sessionID: "s1", error: { message: "err" } })
   await settle()
@@ -167,6 +288,84 @@ test("[US-29] nonsense value for LACODE_SOUND is NOT read as off", async () => {
   } finally {
     delete process.env.LACODE_SOUND
   }
+})
+
+// The sound is played by the TRANSPORT, on the machine that renders the
+// notification -- it is the only place a tone can be heard. So the contract
+// here is the transport's: the sound is ADDITIVE, and a machine without an
+// audio tool still gets the alert itself.
+
+test("[US-29] a machine with no sound player still gets the notification, in full", async () => {
+  // There is no player on the PATH at all, and there IS a notifier: the popup
+  // is what the user is told, and a missing audio tool must never cost it.
+  await withStubbedChannels(["notify-send"], async ({ argv }) => {
+    assert.equal(soundChannel("linux"), "none", "this case is only meaningful with no player installed")
+
+    const result = sendLocal(
+      {
+        title: "Fix the login redirect",
+        message: "Task finished, waiting for your review",
+        urgency: "normal",
+        icon: "utilities-terminal",
+        sound: "done",
+      },
+      "linux",
+    )
+
+    assert.equal(result.ok, true, `the notification must still be delivered: ${result.detail}`)
+    assert.equal(result.detail, undefined, "a missing player is not a delivery failure")
+    assert.deepEqual(
+      argv("notify-send"),
+      [
+        "Fix the login redirect",
+        "Task finished, waiting for your review",
+        "--app-name=LaCode",
+        "--urgency=normal",
+        "--icon=utilities-terminal",
+        "--expire-time=0",
+      ],
+      `the notification must go out with its full body: ${JSON.stringify(argv("notify-send"))}`,
+    )
+  })
+})
+
+test("[US-29] a sound player that cannot start costs only the sound, never the notification", async () => {
+  // The player is installed and the code knows it -- and it cannot run: the
+  // interpreter its shebang names does not exist, so there is no process at
+  // all. The sound is skipped; the alert is not.
+  await withStubbedChannels(["notify-send", "paplay"], async ({ bin, argv }) => {
+    const player = join(bin, "paplay")
+    writeFileSync(player, "#!/nonexistent/interpreter\n")
+    chmodSync(player, 0o755)
+    assert.equal(soundChannel("linux"), "paplay", "the player is installed; it simply cannot start")
+
+    const result = sendLocal(
+      {
+        title: "Fix the login redirect",
+        message: "Task finished, waiting for your review",
+        urgency: "normal",
+        icon: "utilities-terminal",
+        sound: "done",
+      },
+      "linux",
+    )
+
+    assert.equal(result.ok, true, `the notification must still be delivered: ${result.detail}`)
+    assert.deepEqual(
+      argv("notify-send"),
+      [
+        "Fix the login redirect",
+        "Task finished, waiting for your review",
+        "--app-name=LaCode",
+        "--urgency=normal",
+        "--icon=utilities-terminal",
+        "--expire-time=0",
+      ],
+      `the notification must go out with its full body: ${JSON.stringify(argv("notify-send"))}`,
+    )
+    // And the sound was skipped, not half-played: the player never ran.
+    assert.deepEqual(argv("paplay"), [], `a player that cannot start must not have run: ${JSON.stringify(argv("paplay"))}`)
+  })
 })
 
 test("[US-11] a session that went busy and is now idle delivers a done notification", async () => {
@@ -479,7 +678,7 @@ test("[US-25] a permission request delivers exactly one notification naming the 
     metadata: {},
     always: ["*.env"],
   })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
 
   assert.equal(sent.length, 1, `exactly one notification, got ${JSON.stringify(sent)}`)
   assert.match(sent[0].title, /Read the config/, "the notification must name the session, as every other path does")
@@ -504,7 +703,7 @@ test("[US-25] an external_directory prompt names the directory being requested",
     metadata: { parentDir: "/srv/shared/config", filepath: "/srv/shared/config/app.json" },
     always: ["/srv/shared/config/*"],
   })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
 
   assert.equal(sent.length, 1, `expected exactly one notification, got ${JSON.stringify(sent)}`)
   assert.match(sent[0].message, /external directory/i, `the message must say what kind of ask this is: ${sent[0].message}`)
@@ -526,7 +725,7 @@ test("[US-25] a bash prompt names the command rather than a glob", async () => {
     metadata: { command: "rm -rf build" },
     always: ["*"],
   })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
 
   assert.equal(sent.length, 1, `expected exactly one notification, got ${JSON.stringify(sent)}`)
   assert.match(sent[0].message, /rm -rf build/, `the command is the thing being asked about: ${sent[0].message}`)
@@ -539,7 +738,7 @@ test("[US-25] permission.replied sends no notification", async () => {
   const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
   await busy(emit, "s1")
   await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
   assert.equal(sent.length, 1, "the prompt itself notified")
 
   await emit("permission.replied", { sessionID: "s1", requestID: "p1", reply: "once" })
@@ -559,7 +758,7 @@ test("[US-25] a session parked on a permission prompt sends no finished notifica
     patterns: ["/srv/shared/*"],
     metadata: { parentDir: "/srv/shared" },
   })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
   await idle(emit, "s1")
   await settle()
 
@@ -568,15 +767,30 @@ test("[US-25] a session parked on a permission prompt sends no finished notifica
 })
 
 test("[US-25] a permission prompt bypasses the cooldown", async () => {
-  // Two prompts inside the 5s window. The second is a second thing to answer, and
-  // a cooldown that swallowed it is the silent stall this story exists to remove.
+  // Two prompts inside the 5s window. The second one is NOT a second popup:
+  // the popup that is up covers it, and the click answers both -- one popup
+  // for one batch is the whole point.
+  //
+  // What the cooldown must never do is swallow the NEXT prompt of the same
+  // session: a block the user was never told about is the silent stall this
+  // story exists to remove.
   const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
   await busy(emit, "s1")
   await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
   await emit("permission.asked", { id: "p2", sessionID: "s1", permission: "read", patterns: ["*.key"], metadata: {} })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
 
-  assert.equal(sent.length, 2, `both prompts must be announced, got ${JSON.stringify(sent)}`)
+  assert.equal(sent.length, 1, `the batch is one popup, got ${JSON.stringify(sent)}`)
+  assert.match(sent[0].message, /2 requests/, `the popup must say how many requests it covers: ${sent[0].message}`)
+
+  // The batch is answered, and the session asks again inside the cooldown
+  // window. That is a NEW block, and it must be announced.
+  await emit("permission.replied", { sessionID: "s1", requestID: "p1", reply: "once" })
+  await emit("permission.replied", { sessionID: "s1", requestID: "p2", reply: "once" })
+  await emit("permission.asked", { id: "p3", sessionID: "s1", permission: "read", patterns: ["*.secret"], metadata: {} })
+  await settle(PERMISSION_SETTLE_MS)
+
+  assert.equal(sent.length, 2, `the next prompt must be announced inside the window, got ${JSON.stringify(sent)}`)
 })
 
 test("[US-25] unrelated events produce no permission notification", async () => {
@@ -666,7 +880,7 @@ test("[US-25] the notification goes through the injected seam, never a real desk
   await hooks.event({
     event: { type: "permission.asked", properties: { id: "p1", sessionID: "s1", permission: "bash", patterns: ["*"], metadata: { command: "ls" } } },
   })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
 
   assert.equal(sent.length, 1, "the injected sender observed the notification")
   assert.ok(
@@ -689,7 +903,7 @@ test("[US-25] a permission notification carries the request id for the transport
   const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
   await busy(emit, "s1")
   await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
 
   assert.equal(sent.length, 1, `exactly one notification, got ${JSON.stringify(sent)}`)
   assert.equal(sent[0].requestID, "p1", `the seam's fifth argument must be the request id: ${JSON.stringify(sent[0])}`)
@@ -702,7 +916,7 @@ test("[US-25] a permission event with no id delivers a notice that answers nothi
   const { sent, emit, replies } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
   await busy(emit, "s1")
   await emit("permission.asked", { sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
 
   assert.equal(sent.length, 1, `the prompt itself must still notify, got ${JSON.stringify(sent)}`)
   assert.equal(sent[0].requestID, undefined, `no id, no request id on the seam: ${JSON.stringify(sent[0])}`)
@@ -721,7 +935,7 @@ test("[US-25] clicking a button answers the permission exactly once, addressed t
     })
     await busy(emit, "s1")
     await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
-    await settle()
+    await settle(PERMISSION_SETTLE_MS)
 
     assert.equal(sent.length, 1, `${action}: the notification was delivered, got ${JSON.stringify(sent)}`)
     assert.deepEqual(
@@ -742,7 +956,7 @@ test("[US-25] an action that is not a permission reply is ignored, never forward
   })
   await busy(emit, "s1")
   await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
 
   assert.deepEqual(replies, [], `an unrecognised name must never reach the server: ${JSON.stringify(replies)}`)
 })
@@ -755,7 +969,7 @@ test("[US-25] dismissing the popup answers nothing and still reports the deliver
   const { stub, sent, emit, replies } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
   await busy(emit, "s1")
   await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
 
   assert.equal(sent.length, 1, `the popup was raised, got ${JSON.stringify(sent)}`)
   assert.deepEqual(replies, [], `a dismissal must not answer anything: ${JSON.stringify(replies)}`)
@@ -804,7 +1018,7 @@ test("[US-25] a permission already answered elsewhere is not a failure", async (
     })
     await busy(emit, "s1")
     await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
-    await settle()
+    await settle(PERMISSION_SETTLE_MS)
 
     assert.equal(replies.length, 1, `${label}: the reply route was still addressed: ${JSON.stringify(replies)}`)
     const text = stub.text()
@@ -827,7 +1041,7 @@ test("[US-25] a stale click for a permission the server no longer has is a no-op
   })
   await busy(emit, "s1")
   await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
 
   assert.equal(replies.length, 1, `the stale click still reached the reply route: ${JSON.stringify(replies)}`)
   const answered = stub.lines.filter((line) => line.extra?.response === "once")
@@ -840,11 +1054,464 @@ test("[US-25] a stale click for a permission the server no longer has is a no-op
 
   // And the plugin is unharmed: the next prompt notifies and answers as ever.
   await emit("permission.asked", { id: "p2", sessionID: "s1", permission: "read", patterns: ["*.key"], metadata: {} })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
   assert.equal(sent.length, 2, `the next prompt must still notify, got ${JSON.stringify(sent)}`)
   assert.deepEqual(
     replies[1],
     { path: { id: "s1", permissionID: "p2" }, body: { response: "once" } },
     `the next click must answer its own request id: ${JSON.stringify(replies)}`,
   )
+})
+
+// ---------------------------------------------------------------------------
+// US-25 -- which buttons a notifier is given
+// ---------------------------------------------------------------------------
+//
+// The buttons are a property of the CHANNEL, not of the notification alone:
+// `notify-send --action=` is the only way to offer one, so a Mac -- whose
+// channel is osascript or terminal-notifier, neither of which has actions --
+// gets a plain notice, and the answer still has to be given in the terminal.
+//
+// So these two tests read the notifier's argv, on the channel the platform
+// would really pick, with the notification the plugin really raised.
+
+test("[US-25] a permission prompt on a macOS desktop is a plain notice with no buttons", async () => {
+  // The prompt the plugin raises, captured at the seam.
+  const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+  await busy(emit, "s1")
+  await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+  await settle(PERMISSION_SETTLE_MS)
+
+  assert.equal(sent.length, 1, `the prompt must notify: ${JSON.stringify(sent)}`)
+  const prompt = sent[0]
+  assert.equal(prompt.requestID, "p1", "the prompt carries the id a click would be answered against")
+
+  // Every stub answers "once" -- as if the user had clicked Allow once. A
+  // channel with buttons can report that back; a channel without them cannot.
+  await withStubbedChannels(
+    ["osascript", "notify-send", "terminal-notifier"],
+    async ({ argv }) => {
+      const request = {
+        title: prompt.title,
+        message: prompt.message,
+        urgency: prompt.urgency,
+        sound: prompt.sound,
+        requestID: prompt.requestID,
+      }
+
+      const mac = sendLocal(request, "darwin")
+      assert.equal(mac.ok, true, `the macOS send must succeed: ${mac.detail}`)
+
+      // notify-send must not run on a Mac, and terminal-notifier is only the
+      // fallback for a Mac without osascript.
+      assert.deepEqual(argv("notify-send"), [], "notify-send must not be invoked on macOS")
+      assert.deepEqual(argv("terminal-notifier"), [], "osascript ships with macOS, so the fallback must not be the channel")
+
+      // The macOS argv is EXACTLY the script and the two values: five entries,
+      // with no room for a button among them.
+      const macArgv = argv("osascript")
+      assert.equal(macArgv.length, 5, `osascript gets -e, the script, and the two values: ${JSON.stringify(macArgv)}`)
+      assert.equal(macArgv[0], "-e")
+      assert.equal(macArgv[2], "lacode", `the constant marker comes first: ${JSON.stringify(macArgv)}`)
+      assert.deepEqual(
+        macArgv.slice(3),
+        [safeTitle(prompt.title), safeMessage(prompt.message)],
+        `the prompt itself must arrive whole: ${JSON.stringify(macArgv)}`,
+      )
+      assert.deepEqual(
+        macArgv.filter((arg) => arg.startsWith("--action=")),
+        [],
+        `a macOS popup carries no buttons: ${JSON.stringify(macArgv)}`,
+      )
+      const labels = NOTIFICATION_ACTIONS.map(([, label]) => label)
+      assert.ok(
+        !macArgv.some((arg) => labels.includes(arg)),
+        `no action list may reach a macOS popup: ${JSON.stringify(macArgv)}`,
+      )
+      assert.ok(
+        !labels.some((label) => macArgv[1].includes(label)),
+        `the script must not carry the buttons either: ${macArgv[1]}`,
+      )
+
+      // And the answer still has to be given in the terminal: a channel with no
+      // buttons reports no answer, even when it says something.
+      assert.equal(mac.action, undefined, `a macOS popup must not report an answer: ${JSON.stringify(mac)}`)
+
+      // The SAME notification on the channel that CAN offer buttons carries
+      // them, and the click comes back.
+      const linux = sendLocal(request, "linux")
+      assert.equal(linux.ok, true, `the Linux send must succeed: ${linux.detail}`)
+      assert.deepEqual(
+        argv("notify-send").filter((arg) => arg.startsWith("--action=")),
+        PERMISSION_BUTTONS,
+        `the Linux popup must carry the three buttons: ${JSON.stringify(argv("notify-send"))}`,
+      )
+      assert.equal(linux.action, "once", `the clicked button must come back: ${JSON.stringify(linux)}`)
+    },
+    { prints: "once" },
+  )
+})
+
+test("[US-25] a question notification carries no buttons, because a question is not a permission", async () => {
+  // The question, as the plugin raises it.
+  const asked = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
+  await busy(asked.emit, "s1")
+  await asked.emit("question.asked", { sessionID: "s1", questions: [{ question: "Reversible?" }] })
+  await settle()
+  assert.equal(asked.sent.length, 1, `the question must notify: ${JSON.stringify(asked.sent)}`)
+  const question = asked.sent[0]
+  assert.equal(question.requestID, undefined, "a question carries no request id, so there is nothing for a button to answer")
+
+  // The permission, as the plugin raises it.
+  const prompted = await notifier({ sessions: { s2: { id: "s2", title: "Read the config" } } })
+  await busy(prompted.emit, "s2")
+  await prompted.emit("permission.asked", { id: "p1", sessionID: "s2", permission: "read", patterns: ["*.env"], metadata: {} })
+  await settle(PERMISSION_SETTLE_MS)
+  assert.equal(prompted.sent.length, 1, `the prompt must notify: ${JSON.stringify(prompted.sent)}`)
+  const permission = prompted.sent[0]
+  assert.equal(permission.requestID, "p1", "a permission carries the id its click is answered against")
+
+  // ONE channel, two notifications: the difference between them is the
+  // buttons, and nothing else.
+  await withStubbedChannels(
+    ["notify-send"],
+    async ({ argv }) => {
+      const askedResult = sendLocal(
+        { title: question.title, message: question.message, urgency: question.urgency, sound: question.sound },
+        "linux",
+      )
+      assert.equal(askedResult.ok, true, `the question must still be delivered: ${askedResult.detail}`)
+      const questionArgv = argv("notify-send")
+      assert.deepEqual(
+        questionArgv,
+        plainNotifyArgv(question),
+        `a question popup must carry no buttons: ${JSON.stringify(questionArgv)}`,
+      )
+      assert.deepEqual(
+        questionArgv.filter((arg) => arg.startsWith("--action=")),
+        [],
+        `a question popup must carry no buttons: ${JSON.stringify(questionArgv)}`,
+      )
+      assert.equal(askedResult.action, undefined, "a question answers nothing")
+
+      // The permission, on the SAME channel: three buttons, and an answer.
+      const promptedResult = sendLocal(
+        {
+          title: permission.title,
+          message: permission.message,
+          urgency: permission.urgency,
+          sound: permission.sound,
+          requestID: permission.requestID,
+        },
+        "linux",
+      )
+      assert.equal(promptedResult.ok, true, `the prompt must be delivered: ${promptedResult.detail}`)
+      // The stub's log is append-only, so the permission's own arguments are
+      // the ones that came after the question's.
+      assert.deepEqual(
+        argv("notify-send").slice(questionArgv.length),
+        [...plainNotifyArgv(permission), ...PERMISSION_BUTTONS],
+        `a permission popup must carry the three buttons: ${JSON.stringify(argv("notify-send"))}`,
+      )
+      assert.equal(promptedResult.action, "once", `the clicked button must come back: ${JSON.stringify(promptedResult)}`)
+    },
+    { prints: "once" },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// US-30 -- a popup the user is already looking past fades by itself
+// ---------------------------------------------------------------------------
+//
+// The plugin never closes a popup itself: it asks the HELPER to close it,
+// because the popup lives on the desktop and only the desktop knows the
+// notification id the daemon gave it. The `close` seam is that request, so
+// these tests observe a dismissal with no desktop, no helper and no D-Bus.
+//
+// The five-second floor is on the POPUP's own life, not on the moment the user
+// answered: the popup hides at max(now, raisedAt + 5s). One test below measures
+// that floor against the real clock, because it is a promise about what the
+// user sees. The rest use a fake clock, which is what makes "this popup has
+// already been up for more than five seconds" expressible without a
+// five-second wait in every case.
+
+/**
+ * Run a body with a fake clock installed, and take the clock away again.
+ *
+ * The dismissal is a real timer, so a fake `Date.now` is what makes the
+ * five-second rule testable at all. It is restored when the body returns, so
+ * one test can never hand the next one a frozen clock.
+ */
+const withClock = async (body) => {
+  const clock = fakeClock()
+  try {
+    return await body(clock)
+  } finally {
+    clock.restore()
+  }
+}
+
+/** Real elapsed milliseconds. `Date.now` is faked in some of these tests. */
+const realMs = (from) => Number(process.hrtime.bigint() - from) / 1e6
+
+test("[US-30] answering a permission in the TUI closes that session's popup", async () => {
+  await withClock(async (clock) => {
+    const { sent, closed, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+    await busy(emit, "s1")
+    await emit("permission.asked", {
+      id: "p1",
+      sessionID: "s1",
+      permission: "read",
+      patterns: ["*.env"],
+      metadata: {},
+    })
+    await settle(PERMISSION_SETTLE_MS)
+    assert.equal(sent.length, 1, `the prompt itself notified, got ${JSON.stringify(sent)}`)
+    assert.equal(sent[0].sessionID, "s1", `the notification must carry the session it belongs to: ${JSON.stringify(sent[0])}`)
+    assert.deepEqual(closed, [], "nothing is closed while the user is elsewhere")
+
+    // The popup has been up for longer than its five seconds.
+    clock.advance(6_000)
+    await emit("permission.replied", { sessionID: "s1", requestID: "p1", reply: "once" })
+    await settle(50)
+
+    assert.deepEqual(
+      closed.map((entry) => entry.sessionID),
+      ["s1"],
+      `the popup the user just dealt with must fade by itself: ${JSON.stringify(closed)}`,
+    )
+  })
+})
+
+test("[US-30] answering a question in the TUI closes that session's popup", async () => {
+  await withClock(async (clock) => {
+    const { closed, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
+    await busy(emit, "s1")
+    await emit("question.asked", { sessionID: "s1", questions: [{ question: "Reversible?" }] })
+    await settle()
+    assert.deepEqual(closed, [], "nothing is closed while the user is elsewhere")
+
+    clock.advance(6_000)
+    await emit("question.replied", { sessionID: "s1" })
+    await settle(50)
+
+    assert.deepEqual(
+      closed.map((entry) => entry.sessionID),
+      ["s1"],
+      `the popup the user just answered must fade by itself: ${JSON.stringify(closed)}`,
+    )
+  })
+})
+
+test("[US-30] dismissing a question in the TUI closes that session's popup", async () => {
+  // Dropping the question is the user acting on it too: the popup said
+  // "awaiting your response", and there is no response any more.
+  await withClock(async (clock) => {
+    const { closed, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
+    await busy(emit, "s1")
+    await emit("question.asked", { sessionID: "s1", questions: [{ question: "Reversible?" }] })
+    await settle()
+
+    clock.advance(6_000)
+    await emit("question.rejected", { sessionID: "s1", requestID: "que_1" })
+    await settle(50)
+
+    assert.deepEqual(
+      closed.map((entry) => entry.sessionID),
+      ["s1"],
+      `the popup must fade when the question is dropped too: ${JSON.stringify(closed)}`,
+    )
+  })
+})
+
+test("[US-30] typing in the chat closes that session's popup", async () => {
+  // Typing is a USER MESSAGE, and that is how the runtime says it: the
+  // message carries its role. `session.status: busy` is NOT the same
+  // signal -- the runtime raises it whenever the session starts executing,
+  // so a retry or an automatic continuation would look like the user typing
+  // and would close a popup nobody had read.
+  await withClock(async (clock) => {
+    const { closed, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
+    await busy(emit, "s1")
+    await emit("question.asked", { sessionID: "s1", questions: [{ question: "Reversible?" }] })
+    await settle()
+    assert.deepEqual(closed, [], "nothing is closed while the user is elsewhere")
+
+    clock.advance(6_000)
+    await typed(emit, "s1")
+    await settle(50)
+
+    assert.deepEqual(
+      closed.map((entry) => entry.sessionID),
+      ["s1"],
+      `typing in the chat must fade that chat's popup: ${JSON.stringify(closed)}`,
+    )
+  })
+})
+
+test("[US-30] a session going busy on its own never closes a popup", async () => {
+  // The regression this story's signal has to survive.
+  //
+  // `session.status: busy` is the runtime's "the session started executing":
+  // a retry, a resumption, an automatic continuation -- none of which the
+  // user did. It is NOT "the user typed". So it must not dismiss anything:
+  // the popup has been up for longer than its five seconds, which means a
+  // dismissal would be immediate, and a notice the user never read is no
+  // notice at all.
+  await withClock(async (clock) => {
+    const { closed, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
+    await busy(emit, "s1")
+    await emit("question.asked", { sessionID: "s1", questions: [{ question: "Reversible?" }] })
+    await settle()
+    assert.deepEqual(closed, [], "nothing is closed while the user is elsewhere")
+
+    // The popup has been up for longer than its five seconds, so anything
+    // that armed a dismissal would close it now.
+    clock.advance(6_000)
+    await busy(emit, "s1")
+    await settle(100)
+
+    assert.deepEqual(
+      closed,
+      [],
+      `a busy transition is the machine working, not the user: ${JSON.stringify(closed)}`,
+    )
+  })
+})
+
+test("[US-30] a popup is never closed before it has been readable for five seconds", async () => {
+  // The real clock, and the real five seconds: the floor is a promise about
+  // what the user sees, so it is measured in the user's own time.
+  const { closed, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
+  await busy(emit, "s1")
+  // The popup goes up inside this announce, so this is the earliest moment it
+  // could have been raised: the floor is measured from the earliest, never from
+  // a moment that flatters the implementation.
+  const raisedAt = Date.now()
+  await emit("question.asked", { sessionID: "s1", questions: [{ question: "Reversible?" }] })
+  await settle()
+  // The user answers the question straight away.
+  await emit("question.replied", { sessionID: "s1" })
+  const interactedAt = Date.now()
+  assert.ok(interactedAt - raisedAt < 5_000, "control: the user answered before the floor had passed")
+
+  await settle(1_000)
+  assert.deepEqual(closed, [], "a popup that was just raised must not be taken away: a notice nobody could read is no notice")
+
+  await settle(4_800)
+  assert.equal(closed.length, 1, `the popup must fade once the user has worked in the chat: ${JSON.stringify(closed)}`)
+  const elapsed = closed[0].at - raisedAt
+  assert.ok(elapsed >= 5_000, `the popup must stay up for five seconds, it was closed after ${elapsed}ms`)
+})
+
+test("[US-30] a popup the user works in after five seconds fades at once", async () => {
+  await withClock(async (clock) => {
+    const { closed, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
+    await busy(emit, "s1")
+    await emit("question.asked", { sessionID: "s1", questions: [{ question: "Reversible?" }] })
+    await settle()
+
+    // The popup has been up for longer than its five seconds, so there is
+    // nothing left to wait for.
+    clock.advance(6_000)
+    const started = process.hrtime.bigint()
+    await emit("question.replied", { sessionID: "s1" })
+    await settle(50)
+
+    assert.equal(closed.length, 1, `the popup must fade: ${JSON.stringify(closed)}`)
+    const elapsed = realMs(started)
+    assert.ok(elapsed < 1_000, `a popup that has had its five seconds must fade at once, it took ${elapsed}ms`)
+  })
+})
+
+test("[US-30] working in one session's chat leaves another session's popup alone", async () => {
+  await withClock(async (clock) => {
+    const { closed, emit } = await notifier({
+      sessions: { s1: { id: "s1", title: "One" }, s2: { id: "s2", title: "Two" } },
+    })
+    await busy(emit, "s1")
+    await idle(emit, "s1")
+    await settle()
+    await busy(emit, "s2")
+    await idle(emit, "s2")
+    await settle()
+    assert.deepEqual(closed, [], "two popups are up, and neither has been touched")
+
+    clock.advance(6_000)
+    await emit("question.replied", { sessionID: "s1" })
+    await settle(50)
+
+    assert.deepEqual(
+      closed.map((entry) => entry.sessionID),
+      ["s1"],
+      `a notification belongs to its session: ${JSON.stringify(closed)}`,
+    )
+  })
+})
+
+test("[US-30] a session with no popup is never closed", async () => {
+  await withClock(async (clock) => {
+    const { closed, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
+    clock.advance(6_000)
+    await emit("question.replied", { sessionID: "s1" })
+    await busy(emit, "s1")
+    await settle(50)
+
+    assert.deepEqual(closed, [], "there is no popup to take down, so nothing may be asked to close one")
+  })
+})
+
+test("[US-30] a popup nobody works in stays until the user closes it", async () => {
+  await withClock(async (clock) => {
+    const { closed, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
+    await busy(emit, "s1")
+    await idle(emit, "s1")
+    await settle()
+
+    // A long time passes, and the user never touches that chat.
+    clock.advance(60 * 60 * 1_000)
+    await settle(100)
+
+    assert.deepEqual(closed, [], "a popup nobody worked in waits for the X button, exactly as before")
+  })
+})
+
+test("[US-30] closing a permission popup answers nothing", async () => {
+  // The permission was already answered in the terminal. The dismissal takes
+  // the popup down and answers nothing: a fade is not an answer, and the
+  // plugin never picks one.
+  await withClock(async (clock) => {
+    const { closed, emit, replies } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })
+    await busy(emit, "s1")
+    await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+    await settle(PERMISSION_SETTLE_MS)
+
+    clock.advance(6_000)
+    await emit("permission.replied", { sessionID: "s1", requestID: "p1", reply: "once" })
+    await settle(50)
+
+    assert.deepEqual(
+      closed.map((entry) => entry.sessionID),
+      ["s1"],
+      `the popup must be taken down: ${JSON.stringify(closed)}`,
+    )
+    assert.deepEqual(replies, [], `a dismissal answers nothing: ${JSON.stringify(replies)}`)
+  })
+})
+
+test("[US-30] a deleted session's pending dismissal is cancelled", async () => {
+  await withClock(async (clock) => {
+    const { closed, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
+    await busy(emit, "s1")
+    await emit("question.asked", { sessionID: "s1", questions: [{ question: "Reversible?" }] })
+    await settle()
+
+    clock.advance(6_000)
+    await emit("question.replied", { sessionID: "s1" })
+    // The session is gone before the dismissal fires.
+    await emit("session.deleted", { info: { id: "s1" } })
+    await settle(100)
+
+    assert.deepEqual(closed, [], "a dismissal for a session that is gone closes nothing")
+  })
 })

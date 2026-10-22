@@ -104,7 +104,7 @@ work (exploration, implementation, cartography) through the gateway, add an
 # ~/.config/lacode/pool.txt
 omniroute/free-mix
 opencode/big-pickle
-opencode-go/minimax-m3.1-flash-free
+opencode-go/beam-free
 ```
 
 OmniRoute is a provider like any other: the pool decides its place and weight,

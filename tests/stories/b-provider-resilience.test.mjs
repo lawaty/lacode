@@ -4,6 +4,7 @@
 //   US-5  weights express preference between models
 //   US-6  live pool visibility (the pool_status tool)
 //   US-7  a paid model is just another slot
+//   US-31 a limit that hangs is killed, and the retry lands on a slot that answers
 //
 // Every test drives the real plugin default export with a stub PluginInput and
 // an isolated claim directory. No network, no server, no real sleeps: the clock
@@ -54,6 +55,38 @@ const burst = async (hooks, cfg, n, base = "explore") => {
 }
 
 const limitFile = (dir, model) => join(dir, `limit.${model.replace(/[^a-zA-Z0-9._-]/g, "__")}.json`)
+
+/** The sessions the pool asked the server to abort, via the abort URL it POSTs. */
+const stubFetch = () => {
+  const aborted = []
+  const real = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    const match = /\/session\/([^/]+)\/abort/.exec(String(url))
+    if (match) aborted.push(match[1])
+    return new Response("true", { status: 200 })
+  }
+  return { aborted, restore: () => { globalThis.fetch = real } }
+}
+
+/**
+ * Route one spawn and bind it to a child session, exactly as opencode does:
+ * the task hook claims a slot, then session.created binds the child to it.
+ * Without the bind the claim has no target, and a limit signal naming that
+ * session would have nothing to cool and nothing to abort.
+ */
+const spawnChild = async (hooks, cfg, { callID, sessionID = "parent", childID }) => {
+  const routed = await spawn(hooks, cfg, { subagent: "explore", callID, sessionID })
+  await emit(hooks, "session.created", { info: { id: childID, parentID: sessionID } })
+  return routed
+}
+
+/** The models the status view reports as cooling, read off its summary line. */
+const coolingModels = async (hooks) => {
+  const status = await hooks.tool.pool_status.execute({}, {})
+  const line = status.output.split("\n").find((l) => l.startsWith("cooling: "))
+  if (!line) return []
+  return line.replace("cooling: ", "").split(", ").map((entry) => entry.split(" for ")[0])
+}
 
 // ---------------------------------------------------------------------------
 // US-4 — failover
@@ -113,7 +146,7 @@ test("[US-4] with model A cooling, the next spawn goes elsewhere and is never re
   await hooks.dispose()
 })
 
-test("[US-4] when every model is cooling, routing degrades to the least-loaded slot instead of refusing", async () => {
+test("[US-4] when every model is cooling the pool still routes instead of refusing", async () => {
   const { hooks, cfg, models } = await bootPool(
     [
       { model: "prov/a", weight: 1 },
@@ -130,10 +163,49 @@ test("[US-4] when every model is cooling, routing degrades to the least-loaded s
   }
 
   // The whole point: a refused spawn would fail the task. A degraded one does not.
+  // WHICH slot the degraded pick takes is the next test's business.
   const routed = await burst(hooks, cfg, 2)
   for (const variant of routed) {
     assert.match(variant, /^explore-[1-9]$/, `the pool must degrade, not refuse: got ${variant}`)
   }
+  await hooks.dispose()
+})
+
+test("[US-4] when every model is cooling the spawn lands on the least-loaded slot, not on the busier one", async () => {
+  // The degraded pick is a LEAST-LOADED pick, not an arbitrary one. Two slots
+  // carrying different load make the difference visible: the emptier one has to
+  // take the spawn. "Some slot" and "the first slot in the run" both satisfy a
+  // check that only asks whether the spawn went anywhere -- so the load has to
+  // be made unequal first, or the choice is invisible.
+  const slots = [
+    { model: "prov/busy", weight: 3 },
+    { model: "prov/light", weight: 1 },
+  ]
+  const { hooks, cfg, models } = await bootPool(slots, "us4-least-loaded")
+
+  // Unequal load first: the heavy slot holds three claims, the light one one.
+  const routed = await burst(hooks, cfg, 4)
+  assert.deepEqual(routed, ["explore-1", "explore-1", "explore-1", "explore-2"], `the load must be where the weights put it, got ${routed}`)
+
+  const loadOf = async (model) => {
+    const status = await hooks.tool.pool_status.execute({}, {})
+    const line = status.output.split("\n").find((l) => /^\s*slot \d/.test(l) && l.includes(model))
+    return Number(/load=(\d+)\//.exec(line)[1])
+  }
+  assert.equal(await loadOf("prov/busy"), 3, "the heavy slot must hold three claims")
+  assert.equal(await loadOf("prov/light"), 1, "the light slot must hold one claim")
+
+  // Now every model is cooling, so the rotation can pick nothing at all.
+  for (const model of models) {
+    const [provider, id] = [model.slice(0, model.indexOf("/")), model.slice(model.indexOf("/") + 1)]
+    await emit(hooks, "message.updated", {
+      info: { role: "assistant", providerID: provider, modelID: id, error: { message: "usage limit reached" } },
+    })
+  }
+
+  const degraded = await spawn(hooks, cfg, { callID: "degraded", sessionID: "degraded" })
+  assert.equal(degraded.routed, "explore-2", `the degraded pick must be the least-loaded slot, got ${degraded.routed}`)
+  assert.equal(degraded.model, "prov/light", `the least-loaded slot's model must be the one used, got ${degraded.model}`)
   await hooks.dispose()
 })
 
@@ -366,6 +438,48 @@ test("[US-5] past every ceiling, the spawn overflows to the least-loaded slot", 
   await hooks.dispose()
 })
 
+test("[US-5] a slot at its ceiling has its turn skipped and the rotation resumes at the following turn", async () => {
+  // The ceiling is twice a slot's weight, and the run gives a slot one turn per
+  // unit of weight, so a slot reaches its ceiling after exactly two rotations
+  // of the run. Every slot therefore fills at the same moment, and this pool's
+  // OWN claims can never leave one slot full while another still has room --
+  // the turn that would have been skipped is never the turn that comes up.
+  // The asymmetry comes from a second process, which is how a slot really gets
+  // full in a busy pool: another opencode holding claims on that model.
+  const slots = [
+    { model: "prov/full", weight: 1 },
+    { model: "prov/room", weight: 2 },
+  ]
+  const { hooks, cfg, dir } = await bootPool(slots, "us5-skip-full-turn")
+
+  // A sibling opencode process holds two claims on the first slot. Its ceiling
+  // is twice its weight (2 x 1 = 2), so that slot is FULL; the second one still
+  // has room.
+  writeFileSync(
+    join(dir, "claims.sibling.json"),
+    JSON.stringify({
+      "peer:1": { v: "explore", k: 1, m: "prov/full", t: Date.now() },
+      "peer:2": { v: "explore", k: 1, m: "prov/full", t: Date.now() },
+    }),
+  )
+
+  // The run is 1,2,2 and the rotation opens on the full slot's turn. That turn
+  // must be skipped, not served.
+  const { routed } = await spawn(hooks, cfg, { callID: "skip", sessionID: "skip" })
+  assert.equal(routed, "explore-2", `a full slot's turn must be skipped, got ${routed}`)
+
+  // And the rotation resumed at the following turn: the cursor sits on the
+  // turn AFTER the one that was served (position 2 of the run 1,2,2), not on
+  // the turn the full slot would have consumed (which would leave it at 1).
+  const cursor = JSON.parse(readFileSync(join(dir, "cursor.json"), "utf8"))
+  assert.equal(cursor.seq, 2, `the skipped turn must not be consumed: the rotation must resume after the turn it served, got ${JSON.stringify(cursor)}`)
+
+  // And it keeps turning rather than stalling on the full slot.
+  const next = await spawn(hooks, cfg, { callID: "next", sessionID: "next" })
+  assert.equal(next.routed, "explore-2", `the rotation must keep turning past the full slot, got ${next.routed}`)
+  await hooks.dispose()
+})
+
 test("[US-5] equal weights round-robin in declaration order", async () => {
   const slots = ["prov/a", "prov/b", "prov/c"].map((model) => ({ model, weight: 1 }))
   const { hooks, cfg } = await bootPool(slots, "us5-roundrobin")
@@ -497,7 +611,7 @@ test("[US-6] a claim file older than the dead-file threshold is pruned, not coun
   await hooks.dispose()
 })
 
-test("[US-6] the slot the next spawn would take is marked, including when it is at its ceiling", async () => {
+test("[US-6] the slot the next spawn would take is marked, and with every slot at its ceiling it is the least-loaded one", async () => {
   const slots = [
     { model: "prov/a", weight: 1 },
     { model: "prov/b", weight: 1 },
@@ -511,7 +625,7 @@ test("[US-6] the slot the next spawn would take is marked, including when it is 
   const status = await hooks.tool.pool_status.execute({}, {})
   const marked = status.output.split("\n").filter((l) => l.includes("<- next"))
   assert.equal(marked.length, 1, `exactly one slot may be marked as next:\n${status.output}`)
-  assert.match(marked[0], /FULL/, `a slot at its ceiling is still the one the next spawn takes:\n${marked[0]}`)
+  assert.match(marked[0], /FULL/, `with every slot at its ceiling, the next spawn takes the least-loaded one:\n${marked[0]}`)
 
   // And the mark is not decoration: the next real spawn lands on that slot.
   const markedIndex = Number(/slot (\d)/.exec(marked[0])[1])
@@ -525,6 +639,34 @@ test("[US-6] the slot the next spawn would take is marked, including when it is 
   assert.doesNotMatch(open.output.split("\n").find((l) => l.includes("<- next")), /FULL/, "an idle slot is not at its ceiling")
   await hooks.dispose()
   await fresh.dispose()
+})
+
+test("[US-6] a slot at its ceiling is not marked as the slot the next spawn would take", async () => {
+  // The status view previews the next pick, so the mark must be the slot the
+  // rotation would really use. A full slot's turn is skipped, so the mark
+  // belongs to the slot that still has room -- pointing it at the full slot
+  // would send the reader looking at the wrong one.
+  const slots = [
+    { model: "prov/full", weight: 1 },
+    { model: "prov/room", weight: 2 },
+  ]
+  const { hooks, cfg } = await bootPool(slots, "us6-next-not-full")
+
+  // Four claims: two on the light slot (its ceiling is 2 x 1 = 2, so it is
+  // FULL) and two on the heavy one (its ceiling is 2 x 2 = 4, so it has room).
+  await burst(hooks, cfg, 4)
+
+  const status = await hooks.tool.pool_status.execute({}, {})
+  const slotLine = (model) => status.output.split("\n").find((l) => /^\s*slot \d/.test(l) && l.includes(model))
+  const full = slotLine("prov/full")
+  const room = slotLine("prov/room")
+
+  assert.match(full, /load=2\/2 FULL/, `the full slot must be shown as full:\n${status.output}`)
+  assert.doesNotMatch(full, /<- next/, `a slot at its ceiling must not be marked as the next one:\n${status.output}`)
+  assert.match(room, /load=2\/4/, `the other slot must still have room:\n${status.output}`)
+  assert.match(room, /<- next/, `the mark must be on the slot that still has room:\n${status.output}`)
+  assert.doesNotMatch(room, /FULL/, `the marked slot must not be the full one:\n${status.output}`)
+  await hooks.dispose()
 })
 
 // ---------------------------------------------------------------------------
@@ -680,8 +822,427 @@ test("[US-7] no provider is ever left holding an empty whitelist, which opencode
   // And every provider ends up exactly as its shape dictates: the restricted one
   // is never named by a slot, so it is not touched; the slot's own provider stays
   // open, and the model still binds.
-  assert.deepEqual(cfg.provider.restricted.whitelist, ["theirs"], "a whitelist on an untouched provider must be left alone")
-  assert.ok(!("whitelist" in cfg.provider.opened), `the slot's own provider stays open, got ${JSON.stringify(cfg.provider.opened)}`)
-  assert.equal(cfg.agent["explore-1"].model, "opened/slot-model")
+    assert.deepEqual(cfg.provider.restricted.whitelist, ["theirs"], "a whitelist on an untouched provider must be left alone")
+    assert.ok(!("whitelist" in cfg.provider.opened), `the slot's own provider stays open, got ${JSON.stringify(cfg.provider.opened)}`)
+    assert.equal(cfg.agent["explore-1"].model, "opened/slot-model")
+  await hooks.dispose()
+})
+
+// ---------------------------------------------------------------------------
+// US-31 — a limit that hangs is killed, and the retry lands on a slot that
+// answers.
+//
+// A limit does not fail the task, it HANGS it: the provider accepts the
+// request and then says nothing, opencode keeps retrying the refused model,
+// and the claim it is holding is never released. So the pool has to end that
+// wait itself -- cool what the signal is evidence about, abort the session it
+// is about, and let the caller's retry land on a slot that answers.
+//
+// The signal arrives in two shapes, and both are handled here: a retry STATUS
+// opencode reports for a session, and an assistant ERROR carrying the
+// provider's own words. What decides the SCOPE is what the signal names: a
+// provider named in the status benches that whole provider, and a limit that
+// names nobody benches only the model the session was running on -- that is
+// the one the refusal is evidence about.
+//
+// A third case is a signal that is limit-SHAPED but is not a limit: the
+// provider is briefly DOWN rather than out of allowance. That lifts on its
+// own, so it must not bench a healthy model for the quota window -- one short
+// flat window says "not right now", while the quota curve says "gone for the
+// day". The wait still ends: only the abort stops opencode looping on it.
+// ---------------------------------------------------------------------------
+
+test("[US-31] a retry status that names no provider cools the model the session is running on", async () => {
+  const clock = fakeClock()
+  const net = stubFetch()
+  const slots = [
+    { model: "prov/one", weight: 2 },
+    { model: "other/two", weight: 1 },
+  ]
+  const { dir, hooks, cfg } = await bootPool(slots, "us31-model-cooling")
+
+  // The session that reports the limit is running on prov/one.
+  const first = await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-limit" })
+  assert.equal(first.model, "prov/one", `control: the session must run on prov/one, got ${first.model}`)
+
+  // A retry status that names NO provider: the message is the whole signal.
+  await emit(hooks, "session.status", {
+    sessionID: "child-limit",
+    status: { type: "retry", message: "limit reached" },
+  })
+
+  const file = limitFile(dir, "prov/one")
+  assert.ok(existsSync(file), `a cooldown file must be written for the model, got: ${readdirSync(dir).join(", ")}`)
+  const strike = JSON.parse(readFileSync(file, "utf8"))
+  assert.equal(strike.model, "prov/one", `the cooldown must be for the model the session runs on, got ${strike.model}`)
+  assert.ok(strike.until > clock.now(), `the cooldown must be in the future, got ${strike.until} vs ${clock.now()}`)
+  assert.deepEqual(await coolingModels(hooks), ["prov/one"], `only the refused model may cool, got ${JSON.stringify(await coolingModels(hooks))}`)
+
+  // And the slot on ANOTHER provider is untouched: a limit that names no
+  // provider says nothing about the provider next door.
+  assert.ok(!existsSync(limitFile(dir, "other/two")), `no other provider's model may be cooled, got: ${readdirSync(dir).join(", ")}`)
+
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-31] a limit that hangs is aborted and its claim released", async () => {
+  const net = stubFetch()
+  const { dir, hooks, cfg } = await bootPool([{ model: "prov/one", weight: 2 }], "us31-abort")
+
+  await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-hang" })
+
+  // The provider took the request and then went quiet: the status reports the
+  // limit and the session never answers again.
+  await emit(hooks, "session.status", {
+    sessionID: "child-hang",
+    status: { type: "retry", message: "limit reached" },
+  })
+
+  assert.deepEqual(net.aborted, ["child-hang"], `the hanging session must be aborted, got ${JSON.stringify(net.aborted)}`)
+  // The claim goes with it, so the slot is not held by a task that will never
+  // answer.
+  const claims = readFileSync(join(dir, "claims.us31-abort.json"), "utf8")
+  assert.equal(claims, "{}", `the claim must be released, got ${claims}`)
+
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-31] the retry after a limit lands on a slot that is not on cooldown", async () => {
+  const net = stubFetch()
+  // Weights 2 and 1, so the rotation's run is [1,1,2] and the turn AFTER the
+  // first spawn comes BACK to prov/one. Only the cooldown can move the retry
+  // off it: with equal weights the retry would land on the other slot anyway,
+  // and the cooldown would prove nothing.
+  const slots = [
+    { model: "prov/one", weight: 2 },
+    { model: "other/two", weight: 1 },
+  ]
+  const { dir, hooks, cfg } = await bootPool(slots, "us31-reroute")
+
+  const first = await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-first" })
+  assert.equal(first.model, "prov/one", `control: the first spawn must land on prov/one, got ${first.model}`)
+
+  await emit(hooks, "session.status", {
+    sessionID: "child-first",
+    status: { type: "retry", message: "limit reached" },
+  })
+  assert.ok(existsSync(limitFile(dir, "prov/one")), `prov/one must be cooling, got: ${readdirSync(dir).join(", ")}`)
+
+  // The caller's retry. The rotation would have offered prov/one again.
+  const retry = await spawn(hooks, cfg, { subagent: "explore", callID: "c2", sessionID: "parent-2" })
+  assert.notEqual(retry.routed, first.routed, `the retry must leave the cooled slot, got ${retry.routed}`)
+  assert.notEqual(retry.model, first.model, `the retry must not use the cooled model ${first.model}, got ${retry.model}`)
+  assert.equal(retry.model, "other/two", `the retry must land on the slot that answers, got ${retry.model}`)
+
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-31] a limit that names its provider cools every slot on that provider and no other", async () => {
+  const net = stubFetch()
+  const slots = [
+    { model: "prov/one", weight: 2 },
+    { model: "prov/two", weight: 1 },
+    { model: "other/three", weight: 1 },
+  ]
+  const { dir, hooks, cfg } = await bootPool(slots, "us31-provider")
+
+  await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-provider" })
+
+  // The provider names ITSELF, so the refusal is evidence about the whole
+  // provider and every one of its slots is benched.
+  await emit(hooks, "session.status", {
+    sessionID: "child-provider",
+    status: { type: "retry", message: "limit reached", action: { reason: "free_tier_limit", provider: "prov" } },
+  })
+
+  assert.ok(existsSync(limitFile(dir, "prov/one")), `prov/one must be cooled, got: ${readdirSync(dir).join(", ")}`)
+  assert.ok(existsSync(limitFile(dir, "prov/two")), `prov/two must be cooled, got: ${readdirSync(dir).join(", ")}`)
+  assert.ok(!existsSync(limitFile(dir, "other/three")), `a slot on another provider must not be cooled, got: ${readdirSync(dir).join(", ")}`)
+  assert.deepEqual(
+    (await coolingModels(hooks)).sort(),
+    ["prov/one", "prov/two"],
+    `only the named provider's slots may cool, got ${JSON.stringify(await coolingModels(hooks))}`,
+  )
+
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-31] an error that says the limit was reached cools the model and aborts the session", async () => {
+  const clock = fakeClock()
+  const net = stubFetch()
+  const { dir, hooks, cfg } = await bootPool([{ model: "prov/one", weight: 2 }], "us31-error")
+
+  await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-error" })
+
+  // No status code at all: the provider's own phrasing is the whole signal,
+  // and it says "limit reached".
+  await emit(hooks, "message.updated", {
+    info: {
+      role: "assistant",
+      providerID: "prov",
+      modelID: "one",
+      sessionID: "child-error",
+      error: { name: "AI_APICallError", data: { responseBody: "limit reached" } },
+    },
+  })
+
+  const file = limitFile(dir, "prov/one")
+  assert.ok(existsSync(file), `a cooldown file must be written, got: ${readdirSync(dir).join(", ")}`)
+  const strike = JSON.parse(readFileSync(file, "utf8"))
+  assert.equal(strike.model, "prov/one", `the model must be the one cooled, got ${strike.model}`)
+  assert.ok(strike.until > clock.now(), `the cooldown must be in the future, got ${strike.until} vs ${clock.now()}`)
+  // The task already in flight on it is not benched with it: it is aborted, so
+  // the caller re-routes now instead of waiting out the hang.
+  assert.deepEqual(net.aborted, ["child-error"], `the in-flight session must be aborted, got ${JSON.stringify(net.aborted)}`)
+
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-31] a context limit is not a quota, so nothing is cooled and nothing is aborted", async () => {
+  const net = stubFetch()
+  const { dir, hooks, cfg } = await bootPool([{ model: "prov/one", weight: 2 }], "us31-context")
+
+  await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-context" })
+
+  // The prompt was too long. That is the user's own request, not the
+  // provider's allowance, so the model stays in the rotation and the task
+  // keeps running.
+  await emit(hooks, "message.updated", {
+    info: {
+      role: "assistant",
+      providerID: "prov",
+      modelID: "one",
+      sessionID: "child-context",
+      error: { name: "AI_APICallError", data: { responseBody: "context limit reached" } },
+    },
+  })
+
+  assert.deepEqual(
+    readdirSync(dir).filter((f) => f.startsWith("limit.")),
+    [],
+    `a context limit must cool nothing, got ${readdirSync(dir).join(", ")}`,
+  )
+  assert.deepEqual(await coolingModels(hooks), [], `the model must not be cooling, got ${JSON.stringify(await coolingModels(hooks))}`)
+  assert.deepEqual(net.aborted, [], `a context limit must not abort the session, got ${JSON.stringify(net.aborted)}`)
+
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-31] a transient outage is cooled flat, not for the quota window", async () => {
+  const clock = fakeClock()
+  const net = stubFetch()
+  // Weights 2 and 1, so the rotation's run is [1,1,2] and the turn AFTER the
+  // first spawn comes BACK to prov/one -- the same shape as the reroute test
+  // above, so only a cooldown can move the retry off it.
+  const slots = [
+    { model: "prov/one", weight: 2 },
+    { model: "other/two", weight: 1 },
+  ]
+  const { dir, hooks, cfg } = await bootPool(slots, "us31-outage")
+
+  // The session that reports the outage is running on prov/one.
+  const first = await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-outage" })
+  assert.equal(first.model, "prov/one", `control: the session must run on prov/one, got ${first.model}`)
+
+  // An OUTAGE, not a quota: the provider is down rather than out of allowance.
+  // The status carries no `action` block at all, so no provider is named and
+  // the fault is left to the message alone.
+  await emit(hooks, "session.status", {
+    sessionID: "child-outage",
+    status: { type: "retry", message: "Endpoint is unavailable" },
+  })
+
+  const file = limitFile(dir, "prov/one")
+  assert.ok(existsSync(file), `a cooldown file must be written, got: ${readdirSync(dir).join(", ")}`)
+  const strike = JSON.parse(readFileSync(file, "utf8"))
+  assert.equal(strike.reason, "endpoint-unavailable", `an outage must be filed under its own reason, got ${strike.reason}`)
+
+  // The window is FLAT: one short cooldown, never the escalating quota curve.
+  // A quota -- "limit reached" -- would have been 900000ms (15 minutes).
+  const window = strike.until - clock.now()
+  assert.ok(window <= 61_000, `the outage window must be flat (the quota window would have been 900000ms), got ${window}ms`)
+  assert.ok(window < 900_000, `an outage must not take the quota window, got ${window}ms`)
+
+  // The wait still ends: a retry status means opencode is LOOPING on a refused
+  // model, and only the abort stops that. The transient fault changes the
+  // WINDOW, not the wait.
+  assert.deepEqual(net.aborted, ["child-outage"], `the session must still be aborted, got ${JSON.stringify(net.aborted)}`)
+
+  // And the model really is cooling -- flatly, not on a quota bench.
+  assert.deepEqual(await coolingModels(hooks), ["prov/one"], `the model must be cooling, got ${JSON.stringify(await coolingModels(hooks))}`)
+
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-31] an outage does not escalate the next quota window", async () => {
+  const clock = fakeClock()
+  const net = stubFetch()
+  // Weights 2 and 1, exactly as the existing US-31 tests do.
+  const slots = [
+    { model: "prov/one", weight: 2 },
+    { model: "other/two", weight: 1 },
+  ]
+  const { dir, hooks, cfg } = await bootPool(slots, "us31-outage-no-escalate")
+
+  // Route one spawn and bind a child session to the claim.
+  const first = await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-outage" })
+  assert.equal(first.model, "prov/one", `control: the session must run on prov/one, got ${first.model}`)
+
+  // Emit the OUTAGE: no `action` key.
+  await emit(hooks, "session.status", {
+    sessionID: "child-outage",
+    status: { type: "retry", message: "Endpoint is unavailable" },
+  })
+
+  // Route ONE MORE spawn through spawn() — this calls the pool's snapshot(),
+  // which calls readLimits() and RE-READS the cooldown files from disk. This
+  // proves the on-disk outage record cannot resurrect the strike.
+  await spawn(hooks, cfg, { subagent: "explore", callID: "c2", sessionID: "parent2" })
+
+  // Emit a REAL limit error for the SAME model (prov/one).
+  await emit(hooks, "message.updated", {
+    info: {
+      role: "assistant",
+      providerID: "prov",
+      modelID: "one",
+      sessionID: "child-outage",
+      error: { name: "AI_APICallError", data: { responseBody: "limit reached" } },
+    },
+  })
+
+  const file = limitFile(dir, "prov/one")
+  assert.ok(existsSync(file), `a cooldown file must exist for prov/one, got: ${readdirSync(dir).join(", ")}`)
+  const strike = JSON.parse(readFileSync(file, "utf8"))
+  assert.equal(strike.reason, "limit-reached", `the real limit must take over; expected reason "limit-reached", got ${strike.reason}`)
+  assert.equal(strike.strikes, 1, `after an outage the next real failure must be strike 1, NOT 2; got strikes=${strike.strikes}`)
+  const window = strike.until - clock.now()
+  assert.equal(window, 900_000, `the first-strike quota window must be 900000ms (an escalated strike would have been 1800000ms), got ${window}ms`)
+
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-31] an outage that names its provider is not a strike either, so the next real limit is strike 1", async () => {
+  const clock = fakeClock()
+  const net = stubFetch()
+  // Weights 2 and 1, exactly as the outage test above.
+  const slots = [
+    { model: "prov/one", weight: 2 },
+    { model: "other/two", weight: 1 },
+  ]
+  const { dir, hooks, cfg } = await bootPool(slots, "us31-outage-provider-no-escalate")
+
+  // The session that reports the outage is running on prov/one.
+  const first = await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-outage-provider" })
+  assert.equal(first.model, "prov/one", `control: the session must run on prov/one, got ${first.model}`)
+
+  // An OUTAGE that NAMES ITS PROVIDER: the status carries the provider, so the
+  // fault is provider-wide and takes the coolProvider() path rather than the
+  // per-model one. This is the path that used to file the outage as a strike,
+  // because every slot on the provider was cooled through recordStrike().
+  await emit(hooks, "session.status", {
+    sessionID: "child-outage-provider",
+    status: { type: "retry", message: "Endpoint is unavailable", action: { provider: "prov" } },
+  })
+
+  const outage = JSON.parse(readFileSync(limitFile(dir, "prov/one"), "utf8"))
+  assert.equal(outage.reason, "endpoint-unavailable", `an outage must be filed under its own reason, got ${outage.reason}`)
+  const outageWindow = outage.until - clock.now()
+  assert.ok(outageWindow <= 61_000, `the outage window must be flat (the quota window would have been 900000ms), got ${outageWindow}ms`)
+
+  // NO spawn in between, on purpose. A routed spawn would rebuild the strike
+  // memory from disk (readLimits skips the outage record), and that would
+  // MASK an outage that had wrongly been filed as a strike. The in-memory
+  // memory has to be clean on its own.
+  //
+  // Then a REAL limit on the same model.
+  await emit(hooks, "message.updated", {
+    info: {
+      role: "assistant",
+      providerID: "prov",
+      modelID: "one",
+      sessionID: "child-outage-provider",
+      error: { name: "AI_APICallError", data: { responseBody: "limit reached" } },
+    },
+  })
+
+  const strike = JSON.parse(readFileSync(limitFile(dir, "prov/one"), "utf8"))
+  assert.equal(strike.reason, "limit-reached", `the real limit must take over; expected reason "limit-reached", got ${strike.reason}`)
+  assert.equal(strike.strikes, 1, `an outage must never count as a strike, so the real limit is strike 1, NOT 2; got strikes=${strike.strikes}`)
+  const window = strike.until - clock.now()
+  assert.equal(window, 900_000, `the first-strike quota window must be 900000ms (an escalated strike would have been 1800000ms), got ${window}ms`)
+
+  net.restore()
+  await hooks.dispose()
+})
+
+
+test("[US-31] a terminal limit reported as session.error cools the model and aborts the session", async () => {
+  // opencode's terminal path is `session.error` plus an idle status — there is
+  // no retry status and no message.updated for a limit it stops retrying.
+  const clock = fakeClock()
+  const net = stubFetch()
+  const slots = [
+    { model: "prov/one", weight: 2 },
+    { model: "other/two", weight: 1 },
+  ]
+  const { dir, hooks, cfg } = await bootPool(slots, "us31-session-error")
+
+  const first = await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-session-error" })
+  assert.equal(first.model, "prov/one", `control: the session must run on prov/one, got ${first.model}`)
+
+  await emit(hooks, "session.error", {
+    sessionID: "child-session-error",
+    error: { name: "APIError", data: { statusCode: 429, responseBody: "limit reached" } },
+  })
+
+  const file = limitFile(dir, "prov/one")
+  assert.ok(existsSync(file), `a cooldown file must be written for prov/one, got: ${readdirSync(dir).join(", ")}`)
+  const strike = JSON.parse(readFileSync(file, "utf8"))
+  assert.equal(strike.reason, "limit-reached", `the reason must be "limit-reached", got ${strike.reason}`)
+  assert.equal(strike.strikes, 1, `the first terminal limit is strike 1, got ${strike.strikes}`)
+  assert.ok(strike.until > clock.now(), `the cooldown must be in the future, got ${strike.until} vs ${clock.now()}`)
+  assert.deepEqual(net.aborted, ["child-session-error"], `the session must be aborted, got ${JSON.stringify(net.aborted)}`)
+
+  const claims = readFileSync(join(dir, "claims.us31-session-error.json"), "utf8")
+  assert.equal(claims, "{}", `the claim must be released, got ${claims}`)
+
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-31] a terminal limit on a session the pool never bound is logged and aborts nothing", async () => {
+  const net = stubFetch()
+  const slots = [
+    { model: "prov/one", weight: 2 },
+    { model: "other/two", weight: 1 },
+  ]
+  const { dir, hooks, cfg } = await bootPool(slots, "us31-session-error-unbound")
+
+  await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-real" })
+
+  const before = net.aborted.length
+  await emit(hooks, "session.error", {
+    sessionID: "some-other-session",
+    error: { name: "APIError", data: { statusCode: 429, responseBody: "Rate limit exceeded" } },
+  })
+
+  // The plugin sees every session in the process, including the user's own and
+  // other processes'; a pooled child is bound at session.created before any
+  // request, so a claim-less session is not ours to kill.
+  assert.equal(net.aborted.length, before, `no abort may be recorded for an unbound session, got ${JSON.stringify(net.aborted)}`)
+
+  const claims = readFileSync(join(dir, "claims.us31-session-error-unbound.json"), "utf8")
+  assert.notEqual(claims, "{}", `the in-flight claim must survive, got ${claims}`)
+  assert.match(claims, /child-real/, `the real claim must still be in flight, got ${claims}`)
+
+  net.restore()
   await hooks.dispose()
 })

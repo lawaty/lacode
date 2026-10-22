@@ -26,8 +26,9 @@ file in without `mkdir` first.
 Sources 1 and 2 win outright: if they parse, the bundled preset is never read.
 Source 3 is a default, not a floor.
 
-Nothing is hot-reloaded. Change a preset, then restart every running opencode
-process.
+The pool files are not frozen at startup: the running process watches them,
+reloads the slot table, re-binds the variant agents and validates every slot, so a
+change here takes effect without a restart. Plugin CODE still needs one.
 
 ## The flat pool file (recommended)
 
@@ -37,7 +38,7 @@ in place, no JSON and no objects:
 ```text
 # provider/model-id                       weight
 opencode/big-pickle                       3
-opencode-go/minimax-m3.1-flash-free       2
+opencode-go/beam-free       2
 opencode/deepseek-v4.1-flash-free         1
 opencode/glm-5.3-flash-free               1
 ```

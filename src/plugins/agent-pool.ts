@@ -1,3 +1,4 @@
+import { unwatchFile, watchFile } from "node:fs"
 import { tool, type Hooks, type PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
 import * as probe from "../lib/probe.ts"
@@ -14,8 +15,8 @@ import type { Claim } from "../lib/pool.ts"
 // while developing against the working tree.
 //
 // The pool's models are not written here. They come from the preset resolution
-// chain in ../lib/pool.ts (plugin options > ~/.config/lacode/pool.json >
-// presets/free-tier.json), and the config hook rewrites the variant agents
+// chain in ../lib/pool.ts (plugin options > ~/.config/lacode/pool.txt >
+// pool.json > presets/free-tier.json), and the config hook rewrites the variant agents
 // (explore-N, ...) plus the provider whitelists from that source, so
 // changing the pool is a one-file edit instead of twelve agent definitions.
 //
@@ -73,6 +74,10 @@ const HANG_FALLBACK_MS = 10 * 60 * 1000
  * model at a time.
  */
 const PROBE_INTERVAL_MS = 15 * 60 * 1000
+/** How often the pool files are polled for a change; 1s is cheap and feels instant. 0 disables. */
+const SLOT_WATCH_MS = 1000
+/** Editors write a file in more than one step; collapse a burst into one reload. */
+const SLOT_WATCH_DEBOUNCE_MS = 250
 // The kill is one POST to our own local server. It gets a deadline because the
 // reaper is the thing that must never wedge: an unbounded fetch would leave
 // s.reaping true and silently disarm the watchdog for the rest of the process.
@@ -101,6 +106,10 @@ export type AgentPoolOptions = {
   reapMs?: number
   /** How often cooled models are probed by using them; the 15m default, 0 disables. */
   probeMs?: number
+  /** Poll interval for the pool files; the 1s default, 0 disables the watcher. */
+  watchMs?: number
+  /** How long to wait after a pool-file change before reloading; the 250ms default. */
+  watchDebounceMs?: number
   /** Explicit slot file. Short-circuits the preset resolution chain. */
   modelsFile?: string
   /** Inline `{ slots: [...] }`, highest priority in the resolution chain. */
@@ -184,6 +193,15 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     if (strike) await log("warn", `cooling ${claim.m} for ${Math.round((strike.until - now) / 1000)}s (hang)`)
   }
 
+  // The claim this process owns that is running on `sessionID`, if any. A claim
+  // is bound to the child session opencode creates for it, so the session id is
+  // what ties a limit signal back to the slot that took it.
+  const claimFor = (sessionID: string | undefined) => {
+    if (!sessionID) return undefined
+    for (const [key, claim] of s.own) if (claim.g === sessionID) return { key, claim }
+    return undefined
+  }
+
   // A usage limit HANGS rather than failing: opencode keeps retrying the same
   // refused model, so the claim it is holding never comes back and the reaper
   // would only condemn it after STUCK_MIN_AGE_MS of age -- minutes the caller
@@ -193,10 +211,17 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
   // seconds instead of minutes. Scoped to the claim that owns the session so an
   // unrelated session's error never kills someone else's work.
   const failOver = async (sessionID: string | undefined, model: string, reason: string) => {
-    if (!sessionID) return
-    const entry = [...s.own.entries()].find(([, claim]) => claim.g === sessionID)
-    if (!entry) return
-    const [key, claim] = entry
+    const entry = claimFor(sessionID)
+    if (!entry) {
+      // A limit on a session the pool never bound is not ours to kill: the
+      // plugin sees every session in the process, including the user's own and
+      // other processes'. A child is bound at session.created, before any
+      // request, so a pool-routed session always has a claim. Log the rest so a
+      // stall stays visible instead of silent.
+      await log("warn", `limit (${reason}) on ${model} for session ${sessionID ?? "?"}, which has no pool claim; nothing aborted`)
+      return
+    }
+    const { key, claim } = entry
     const kill = await abortSession(sessionID)
     pool.release(s, key)
     await log(
@@ -325,14 +350,16 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
   // The timer is armed only while something is actually cooling — probeCooling
   // returns immediately when it is not — so the common case costs one timestamp
   // comparison every fifteen minutes and no request at all.
-  const EMPTY_REPORT: probe.ProbeReport = { outcomes: [], cleared: [], kept: [], changed: false }
+  const EMPTY_REPORT: probe.ProbeReport = { outcomes: [], cleared: [], kept: [], missing: [], changed: false }
 
   // The `agent-pool: ` prefix belongs to whoever presents this — pool_status and this
-// tool share it — so it is added there and not baked into the summary.
-const reportTitle = (report: probe.ProbeReport) =>
-  report.outcomes.length === 0
-    ? "nothing cooling to probe"
-    : `probed ${report.outcomes.length} cooling model(s), re-admitted ${report.cleared.length}`
+  // tool share it — so it is added there and not baked into the summary.
+  const reportTitle = (report: probe.ProbeReport) => {
+    if (report.outcomes.length === 0) return "nothing cooling to probe"
+    const parts = [`probed ${report.outcomes.length} model(s)`, `re-admitted ${report.cleared.length}`]
+    if (report.missing.length > 0) parts.push(`benched ${report.missing.length} missing`)
+    return parts.join(", ")
+  }
 
   /** Brief by design: this lands in a toast and in a tool answer, not in a report. */
   const reportText = (report: probe.ProbeReport): string => {
@@ -341,13 +368,21 @@ const reportTitle = (report: probe.ProbeReport) =>
       ...report.outcomes.map((outcome) =>
         outcome.ok
           ? `${outcome.model}: answered — cooldown cleared (it had ${formatWindow(outcome.hadSeconds)} left), back in the rotation`
-          : `${outcome.model}: still limited (${outcome.reason}) — cooldown kept${
-              outcome.leftSeconds > 0 ? `, ${formatWindow(outcome.leftSeconds)} left` : ""
-            }`,
+          : outcome.reason === pool.MODEL_MISSING_REASON
+            ? `${outcome.model}: not served by the provider (${outcome.reason}) — benched${
+                outcome.leftSeconds > 0 ? `, ${formatWindow(outcome.leftSeconds)} left` : ""
+              }`
+            : `${outcome.model}: still limited (${outcome.reason}) — cooldown kept${
+                outcome.leftSeconds > 0 ? `, ${formatWindow(outcome.leftSeconds)} left` : ""
+              }`,
       ),
       report.cleared.length > 0
         ? `re-admitted: ${report.cleared.join(", ")}. They route again on the next pooled spawn — nothing needs restarting or reloading.`
-        : "nothing was re-admitted; the pool is short exactly as much as it was.",
+        : report.missing.length > 0
+          ? `benched: ${report.missing.join(", ")}. The provider does not serve them; replace them in the pool.`
+          : report.outcomes.every((outcome) => outcome.ok)
+            ? "every model that was asked answered; nothing needed re-admitting."
+            : "nothing was re-admitted; the pool is short exactly as much as it was.",
     ].join("\n")
   }
 
@@ -364,7 +399,9 @@ const reportTitle = (report: probe.ProbeReport) =>
     const message =
       report.cleared.length > 0
         ? `Re-admitted ${report.cleared.join(", ")} — they answer again.`
-        : `${report.kept.length} cooling model(s) re-checked, still limited.`
+        : report.missing.length > 0
+          ? `Benched ${report.missing.join(", ")} — the provider does not serve them.`
+          : `${report.kept.length} cooling model(s) re-checked, still limited.`
     await log("info", `pool probe: ${message}`, { cleared: report.cleared, kept: report.kept })
     try {
       await client.tui?.showToast?.({
@@ -397,64 +434,136 @@ const reportTitle = (report: probe.ProbeReport) =>
       : "cooldown probe disabled (probeMs: 0); use the pool_recheck tool to check on demand",
   )
 
-  return {
-    config: async (cfg) => {
-      const slots = pool.ensureSlots(s, (m) => void warnOnce(m))
-      const agents = cfg.agent as Record<string, { model?: string; [k: string]: unknown }> | undefined
-      const providers = cfg.provider as Record<string, { whitelist?: string[] }> | undefined
-      const known = new Set<string>()
-      for (const [name, def] of Object.entries(cfg.agent ?? {})) if (def?.model) s.models.set(name, def.model)
+  // The config object opencode handed us. It is retained because the variant
+  // agents' models are written HERE, not read from `s.slots` at spawn time -- so
+  // a slot-table reload must re-run this binding against the same object.
+  let liveConfig: Parameters<NonNullable<Hooks["config"]>>[0] | undefined
 
-      for (const slot of slots) {
-        // The variant agents carry no model of their own -- neither in the
-        // injected agent set nor in the author's opencode.jsonc. It is written
-        // here from the resolved preset, so the preset is the only place a pool
-        // model is ever written down. A model already present on a variant is a
-        // stale leftover and is reported, not obeyed.
-        for (const base of pool.BASES) {
-          const name = pool.agentFor(base, slot.index)
-          const def = agents?.[name]
-          if (!def) {
-            await warnOnce(`variant ${name} is missing from the config; spawns of ${base} that route to slot ${slot.index} would fail`)
-            continue
-          }
-          if (def.model && def.model !== slot.model) {
-            await warnOnce(`${name} still hard-codes ${def.model}; the resolved pool preset wins (${slot.model}). Delete the line to keep one source of truth.`)
-          }
-          def.model = slot.model
-          known.add(name)
-          s.models.set(name, slot.model)
-        }
+  /**
+   * Write the resolved slot table into the variant agents and provider
+   * whitelists.
+   *
+   * Idempotent on purpose: `def.model` is overwritten, a whitelist append is
+   * guarded, and `s.known` is replaced rather than merged. That is what makes it
+   * safe to run again from the watcher when the pool changes.
+   */
+  const bind = async (cfg: Parameters<NonNullable<Hooks["config"]>>[0]) => {
+    const slots = pool.ensureSlots(s, (m) => void warnOnce(m))
+    const agents = cfg.agent as Record<string, { model?: string; [k: string]: unknown }> | undefined
+    const providers = cfg.provider as Record<string, { whitelist?: string[] }> | undefined
+    const known = new Set<string>()
+    for (const [name, def] of Object.entries(cfg.agent ?? {})) if (def?.model) s.models.set(name, def.model)
 
-        // A provider whitelist is an ALLOWLIST: opencode deletes every model a
-        // provider offers that the list does not name. So a whitelist the user
-        // wrote really is a restriction, and a slot whose model is missing from
-        // it silently resolves to no model at all -- append it rather than making
-        // the user edit a second file. An ABSENT whitelist already allows
-        // everything, and creating one here would delete every model of theirs the
-        // pool does not name, so an absent list stays absent.
-        // Split on the first slash only: some providers (openrouter) put a vendor
-        // segment in the model id itself, e.g. openrouter/nvidia/nemotron-3-ultra:free.
-        const slash = slot.model.indexOf("/")
-        const provider = slot.model.slice(0, slash)
-        const id = slot.model.slice(slash + 1)
-        const entry = providers?.[provider]
-        if (!entry) {
-          await warnOnce(`provider ${provider} is not configured in opencode.jsonc; slot ${slot.index} (${slot.model}) cannot resolve`)
+    for (const slot of slots) {
+      // The variant agents carry no model of their own -- neither in the
+      // injected agent set nor in the author's opencode.jsonc. It is written
+      // here from the resolved preset, so the preset is the only place a pool
+      // model is ever written down. A model already present on a variant is a
+      // stale leftover and is reported, not obeyed.
+      for (const base of pool.BASES) {
+        const name = pool.agentFor(base, slot.index)
+        const def = agents?.[name]
+        if (!def) {
+          await warnOnce(`variant ${name} is missing from the config; spawns of ${base} that route to slot ${slot.index} would fail`)
           continue
         }
-        const list = entry.whitelist
-        if (list && !list.includes(id)) {
-          list.push(id)
-          await log("info", `whitelisted ${id} on ${provider} (${s.origin} slot ${slot.index})`)
+        if (def.model && def.model !== slot.model) {
+          await warnOnce(`${name} still hard-codes ${def.model}; the resolved pool preset wins (${slot.model}). Delete the line to keep one source of truth.`)
         }
+        def.model = slot.model
+        known.add(name)
+        s.models.set(name, slot.model)
       }
 
-      s.known = known
-      await log(
-        "info",
-        `${s.origin}: bound ${known.size} variant agent(s) to ${slots.length} slot(s): ${slots.map((sl) => `${sl.index}=${sl.model} w${sl.weight}`).join(", ")}`,
-      )
+      // A provider whitelist is an ALLOWLIST: opencode deletes every model a
+      // provider offers that the list does not name. So a whitelist the user
+      // wrote really is a restriction, and a slot whose model is missing from
+      // it silently resolves to no model at all -- append it rather than making
+      // the user edit a second file. An ABSENT whitelist already allows
+      // everything, and creating one here would delete every model of theirs the
+      // pool does not name, so an absent list stays absent.
+      // Split on the first slash only: some providers (openrouter) put a vendor
+      // segment in the model id itself, e.g. openrouter/nvidia/nemotron-3-ultra:free.
+      const slash = slot.model.indexOf("/")
+      const provider = slot.model.slice(0, slash)
+      const id = slot.model.slice(slash + 1)
+      const entry = providers?.[provider]
+      if (!entry) {
+        await warnOnce(`provider ${provider} is not configured in opencode.jsonc; slot ${slot.index} (${slot.model}) cannot resolve`)
+        continue
+      }
+      const list = entry.whitelist
+      if (list && !list.includes(id)) {
+        list.push(id)
+        await log("info", `whitelisted ${id} on ${provider} (${s.origin} slot ${slot.index})`)
+      }
+    }
+
+    s.known = known
+    await log(
+      "info",
+      `${s.origin}: bound ${known.size} variant agent(s) to ${slots.length} slot(s): ${slots.map((sl) => `${sl.index}=${sl.model} w${sl.weight}`).join(", ")}`,
+    )
+  }
+
+  /**
+   * The slot VALIDATION pass: probe every model in the table, cooling or not.
+   *
+   * A cooling model is re-admitted if it answers. A model the provider does not
+   * serve is benched (see probeOne), so the next spawn routes around a slot that
+   * would have failed. Shared with the on-demand recheck path, so its failures
+   * never throw into the watcher.
+   */
+  const runValidation = async (models: string[]): Promise<probe.ProbeReport> => {
+    let report = EMPTY_REPORT
+    try {
+      report = await probe.probeModels(client as probe.ProbeClient, { state: s, directory, models })
+    } catch (error) {
+      await log("error", `pool validation failed: ${String(error)}`)
+      return EMPTY_REPORT
+    }
+    await announce(report)
+    return report
+  }
+
+  // Watch every file the resolution chain consults. A change reaches
+  // reloadSlots(), which is the only way past the read-once cache in
+  // ensureSlots(); the variants are re-bound to the new table before the
+  // validation pass, because a variant's model lives in the config object.
+  const watchMs = opts.watchMs ?? SLOT_WATCH_MS
+  const watchDebounceMs = opts.watchDebounceMs ?? SLOT_WATCH_DEBOUNCE_MS
+  const sources = watchMs > 0 ? pool.slotSources(opts) : []
+  let reloadTimer: ReturnType<typeof setTimeout> | undefined
+  const reloadFromDisk = async () => {
+    const reload = pool.reloadSlots(s, (m) => void warnOnce(m))
+    if (!reload.changed) return
+    await log(
+      "info",
+      `pool changed (${reload.origin}): ${reload.slots.map((sl) => `${sl.index}=${sl.model} w${sl.weight}`).join(", ")}`,
+    )
+    if (liveConfig) await bind(liveConfig)
+    await runValidation(reload.slots.map((slot) => slot.model))
+  }
+  const scheduleReload = () => {
+    if (reloadTimer) return
+    reloadTimer = setTimeout(() => {
+      reloadTimer = undefined
+      void reloadFromDisk()
+    }, watchDebounceMs)
+    reloadTimer.unref?.()
+  }
+  for (const source of sources) watchFile(source, { interval: watchMs, persistent: false }, scheduleReload)
+  void log(
+    "info",
+    sources.length > 0
+      ? `pool config watch armed: ${sources.join(", ")} every ${watchMs}ms; a change reloads the slots and validates every slot`
+      : "pool config watch disabled (watchMs: 0)",
+  )
+
+  return {
+    config: async (cfg) => {
+      liveConfig = cfg
+      await bind(cfg)
     },
 
     event: async ({ event }) => {
@@ -471,36 +580,126 @@ const reportTitle = (report: probe.ProbeReport) =>
           const status = props.status as
             | { type?: string; message?: string; next?: number; action?: { reason?: string; provider?: string } }
             | undefined
-          const reason = status?.action?.reason ?? ""
-          // opencode reports a provider-wide limit itself, per session: a retry
-          // status carrying the provider and a `next` reset timestamp. This fires
-          // even when no assistant error is attached to a message, and it is
-          // provider-wide, so cool every slot on that provider until the stated
-          // reset. "free_tier_limit" is opencode's own reason; a limit-shaped
-          // reason from any other provider is the same statement, so both count.
-          if (status?.type === "retry" && status.action?.provider && (reason === "free_tier_limit" || pool.isLimitText(reason))) {
-            const provider = status.action.provider
+          const action = status?.action
+          const provider = typeof action?.provider === "string" ? action.provider : undefined
+          const reason = action?.reason ?? ""
+          // The provider's OWN words. opencode attaches an `action` block only for
+          // the two error bodies it knows (FreeUsageLimitError, GoUsageLimitError);
+          // any other provider limit arrives as a retry status carrying only a
+          // message -- "limit reached", "daily limit reached". Reading the message
+          // is what lets a provider with its own vocabulary count, and it is the
+          // only signal there is when the provider is not named.
+          const message = typeof status?.message === "string" ? status.message : ""
+          const limited = reason === "free_tier_limit" || pool.isLimitText(reason) || pool.isLimitText(message)
+          if (status?.type === "retry" && limited) {
             // A probe's own 429 is evidence about one request, not about every slot
             // on the provider, and letting it bench the whole provider would turn a
             // health check into a denial of service against the pool running it.
             // The probe settles its own model's cooldown instead (src/lib/probe.ts).
             if (sessionID && pool.isProbe(s, sessionID)) {
-              await log("debug", `probe on provider ${provider} was limited (${reason || "rate-limited"}); not cooling the provider`)
+              await log("debug", `probe on provider ${provider ?? "?"} was limited (${reason || "rate-limited"}); not cooling the provider`)
               return
             }
-            const until = typeof status.next === "number" && status.next > Date.now() ? status.next : Date.now() + HANG_FALLBACK_MS
-            const cooled = pool.coolProvider(s, provider, until, reason || "rate-limited")
-            if (cooled.length > 0) {
-              await log("warn", `limit on provider ${provider} (${reason || "rate-limited"}); cooling ${cooled.length} slot(s) until ${new Date(until).toISOString().slice(11, 19)}Z`, {
-                provider,
-                until,
-                models: cooled.map((c) => c.model),
-              })
+            const own = claimFor(sessionID)
+            // A transient upstream outage is not a quota: it lifts on its own, so
+            // it gets one short, flat window and never counts as a strike -- the
+            // same line the assistant-error branch draws below. Without it, a
+            // momentary outage reported in a retry status benches a healthy model
+            // for the quota window and files it under the wrong reason. A reason
+            // that says quota wins: "free_tier_limit" is the provider saying it is
+            // out of allowance, not that it is down.
+            const outage = pool.isUnavailableText(message) && !pool.isQuotaReason(reason)
+            // An outage is filed under its own reason, because that reason is what
+            // tells the pool the record is a COOLING record and never a strike (see
+            // pool.recordStrike). A reason that says quota still wins -- the
+            // provider is out of allowance, not down -- but a reason that says
+            // nothing about quota does not get to relabel an outage as something
+            // else, because then the outage would land in the strike memory.
+            const named = outage ? pool.UNAVAILABLE_REASON : reason || pool.limitReason(message) || "rate-limited"
+            if (provider) {
+              // An outage gets the flat window as well: a provider that is briefly
+              // down must not be benched for the quota window because it said so
+              // in the wrong words.
+              const until = outage
+                ? Date.now() + pool.UNAVAILABLE_COOLDOWN_MS
+                : typeof status.next === "number" && status.next > Date.now()
+                  ? status.next
+                  : Date.now() + HANG_FALLBACK_MS
+              const cooled = pool.coolProvider(s, provider, until, named)
+              if (cooled.length > 0) {
+                await log("warn", `limit on provider ${provider} (${named}); cooling ${cooled.length} slot(s) until ${new Date(until).toISOString().slice(11, 19)}Z`, {
+                  provider,
+                  until,
+                  models: cooled.map((c) => c.model),
+                })
+              }
+            } else if (own) {
+              // No provider named: cool the MODEL the session is running on. That
+              // is the one model this refusal is evidence about, and cooling it is
+              // what sends the retry to a slot that answers. A reset the provider
+              // stated in the message wins over the computed backoff.
+              if (outage) {
+                // The session is still aborted below: a retry status means opencode
+                // is LOOPING on a refused model, and only the abort ends the wait.
+                // What an outage changes is the WINDOW, not the wait.
+                const transient = pool.coolUnavailable(s, own.claim.m)
+                if (transient) await log("warn", `cooling ${own.claim.m} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason})`)
+              } else {
+                const stated = pool.statedCooldown(message)
+                const strike = pool.recordStrike(s, own.claim.m, named, stated)
+                if (strike) {
+                  await log("warn", `limit on ${own.claim.m} (${named}); cooling it for ${Math.round((strike.until - Date.now()) / 1000)}s`, {
+                    model: own.claim.m,
+                    slot: own.claim.k,
+                    session: sessionID,
+                  })
+                }
+              }
             }
             // The provider is benched, but the task already retrying on it is not:
             // abort it now rather than leave it to burn the whole retry budget.
-            await failOver(sessionID, provider, reason || "rate-limited")
+            await failOver(sessionID, provider ?? own?.claim.m ?? "?", named)
           }
+          return
+        }
+
+        if (event.type === "session.error") {
+          const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined
+          // opencode reports a terminal API error as `session.error` plus an idle
+          // status, not as a retry status, so the branch above never sees it.
+          const error = props.error as
+            | { data?: { statusCode?: number; responseHeaders?: Record<string, string> } }
+            | undefined
+          const haystack = JSON.stringify(error) ?? ""
+          if (sessionID && pool.isProbe(s, sessionID)) {
+            await log("debug", `probe session ${sessionID} ended with an error; not cooling anything`)
+            return
+          }
+          const status = typeof error?.data?.statusCode === "number" ? error.data.statusCode : undefined
+          const limited = pool.isLimitText(haystack) || status === 429
+          const outage = pool.isUnavailableText(haystack)
+          if (!limited && !outage) return
+          const own = claimFor(sessionID)
+          const named = outage ? pool.UNAVAILABLE_REASON : pool.limitReason(haystack) ?? "rate-limited"
+          if (own) {
+            if (outage) {
+              const transient = pool.coolUnavailable(s, own.claim.m)
+              if (transient) {
+                await log("warn", `cooling ${own.claim.m} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason}) after a terminal error`)
+              }
+            } else {
+              const stated = pool.statedCooldown(haystack) ?? pool.retryAfterMs(error?.data?.responseHeaders)
+              const strike = pool.recordStrike(s, own.claim.m, named, stated)
+              if (strike) {
+                await log("warn", `limit on ${own.claim.m} (${named}); cooling it for ${Math.round((strike.until - Date.now()) / 1000)}s from a terminal session.error`, {
+                  model: own.claim.m,
+                  slot: own.claim.k,
+                  session: sessionID,
+                })
+              }
+            }
+          }
+          await failOver(sessionID, own?.claim.m ?? "?", named)
           return
         }
 
@@ -559,9 +758,7 @@ const reportTitle = (report: probe.ProbeReport) =>
           return
         }
         const stated = pool.statedCooldown(haystack) ?? pool.retryAfterMs((info.error as { data?: { responseHeaders?: Record<string, string> } }).data?.responseHeaders)
-        const reason = haystack.match(/rate[\s_-]?limit|usage limit|too many requests|quota|freelimiterror|overloaded/i)?.[0]
-          ?.toLowerCase()
-          .replace(/[\s_]/g, "-")
+        const reason = pool.limitReason(haystack)
         const strike = pool.recordStrike(s, model, reason ?? "rate-limited", stated)
         if (strike) await log("warn", `cooling ${model} for ${Math.round((strike.until - Date.now()) / 1000)}s (${reason ?? "rate-limited"}, strike ${strike.strikes})`)
         // The model is benched; the task already in flight on it is not. Abort it
@@ -575,7 +772,18 @@ const reportTitle = (report: probe.ProbeReport) =>
     "tool.execute.before": async (input, output) => {
       if (input.tool !== "task") return
       const requested = output.args?.subagent_type
-      if (typeof requested !== "string") return
+      if (typeof requested !== "string") {
+        // A task spawn with no subagent_type never reaches the routing below:
+        // opencode runs the default subagent, which carries no pool model, so
+        // the spawn silently inherits the caller's model. That is the one way a
+        // delegated read can cost a primary-model turn without the pool ever
+        // seeing it, so it is worth saying even though the spawn cannot be fixed
+        // after the fact. Pass the base name ("explore" / "implement") instead.
+        await warnOnce(
+          'task spawn has no subagent_type, so the pool cannot route it -- it will run on the caller\'s own model. Pass subagent_type "explore" or "implement" to use a slot.',
+        )
+        return
+      }
 
       // Refused here, ahead of routing and deliberately OUTSIDE the try below.
       // That catch exists so a routing slip never costs the caller a spawn; a
@@ -666,15 +874,16 @@ const reportTitle = (report: probe.ProbeReport) =>
     tool: {
       pool_recheck: tool({
         description:
-          "Probe the models the pool has benched and re-admit the ones that answer. Each probe is a real request on that exact model, so it settles what a cooldown can only guess: if the model replies, its cooldown is cleared and it is back in the rotation; if it is still limited, the existing cooldown stands. Call it after resetting a quota in the provider's own console, when the pool feels short of capacity, or to check now instead of waiting for the next automatic pass.",
+          "Probe the models the pool has benched and re-admit the ones that answer. Each probe is a real request on that exact model, so it settles what a cooldown can only guess: if the model replies, its cooldown is cleared and it is back in the rotation; if it is still limited, the existing cooldown stands; if the provider does not serve it at all, it is benched so routing stops choosing it. Pass `models` to validate those even when they are not cooling. Call it after editing the pool, after resetting a quota in the provider's own console, when the pool feels short of capacity, or to check now instead of waiting for the next automatic pass.",
         args: {
           models: tool.schema
             .array(tool.schema.string())
             .optional()
-            .describe("Model ids to probe, as provider/model-id. Omit to probe every model that is cooling."),
+            .describe("Model ids to validate, as provider/model-id. Omit to probe only the models that are cooling."),
         },
         async execute(args) {
-          const report = await runProbe(args?.models)
+          const models = args?.models
+          const report = models && models.length > 0 ? await runValidation(models) : await runProbe()
           return { title: `agent-pool: ${reportTitle(report)}`, output: reportText(report) }
         },
       }),
@@ -713,8 +922,8 @@ const reportTitle = (report: probe.ProbeReport) =>
             ].filter(Boolean)
             const marker = slot.index === next.index ? " <- next" : ""
             // claims/ceiling: the ceiling is reached at the denominator (twice the
-            // slot's weight), and a slot at its ceiling is only used again once every
-            // other slot is also there.
+            // slot's weight), and a slot at its ceiling is only used again once no
+            // other slot is both available and under its ceiling.
             const load = entry?.total ?? 0
             const atCeiling = !pool.underCeiling(slot, snap.counts)
             return `  slot ${slot.index} w${slot.weight}  ${slot.model}  load=${load}/${pool.slotCeiling(slot)}${atCeiling ? " FULL" : ""}${marker}  [${users}${notes.length ? "; " + notes.join("; ") : ""}]`
@@ -732,7 +941,7 @@ const reportTitle = (report: probe.ProbeReport) =>
           return {
             title: `agent-pool: ${total} task(s) in flight, ${coolingNow.length} model(s) cooling`,
             output: [
-              `shared pool over ${slots.length} model(s) from ${s.origin}; bases: ${pool.BASES.join(", ")}\nround robin in slot order, each slot taking as many turns as its weight says, so no slot is starved while another drains (FULL = at ceiling, used only when every slot is)`,
+              `shared pool over ${slots.length} model(s) from ${s.origin}; bases: ${pool.BASES.join(", ")}\nround robin in slot order, each slot taking as many turns as its weight says, so no slot is starved while another drains (FULL = at ceiling, used only when no other slot is available and under its ceiling)`,
               ...slots.map(line),
               "",
               "by process:",
@@ -747,8 +956,17 @@ const reportTitle = (report: probe.ProbeReport) =>
               // "still cooling" and "nobody has actually asked it lately" are
               // different situations and this is the line that tells them apart.
               probeMs > 0
-                ? `cooldown probe: last ${s.lastProbe ? `${Math.max(0, Math.round((now - s.lastProbe) / 1000))}s ago` : "never (nothing has been cooling)"}, every ${Math.round(probeMs / 60000)}m; call the pool_recheck tool to ask now.`
-                : "cooldown probe: off (probeMs: 0); call the pool_recheck tool to ask now.",
+                ? `cooldown probe: last ${
+                    s.lastProbe
+                      ? `${Math.max(0, Math.round((now - s.lastProbe) / 1000))}s ago`
+                      : coolingNow.length > 0
+                        ? "never in this process (cooldowns came from disk)"
+                        : "never (nothing has been cooling)"
+                  }, every ${Math.round(probeMs / 60000)}m; call the pool_recheck tool (or run /pool-recheck) to ask now.`
+                : "cooldown probe: off (probeMs: 0); call the pool_recheck tool (or run /pool-recheck) to ask now.",
+              watchMs > 0
+                ? `pool config watch: ${sources.join(", ")} every ${watchMs}ms; a change reloads the slot table and validates every slot.`
+                : "pool config watch: off (watchMs: 0).",
               coolingNow.length === 0
                 ? "no models cooling down."
                 : `cooling: ${coolingNow.map(([m, st]) => `${m} for ${Math.ceil((st.until - now) / 1000)}s`).join(", ")}`,
@@ -761,6 +979,8 @@ const reportTitle = (report: probe.ProbeReport) =>
     dispose: async () => {
       clearInterval(timer)
       if (probeTimer) clearInterval(probeTimer)
+      if (reloadTimer) clearTimeout(reloadTimer)
+      for (const source of sources) unwatchFile(source, scheduleReload)
       s.own.clear()
       // Drop the per-session bookkeeping with the claims: nothing can be running
       // once the hooks are gone, and these are the two maps that would otherwise

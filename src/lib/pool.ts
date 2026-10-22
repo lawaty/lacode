@@ -26,9 +26,9 @@ import { PACKAGE_ROOT } from "./package-root.ts"
 // plain round robin in declaration order, and 2 over 2 / 1 over 1 reproduces the old
 // primary/overflow cycle exactly.
 //
-// Once EVERY slot is at or over its ceiling nothing can gate anything, so the overflow
-// goes to the least loaded slot -- the pool never blocks, and a burst past the summed
-// ceilings degrades to even spreading rather than piling on slot 1.
+// Once NO slot is both available and under its ceiling nothing can gate anything, so
+// the overflow goes to the least loaded slot -- the pool never blocks, and a burst past
+// the summed ceilings degrades to even spreading rather than piling on slot 1.
 //
 // This module holds the state and the decision; src/plugins/agent-pool.ts owns
 // the hooks (task routing, limit detection, hang reaping) and
@@ -37,8 +37,9 @@ import { PACKAGE_ROOT } from "./package-root.ts"
 // passes through the task hook.
 //
 // Which models fill the slots comes from the preset resolution chain (see
-// resolveModels), resolved once per process into State.slots and shared by every
-// hook in the process.
+// resolveModels), resolved into State.slots and shared by every hook in the
+// process. A watcher in src/plugins/agent-pool.ts calls reloadSlots() when a
+// source file changes, so an edit reaches the running process.
 //
 // COST IS THE USER'S CHOICE (US-7). Nothing here, and nothing in the preset
 // loader, asks what a model costs or whether it is free: any provider/model-id
@@ -61,6 +62,15 @@ export const HANG_COOLDOWN_MS = 10 * 60 * 1000
 // A transient upstream outage self-resolves, so it is cooled briefly and re-probed
 // rather than escalated like a strike. See coolUnavailable().
 export const UNAVAILABLE_COOLDOWN_MS = 60 * 1000
+/**
+ * The reason a transient outage is filed under.
+ *
+ * It is not a quota and it is not a strike: such a record benches a model for
+ * one short flat window and must never enter the strike memory, or the next
+ * real failure on that model would start at strike 2 and get a window twice as
+ * long as the first one.
+ */
+export const UNAVAILABLE_REASON = "endpoint-unavailable"
 // A weight counts the turns a slot takes per rotation, and its ceiling is a small
 // multiple of that (SLOT_CEILING_FACTOR), so this bounds both the ceiling and the
 // total pool capacity (4 slots at MAX_WEIGHT, each ceilinged at SLOT_CEILING_FACTOR
@@ -123,6 +133,23 @@ export const STATED_COOLDOWN_MAX_MS = QUOTA_COOLDOWN_MAX_MS
  */
 export const isQuotaReason = (reason: string) => /quota|limit|rate|too-many|overloaded|429/i.test(reason)
 
+/**
+ * The reason a model id the provider does not serve is filed under.
+ *
+ * A withdrawn or mistyped model is not a quota: it does not reopen on a
+ * schedule, so re-probing it every few minutes only spends requests. It is
+ * benched for the quota cap instead, and a later probe re-admits it if the
+ * provider starts serving it again.
+ */
+export const MODEL_MISSING_REASON = "model-missing"
+export const MODEL_MISSING_COOLDOWN_MS = QUOTA_COOLDOWN_MAX_MS
+// The wording opencode uses when a provider does not know a model id:
+// "Model not found: provider/model. Did you mean: ...". Deliberately textual --
+// a bare 404 can be a gateway route, and benching a healthy model for it would
+// take a slot out over a missing endpoint.
+const MODEL_MISSING_PATTERN = /model\s+(?:not\s+found|does\s+not\s+exist|is\s+not\s+available)|(?:unknown|no\s+such)\s+model/i
+export const isModelMissingText = (text: string) => MODEL_MISSING_PATTERN.test(text)
+
 export type Slot = { index: number; model: string; weight: number }
 
 export type Claim = {
@@ -163,8 +190,9 @@ export const BASES = ["explore", "implement", "context"]
 // this order, and the first one that yields usable slots wins:
 //
 //   1. plugin options   ["@lawaty/lacode", { "models": { "slots": [...] } }]
-//   2. user config      ~/.config/lacode/pool.json
-//   3. bundled preset   <package root>/presets/free-tier.json
+//   2. user config      ~/.config/lacode/pool.txt (flat, preferred)
+//   3. user config      ~/.config/lacode/pool.json
+//   4. bundled preset   <package root>/presets/free-tier.json
 //
 // Anything missing or unusable falls through silently to the next link; the
 // built-in FALLBACK_SLOTS below is the last resort so routing always works. A
@@ -190,7 +218,7 @@ export const USER_MODELS_TXT = join(USER_CONFIG_DIR, "pool.txt")
 
 export const FALLBACK_SLOTS: Slot[] = [
   { index: 1, model: "opencode/big-pickle", weight: 3 },
-  { index: 2, model: "opencode-go/minimax-m3.1-flash-free", weight: 2 },
+  { index: 2, model: "opencode-go/beam-free", weight: 2 },
   { index: 3, model: "opencode/deepseek-v4.1-flash-free", weight: 1 },
   { index: 4, model: "opencode/glm-5.3-flash-free", weight: 1 },
 ]
@@ -422,7 +450,43 @@ const LIMIT_PATTERNS = [
   UNAVAILABLE_PATTERN,
 ]
 
-export const isLimitText = (text: string) => LIMIT_PATTERNS.some((re) => re.test(text))
+// A provider with its own limit vocabulary: "limit reached", "daily limit
+// reached", "usage limit exceeded", "you have reached your limit".
+//
+// The CONTEXT family is excluded on purpose. "context limit reached" is a
+// prompt that is too long, not a provider that has run out of allowance, and
+// benching a model for it would take a healthy provider out of rotation over
+// the user's own prompt.
+const LIMIT_REACHED_PATTERN = /\blimits?[\s_-]?(?:reached|exceeded)\b|\breached\s+(?:your|the|its)\s+limit\b/i
+const CONTEXT_LIMIT_PATTERN = /(?:context|token|length|window|prompt|char|character|byte|size)\s*(?:limit|length|size|window)/i
+
+// The vocabulary a limit is NAMED by. The first alternative that matches
+// anywhere in the text wins, so "rate limit reached" is named "rate-limit" and
+// "daily limit reached" is named "limit-reached".
+const LIMIT_REASON_PATTERN = /rate[\s_-]?limit|usage limit|too many requests|quota|freelimiterror|overloaded|limits?[\s_-]?(?:reached|exceeded)/i
+
+export const isLimitText = (text: string) =>
+  LIMIT_PATTERNS.some((re) => re.test(text)) ||
+  (LIMIT_REACHED_PATTERN.test(text) && !CONTEXT_LIMIT_PATTERN.test(text))
+
+/**
+ * The name of the limit a text reports, for a cooldown file's `reason`.
+ *
+ * One vocabulary, read from one place: the pool, the prober and the fail-over
+ * path all take the reason from here, so a log line and a cooldown file never
+ * spell the same fault two ways. Returns undefined when the text carries no
+ * limit at all -- the caller decides what to call that.
+ *
+ * The SAME predicate that decides whether a text is a limit decides this, so
+ * the two cannot disagree: a text the matcher excludes on purpose -- "context
+ * limit reached", a prompt that is too long rather than a provider out of
+ * allowance -- is given no reason at all, and neither a cooldown file nor the
+ * prober's short reason ever calls it a limit.
+ */
+export const limitReason = (text: string): string | undefined => {
+  if (!isLimitText(text)) return undefined
+  return text.match(LIMIT_REASON_PATTERN)?.[0]?.toLowerCase().replace(/[\s_]/g, "-")
+}
 
 export const isUnavailableText = (text: string) => UNAVAILABLE_PATTERN.test(text)
 
@@ -577,8 +641,8 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
   return g[key]
 }
 
-// Read once per process, on first use: plugins are not hot-reloaded, so editing
-// the preset means restarting opencode anyway.
+// Read once per process, on first use. A pool-file watcher reaches a fresh table
+// through reloadSlots() below rather than through this cache.
 export function ensureSlots(s: State, onWarn: (m: string) => void) {
   if (s.slots.length > 0) return s.slots
   const { slots, problems, origin } = resolveModels({ models: s.inlineModels, modelsFile: s.modelsFile })
@@ -586,6 +650,54 @@ export function ensureSlots(s: State, onWarn: (m: string) => void) {
   s.origin = origin
   for (const problem of problems) onWarn(problem)
   return slots
+}
+
+/**
+ * Identity of a resolved slot table, by VALUE.
+ *
+ * resolveModels returns the shared FALLBACK_SLOTS array by reference on several
+ * paths, so reference equality says nothing. The origin is part of the identity:
+ * deleting pool.txt and falling through to pool.json with the same models still
+ * changes where the table came from, and the status line must say so.
+ */
+const slotSignature = (origin: string, slots: Slot[]) =>
+  `${origin}\u0000${slots.map((slot) => `${slot.index}:${slot.model}:${slot.weight}`).join("|")}`
+
+export type SlotReload = { changed: boolean; slots: Slot[]; origin: string }
+
+/**
+ * Re-resolve the chain and install the result when the slot table changed.
+ *
+ * ensureSlots() is a read-once cache, so the watcher must come through here.
+ * Assigning a new `s.slots` array is safe: every consumer reads it at call time,
+ * `snapshot()` counts load by CLAIM.MODEL, and `release()` deletes claims by key.
+ * What the caller MUST do on a change is re-bind the variant agents -- their model
+ * is written by the config hook, not read from `s.slots` at spawn time.
+ *
+ * A comment or whitespace edit resolves to the same table and reports
+ * `changed: false`, so it neither re-binds an agent nor spends a probe.
+ */
+export function reloadSlots(s: State, onWarn: (m: string) => void): SlotReload {
+  const { slots, problems, origin } = resolveModels({ models: s.inlineModels, modelsFile: s.modelsFile })
+  const changed = slotSignature(origin, slots) !== slotSignature(s.origin, s.slots)
+  if (!changed) return { changed, slots, origin }
+  s.slots = slots
+  s.origin = origin
+  for (const problem of problems) onWarn(problem)
+  return { changed, slots, origin }
+}
+
+/**
+ * The files whose contents can change the resolved slot table, in chain order.
+ *
+ * An inline `models` option has no file to watch; an explicit `modelsFile`
+ * replaces the whole chain. Absent files are included on purpose: watchFile fires
+ * when the user creates `pool.txt` for the first time.
+ */
+export function slotSources(input: { models?: unknown; modelsFile?: string } = {}): string[] {
+  if (input.models !== undefined) return []
+  if (input.modelsFile) return [input.modelsFile]
+  return [USER_MODELS_TXT, USER_MODELS_PATH, DEFAULT_PRESET]
 }
 
 export const claimKey = (sessionID: string, callID: string) => `${sessionID}:${callID}`
@@ -841,16 +953,20 @@ export function readLimits(s: State): Map<string, Strike> {
     try {
       const strike = JSON.parse(readFileSync(path, "utf8")) as Strike
       if (typeof strike.until !== "number" || typeof strike.model !== "string") continue
+      // An outage is not a strike: it benches the model for one flat window and
+      // must not count towards the streak, or the next real failure on this
+      // model would start at strike 2 and get twice the first window.
+      const countsAsStrike = strike.reason !== UNAVAILABLE_REASON
       if (strike.until > now) {
         cooling.set(strike.model, strike)
-        memory.set(strike.model, strike)
+        if (countsAsStrike) memory.set(strike.model, strike)
       } else if (typeof strike.last === "number" && now - strike.last < STRIKE_DECAY_MS) {
         // Lapsed, but recent enough that a new failure is still the same streak.
         // Keep the record -- strikes intact -- so the NEXT failure escalates
         // instead of restarting at strike 1. Only its absence from `cooling`
         // re-admits the model; deleting the file here (the old behaviour) threw
         // the strike count away and reset the backoff on every lapse.
-        memory.set(strike.model, strike)
+        if (countsAsStrike) memory.set(strike.model, strike)
       } else {
         unlinkSync(path)
       }
@@ -863,8 +979,29 @@ export function readLimits(s: State): Map<string, Strike> {
   return cooling
 }
 
+/**
+ * Record a strike on a model: cool it, count it, and write the record so every
+ * process sees it.
+ *
+ * This is the ONE place where the "an outage is a cooling record, never a
+ * strike" rule is enforced, because this is the one funnel every strike passes
+ * through. The reason is the discriminator -- the same one readLimits() uses
+ * when it rebuilds the memory from disk -- so an outage handed in here takes
+ * coolUnavailable()'s flat window and never enters the strike memory.
+ *
+ * It is enforced HERE rather than in the callers so that no caller can get it
+ * wrong: the provider path (coolProvider) cools every slot on a provider and
+ * used to route an outage through this function like any other failure, which
+ * filed it as strike 1. The next REAL limit on that model then started at
+ * strike 2 and took twice the window -- a healthy provider benched for the
+ * quota window over a moment's outage.
+ */
 export function recordStrike(s: State, model: string, reason: string, stated?: number) {
   if (!s.dirReady) return
+  // An outage is cooled flat and is never a strike, whatever window the caller
+  // stated: one short window says "not right now", and the strike memory is
+  // left alone so the next real failure on this model starts at strike 1.
+  if (reason === UNAVAILABLE_REASON) return coolUnavailable(s, model)
   const now = Date.now()
   // Read the prior count from the whole memory map, not from `cooling`: a lapsed
   // cooldown is no longer cooling but its strike streak still counts (readLimits).
@@ -901,9 +1038,12 @@ export function coolUnavailable(s: State, model: string) {
   const prior = s.cooling.get(model)
   const until = now + UNAVAILABLE_COOLDOWN_MS
   if (prior && prior.until > until) return prior
-  const strike: Strike = { model, until, strikes: 1, reason: "endpoint-unavailable", last: now }
+  const strike: Strike = { model, until, strikes: 1, reason: UNAVAILABLE_REASON, last: now }
   s.cooling.set(model, strike)
-  s.strikes.set(model, strike)
+  // The record goes into the COOLING map -- the model is benched -- and into the
+  // file, so every process sees the window. It never enters the STRIKE memory:
+  // an outage lifts on its own, so the next real failure on this model must
+  // start at strike 1 and get the first window, not an escalated one.
   const path = join(s.dir, limitFile(model))
   try {
     writeFileSync(`${path}.tmp`, JSON.stringify(strike))
@@ -1158,8 +1298,10 @@ export function pickSlot(s: State, snap: Snapshot, options?: { advance?: boolean
   // same thing: a request goes to a provider already known to be unhealthy, and
   // gets a fast, self-cooling rejection instead of no request at all.
   const pool = usable.length > 0 ? usable : slots
-  // Every slot is at or over its ceiling, so no weight can gate the pick: spread the
-  // overflow over the least loaded slot rather than refusing the work.
+  // No slot is BOTH available and under its ceiling, so nothing can gate the
+  // pick: spread the overflow over the least loaded slot rather than refusing
+  // the work. The condition is not "every slot is at its ceiling" -- a slot
+  // that is cooling but still under its ceiling frees the others.
   return pool.reduce((best, slot) => (loadOf(snap.counts, slot.model) < loadOf(snap.counts, best.model) ? slot : best), pool[0])
 }
 

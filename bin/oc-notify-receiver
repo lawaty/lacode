@@ -14,7 +14,7 @@
 # pops up an empty notification -- which is exactly what this script used to do.
 # The sender therefore passes a SINGLE argument of the form:
 #
-#     title\nmessage\nurgency\nicon\nsound\nrequestID
+#     title\nmessage\nurgency\nicon\nsound\nrequestID\ncorrelationKey
 #
 # NEWLINE is the delimiter because both senders strip control characters from the
 # title and the message before assembling the payload, so no field can contain
@@ -29,6 +29,25 @@
 # The FIFTH field is the sound, and it is ignored here: this receiver has no
 # sounds directory to play it from. The field is still carried, so the legacy
 # sender and the published one put the same thing on the wire.
+#
+# The SEVENTH field is the CORRELATION KEY: the session the popup belongs to.
+# It is empty when there is none, so the field count never changes and a
+# six-field payload from an older sender still works against this receiver.
+# Like the request id it is opaque: never shown, never passed to a command,
+# never used to build an argument.
+#
+# A seventh field that begins with the literal "close:" is not a notification
+# at all -- it is a CLOSE REQUEST, and the rest of the field is the
+# correlation key whose popups are to be taken down. "close:" is a RECOGNISED
+# VALUE, not a command: the receiver closes those popups over D-Bus, sends
+# nothing back, and exits.
+#
+# A popup is closed when the user starts working in that session's chat: it has
+# said everything it is going to say, so it fades instead of waiting for the X
+# button. Only the desktop that RAISED a popup knows the id the notification
+# daemon gave it, so this receiver -- the desktop's end of the hop -- records
+# that id in <state dir>/<safe key>.ids, one id per line, and closes them again
+# when the close request arrives.
 #
 # A payload with fewer than six fields carries no request id, and therefore no
 # buttons -- so an older sender still works against this receiver.
@@ -71,6 +90,10 @@ MSG="${fields[1]:-}"
 URGENCY="${fields[2]:-normal}"
 ICON="${fields[3]:-utilities-terminal}"
 REQUEST_ID="${fields[5]:-}"
+# The SEVENTH field is the correlation key. A payload with fewer than seven
+# fields has none: that is an older sender, and it keeps working exactly as it
+# always has.
+CORRELATION_KEY="${fields[6]:-}"
 
 # Both senders already strip control characters; this is the trust boundary, so
 # the check is repeated here rather than assumed from the other end.
@@ -80,6 +103,10 @@ MSG="${MSG//[[:cntrl:]]/ }"
 # that arrives from an attacker-controlled environment. It is never used to
 # build an argument -- only its emptiness is ever tested.
 REQUEST_ID="${REQUEST_ID//[[:cntrl:]]/ }"
+# The correlation key is stripped for the same reason: it is a field of the
+# same payload. It is never used to build an argument either -- only its
+# emptiness and its "close:" prefix are ever tested.
+CORRELATION_KEY="${CORRELATION_KEY//[[:cntrl:]]/ }"
 
 # A payload with no newline at all is the OLD sender's argument list, already
 # flattened by ssh into one space-joined string. That is the bug this receiver
@@ -97,6 +124,152 @@ case "$ICON" in
   utilities-terminal|dialog-information|dialog-error|dialog-warning|system-run|emblem-default) ;;
   *) ICON=utilities-terminal ;;
 esac
+
+# ---------------------------------------------------------------------------
+# The correlation key and the notification ids
+#
+# A popup belongs to one session, and only that session may take it down: the
+# user answers the permission in the TUI and THAT session's popup fades, while
+# every other popup stays.
+#
+# So a notification has to be findable again after it was raised -- and only
+# the desktop that raised it knows the id the notification daemon assigned. The
+# raiser records that id in a file named after the correlation key, and the
+# closer reads the file, closes every id in it, and deletes the file.
+#
+# The correlation key is the session id. It is DATA: it is never shown, never
+# passed to a command and never used to build an argument. Only two things are
+# ever tested about it -- whether it is empty, and whether it begins with the
+# literal "close:".
+# ---------------------------------------------------------------------------
+
+# The directory where the notification ids are recorded.
+#
+# Resolved LAZILY, at call time, and never cached: a test that redirects HOME
+# must get its own directory, and a cached value would keep writing into
+# whichever directory the first call happened to see.
+notify_state_dir() {
+  printf '%s' "${LACODE_NOTIFY_DIR:-${HOME:-}/.local/share/opencode/lacode/notify}"
+}
+
+# The file name a correlation key maps to.
+#
+# THE CONTRACT WITH THE TYPESCRIPT SIDE: every character outside
+# [A-Za-z0-9._-] becomes "_", and the result is truncated to 64 characters.
+# src/tunnel/index.ts applies the same rule, and the two must produce the SAME
+# name -- the raiser writes <safe key>.ids and the closer reads it back, so a
+# difference of one character would mean the closer never finds the file and
+# the popup never fades.
+#
+# The key never reaches a command argument: only this file NAME comes from it,
+# and "/" cannot survive the replacement, so the name can never point outside
+# the state directory.
+notify_safe_key() {
+  local key="${1-}"
+  key="${key//[^A-Za-z0-9._-]/_}"
+  printf '%s' "${key:0:64}"
+}
+
+# The file that holds the notification ids of one correlation key.
+#
+# One id per line: a session can have more than one popup up at a time, and
+# each of them is closed by its own id.
+notify_id_file() {
+  printf '%s/%s.ids' "$(notify_state_dir)" "$(notify_safe_key "${1-}")"
+}
+
+# Record a notification id under a correlation key.
+#
+# APPENDED to here, and read then DELETED by the closer: the ids are spent
+# once they have been closed, and a file that outlived them would make the
+# next close try to close ids the daemon has forgotten.
+#
+# The id is validated as a decimal integer before it is written: it is read
+# back later and handed to a command, and a file that anything on this machine
+# can write is not a file to trust.
+record_notification_id() {
+  local key="${1-}" id="${2-}"
+  [[ -n "$key" ]] || return 0
+  [[ "$id" =~ ^[0-9]+$ ]] || return 0
+  local dir file
+  dir="$(notify_state_dir)"
+  file="$(notify_id_file "$key")"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  printf '%s\n' "$id" >> "$file" 2>/dev/null || return 0
+  return 0
+}
+
+# Close one notification by its id, over the session bus.
+#
+# gdbus first, dbus-send second: both are verified to work on the desktop this
+# ships to, and the second is the fallback for a machine without the first.
+#
+# The id is validated as a decimal integer FIRST: it comes out of a file that
+# anything on this machine can write, and an id that is not a number must
+# never reach a command argument.
+close_notification() {
+  local id="${1-}"
+  [[ "$id" =~ ^[0-9]+$ ]] || return 0
+  if command -v gdbus >/dev/null 2>&1; then
+    if gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.CloseNotification "$id" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  if command -v dbus-send >/dev/null 2>&1; then
+    dbus-send --session --dest=org.freedesktop.Notifications --type=method_call /org/freedesktop/Notifications org.freedesktop.Notifications.CloseNotification "uint32:$id" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+# Close every popup recorded for a correlation key.
+#
+# The file holds one id per line and is read then DELETED here. A close that
+# fails is not an error the user needs to see: the popup stays, and nothing
+# else changes -- so one id that cannot be closed does not stop the ones
+# after it.
+close_session_popups() {
+  local key="${1-}" file line
+  [[ -n "$key" ]] || return 0
+  file="$(notify_id_file "$key")"
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Whitespace goes: an id is a number, and a number with a space in it is
+    # not one.
+    line="${line//[[:space:]]/}"
+    [[ -n "$line" ]] || continue
+    close_notification "$line" || true
+  done < "$file"
+  rm -f "$file" 2>/dev/null || true
+  return 0
+}
+
+# notify-send exists, so this is a Linux session bus whatever it looks like.
+# Fall back to the common X11 layouts only when the inherited environment has
+# neither.
+#
+# The session bus is needed by the CLOSE path as much as by the notification
+# one, so this is set up before either: closing a popup is a D-Bus call, and
+# this receiver runs as a forced command with no login session to inherit a
+# bus address from.
+export DISPLAY="${DISPLAY:-:0}"
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+fi
+
+# A CLOSE REQUEST: the seventh field begins with "close:" and the rest of it
+# is the correlation key whose popups are to be taken down.
+#
+# This is a RECOGNISED VALUE, not a command: nothing about the field is ever
+# executed, and the key is never used to build an argument -- it names a file
+# in the state directory and nothing else.
+#
+# The popups of that key were raised HERE, on this desktop, so this is where
+# they are closed. Nothing is sent back: a dismissal answers nothing, and the
+# stdout of this script is the answer that travels home.
+if [[ "$CORRELATION_KEY" == close:* ]]; then
+  close_session_popups "${CORRELATION_KEY#close:}"
+  exit 0
+fi
 
 # This is the LINUX end of the hop: notify-send (libnotify) is the channel, and
 # libnotify is a Linux thing. A machine with no notify-send is told so plainly
@@ -121,12 +294,32 @@ if ! command -v notify-send >/dev/null 2>&1; then
   exit 127
 fi
 
-# notify-send exists, so this is a Linux session bus whatever it looks like.
-# Fall back to the common X11 layouts only when the inherited environment has
-# neither.
-export DISPLAY="${DISPLAY:-:0}"
-if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
-  export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+# A popup with a correlation key carries its id back to this receiver, which
+# records it so the popup can be closed later.
+#
+# Every notify-send below carries --app-name=LaCode: the popup's header IS the
+# notification's app name, and notify-send reports its OWN name when none is
+# given -- so without it the popup claimed to be from a program the user never
+# ran.
+#
+# notify-send prints the id on its FIRST line and, for a popup the user
+# clicked, the action's name after it. The two are split apart: the id is
+# recorded and NEVER printed, because stdout is the answer that travels home
+# and the answer is the action.
+if [[ -n "$CORRELATION_KEY" ]]; then
+  output=""
+  if [[ -n "$REQUEST_ID" ]]; then
+    output="$(notify-send "$TITLE" "$MSG" --app-name=LaCode --urgency="$URGENCY" --icon="$ICON" --expire-time=0 --print-id --action=once='Allow once' --action=always='Always allow' --action=reject='Deny')" || exit 1
+  else
+    output="$(notify-send "$TITLE" "$MSG" --app-name=LaCode --urgency="$URGENCY" --icon="$ICON" --expire-time=0 --print-id)" || exit 1
+  fi
+  record_notification_id "$CORRELATION_KEY" "${output%%$'\n'*}"
+  # An actionable popup answers with the name of the button the user clicked;
+  # a plain one has no answer to publish and prints nothing at all.
+  if [[ -n "$REQUEST_ID" && "$output" == *$'\n'* ]]; then
+    printf '%s\n' "${output#*$'\n'}"
+  fi
+  exit 0
 fi
 
 # An actionable notification carries buttons, so the user can answer without
@@ -140,10 +333,10 @@ fi
 # stderr is left alone -- this runs as a forced command, so its stderr reaches
 # whoever opened the ssh connection and nobody else.
 if [[ -n "$REQUEST_ID" ]]; then
-  action="$(notify-send "$TITLE" "$MSG" --urgency="$URGENCY" --icon="$ICON" --expire-time=0 --action=once='Allow once' --action=always='Always allow' --action=reject='Deny')" || exit 1
+  action="$(notify-send "$TITLE" "$MSG" --app-name=LaCode --urgency="$URGENCY" --icon="$ICON" --expire-time=0 --action=once='Allow once' --action=always='Always allow' --action=reject='Deny')" || exit 1
   printf '%s\n' "$action"
   exit 0
 fi
 
 # --expire-time=0: the notification waits for the user to close it; without it the desktop's own timeout takes it away, and a notice they missed is no notice.
-exec notify-send "$TITLE" "$MSG" --urgency="$URGENCY" --icon="$ICON" --expire-time=0
+exec notify-send "$TITLE" "$MSG" --app-name=LaCode --urgency="$URGENCY" --icon="$ICON" --expire-time=0

@@ -269,6 +269,11 @@ fi
 TUNNEL_KEY="$HOME/.ssh/oc_notify"
 RECEIVER="$HOME/.local/bin/oc-notify-receiver"
 RECEIVER_SRC="$SCRIPT_DIR/oc-notify-receiver"
+# The preflight runs on the DESKTOP too, as the tunnel unit's ExecStartPre: it
+# frees the tunnel port when the session that held it died without releasing it.
+# It is not pushed to the hosts -- it talks to them.
+PREFLIGHT="$HOME/.local/bin/oc-tunnel-preflight"
+PREFLIGHT_SRC="$SCRIPT_DIR/oc-tunnel-preflight"
 
 # ---------------------------------------------------------------------------
 # Persistent tunnel service, one per host.
@@ -340,6 +345,42 @@ install_tunnel_unit() {
   local host="$1" port="$2" unit="oc-tunnel@$1"
   local unit_file="$TUNNEL_UNIT_DIR/$unit.service"
 
+  # The ExecStartPre line names a FILE, and systemd refuses to start a unit
+  # whose ExecStartPre does not exist: 203/EXEC. With Restart=always that unit
+  # then retries every 10 seconds forever, so it is not "no preflight" but "no
+  # tunnel" -- and every notification from $host dies with it, visibly only in
+  # the remote's journal, on the other side of the hop.
+  #
+  # So the line is written only when the preflight is really there, and the
+  # tunnel degrades to the behaviour it had before the preflight existed: it
+  # comes up, and it cannot free a stale port by itself. The SAME line decides
+  # the "up to date" check below: a guard that demands a line the renderer may
+  # omit either rewrites the unit on every run or never converges.
+  local preflight_line=""
+  if [[ -x "$PREFLIGHT" ]] || { [[ $DRY_RUN -eq 1 ]] && [[ -f "$PREFLIGHT_SRC" ]]; }; then
+    preflight_line="ExecStartPre=$PREFLIGHT $host $port"
+  else
+    warn "the tunnel preflight is not installed at $PREFLIGHT -- $unit starts without it"
+  fi
+
+  # The preflight's own comment travels with its line: a unit that does not run
+  # the preflight must not explain a line it does not have.
+  local preflight_block=""
+  if [[ -n "$preflight_line" ]]; then
+    preflight_block="$(cat <<PREFLIGHT_BLOCK
+# ExecStartPre frees the port before this unit claims it. A session that died
+# without releasing it (the desktop's address changed, so the ssh connection is
+# gone) leaves the REMOTE's sshd holding PORT until its own keepalive notices
+# (hours), and this unit then fails forever with "remote port forwarding failed
+# for listen port $port" -- which silently kills every notification from $host,
+# because the failure lands in the remote's journal, not here. The preflight
+# asks the remote whether the listener still answers and frees it only when it
+# provably does not.
+$preflight_line
+PREFLIGHT_BLOCK
+)"
+  fi
+
   local rendered
   rendered="$(cat <<UNIT
 [Unit]
@@ -358,6 +399,7 @@ Type=simple
 # ClearAllForwardings is NOT used here: this process exists to hold a forward.
 # The RemoteForward lines in ~/.ssh/config are dropped by oc-sync instead, because
 # leaving them in is what made every login race this unit for the same port.
+$preflight_block
 ExecStart=/usr/bin/ssh -N -T -o ExitOnForwardFailure=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R $port:localhost:22 $host
 Restart=always
 RestartSec=10
@@ -380,10 +422,28 @@ UNIT
     return 1
   fi
 
-  if [[ ! -f "$unit_file" ]] || ! grep -qF -- "-R $port:localhost:22 $host" "$unit_file" \
-     || ! grep -qF "Restart=always" "$unit_file"; then
+  # The guard asks for the preflight line only when the renderer wrote one.
+  # A unit written before the preflight existed has no ExecStartPre, so it
+  # would keep failing to rebind a stale port forever while looking up to
+  # date -- and a unit that names a preflight this machine does not have would
+  # fail to start at all, so it is rewritten without the line.
+  local rewritten=0
+  local stale=0
+  if [[ ! -f "$unit_file" ]]; then
+    stale=1
+  else
+    grep -qF -- "-R $port:localhost:22 $host" "$unit_file" || stale=1
+    grep -qF "Restart=always" "$unit_file" || stale=1
+    if [[ -n "$preflight_line" ]]; then
+      grep -qF -- "$preflight_line" "$unit_file" || stale=1
+    else
+      grep -qF "ExecStartPre=" "$unit_file" && stale=1
+    fi
+  fi
+  if [[ $stale -eq 1 ]]; then
     if printf '%s\n' "$rendered" > "$unit_file"; then
       ok "wrote $unit_file (host port $port)"
+      rewritten=1
     else
       bad "could not write $unit_file"
       return 1
@@ -393,6 +453,13 @@ UNIT
   fi
 
   systemctl --user daemon-reload >/dev/null 2>&1 || true
+  # A rewritten unit needs a restart, not just a reload: the RUNNING instance
+  # still has the old ExecStart, so the new ExecStartPre would never run and a
+  # stale port would never be freed. An up-to-date unit is left running -- it is
+  # already holding the forward, and restarting it would drop a working tunnel.
+  if [[ $rewritten -eq 1 ]]; then
+    systemctl --user restart "$unit" >/dev/null 2>&1 || true
+  fi
   # Linger lets the unit keep running with no login session, which is the whole
   # point: the tunnel must not depend on you being logged in interactively.
   loginctl enable-linger "$USER" >/dev/null 2>&1 || true
@@ -511,8 +578,48 @@ setup_tunnel_auth() {
   fi
 }
 
+# The tunnel preflight, next to the receiver because it is the same kind of
+# thing: a desktop-side helper the unit depends on, refreshed by content.
+#
+# It runs as the unit's ExecStartPre and frees the tunnel port when the session
+# that held it died without releasing it -- the remote's sshd keeps the port
+# bound for hours otherwise, and the unit then fails forever with "remote port
+# forwarding failed", which silently kills every notification from that host.
+#
+# CONTENT, NOT JUST PRESENCE, for the same reason as the receiver: a stale copy
+# is exactly the one that misbehaves. An older preflight does not know how to
+# probe a listener, so the port stays stuck and the tunnel never comes back.
+#
+# A missing SOURCE is not "nothing to do": it is the whole preflight missing,
+# and the unit would name a file that is not there. The file is tracked in git,
+# so a fresh checkout has it -- an untracked copy is what made this silent.
+install_tunnel_preflight() {
+  if [[ ! -f "$PREFLIGHT_SRC" ]]; then
+    bad "oc-tunnel-preflight is missing from $PREFLIGHT_SRC -- the tunnel unit will start without it"
+    return 1
+  fi
+  if [[ ! -f "$PREFLIGHT" ]] || ! cmp -s "$PREFLIGHT_SRC" "$PREFLIGHT"; then
+    local verb="install"
+    [[ -f "$PREFLIGHT" ]] && verb="refresh"
+    if [[ $DRY_RUN -eq 1 ]]; then
+      ok "[dry-run] would $verb oc-tunnel-preflight -> $PREFLIGHT"
+    else
+      mkdir -p "$(dirname -- "$PREFLIGHT")"
+      if cp "$PREFLIGHT_SRC" "$PREFLIGHT" && chmod 700 "$PREFLIGHT"; then
+        ok "${verb}ed oc-tunnel-preflight"
+      else
+        bad "could not install $PREFLIGHT -- the tunnel unit will start without it"
+        return 1
+      fi
+    fi
+  fi
+}
+
 setup_tunnel_auth
 TUNNEL_AUTH_FAILED=$?
+# Once, before the per-host loop: the preflight is the same on every host, and
+# it lives on THIS machine, so it is never pushed to the hosts.
+install_tunnel_preflight || warn "tunnel preflight not installed -- the tunnel units will start without it and cannot free a stale port by themselves"
 drop_config_remoteforward
 
 [[ -f "$OC_SCRIPT" ]] || { echo "Error: $OC_SCRIPT not found (set OC_SCRIPT to the oc helper)." >&2; exit 1; }

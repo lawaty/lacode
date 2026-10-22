@@ -26,8 +26,8 @@
 // quietly defeat that.
 
 import { builtinModules } from "node:module"
-import { chmod, rm, stat } from "node:fs/promises"
-import { dirname, join, resolve } from "node:path"
+import { chmod, mkdir, readdir, rename, rm, stat } from "node:fs/promises"
+import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import * as esbuild from "esbuild"
 
@@ -87,14 +87,25 @@ const exists = async (path) => {
 
 /** Build `dist/`. Exported so the test fixtures can build without shelling out. */
 export const build = async ({ log = false } = {}) => {
-  // Wipe first: a stale dist/index.js from a renamed source is worse than no
-  // dist at all, because the manifest would happily resolve to it.
-  await rm(join(ROOT, "dist"), { recursive: true, force: true })
+  const dist = join(ROOT, "dist")
+  await mkdir(dist, { recursive: true })
 
+  // Build each entry to a temp file and RENAME it into place, rather than
+  // wiping dist first.
+  //
+  // Wiping is what the old build did, and it left a window in which
+  // `dist/index.js` did not exist. A running opencode imports the plugin by
+  // absolute file URL; a process that started in that window failed to load
+  // LaCode entirely and then ran every `task` spawn on the caller's model. The
+  // rename is atomic, so a reader sees either the previous build or the new one
+  // and never an absent file. Stale files are removed AFTER the live entries are
+  // in place, which keeps the old "no stale dist" guarantee.
   for (const entry of ENTRY_POINTS) {
+    const outfile = join(ROOT, entry.out)
+    const staged = join(dirname(outfile), `.${basename(outfile)}.${process.pid}.tmp`)
     await esbuild.build({
       entryPoints: [join(ROOT, entry.in)],
-      outfile: join(ROOT, entry.out),
+      outfile: staged,
       bundle: true,
       format: "esm",
       platform: "node",
@@ -107,8 +118,16 @@ export const build = async ({ log = false } = {}) => {
     // npm only guarantees the executable bit on `bin` targets at INSTALL time.
     // Setting it here means the tarball, a `git archive`, and a plain `cp -r` of
     // dist/ all carry a runnable CLI rather than one that needs a chmod first.
-    if (entry.executable) await chmod(join(ROOT, entry.out), 0o755)
+    if (entry.executable) await chmod(staged, 0o755)
+    await rename(staged, outfile)
     if (log) console.log(`  ${entry.in} -> ${entry.out}`)
+  }
+
+  // Now that every live entry has been swapped in, drop anything else. A temp
+  // file left by a failed build goes too.
+  const expected = new Set(ENTRY_POINTS.map((entry) => basename(entry.out)))
+  for (const name of await readdir(dist)) {
+    if (!expected.has(name)) await rm(join(dist, name), { recursive: true, force: true })
   }
 
   const { default: manifest } = await import(pathToFileURL(join(ROOT, "package.json")).href, { with: { type: "json" } })

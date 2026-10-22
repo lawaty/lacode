@@ -18,7 +18,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { execFile } from "node:child_process"
-import { chmodSync, cpSync, existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, cpSync, existsSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { promisify } from "node:util"
 import { ROOT, cleanupAll, scratch, settle } from "./_harness.mjs"
@@ -62,15 +62,29 @@ const SKIP_LINUX_CHANNEL = "the local notification channel here is osascript, wh
  */
 const CHANNELS = ["notify-send", "osascript", "terminal-notifier"]
 
+/** Every player `soundChannel` may pick, so the assertion is not machine-bound. */
+const PLAYERS = ["paplay", "aplay", "pw-play", "afplay"]
+
 const stubTransport = () => {
   const bin = scratch("stub-bin-")
   const sshLog = join(bin, "ssh.log")
   const channelLogs = Object.fromEntries(CHANNELS.map((name) => [name, join(bin, `${name}.log`)]))
+  const playerLogs = Object.fromEntries(PLAYERS.map((name) => [name, join(bin, `${name}.log`)]))
+  const gdbusLog = join(bin, "gdbus.log")
+  const gdbusBusLog = join(bin, "gdbus-bus.log")
 
   const recorder = (log) => `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done\nexit 0\n`
   writeFileSync(join(bin, "ssh"), recorder(sshLog))
   for (const name of CHANNELS) writeFileSync(join(bin, name), recorder(channelLogs[name]))
-  for (const name of ["ssh", ...CHANNELS]) chmodSync(join(bin, name), 0o755)
+  for (const name of PLAYERS) writeFileSync(join(bin, name), recorder(playerLogs[name]))
+  // The session bus is an ENVIRONMENT variable, not an argv entry. Recording
+  // only the arguments can therefore not tell "the desktop's own bus" from a
+  // bus address the remote happened to export, so the stub records both.
+  writeFileSync(
+    join(bin, "gdbus"),
+    `#!/bin/sh\nprintf '%s\\0' "$DBUS_SESSION_BUS_ADDRESS" >> ${JSON.stringify(gdbusBusLog)}\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(gdbusLog)}; done\nexit 0\n`,
+  )
+  for (const name of ["ssh", "gdbus", ...CHANNELS, ...PLAYERS]) chmodSync(join(bin, name), 0o755)
 
   // NUL records, dropped only at the trailing terminator: an empty notification
   // body is a real argument, and `filter(Boolean)` would silently delete
@@ -94,6 +108,14 @@ const stubTransport = () => {
     desktopArgv: () => CHANNELS.flatMap((name) => argv(channelLogs[name])),
     notifyArgv: () => argv(channelLogs["notify-send"]),
     sshArgv: () => argv(sshLog),
+    /** Every argument handed to one player, for the side that owns a speaker. */
+    playerArgv: (name) => argv(playerLogs[name]),
+    /** Every argument handed to ANY player: silence is the empty array. */
+    playerArgvs: () => PLAYERS.flatMap((name) => argv(playerLogs[name])),
+    /** The arguments the session-bus close was invoked with. */
+    gdbusArgv: () => argv(gdbusLog),
+    /** The bus the close was actually pointed at, empty when it inherited none. */
+    gdbusBus: () => argv(gdbusBusLog).at(-1) ?? "",
   }
 }
 
@@ -134,28 +156,46 @@ const lacode = async (args, { transports, env = {} } = {}) => {
  * makes it runnable -- and assertable -- from any platform, which is why this
  * helper stubs rather than skipping on darwin. What it pins here is the parse,
  * and the parse is portable.
+ *
+ * Three stubs, three questions:
+ *   * `notify-send` prints the notification id on its first line ONLY when it is
+ *     asked for one (`--print-id`), and the clicked action's name after it --
+ *     exactly like the real one. The id is the daemon's handle on the popup and
+ *     the action is the user's answer, and the receiver must never confuse them.
+ *   * `gdbus` records the notification ids it was asked to close. Closing a
+ *     popup is a call to the notification daemon on the session bus, and the
+ *     daemon is the desktop: this is what makes "the popup was taken down" a
+ *     file read rather than an assumption.
+ *   * LACODE_NOTIFY_DIR points the receiver's id file at a temp directory, so a
+ *     suite can never write into the developer's real state directory.
  */
-const runReceiver = async ({ command, args = [], click } = {}) => {
+const runReceiver = async ({ command, args = [], click, notifyId, notifyDir } = {}) => {
   const transports = stubTransport()
-  // `click` makes the stubbed notifier behave like a user who chose a button:
-  // libnotify prints the chosen action's NAME on stdout when --action is used,
-  // and that stdout is the whole answer an actionable notification produces.
-  // The argv is still recorded, so one run can assert both what the notifier
-  // was handed and what it "clicked".
-  if (click !== undefined) {
+  const dir = notifyDir ?? scratch("receiver-notify-")
+  if (notifyId !== undefined || click !== undefined) {
     const log = join(transports.bin, "notify-send.log")
-    writeFileSync(
-      join(transports.bin, "notify-send"),
-      `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done\nprintf '%s\\n' ${JSON.stringify(click)}\nexit 0\n`,
-    )
+    const lines = ["#!/bin/sh", `for a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done`]
+    if (notifyId !== undefined) {
+      lines.push(`for a in "$@"; do if [ "$a" = "--print-id" ]; then printf '%s\\n' ${JSON.stringify(notifyId)}; break; fi; done`)
+    }
+    if (click !== undefined) lines.push(`printf '%s\\n' ${JSON.stringify(click)}`)
+    lines.push("exit 0")
+    writeFileSync(join(transports.bin, "notify-send"), lines.join("\n") + "\n")
     chmodSync(join(transports.bin, "notify-send"), 0o755)
   }
+  const gdbusLog = join(transports.bin, "gdbus.log")
+  writeFileSync(
+    join(transports.bin, "gdbus"),
+    `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(gdbusLog)}; done\nexit 0\n`,
+  )
+  chmodSync(join(transports.bin, "gdbus"), 0o755)
   const home = scratch("receiver-home-")
   const result = await exec("bash", [join(ROOT, "bin", "oc-notify-receiver"), ...args], {
     env: {
       PATH: [transports.bin, process.env.PATH].filter(Boolean).join(":"),
       HOME: home,
       XDG_DATA_HOME: join(home, ".local", "share"),
+      LACODE_NOTIFY_DIR: dir,
       SSH_ORIGINAL_COMMAND: command,
     },
     timeout: 10_000,
@@ -165,6 +205,24 @@ const runReceiver = async ({ command, args = [], click } = {}) => {
     stderr: result.stderr ?? "",
     stdout: result.stdout ?? "",
     notifyArgv: transports.notifyArgv(),
+    /** Every argument the legacy receiver handed to a sound player. */
+    playerArgvs: transports.playerArgvs,
+    /** The directory the receiver records notification ids in. */
+    notifyDir: dir,
+    /** The notification ids the stubbed daemon was asked to close. */
+    gdbusClosed: () => {
+      if (!existsSync(gdbusLog)) return []
+      const parts = readFileSync(gdbusLog, "utf8").split("\0")
+      if (parts[parts.length - 1] === "") parts.pop()
+      return parts.filter((arg) => /^\d+$/.test(arg))
+    },
+    /** The contents of one id file, by FILE NAME, or null when there is none. */
+    idFile: (name) => {
+      const file = join(dir, name)
+      return existsSync(file) ? readFileSync(file, "utf8") : null
+    },
+    /** Every id file the receiver wrote, by name. */
+    idFiles: () => (existsSync(dir) ? readdirSync(dir).sort() : []),
   }
 }
 
@@ -272,6 +330,55 @@ test("[US-13] the desktop user and port come from configuration, never from the 
   assert.match(result.stderr, /OC_LOCAL_USER is unset/, `the refusal must be explained: ${result.stderr}`)
 })
 
+test("[US-13] the desktop's session bus comes from the local user, never from the remote", async () => {
+  const key = "ses_abc123"
+  const remoteBus = "unix:path=/run/user/9999/bus"
+  const sender = stubTransport()
+
+  // The remote host has its own session bus and exports it, exactly as a host
+  // with a desktop session would. The marker names the LOCAL user, and that is
+  // the identity the bus must belong to on the far end.
+  const sent = await lacode(["notify", "T", "M"], {
+    transports: sender,
+    env: {
+      SSH_CLIENT: "10.0.0.1 51000 10.0.0.2 22",
+      OC_LOCAL_USER: "desktop-user",
+      OC_TUNNEL_PORT: "10022",
+      DBUS_SESSION_BUS_ADDRESS: remoteBus,
+      LACODE_NOTIFY_CLOSE: key,
+    },
+  })
+  assert.equal(sent.code, 0)
+  const hop = sender.sshArgv()
+  assert.ok(hop.length > 0, "the close request must cross the hop")
+  const payload = hop.at(-1)
+  assert.equal(payload.split("\n")[6], `close:${key}`, "the request names the session to close on the desktop")
+  assert.ok(!hop.includes(remoteBus), "the remote's bus address must never be what the desktop is told to use")
+
+  // The desktop raised this popup earlier, so its daemon id is already on file.
+  const notifyDir = scratch("receiver-notify-")
+  writeFileSync(join(notifyDir, `${key}.ids`), "42\n")
+
+  const desktop = stubTransport()
+  const landed = await lacode(["receive"], {
+    transports: desktop,
+    env: { SSH_ORIGINAL_COMMAND: payload, LACODE_NOTIFY_DIR: notifyDir },
+  })
+
+  assert.equal(landed.code, 0, `the desktop must close the popup: ${landed.stderr}`)
+  assert.deepEqual(
+    desktop.gdbusArgv().filter((arg) => /^\d+$/.test(arg)),
+    ["42"],
+    "the popup must be closed by the id the desktop recorded",
+  )
+  // The forced command inherits no session bus, so the helper supplies the
+  // local user's. process.getuid() is the desktop account -- the same account
+  // the marker names -- and the remote's exported path must not be reused.
+  const localBus = `unix:path=/run/user/${process.getuid()}/bus`
+  assert.equal(desktop.gdbusBus(), localBus, `the close must use the desktop's own session bus, not ${remoteBus}`)
+  assert.notEqual(desktop.gdbusBus(), remoteBus, "the remote host's bus address must not leak onto the desktop")
+})
+
 test("[US-13] unvalidated urgency and icon never reach a notifier, on any platform", async () => {
   // The security half, and it is the half that must hold everywhere. The local
   // channel differs by platform, so the assertion is made against EVERY stubbed
@@ -324,7 +431,7 @@ test("[US-13] the notification crosses the hop as ONE delimited argument, never 
     env: { SSH_CLIENT: "10.0.0.1 51000 10.0.0.2 22", OC_LOCAL_USER: "desktop-user" },
   })
 
-  // Exactly ONE argument follows the host, carrying all six fields. Four
+  // Exactly ONE argument follows the host, carrying all seven fields. Four
   // separate arguments looked equivalent on this side and delivered nothing: ssh
   // concatenates them into a single command string for the forced command.
   //
@@ -334,17 +441,24 @@ test("[US-13] the notification crosses the hop as ONE delimited argument, never 
   // no LACODE_REQUEST_ID answers nothing, so its id field is empty -- but the
   // field itself is always there, because a wire whose field count changes
   // between senders is not a contract.
+  //
+  // Seven fields since the popup became closable (US-30): the seventh is the
+  // correlation key, empty when there is none. The field count never changes,
+  // so a six-field payload from an older sender still works against this
+  // receiver, and a seven-field payload still reaches an older receiver, which
+  // ignores the field it does not know.
   const hop = transports.sshArgv()
   const after = hop.slice(hop.indexOf("--") + 1)
   assert.equal(after.length, 1, `the hop must carry a single payload argument: ${JSON.stringify(hop)}`)
   const fields = after[0].split("\n")
-  assert.equal(fields.length, 6, `the payload must be newline-delimited into six fields: ${JSON.stringify(fields)}`)
+  assert.equal(fields.length, 7, `the payload must be newline-delimited into seven fields: ${JSON.stringify(fields)}`)
   assert.ok(fields[0].includes(payload), `the payload must cross verbatim in field 1: ${JSON.stringify(fields)}`)
   assert.ok(fields[1].includes(`Message; touch ${marker}`), `field 2 must cross verbatim: ${JSON.stringify(fields)}`)
   assert.equal(fields[2], "normal")
   assert.equal(fields[3], "utilities-terminal")
   assert.equal(fields[4], "none", "a four-argument caller still gets a valid payload with sound: 'none'")
   assert.equal(fields[5], "", "a notification that answers nothing carries an empty request id field")
+  assert.equal(fields[6], "", "a notification with no session carries an empty correlation key field")
   // ...and nothing was ever executed. A second command smuggled through the hop
   // would own the local desktop, which is why the receiver parses rather than
   // evaluates.
@@ -401,7 +515,7 @@ test("[US-18] the forced command reads the payload from the environment, never f
   const delivered = await runReceiver({ command: ["From the environment", "Body", "critical", "dialog-error"].join("\n") })
   assert.deepEqual(
     delivered.notifyArgv,
-    ["From the environment", "Body", "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
+    ["From the environment", "Body", "--app-name=LaCode", "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
     `the payload must drive every field: ${JSON.stringify(delivered.notifyArgv)}`,
   )
 })
@@ -422,7 +536,7 @@ test("[US-18] a body with spaces, punctuation and glob characters crosses the ho
   const landed = await runReceiver({ command: hop[hop.length - 1] })
   assert.deepEqual(
     landed.notifyArgv,
-    [title, body, "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
+    [title, body, "--app-name=LaCode", "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
     `the notification must arrive whole, not split on whitespace: ${JSON.stringify(landed.notifyArgv)}`,
   )
 })
@@ -440,13 +554,13 @@ test("[US-18] a hostile payload is parsed as data: nothing runs and no argument 
   })
 
   assert.ok(!existsSync(marker), "nothing in the payload may ever be executed")
-  // Exactly five arguments: the two text fields verbatim, the two flags from
-  // whitelisted values, and the never-expire flag. The fifth payload field is
-  // dropped, and the injected `--icon=dialog-error` inside the urgency field is
-  // replaced, not concatenated.
+  // Exactly six arguments: the two text fields verbatim, the app name, the two
+  // flags from whitelisted values, and the never-expire flag. The fifth
+  // payload field is dropped, and the injected `--icon=dialog-error` inside the
+  // urgency field is replaced, not concatenated.
   assert.deepEqual(
     landed.notifyArgv,
-    [hostileTitle, hostileBody, "--urgency=normal", "--icon=dialog-warning", "--expire-time=0"],
+    [hostileTitle, hostileBody, "--app-name=LaCode", "--urgency=normal", "--icon=dialog-warning", "--expire-time=0"],
     `a hostile payload must reach notify-send as inert text: ${JSON.stringify(landed.notifyArgv)}`,
   )
   assert.equal(landed.code, 0)
@@ -466,7 +580,7 @@ test("[US-14] a payload that cannot be understood degrades to a LaCode popup ins
   ]) {
     const landed = await runReceiver({ command })
     assert.equal(landed.code, 0, `${label}: the receiver must exit 0, got ${landed.code}: ${landed.stderr}`)
-    assert.equal(landed.notifyArgv.length, 5, `${label}: it must still pop up exactly one notification: ${JSON.stringify(landed.notifyArgv)}`)
+    assert.equal(landed.notifyArgv.length, 6, `${label}: it must still pop up exactly one notification: ${JSON.stringify(landed.notifyArgv)}`)
     assert.equal(landed.notifyArgv[0], label === "empty" ? "LaCode" : "Some Title Some Message normal utilities-terminal",
       `${label}: an unreadable payload must show its own content, not an empty popup`)
   }
@@ -618,7 +732,7 @@ test("[US-14] doctor reports what the environment resolves to without failing wh
   assert.match(remote.stdout, /OC_LOCAL_USER is unset/, "doctor must say what is missing")
 })
 
-const { describe: describeEnv, localChannel, safeMessage, safeTitle, sendLocal, sendRemote, soundChannel } =
+const { describe: describeEnv, localChannel, safeCorrelationKey, safeMessage, safeTitle, sendLocal, sendRemote, soundChannel } =
   await import(join(ROOT, "src", "tunnel", "index.ts"))
 
 /**
@@ -797,7 +911,7 @@ test("[US-26] Linux still delivers through notify-send, argument for argument, a
     assert.equal(result.ok, true, `the send must succeed: ${result.detail}`)
     assert.deepEqual(
       argv("notify-send"),
-      ["opencode — Fix the login", "Task finished", "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
+      ["opencode — Fix the login", "Task finished", "--app-name=LaCode", "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
       `the Linux call must carry exactly these arguments: ${JSON.stringify(argv("notify-send"))}`,
     )
     assert.deepEqual(argv("osascript"), [], "macOS must not change what Linux does")
@@ -838,7 +952,7 @@ test("[US-26] a normal-urgency notification is not auto-dismissed either", () =>
     assert.equal(result.ok, true, `the send must succeed: ${result.detail}`)
     assert.deepEqual(
       argv("notify-send"),
-      ["opencode — Fix the login", "Task finished", "--urgency=normal", "--icon=emblem-default", "--expire-time=0"],
+      ["opencode — Fix the login", "Task finished", "--app-name=LaCode", "--urgency=normal", "--icon=emblem-default", "--expire-time=0"],
       `a notification that is not an error is still only manually closable: ${JSON.stringify(argv("notify-send"))}`,
     )
   })
@@ -879,14 +993,134 @@ test("[US-26] doctor names the channel this platform would use, not a binary it 
   })
 })
 
+test("[US-26] the notification-hop doc leads with the shipped direct-ssh path, not the reverse forward", () => {
+  // The shipped path is the npm-installed plugin over a direct ssh
+  // (ControlMaster/ControlPersist) set up by `lacode tunnel setup`, with
+  // `lacode receive` as the forced command. The reverse-forward/`bin/oc*`
+  // model is the older topology: a Mac user sent to it first would debug
+  // scripts that were never meant to run on their machine.
+  //
+  // This reads the real document and asserts the ORDER, not a copied phrase:
+  // a doc that still mentions both paths is fine, one that introduces the
+  // alternative before the shipped path is not. The heading is what marks the
+  // alternative, because the lead section also says "there is no reverse
+  // forward" -- a negation, not an instruction.
+  const doc = readFileSync(join(ROOT, "docs", "TUNNEL.md"), "utf8")
+  const lines = doc.split("\n")
+  const firstLine = (pattern) => lines.findIndex((line) => pattern.test(line))
+  const at = (index) => `line ${index + 1}: ${JSON.stringify(lines[index].trim())}`
+
+  const shipped = [
+    { pattern: /ControlMaster|ControlPersist/i, what: "the direct ssh hop (ControlMaster/ControlPersist)" },
+    { pattern: /lacode tunnel setup/, what: "`lacode tunnel setup`" },
+    { pattern: /lacode receive/, what: "the `lacode receive` forced command" },
+  ].map((item) => ({ ...item, index: firstLine(item.pattern) }))
+
+  for (const item of shipped) {
+    assert.notEqual(item.index, -1, `docs/TUNNEL.md must describe the shipped path: ${item.what} is absent`)
+  }
+  const firstShipped = Math.min(...shipped.map((item) => item.index))
+  const shippedCue = shipped.find((item) => item.index === firstShipped)
+
+  const alternative = firstLine(/^#{1,6}\s+.*(reverse[- ]forward|legacy)/i)
+  assert.notEqual(alternative, -1, "docs/TUNNEL.md must still document the reverse-forward alternative, so it can be identified as what it is")
+  assert.ok(
+    firstShipped < alternative,
+    `docs/TUNNEL.md must lead with the shipped path; the first alternative heading is ${at(alternative)}, before ${shippedCue.what} at ${at(firstShipped)}`,
+  )
+})
+
+test("[US-26] bin/oc-sync refuses before reading the host list when bash or GNU timeout is missing", async () => {
+  // Criterion: on a machine without GNU `timeout` or with bash older than 4.0,
+  // the deploy script must refuse BEFORE touching anything, name each missing
+  // prerequisite, and name the `lacode` subcommand to use instead. The failure
+  // it replaces is the misleading one: `mapfile` does not exist on bash 3.2, so
+  // the host list comes back empty and the script used to say "no hosts
+  // configured" -- sending the reader to edit .env over a missing interpreter.
+  //
+  // This workstation has no bash 3.x binary. The behavioural half therefore
+  // uses `bash --posix` on a PATH with no `timeout` (and a Darwin `uname`, which
+  // is the machine the criterion is about) plus stub and recorder ssh/rsync, so
+  // "it refused before touching a host" is observable. On a real Mac `/bin/bash`
+  // IS 3.2 and this same run takes the version branch for real; on Linux the
+  // source-order check below stands in for that unproven half: it proves every
+  // bash-4-only construct sits after the `check_prereqs` call, so bash 3 reaches
+  // the refusal before any of them runs, and that no bash-4 SYNTAX exists that
+  // would fail at parse time before the preflight could speak.
+  const bin = scratch("oc-sync-prereq-")
+  const sshLog = join(bin, "ssh.log")
+  const rsyncLog = join(bin, "rsync.log")
+  const recorder = (log) => `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done\nexit 0\n`
+  // A Mac, because the portable way forward the criterion asks for is the
+  // `lacode` subcommand, and that is the branch the script chooses from uname.
+  writeFileSync(join(bin, "uname"), `#!/bin/sh\nprintf '%s\\n' Darwin\n`)
+  writeFileSync(join(bin, "ssh"), recorder(sshLog))
+  writeFileSync(join(bin, "rsync"), recorder(rsyncLog))
+  for (const name of ["uname", "ssh", "rsync"]) chmodSync(join(bin, name), 0o755)
+  // The commands the script reaches before the preflight (and the host-list
+  // readers, so a regression that removed the refusal would get far enough to
+  // try them). `timeout` is deliberately absent from this PATH.
+  for (const name of ["dirname", "grep", "sed", "tr"]) {
+    const real = ["/usr/bin", "/bin"].map((dir) => join(dir, name)).find(existsSync)
+    assert.ok(real, `the test needs ${name} on this machine`)
+    symlinkSync(real, join(bin, name))
+  }
+
+  const home = scratch("oc-sync-home-")
+  const result = await exec("/bin/bash", ["--posix", join(ROOT, "bin", "oc-sync"), "--dry-run"], {
+    env: {
+      PATH: bin,
+      HOME: home,
+      OC_SYNC_ENV_FILE: join(home, "no-such.env"),
+      OC_HOSTS: "a-host-that-must-not-be-contacted",
+      OC_LOCAL_USER: "tester",
+    },
+    timeout: 20_000,
+  }).catch((error) => error)
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`
+
+  assert.equal(result.code, 1, `the preflight must exit 1, not proceed: ${output.trim()}`)
+  assert.match(output, /timeout/, `the missing prerequisite must be named: ${output.trim()}`)
+  assert.match(output, /lacode (notify|forward|doctor)/, `the portable command must be named: ${output.trim()}`)
+  assert.doesNotMatch(output, /no hosts configured/, `the misleading host-list diagnosis must not come back: ${output.trim()}`)
+  assert.equal(existsSync(sshLog), false, "the refusal must come before any ssh call")
+  assert.equal(existsSync(rsyncLog), false, "the refusal must come before any rsync call")
+
+  // On a Mac this is the real bash-3.2 branch. On Linux it is not, so also
+  // assert that branch names the bash floor when it is the one that fired.
+  const bashMajor = Number((await exec("/bin/bash", ["-c", 'printf "%s" "${BASH_VERSINFO[0]}"'])).stdout.trim())
+  if (bashMajor < 4) {
+    assert.match(output, /bash 4\.0 or newer/, `the bash prerequisite must be named too: ${output.trim()}`)
+  }
+
+  const source = readFileSync(join(ROOT, "bin", "oc-sync"), "utf8")
+  const code = source.split("\n").map((text, index) => ({ text, line: index + 1 })).filter(({ text }) => !/^\s*#/.test(text))
+  const call = code.find(({ text }) => /^\s*check_prereqs\s*$/.test(text))
+  assert.ok(call, "bin/oc-sync must call check_prereqs before it reads hosts")
+  const gate = code.find(({ text }) => /BASH_VERSINFO\[0\]\s*<\s*4/.test(text))
+  assert.ok(gate, "bin/oc-sync must test the bash version before it uses bash-4 features")
+  assert.ok(gate.line < call.line, `the version gate must be inside the preflight, not after it`)
+
+  const bash4Commands = code.filter(({ text }) =>
+    /^\s*(mapfile|readarray)\b/.test(text) || /^\s*declare\s+-A\b/.test(text) || /^\s*printf\s+-v\b/.test(text))
+  assert.ok(bash4Commands.length > 0, "the script really does use bash-4 builtins, so the gate is load-bearing rather than decorative")
+  for (const { text, line } of bash4Commands) {
+    assert.ok(line > call.line, `a bash-4 construct at line ${line} would run before the preflight at line ${call.line}: ${text.trim()}`)
+  }
+
+  const bash4Syntax = code.filter(({ text }) => /&>>|\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?(,,|\^\^)/.test(text))
+  assert.deepEqual(
+    bash4Syntax.map(({ line, text }) => `${line}: ${text.trim()}`),
+    [],
+    "bash-4-only syntax would fail to parse on bash 3.2 before the preflight could run",
+  )
+})
+
 // US-29 -- notification sound. The four outcomes each name a bundled WAV, and
 // the sound is played HERE, on the machine that renders the notification, which
 // is the only place a tone can be heard: a remote opencode host has no speakers.
 // These drive sendLocal directly, because the player is spawned detached and the
 // thing under test is which FILE it was handed, not what a notifier did with it.
-
-/** Every player `soundChannel` may pick, so the assertion is not machine-bound. */
-const PLAYERS = ["paplay", "aplay", "pw-play", "afplay"]
 
 /**
  * Run `fn` with PATH holding only `names`, each a stub recording its argv.
@@ -984,6 +1218,53 @@ test("[US-29] the sound still plays on a desktop with no notification channel at
   })
 })
 
+test("[US-29] a hop's sound plays where the notice is rendered, never on the opencode host", async () => {
+  const title = "opencode — Fix the login"
+  const sender = stubTransport()
+
+  const sent = await lacode(["notify", title, "Task finished", "normal", "utilities-terminal", "done"], {
+    transports: sender,
+    env: { SSH_CLIENT: "10.0.0.1 51000 10.0.0.2 22", OC_LOCAL_USER: "desktop-user", OC_TUNNEL_PORT: "10022" },
+  })
+  assert.equal(sent.code, 0)
+  // The remote opencode host is headless: it must carry the sound NAME on the
+  // wire, not try to play it where no one could hear it.
+  await settle(100)
+  assert.deepEqual(sender.playerArgvs(), [], "the opencode host must never invoke a player: it has no speakers for the user")
+
+  const hop = sender.sshArgv()
+  assert.ok(hop.length > 0, "the notification must cross the hop")
+  const payload = hop.at(-1)
+  assert.equal(payload.split("\n")[4], "done", `the outcome's sound name must cross the hop: ${JSON.stringify(payload)}`)
+
+  // The published forced command is `lacode receive`, which renders on the
+  // desktop and is therefore where the tone can actually be heard.
+  const desktop = stubTransport()
+  const received = await lacode(["receive"], {
+    transports: desktop,
+    env: { SSH_ORIGINAL_COMMAND: payload },
+  })
+  assert.equal(received.code, 0, `the desktop must deliver the notice: ${received.stderr}`)
+  assert.ok(desktop.notifyArgv().includes(title), `the notice must be rendered on the desktop: ${JSON.stringify(desktop.notifyArgv())}`)
+  // The player is detached and outlives `lacode receive`, so its log lands on a
+  // later tick than the CLI's exit.
+  for (let i = 0; i < 50 && desktop.playerArgvs().length === 0; i++) await settle()
+  const played = desktop.playerArgvs()
+  assert.equal(played.length, 1, `the desktop must play exactly the named sound: ${JSON.stringify(played)}`)
+  assert.match(played[0], /sounds[/\\]done\.wav$/, `the desktop must play that outcome's own asset: ${played[0]}`)
+
+  // The author-local bash receiver is the other desktop end of the same wire,
+  // and it IGNORES field 5 by design (`bin/oc-notify-receiver`: "this receiver
+  // has no sounds directory to play it from"). Pin that actual rather than
+  // inventing a tone: for that legacy topology the criterion is not met, while
+  // the published `lacode receive` path above does meet it.
+  const legacy = await runReceiver({ command: payload })
+  assert.equal(legacy.code, 0, `the legacy receiver must still deliver: ${legacy.stderr}`)
+  assert.equal(legacy.notifyArgv[0], title, "the legacy receiver renders the notice")
+  await settle(100)
+  assert.deepEqual(legacy.playerArgvs(), [], "bin/oc-notify-receiver ignores the sound field, so the legacy hop plays nothing")
+})
+
 // ---------------------------------------------------------------------------
 // US-25 -- the permission buttons ride the same hop
 // ---------------------------------------------------------------------------
@@ -1010,6 +1291,7 @@ test("[US-25] the receiver offers the three permission buttons only when the pay
     [
       "opencode — Fix the login",
       "Awaiting your permission — run `ls`",
+      "--app-name=LaCode",
       "--urgency=normal",
       "--icon=utilities-terminal",
       "--expire-time=0",
@@ -1026,7 +1308,7 @@ test("[US-25] the receiver offers the three permission buttons only when the pay
   assert.equal(plain.code, 0, `the receiver must succeed: ${plain.stderr}`)
   assert.deepEqual(
     plain.notifyArgv,
-    ["opencode — Fix the login", "Task finished", "--urgency=normal", "--icon=utilities-terminal", "--expire-time=0"],
+    ["opencode — Fix the login", "Task finished", "--app-name=LaCode", "--urgency=normal", "--icon=utilities-terminal", "--expire-time=0"],
     `a payload with no request id must carry no buttons: ${JSON.stringify(plain.notifyArgv)}`,
   )
 })
@@ -1046,7 +1328,7 @@ test("[US-25] a payload with fewer than six fields carries no request id, so an 
     assert.equal(landed.code, 0, `${label}: the receiver must succeed: ${landed.stderr}`)
     assert.deepEqual(
       landed.notifyArgv,
-      [fields[0], fields[1], "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
+      [fields[0], fields[1], "--app-name=LaCode", "--urgency=critical", "--icon=dialog-error", "--expire-time=0"],
       `${label}: an old payload must still deliver, with no buttons attached: ${JSON.stringify(landed.notifyArgv)}`,
     )
   }
@@ -1087,4 +1369,137 @@ test("[US-25] the clicked button's name comes back over the hop as the sender's 
     assert.equal(plain.ok, true)
     assert.equal(plain.action, undefined, `a notification that asked nothing must return no action: ${JSON.stringify(plain)}`)
   })
+})
+
+// ---------------------------------------------------------------------------
+// US-30 -- a popup the user is already looking past fades by itself
+// ---------------------------------------------------------------------------
+//
+// The popup lives on the DESKTOP, and only the desktop knows the id the
+// notification daemon gave it. So the desktop records that id under the
+// notification's correlation key -- the seventh field of the payload -- and a
+// later close request, a seventh field that begins with "close:", closes it
+// there.
+//
+// These drive the REAL receiver with the notifier and the session bus stubbed,
+// so "the popup was taken down" is a file read rather than an assumption, and
+// "no popup was raised" is the absence of one.
+
+test("[US-30] the receiver records the notification id under its correlation key", async () => {
+  const key = "ses_abc123"
+  const notifyDir = scratch("receiver-notify-")
+  const landed = await runReceiver({
+    command: ["opencode — Fix the login", "Task finished", "normal", "utilities-terminal", "none", "", key].join("\n"),
+    notifyId: "42",
+    notifyDir,
+  })
+
+  assert.equal(landed.code, 0, `the receiver must succeed: ${landed.stderr}`)
+  assert.ok(
+    landed.notifyArgv.includes("--print-id"),
+    `the notifier must be asked for the id, or the popup can never be found again: ${JSON.stringify(landed.notifyArgv)}`,
+  )
+  assert.equal(landed.idFile("ses_abc123.ids"), "42\n", "the id must be recorded under the correlation key")
+  // stdout is the answer that travels home. The id is the daemon's handle on
+  // the popup, not an answer, so it must never appear there.
+  assert.equal(landed.stdout, "", `the id must never reach stdout: ${JSON.stringify(landed.stdout)}`)
+
+  // A second popup for the same session: the file grows, one id per line,
+  // because a session can have more than one popup up at a time and each of
+  // them is closed by its own id.
+  const second = await runReceiver({
+    command: ["opencode — Fix the login", "Task finished", "normal", "utilities-terminal", "none", "", key].join("\n"),
+    notifyId: "43",
+    notifyDir,
+  })
+  assert.equal(second.idFile("ses_abc123.ids"), "42\n43\n", "each id gets a line of its own")
+})
+
+test("[US-30] the receiver prints only the action, never the id", async () => {
+  const key = "ses_abc123"
+  const landed = await runReceiver({
+    command: ["opencode — Fix the login", "Awaiting your permission", "normal", "utilities-terminal", "permission", "p1", key].join("\n"),
+    notifyId: "42",
+    click: "once",
+  })
+
+  assert.equal(landed.code, 0, `the receiver must succeed: ${landed.stderr}`)
+  assert.equal(landed.stdout.trim(), "once", `stdout carries the answer: ${JSON.stringify(landed.stdout)}`)
+  assert.ok(!landed.stdout.includes("42"), `the id must never reach stdout: ${JSON.stringify(landed.stdout)}`)
+  assert.equal(landed.idFile("ses_abc123.ids"), "42\n", "the id is still recorded, so the popup can be closed later")
+})
+
+test("[US-30] a close request closes that session's popups and raises nothing", async () => {
+  const key = "ses_abc123"
+  const notifyDir = scratch("receiver-notify-")
+  // The popup was raised a moment ago, so its id is on file.
+  const raised = await runReceiver({
+    command: ["opencode — Fix the login", "Task finished", "normal", "utilities-terminal", "none", "", key].join("\n"),
+    notifyId: "42",
+    notifyDir,
+  })
+  assert.equal(raised.code, 0, `the receiver must succeed: ${raised.stderr}`)
+  assert.equal(raised.idFile("ses_abc123.ids"), "42\n", "the popup's id is on file before it is closed")
+
+  // Now the user works in that chat, and the desktop is asked to take the
+  // popup down: a seventh field that begins with "close:".
+  const closed = await runReceiver({
+    command: ["", "", "", "", "", "", `close:${key}`].join("\n"),
+    notifyDir,
+  })
+
+  assert.equal(closed.code, 0, `a close request must exit 0: ${closed.stderr}`)
+  assert.deepEqual(closed.gdbusClosed(), ["42"], "the popup must be closed over the session bus")
+  assert.deepEqual(closed.notifyArgv, [], "a close request must raise no notification")
+  assert.equal(closed.stdout, "", "a close request must print nothing")
+  assert.equal(closed.idFile("ses_abc123.ids"), null, "the id file is spent once its ids are closed")
+})
+
+test("[US-30] a six-field payload from an older sender still works, and is not tracked", async () => {
+  // The old wire is still the wire: a sender that knows nothing about
+  // correlation keys must deliver exactly as it always did, and must not have
+  // an id captured for a popup nobody can close.
+  const landed = await runReceiver({
+    command: ["opencode — Fix the login", "Task finished", "normal", "utilities-terminal", "none"].join("\n"),
+    notifyId: "42",
+  })
+
+  assert.equal(landed.code, 0, `the receiver must succeed: ${landed.stderr}`)
+  assert.ok(
+    !landed.notifyArgv.includes("--print-id"),
+    `a notification with no correlation key must not ask for an id: ${JSON.stringify(landed.notifyArgv)}`,
+  )
+  assert.deepEqual(landed.idFiles(), [], "no id may be written for a notification that carries no correlation key")
+  assert.equal(landed.stdout, "", `nothing but an answer may reach stdout: ${JSON.stringify(landed.stdout)}`)
+})
+
+test("[US-30] the correlation key maps to the same file name on both sides of the hop", async () => {
+  // The raiser writes <safe key>.ids and the closer reads it back, so the two
+  // sides have to compute the SAME name -- a difference of one character would
+  // mean the closer never finds the file and the popup never fades.
+  //
+  // The key here carries characters outside [A-Za-z0-9._-], because that is
+  // where the two rules could disagree. The file name the receiver actually
+  // used is read from the directory, and compared with the one the TypeScript
+  // side computes -- not looked up through it.
+  const key = "ses/abc 123:x"
+  const notifyDir = scratch("receiver-notify-")
+  const raised = await runReceiver({
+    command: ["opencode — Fix the login", "Task finished", "normal", "utilities-terminal", "none", "", key].join("\n"),
+    notifyId: "42",
+    notifyDir,
+  })
+
+  assert.deepEqual(
+    raised.idFiles(),
+    [`${safeCorrelationKey(key)}.ids`],
+    "the bash side and the TypeScript side must name the file the same way",
+  )
+
+  // And the closer finds what the raiser wrote, with the same key.
+  const closed = await runReceiver({
+    command: ["", "", "", "", "", "", `close:${key}`].join("\n"),
+    notifyDir,
+  })
+  assert.deepEqual(closed.gdbusClosed(), ["42"], "the closer must find the file the raiser wrote")
 })

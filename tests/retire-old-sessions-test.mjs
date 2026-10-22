@@ -180,7 +180,7 @@ const idsIn = (db, table, column) => {
 // parseArgs
 // ---------------------------------------------------------------------------
 
-test("parseArgs starts from the documented defaults", () => {
+test("[US-32] parseArgs starts from the documented defaults", () => {
   assert.deepEqual(parseArgs([]), {
     days: 30,
     graceHours: 24,
@@ -194,7 +194,7 @@ test("parseArgs starts from the documented defaults", () => {
   assert.deepEqual(parseArgs(undefined), parseArgs([]), "no argument at all is the same as no argument")
 })
 
-test("parseArgs reads every flag the usage names", () => {
+test("[US-32] parseArgs reads every flag the usage names", () => {
   assert.deepEqual(
     parseArgs([
       "--days", "60",
@@ -221,13 +221,13 @@ test("parseArgs reads every flag the usage names", () => {
   assert.equal(parseArgs(["-h"]).help, true, "the short help flag is the long one")
 })
 
-test("parseArgs leaves the caller's argument list alone", () => {
+test("[US-32] parseArgs leaves the caller's argument list alone", () => {
   const argv = ["--days", "60", "--dry-run"]
   parseArgs(argv)
   assert.deepEqual(argv, ["--days", "60", "--dry-run"], "the tool must not rewrite the array it was handed")
 })
 
-test("an option the tool does not know is refused", () => {
+test("[US-32] an option the tool does not know is refused", () => {
   assert.throws(() => parseArgs(["--nope"]), /unknown option: --nope/)
   assert.throws(
     () => parseArgs(["--nope"]),
@@ -236,14 +236,14 @@ test("an option the tool does not know is refused", () => {
   )
 })
 
-test("a flag without its value is refused", () => {
+test("[US-32] a flag without its value is refused", () => {
   assert.throws(() => parseArgs(["--days"]), /--days needs a value/)
   assert.throws(() => parseArgs(["--directory"]), /--directory needs a value/)
   // A value that is itself a flag is a missing value, not a value.
   assert.throws(() => parseArgs(["--days", "--limit", "5"]), /--days needs a value/)
 })
 
-test("a flag whose value is not a number is refused", () => {
+test("[US-32] a flag whose value is not a number is refused", () => {
   assert.throws(() => parseArgs(["--days", "soon"]), /--days needs a non-negative number/)
   assert.throws(() => parseArgs(["--grace-hours", "-1"]), /--grace-hours needs a non-negative number/)
   assert.throws(() => parseArgs(["--limit", "1.5.2"]), /--limit needs a non-negative number/)
@@ -253,7 +253,7 @@ test("a flag whose value is not a number is refused", () => {
 // computeCutoffs
 // ---------------------------------------------------------------------------
 
-test("computeCutoffs turns the two windows into two timestamps", () => {
+test("[US-32] computeCutoffs turns the two windows into two timestamps", () => {
   assert.deepEqual(computeCutoffs(NOW, 30, 24), {
     createdCutoff: NOW - 30 * DAY_MS,
     updatedCutoff: NOW - 24 * HOUR_MS,
@@ -268,7 +268,7 @@ test("computeCutoffs turns the two windows into two timestamps", () => {
 // candidateSql
 // ---------------------------------------------------------------------------
 
-test("the candidate query selects the old sessions and nothing else", () => {
+test("[US-32] the candidate query selects the old sessions and nothing else", () => {
   withFixture((db) => {
     const cutoffs = computeCutoffs(NOW, 30, 24)
     const rows = db.prepare(candidateSql(cutoffs, [])).all()
@@ -282,7 +282,7 @@ test("the candidate query selects the old sessions and nothing else", () => {
   })
 })
 
-test("each session is left out for the window the brief names, not another", () => {
+test("[US-32] each session is left out for the window the brief names, not another", () => {
   withFixture((db) => {
     // With no grace at all the two touched sessions come back, so what kept
     // them out was the grace window and nothing else.
@@ -298,7 +298,7 @@ test("each session is left out for the window the brief names, not another", () 
   })
 })
 
-test("the candidate query carries the fields the archive record needs", () => {
+test("[US-32] the candidate query carries the fields the archive record needs", () => {
   withFixture((db) => {
     const cutoffs = computeCutoffs(NOW, 30, 24)
     const rows = db.prepare(candidateSql(cutoffs, [])).all()
@@ -312,7 +312,7 @@ test("the candidate query carries the fields the archive record needs", () => {
   })
 })
 
-test("a directory filter narrows the selection to that directory", () => {
+test("[US-32] a directory filter narrows the selection to that directory", () => {
   withFixture((db) => {
     const cutoffs = computeCutoffs(NOW, 30, 24)
     const other = db.prepare(candidateSql(cutoffs, ["/b"])).all().map((row) => row.id)
@@ -326,7 +326,7 @@ test("a directory filter narrows the selection to that directory", () => {
   })
 })
 
-test("a child in another directory goes with its parent, on purpose", () => {
+test("[US-32] a child in another directory goes with its parent, on purpose", () => {
   withFixture((db) => {
     // The child lives in /b and its parent in /a, and the run is pointed at
     // /a. The child comes along, and that is the deliberate behaviour: the
@@ -362,7 +362,7 @@ test("a child in another directory goes with its parent, on purpose", () => {
 // selectSessions
 // ---------------------------------------------------------------------------
 
-test("no limit selects every candidate", () => {
+test("[US-32] no limit selects every candidate", () => {
   const rows = [
     { id: "old-parent", parent_id: null },
     { id: "old-child", parent_id: "old-parent" },
@@ -374,7 +374,7 @@ test("no limit selects every candidate", () => {
   )
 })
 
-test("a limit takes the oldest candidates whole, so a child never outlives its parent", () => {
+test("[US-32] a limit takes the oldest candidates whole, so a child never outlives its parent", () => {
   const rows = [
     { id: "old-parent", parent_id: null },
     { id: "old-child", parent_id: "old-parent" },
@@ -391,7 +391,7 @@ test("a limit takes the oldest candidates whole, so a child never outlives its p
   )
 })
 
-test("a limit keeps a whole tree, not only the children of the root", () => {
+test("[US-32] a limit keeps a whole tree, not only the children of the root", () => {
   const rows = [
     { id: "old-parent", parent_id: null },
     { id: "old-child", parent_id: "old-parent" },
@@ -405,7 +405,7 @@ test("a limit keeps a whole tree, not only the children of the root", () => {
   )
 })
 
-test("a candidate whose parent is not a candidate is a root of its own", () => {
+test("[US-32] a candidate whose parent is not a candidate is a root of its own", () => {
   // The recursion descends, it does not climb: a candidate may have a parent
   // that is not a candidate. That parent stays alive and is left alone, and
   // the candidate counts against the limit on its own.
@@ -416,7 +416,7 @@ test("a candidate whose parent is not a candidate is a root of its own", () => {
   assert.deepEqual(selectSessions(rows, 1).map((row) => row.id), ["old-child"])
 })
 
-test("the selected set keeps a child exactly when it keeps its parent", () => {
+test("[US-32] the selected set keeps a child exactly when it keeps its parent", () => {
   withFixture((db) => {
     const cutoffs = computeCutoffs(NOW, 30, 24)
     const rows = db.prepare(candidateSql(cutoffs, [])).all()
@@ -435,7 +435,7 @@ test("the selected set keeps a child exactly when it keeps its parent", () => {
 // childTableSql
 // ---------------------------------------------------------------------------
 
-test("the child table query finds every table that owns rows of a session", () => {
+test("[US-32] the child table query finds every table that owns rows of a session", () => {
   withFixture((db) => {
     const tables = db.prepare(childTableSql()).all().map((row) => row.tbl).sort()
     assert.deepEqual(tables, [
@@ -453,7 +453,7 @@ test("the child table query finds every table that owns rows of a session", () =
   })
 })
 
-test("the tool's delete list covers every table the child query found", () => {
+test("[US-32] the tool's delete list covers every table the child query found", () => {
   withFixture((db) => {
     const childTables = db.prepare(childTableSql()).all().map((row) => row.tbl)
     const statements = toolStatements(childTables, ["old-parent"])
@@ -487,19 +487,19 @@ test("the tool's delete list covers every table the child query found", () => {
 // deleteStatement
 // ---------------------------------------------------------------------------
 
-test("a delete statement names its table and its column and quotes its ids", () => {
+test("[US-32] a delete statement names its table and its column and quotes its ids", () => {
   assert.deepEqual(deleteStatement("session", "id", ["old-parent", "old-other"]), [
     "DELETE FROM session WHERE id IN ('old-parent','old-other')",
   ])
 })
 
-test("a single quote in an id is doubled, so the statement stays one string", () => {
+test("[US-32] a single quote in an id is doubled, so the statement stays one string", () => {
   assert.deepEqual(deleteStatement("session", "id", ["it's"]), [
     "DELETE FROM session WHERE id IN ('it''s')",
   ])
 })
 
-test("more than five hundred ids are split into several statements", () => {
+test("[US-32] more than five hundred ids are split into several statements", () => {
   const ids = Array.from({ length: 501 }, (_, index) => `id-${index}`)
   const statements = deleteStatement("session", "id", ids)
   assert.equal(statements.length, 2, "a long IN list is a statement-size risk, so it is cut up")
@@ -512,13 +512,13 @@ test("more than five hundred ids are split into several statements", () => {
   assert.deepEqual(deleteStatement("session", "id", []), [], "no ids means no statement to run")
 })
 
-test("an identifier that is not a plain name is refused", () => {
+test("[US-32] an identifier that is not a plain name is refused", () => {
   assert.throws(() => deleteStatement("session; DROP TABLE session", "id", ["x"]), /unsafe SQL identifier/)
   assert.throws(() => deleteStatement("session", "id; --", ["x"]), /unsafe SQL identifier/)
   assert.throws(() => deleteStatement("session", "1id", ["x"]), /unsafe SQL identifier/)
 })
 
-test("chunkIds cuts a list into the pieces one statement may carry", () => {
+test("[US-32] chunkIds cuts a list into the pieces one statement may carry", () => {
   assert.deepEqual(chunkIds([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]])
   assert.deepEqual(chunkIds([], 2), [])
   assert.deepEqual(chunkIds(null, 2), [])
@@ -530,7 +530,7 @@ test("chunkIds cuts a list into the pieces one statement may carry", () => {
 // the delete
 // ---------------------------------------------------------------------------
 
-test("the delete takes the old sessions and everything that belongs to them", () => {
+test("[US-32] the delete takes the old sessions and everything that belongs to them", () => {
   withFixture((db) => {
     const cutoffs = computeCutoffs(NOW, 30, 24)
     const retired = db.prepare(candidateSql(cutoffs, [])).all().map((row) => row.id)
@@ -560,7 +560,7 @@ test("the delete takes the old sessions and everything that belongs to them", ()
   })
 })
 
-test("the delete leaves the sessions the grace window kept exactly as they were", () => {
+test("[US-32] the delete leaves the sessions the grace window kept exactly as they were", () => {
   withFixture((db) => {
     const cutoffs = computeCutoffs(NOW, 30, 24)
     const retired = db.prepare(candidateSql(cutoffs, [])).all().map((row) => row.id)
@@ -587,7 +587,7 @@ test("the delete leaves the sessions the grace window kept exactly as they were"
 // parseRows
 // ---------------------------------------------------------------------------
 
-test("parseRows reads the JSON the CLI prints", () => {
+test("[US-32] parseRows reads the JSON the CLI prints", () => {
   assert.deepEqual(parseRows('[{"id":"old-parent","title":"Old parent"}]'), [
     { id: "old-parent", title: "Old parent" },
   ])
@@ -600,7 +600,7 @@ test("parseRows reads the JSON the CLI prints", () => {
 // summarize
 // ---------------------------------------------------------------------------
 
-test("summarize says what went, in one line", () => {
+test("[US-32] summarize says what went, in one line", () => {
   assert.equal(
     summarize({ sessions: 3, events: 5, children: 7 }),
     "retired 3 session(s) with 5 event row(s) and 7 child row(s)",

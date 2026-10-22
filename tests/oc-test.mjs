@@ -8,7 +8,8 @@
 // assertion on the source, or a run of the script against a temp HOME and a temp
 // host list.
 
-import { execFileSync, spawnSync } from "node:child_process"
+import { execFileSync, spawn, spawnSync } from "node:child_process"
+import { test as nodeTest } from "node:test"
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, chmodSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import * as path from "node:path"
@@ -27,18 +28,29 @@ const failures = []
  * A skip is only ever correct when the thing under test cannot exist on this
  * machine -- not when it is inconvenient. Every skip below names a specific,
  * checkable cause, so "it was skipped" is never mistaken for "it passed".
+ *
+ * The body runs HERE, once, and the outcome is then MIRRORED into node's test
+ * runner as a named subtest. This suite predates node:test and keeps its own
+ * harness, so without the mirror `node --test tests/` counted the whole file
+ * as ONE test: a regression in any of these checks was invisible in the
+ * runner's output, and the suite's pass count said nothing about how much was
+ * actually checked. The mirror runs nothing twice -- it only reports what this
+ * harness already decided.
  */
 const check = (name, fn, options = {}) => {
   if (typeof options.skip === "string" && options.skip) {
     skipped++
     console.log(`SKIP: ${name} -- ${options.skip}`)
+    nodeTest(name, { skip: options.skip }, () => {})
     return
   }
   try {
     fn()
     passed++
+    nodeTest(name, () => {})
   } catch (error) {
     failures.push(`${name}: ${error.message}`)
+    nodeTest(name, () => { throw new Error(error.message) })
   }
 }
 
@@ -72,6 +84,9 @@ const bashMajor = Number(bashVersion.split(".")[0]) || 0
  * the run cannot work; the preflight is what now says so.
  */
 const hasTimeout = () => spawnSync("sh", ["-c", "command -v timeout"], { encoding: "utf8" }).status === 0
+
+/** Is a command on the PATH the child will see? Probed, never assumed. */
+const hasCommand = (command) => spawnSync("sh", ["-c", `command -v ${command}`], { encoding: "utf8" }).status === 0
 
 /**
  * A PATH with one binary removed, rather than a PATH that merely happens to
@@ -118,6 +133,21 @@ const NO_OC_SYNC = [
   !hasTimeout() ? "bin/oc-sync needs GNU coreutils' timeout, which this PATH does not have" : "",
 ].filter(Boolean).join("; ")
 
+/**
+ * Why the checks that run the tunnel preflight's REMOTE half cannot run here,
+ * or "" if they can.
+ *
+ * The remote script finds the holder of the port with `ss`, and the stand-in
+ * listener that plays the remote's sshd is written in python (or netcat, if
+ * there is no python). Both are probed rather than assumed.
+ */
+const NO_REMOTE_PROBE = [
+  !hasCommand("ss") ? "the remote script finds its listener with ss, and this PATH has no ss" : "",
+  !hasCommand("python3") && !hasCommand("nc")
+    ? "the stand-in listener for the remote's sshd needs python3 or nc, and this PATH has neither"
+    : "",
+].filter(Boolean).join("; ")
+
 // Every run of oc-sync from this file must be hermetic.
 //
 // With no OC_SYNC_ENV_FILE the script sources the personal
@@ -143,7 +173,7 @@ const hermeticEnv = (extra = {}) => ({
 // runtime one, and the runtime gate is the preflight check further down.
 // ---------------------------------------------------------------------------
 
-for (const script of ["oc", "oc-notify", "oc-sync", "oc-notify-receiver"]) {
+for (const script of ["oc", "oc-notify", "oc-sync", "oc-notify-receiver", "oc-tunnel-preflight"]) {
   check(`syntax: ${script}`, () => {
     const result = spawnSync("bash", ["-n", path.join(BIN, script)], { encoding: "utf8" })
     assert(result.status === 0, `bash -n failed: ${result.stderr}`)
@@ -499,14 +529,18 @@ check("receiver actually splits the payload, on this machine's bash", () => {
     // The whole point: word splitting would turn this into six arguments, and
     // globbing would have eaten the `*` even if it had not.
     assert(argv[1] === body, `the body must arrive as ONE argument, got ${JSON.stringify(argv)}`)
-    assert(argv[2] === "--urgency=critical", `urgency must survive, got ${JSON.stringify(argv)}`)
-    assert(argv[3] === "--icon=dialog-error", `icon must survive, got ${JSON.stringify(argv)}`)
+    // The app name: the popup's header IS the notification's app name, and
+    // notify-send reports its own name ("notify-send") when none is given, so
+    // every send has to name LaCode itself.
+    assert(argv[2] === "--app-name=LaCode", `the popup must be raised under LaCode's name, got ${JSON.stringify(argv)}`)
+    assert(argv[3] === "--urgency=critical", `urgency must survive, got ${JSON.stringify(argv)}`)
+    assert(argv[4] === "--icon=dialog-error", `icon must survive, got ${JSON.stringify(argv)}`)
     // --expire-time=0 is the freedesktop "never expire" timeout: the popup waits
     // for the user to close it instead of being taken away by the desktop's own
     // timer, and a notice the user missed is no notice. It is the last argument,
     // and nothing else is added after it.
-    assert(argv[4] === "--expire-time=0", `the notification must never be auto-dismissed, got ${JSON.stringify(argv)}`)
-    assert(argv.length === 5, `the never-expire flag must be the last argument, got ${JSON.stringify(argv)}`)
+    assert(argv[5] === "--expire-time=0", `the notification must never be auto-dismissed, got ${JSON.stringify(argv)}`)
+    assert(argv.length === 6, `the never-expire flag must be the last argument, got ${JSON.stringify(argv)}`)
   } finally {
     rmSync(home, { recursive: true, force: true })
   }
@@ -548,7 +582,7 @@ check("a notification is never auto-dismissed: the receiver asks for no expiry",
   // desktop daemon's own timer dismisses the popup, and a notice the user
   // missed is no notice.
   const src = read("oc-notify-receiver")
-  assert(/exec notify-send "\$TITLE" "\$MSG" --urgency="\$URGENCY" --icon="\$ICON" --expire-time=0/.test(src),
+  assert(/exec notify-send "\$TITLE" "\$MSG" --app-name=LaCode --urgency="\$URGENCY" --icon="\$ICON" --expire-time=0/.test(src),
     "the receiver must pass --expire-time=0 to notify-send")
 })
 
@@ -557,8 +591,30 @@ check("a notification is never auto-dismissed: oc asks for no expiry", () => {
   // receiver does: a notification raised on this host stays until the user
   // closes it too.
   const src = read("oc")
-  assert(/notify-send "\$title" "\$msg" --urgency="\$urgency" --icon="\$icon" --expire-time=0/.test(src),
+  assert(/notify-send "\$title" "\$msg" --app-name=LaCode --urgency="\$urgency" --icon="\$icon" --expire-time=0/.test(src),
     "the local branch must pass --expire-time=0 to notify-send")
+})
+
+check("every notify-send call names the app, so the popup does not claim to be 'notify-send'", () => {
+  // The popup's header IS the notification's app name, and notify-send reports
+  // its OWN name when none is given -- so a send that does not name LaCode
+  // raises a popup that claims to be from a program the user never ran.
+  //
+  // Both scripts, every call site: the flag is a property of the popup, not of
+  // one branch of it, and a call that forgets it is a popup with the wrong
+  // header and nothing else to show it.
+  for (const script of ["oc", "oc-notify-receiver"]) {
+    const src = read(script)
+    // Comments are stripped first, and only a real invocation is matched: a
+    // line that hands two quoted variables to notify-send. `command -v
+    // notify-send` is not a send.
+    const code = src.replace(/^\s*#.*$/gm, "")
+    const calls = code.match(/notify-send "\$[A-Za-z_]+" "\$[A-Za-z_]+"[^\n]*/g) || []
+    assert(calls.length > 0, `${script} must call notify-send`)
+    for (const call of calls) {
+      assert(/--app-name=LaCode/.test(call), `every notify-send call in ${script} must name the app: ${call}`)
+    }
+  }
 })
 
 check("receiver fails cleanly, with a way out, where notify-send does not exist", () => {
@@ -595,6 +651,118 @@ check("receiver fails cleanly, with a way out, where notify-send does not exist"
   } finally {
     stripped.scratch()
     rmSync(home, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// The helper: raising a popup, and taking it back down
+// ---------------------------------------------------------------------------
+//
+// A popup lives on the desktop, and only the desktop knows the id the
+// notification daemon gave it. So the helper that RAISES the popup records that
+// id under the notification's correlation key, and the helper that is asked to
+// CLOSE it reads the file back, closes every id in it over the session bus, and
+// deletes the file.
+//
+// Both run here for real, with the notifier and the session bus stubbed on a
+// PATH of their own: a real binary, a real argv, a real exit status. Nothing
+// reaches a desktop, a network or a session bus, and nothing is written outside
+// a temp directory.
+
+/**
+ * A stub PATH with the notifier and the session bus stubbed out.
+ *
+ * `notify-send` prints the id the daemon would have assigned, but ONLY when it
+ * is asked for one with `--print-id`: that id is the only handle on the popup,
+ * and a notifier that printed it unasked would put a number where an answer
+ * belongs. `gdbus` records the notification ids it was asked to close.
+ */
+const stubDesktop = (dir, { notifyId = "42" } = {}) => {
+  const notifyLog = path.join(dir, "notify-send.log")
+  const gdbusLog = path.join(dir, "gdbus.log")
+  writeFileSync(
+    path.join(dir, "notify-send"),
+    `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(notifyLog)}; done\n` +
+      `for a in "$@"; do if [ "$a" = "--print-id" ]; then printf '%s\\n' ${JSON.stringify(notifyId)}; break; fi; done\n` +
+      `exit 0\n`,
+  )
+  writeFileSync(
+    path.join(dir, "gdbus"),
+    `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(gdbusLog)}; done\nexit 0\n`,
+  )
+  chmodSync(path.join(dir, "notify-send"), 0o755)
+  chmodSync(path.join(dir, "gdbus"), 0o755)
+  const argvOf = (log) => {
+    if (!existsSync(log)) return []
+    const parts = readFileSync(log, "utf8").split("\0")
+    if (parts[parts.length - 1] === "") parts.pop()
+    return parts
+  }
+  return {
+    notifyArgv: () => argvOf(notifyLog),
+    closedIds: () => argvOf(gdbusLog).filter((arg) => /^\d+$/.test(arg)),
+  }
+}
+
+/** The env a helper run needs to be hermetic: no tunnel, no real HOME. */
+const helperEnv = (dir, state, extra = {}) => ({
+  PATH: `${dir}${path.delimiter}${process.env.PATH}`,
+  HOME: dir,
+  LACODE_NOTIFY_DIR: state,
+  ...extra,
+})
+
+check("the helper records the notification id under its correlation key", () => {
+  // Without an id there is no handle on the popup, so a later close request
+  // could never find it. The id is asked for, recorded next to the key, and
+  // kept OFF stdout: stdout is the answer channel, and the answer is the
+  // action the user clicked.
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-notify-id-"))
+  const state = mkdtempSync(path.join(tmpdir(), "ocsync-notify-state-"))
+  try {
+    const desktop = stubDesktop(dir)
+    const result = spawnSync(
+      "bash",
+      [path.join(BIN, "oc-notify"), "opencode — Deploy", "Task finished", "normal", "utilities-terminal"],
+      { encoding: "utf8", env: helperEnv(dir, state, { LACODE_NOTIFY_SESSION: "ses_abc123" }) },
+    )
+
+    assert(result.status === 0, `the notification must succeed: ${result.stderr}`)
+    assert(desktop.notifyArgv().includes("--print-id"),
+      `the notifier must be asked for the id: ${JSON.stringify(desktop.notifyArgv())}`)
+    const ids = readFileSync(path.join(state, "ses_abc123.ids"), "utf8")
+    assert(ids === "42\n", `the id must be recorded under the correlation key: ${JSON.stringify(ids)}`)
+    assert(!result.stdout.includes("42"), `the id must never reach stdout: ${JSON.stringify(result.stdout)}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(state, { recursive: true, force: true })
+  }
+})
+
+check("the helper closes a session's popups when it is asked to, and sends nothing", () => {
+  // A close request is not a notification. It takes the popups down, spends the
+  // id file, sends nothing at all and exits 0 -- a dismissal that raised a
+  // popup of its own would be worse than no dismissal.
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-notify-close-"))
+  const state = mkdtempSync(path.join(tmpdir(), "ocsync-notify-state-"))
+  try {
+    const desktop = stubDesktop(dir)
+    writeFileSync(path.join(state, "ses_abc123.ids"), "42\n43\n")
+    const result = spawnSync(
+      "bash",
+      [path.join(BIN, "oc-notify"), "opencode", "", "normal", "utilities-terminal"],
+      { encoding: "utf8", env: helperEnv(dir, state, { LACODE_NOTIFY_CLOSE: "ses_abc123" }) },
+    )
+
+    assert(result.status === 0, `a close request must succeed: ${result.stderr}`)
+    assert(JSON.stringify(desktop.closedIds()) === JSON.stringify(["42", "43"]),
+      `every recorded id must be closed: ${JSON.stringify(desktop.closedIds())}`)
+    assert(!existsSync(path.join(state, "ses_abc123.ids")), "the id file must be spent once its ids are closed")
+    assert(desktop.notifyArgv().length === 0, `a close request must send no notification: ${JSON.stringify(desktop.notifyArgv())}`)
+    assert((result.stdout || "") === "", `a close request must print nothing: ${JSON.stringify(result.stdout)}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(state, { recursive: true, force: true })
   }
 })
 
@@ -872,10 +1040,609 @@ check("oc-sync's preflight runs AFTER argument parsing, so --help and bad flags 
 })
 
 // ---------------------------------------------------------------------------
+// oc-tunnel-preflight: the tunnel unit's ExecStartPre
+//
+// The unit's ExecStartPre frees a tunnel port that a DEAD session still holds
+// on the remote. The desktop's ssh connection is gone -- its address changed,
+// or the machine slept -- but the remote's sshd keeps the port bound until its
+// own TCP keepalive notices, which takes hours. The unit then fails forever
+// with "remote port forwarding failed for listen port PORT", and every
+// notification from that host dies silently.
+//
+// Three properties have to hold at once, and each is checked on its own:
+//
+//   1. IT NEVER FAILS. A preflight that exits non-zero is a unit that does not
+//      start, which is worse than the stale port it was meant to clear.
+//   2. IT ASKS THE REMOTE THE RIGHT QUESTION. The remote script is fed to ssh
+//      on stdin, so that text IS the contract: it has to probe the listener,
+//      not guess at it.
+//   3. IT ONLY KILLS AN sshd. Anything else on that port belongs to somebody
+//      else.
+//
+// The remote half is tested by extracting the script the preflight sends and
+// running it HERE, against a stand-in listener: no network, and the ssh call
+// itself is a stub that records what it was given.
+// ---------------------------------------------------------------------------
+
+const PREFLIGHT = path.join(BIN, "oc-tunnel-preflight")
+
+/**
+ * The remote-side script the preflight feeds to ssh on stdin.
+ *
+ * It is a heredoc in the source, so it is read out of the file rather than
+ * restated here: a copy in the test would keep passing after the script
+ * changed, and the script is the whole contract with the remote.
+ */
+const remoteScript = () => {
+  const src = read("oc-tunnel-preflight")
+  const marker = "<<'REMOTE'\n"
+  const start = src.indexOf(marker)
+  assert(start !== -1, "the preflight must feed the remote script to ssh on stdin")
+  const from = start + marker.length
+  const end = src.indexOf("\nREMOTE\n", from)
+  assert(end !== -1, "the remote script must be closed by its REMOTE terminator")
+  return src.slice(from, end)
+}
+
+/**
+ * An `ssh` stub that records how it was called.
+ *
+ * The preflight must never open a real connection, so `ssh` on the PATH is a
+ * script that writes its argv and its stdin to files. The stdin file holds
+ * the remote script exactly as the preflight sent it; the argv file holds the
+ * options and arguments it sent it with.
+ */
+const sshStub = (dir, { status = 0, say = "" } = {}) => {
+  const argvFile = path.join(dir, "ssh-argv")
+  const stdinFile = path.join(dir, "ssh-stdin")
+  const stub = path.join(dir, "ssh")
+  const lines = [
+    "#!/bin/sh",
+    `printf '%s\\n' "$@" > ${JSON.stringify(argvFile)}`,
+    `cat > ${JSON.stringify(stdinFile)}`,
+  ]
+  if (say) lines.push(`printf '%s\\n' ${JSON.stringify(say)}`)
+  lines.push(`exit ${status}`)
+  writeFileSync(stub, lines.join("\n") + "\n")
+  chmodSync(stub, 0o755)
+  return { argvFile, stdinFile, stub }
+}
+
+/** Run the preflight with the stubbed ssh first on the PATH. */
+const runPreflight = (dir, args = []) => spawnSync("bash", [PREFLIGHT, ...args], {
+  encoding: "utf8",
+  env: { ...process.env, PATH: `${dir}${path.delimiter}${process.env.PATH}` },
+})
+
+check("the tunnel preflight exits 0 and says nothing without a host and a port", () => {
+  // A preflight is the unit's ExecStartPre: whatever it exits with, the unit
+  // does. It must never be the reason the unit fails to start.
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-preflight-noargs-"))
+  try {
+    const stub = sshStub(dir)
+    const result = runPreflight(dir)
+    assert(result.status === 0, `expected exit 0, got ${result.status}: ${result.stderr}`)
+    assert(result.stdout === "", `the preflight must print nothing, got ${JSON.stringify(result.stdout)}`)
+    assert(!existsSync(stub.argvFile), "ssh must not be called without a host and a port")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+check("the tunnel preflight never reaches ssh with a bad host or port", () => {
+  // An empty host, an empty port and a non-numeric port are all "do nothing":
+  // there is no remote to ask, and a port that is not a number is not a port.
+  const cases = [["", "10022"], ["a-host", ""], ["a-host", "abc"]]
+  for (const [host, port] of cases) {
+    const dir = mkdtempSync(path.join(tmpdir(), "ocsync-preflight-bad-"))
+    try {
+      const stub = sshStub(dir)
+      const result = runPreflight(dir, [host, port])
+      assert(result.status === 0, `host=${host} port=${port}: expected exit 0, got ${result.status}: ${result.stderr}`)
+      assert(result.stdout === "", `host=${host} port=${port}: expected no output, got ${JSON.stringify(result.stdout)}`)
+      assert(!existsSync(stub.argvFile), `host=${host} port=${port}: ssh must not be called at all`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+check("the tunnel preflight survives an unreachable remote", () => {
+  // ssh failing is the normal case when the remote is down or the network is
+  // gone. The preflight must still succeed: the unit's own attempts are what
+  // report that, and a preflight that failed would take the unit down with it.
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-preflight-unreachable-"))
+  try {
+    const stub = sshStub(dir, { status: 255 })
+    const result = runPreflight(dir, ["a-host", "10022"])
+    assert(result.status === 0, `expected exit 0, got ${result.status}: ${result.stderr}`)
+    assert(result.stdout === "", `the preflight must print nothing, got ${JSON.stringify(result.stdout)}`)
+    assert(existsSync(stub.argvFile), "ssh must have been tried: the remote script is the whole point")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+check("the tunnel preflight prints the remote's line and nothing else", () => {
+  // Exactly one line, and only when a port was actually freed: the systemd
+  // journal records the recovery and stays quiet the rest of the time.
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-preflight-line-"))
+  try {
+    const freed = "oc-tunnel-preflight: freed a dead listener on port 10022"
+    sshStub(dir, { say: freed })
+    const result = runPreflight(dir, ["a-host", "10022"])
+    assert(result.status === 0, `expected exit 0, got ${result.status}: ${result.stderr}`)
+    assert(result.stdout === `${freed}\n`, `expected exactly the freed line, got ${JSON.stringify(result.stdout)}`)
+
+    // Anything else the remote says is not the one line the preflight knows,
+    // so it stays silent rather than putting noise in the journal.
+    sshStub(dir, { say: "some other output" })
+    const quiet = runPreflight(dir, ["a-host", "10022"])
+    assert(quiet.status === 0, `expected exit 0, got ${quiet.status}: ${quiet.stderr}`)
+    assert(quiet.stdout === "", `expected no output, got ${JSON.stringify(quiet.stdout)}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+check("the remote script probes the listener instead of guessing at it", () => {
+  // The remote script is fed to ssh on stdin, so its text IS the contract.
+  // Three things have to be in it:
+  //   - the ss lookup that finds WHO holds the port,
+  //   - the /dev/tcp probe that asks whether that holder still answers,
+  //   - the /proc/<pid>/comm check that makes sure it is an sshd.
+  // And the kill must sit in the NO-BANNER branch: a live forward is never
+  // touched.
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-preflight-script-"))
+  try {
+    const stub = sshStub(dir)
+    const port = "54321"
+    const result = runPreflight(dir, ["a-host", port])
+    assert(result.status === 0, `expected exit 0, got ${result.status}: ${result.stderr}`)
+    const script = readFileSync(stub.stdinFile, "utf8")
+    assert(/ss -ltnpH "sport = :/.test(script), "the script must find the listener with ss")
+    assert(/\/dev\/tcp/.test(script), "the script must probe the port over bash's /dev/tcp")
+    assert(/\/proc\/\$pid\/comm/.test(script), "the script must read the holder's comm")
+    assert(/= "sshd"/.test(script), "the script must accept only an sshd as the holder")
+    assert(/SSH\*/.test(script), "the script must recognise the SSH banner")
+    const banner = script.indexOf("SSH*)")
+    const kill = script.indexOf('kill "$pid"')
+    assert(banner !== -1 && kill > banner, "the kill must sit in the no-banner branch, never in the live one")
+    assert((script.match(/kill "\$pid"/g) || []).length === 1, "there must be exactly one kill")
+
+    // The port travels as an ARGUMENT, never as text in the script: a script
+    // with the port spliced into it is a script that has to be quoted.
+    assert(!script.includes(port), `the port must not be interpolated into the script: ${script}`)
+    const argv = readFileSync(stub.argvFile, "utf8").split("\n").filter((line) => line.length > 0)
+    assert(argv.includes(port), `the port must be passed as an argument, got ${JSON.stringify(argv)}`)
+    assert(argv.includes("bash") && argv.includes("-s") && argv.includes("--"),
+      `the remote script must be fed on stdin with the port after --, got ${JSON.stringify(argv)}`)
+    // ClearAllForwardings=yes is not optional: without it this preflight's own
+    // ssh would try to claim the tunnel port and could become the next stale
+    // holder -- the failure this script exists to clear.
+    assert(argv.includes("ClearAllForwardings=yes"),
+      `the preflight's own ssh must clear forwardings, got ${JSON.stringify(argv)}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// The remote half, run here
+//
+// The remote script is extracted from the preflight and run on this machine
+// against a stand-in listener, because that is the only way to see what it
+// decides. Two things have to be arranged for that to be honest:
+//
+//   - The script finds its listener with `ss`, so it needs one.
+//   - It only ever kills a process whose /proc/<pid>/comm is exactly "sshd",
+//     because only an sshd can hold a remote-forward listener. A stand-in
+//     listener is named after whatever ran it, so the production check cannot
+//     pass here.
+//
+// The check is NOT weakened in bin/oc-tunnel-preflight. It is replaced in a
+// COPY of the script, with a stub that reports "sshd", so the probe and the
+// kill decision are exercised for real; and the UNMODIFIED script is what
+// proves the safety property -- a listener that is not an sshd is left alone.
+// ---------------------------------------------------------------------------
+
+/**
+ * The comm check the remote script makes before it will touch a pid, and the
+ * stub that stands in for it in a copy of the script.
+ *
+ * The exact text of the production check is pinned here on purpose: if it is
+ * reworded, this test says so instead of quietly testing a check that no
+ * longer exists.
+ */
+const COMM_CHECK = `[ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "sshd" ] || exit 0`
+const COMM_STUB = `[ "$(printf 'sshd')" = "sshd" ] || exit 0`
+
+const remoteScriptAsSshd = () => {
+  const script = remoteScript()
+  assert(script.includes(COMM_CHECK), "the remote script must check /proc/<pid>/comm before it kills anything")
+  return script.split(COMM_CHECK).join(COMM_STUB)
+}
+
+/** Run a copy of the remote script here, against a local port. */
+const runRemote = (dir, script, port) => {
+  const file = path.join(dir, "remote.sh")
+  writeFileSync(file, script)
+  return spawnSync("bash", [file, String(port)], { encoding: "utf8", timeout: 30000 })
+}
+
+/** A port nothing is listening on, asked of the kernel rather than guessed. */
+const freePort = () => {
+  const result = spawnSync(process.execPath, ["-e",
+    'const { createServer } = require("node:net"); const s = createServer(); s.listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close() })',
+  ], { encoding: "utf8" })
+  const port = Number((result.stdout || "").trim())
+  assert(port > 0, `could not pick a free port: ${result.stderr}`)
+  return port
+}
+
+/** Is something LISTENing on that port? That is the liveness of the forward. */
+const portIsListening = (port) => {
+  const result = spawnSync("ss", ["-ltnH", `sport = :${port}`], { encoding: "utf8" })
+  return (result.stdout || "").trim().length > 0
+}
+
+/** A synchronous sleep, so a polling wait can live inside a check body. */
+const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) }
+
+const waitFor = (predicate, timeoutMs) => {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    sleepSync(25)
+  }
+  return false
+}
+
+/**
+ * A stand-in for the remote's sshd holding a forward.
+ *
+ * "banner": answers the probe with an SSH banner -- a LIVE forward.
+ * "silent": accepts the connection and says nothing -- a DEAD forward, which
+ * is what a session that died without releasing the port looks like.
+ *
+ * The listener's liveness is read back from the PORT (is it still LISTENing?)
+ * rather than from a pid: the port is what the remote script acts on, and it
+ * does not depend on how the listener was started.
+ */
+const LISTENER_PY = `import socket, sys
+
+mode, port = sys.argv[1], int(sys.argv[2])
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(16)
+conns = []
+while True:
+    try:
+        c, _ = s.accept()
+    except OSError:
+        break
+    conns.append(c)
+    try:
+        c.recv(1024)
+    except OSError:
+        pass
+    if mode == "banner":
+        try:
+            c.sendall(b"SSH-2.0-test\\r\\n")
+        except OSError:
+            pass
+`
+
+/** The same listener without python: netcat holds the connection open. */
+const ncListener = (mode, port) => {
+  const feed = mode === "banner" ? "(printf 'SSH-2.0-test\\r\\n'; sleep 30)" : "sleep 30"
+  return `${feed} | nc -k -l 127.0.0.1 ${port}`
+}
+
+const startListener = (dir, mode) => {
+  const port = freePort()
+  const script = path.join(dir, `listener-${mode}.py`)
+  writeFileSync(script, LISTENER_PY)
+  const child = hasCommand("python3")
+    ? spawn("python3", [script, mode, String(port)], { detached: true, stdio: "ignore" })
+    : spawn("sh", ["-c", ncListener(mode, port)], { detached: true, stdio: "ignore" })
+  // A spawn failure must not become an unhandled 'error' event.
+  child.on("error", () => {})
+  // The listener outlives this check on purpose; the group is killed in stop().
+  child.unref()
+  const up = waitFor(() => portIsListening(port), 5000)
+  assert(up, `the stand-in listener never came up on port ${port}`)
+  return {
+    port,
+    stop: () => { try { process.kill(-child.pid, "SIGKILL") } catch { /* already gone */ } },
+  }
+}
+
+check("a live forward is left alone", () => {
+  // A live forward answers the probe with the desktop's sshd banner. Nothing
+  // is killed, nothing is printed, and the port stays held.
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-preflight-live-"))
+  let listener = null
+  try {
+    listener = startListener(dir, "banner")
+    const result = runRemote(dir, remoteScriptAsSshd(), listener.port)
+    assert(!result.error, `the remote script did not run: ${result.error?.message}`)
+    assert(result.status === 0, `the remote script must exit 0, got ${result.status}: ${result.stderr}`)
+    assert(result.stdout === "", `a live forward must print nothing, got ${JSON.stringify(result.stdout)}`)
+    assert(portIsListening(listener.port), "a live forward must be left alone: the port is still held")
+  } finally {
+    if (listener) listener.stop()
+    rmSync(dir, { recursive: true, force: true })
+  }
+}, { skip: NO_REMOTE_PROBE })
+
+check("a dead forward is cleared", () => {
+  // A dead forward accepts the connection and then says nothing, because the
+  // channel to the desktop is gone. That is provably a stale holder, so it is
+  // killed and the freed port is reported.
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-preflight-dead-"))
+  let listener = null
+  try {
+    listener = startListener(dir, "silent")
+    const result = runRemote(dir, remoteScriptAsSshd(), listener.port)
+    assert(!result.error, `the remote script did not run: ${result.error?.message}`)
+    assert(result.status === 0, `the remote script must exit 0, got ${result.status}: ${result.stderr}`)
+    assert(result.stdout.trim() === `oc-tunnel-preflight: freed a dead listener on port ${listener.port}`,
+      `the freed port must be reported, got ${JSON.stringify(result.stdout)}`)
+    const gone = waitFor(() => !portIsListening(listener.port), 5000)
+    assert(gone, "the stale listener must be killed: the port is still held")
+  } finally {
+    if (listener) listener.stop()
+    rmSync(dir, { recursive: true, force: true })
+  }
+}, { skip: NO_REMOTE_PROBE })
+
+check("a listener that is not an sshd is never killed", () => {
+  // The safety property, and the more valuable of the two: only an sshd can
+  // hold a remote-forward listener, and anything else on that port belongs to
+  // somebody else. The stand-in listener is not an sshd, so the UNMODIFIED
+  // script must walk away from it -- and say nothing while it does.
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-preflight-other-"))
+  let listener = null
+  try {
+    listener = startListener(dir, "banner")
+    const result = runRemote(dir, remoteScript(), listener.port)
+    assert(!result.error, `the remote script did not run: ${result.error?.message}`)
+    assert(result.status === 0, `the remote script must exit 0, got ${result.status}: ${result.stderr}`)
+    assert(result.stdout === "", `nothing must be printed, got ${JSON.stringify(result.stdout)}`)
+    assert(portIsListening(listener.port), "a listener that is not an sshd must survive")
+  } finally {
+    if (listener) listener.stop()
+    rmSync(dir, { recursive: true, force: true })
+  }
+}, { skip: NO_REMOTE_PROBE })
+
+check("the tunnel unit runs the preflight before it claims the port", () => {
+  // The order is the point: the preflight frees the port, and only then does
+  // ssh try to bind it. A unit that starts ssh first loses the race it is
+  // supposed to win.
+  //
+  // The line is rendered into the unit ONLY when the preflight is installed
+  // (the check below proves that), so the order is proved by the rendered
+  // unit rather than by the template -- what the template has to carry is the
+  // decision, not the line.
+  const src = read("oc-sync")
+  assert(/preflight_line="ExecStartPre=\$PREFLIGHT \$host \$port"/.test(src),
+    "the preflight must be called with the host and the port")
+  assert(/^PREFLIGHT="\$HOME\/\.local\/bin\/oc-tunnel-preflight"$/m.test(src),
+    "PREFLIGHT must point at the installed preflight")
+  // The guard, not just the renderer: it must ask for the preflight line only
+  // when the renderer wrote one. A guard that demands a line the renderer may
+  // omit either rewrites the unit on every run or never converges -- and a
+  // unit that names a preflight this machine does not have cannot start.
+  assert(/grep -qF -- "\$preflight_line" "\$unit_file"/.test(src),
+    "the rewrite guard must ask for the line the renderer wrote")
+  assert(/grep -qF "ExecStartPre=" "\$unit_file" && stale=1/.test(src),
+    "a unit that names a preflight this machine does not have must be rewritten")
+  // A rewritten unit needs a restart, not just a reload: the RUNNING instance
+  // still has the old ExecStart, so the new ExecStartPre would never run and
+  // the stale port would never be freed.
+  assert(/rewritten=1/.test(src), "a rewritten unit must be marked as rewritten")
+  assert(/systemctl --user restart "\$unit"/.test(src), "a rewritten unit must be restarted")
+})
+
+/**
+ * install_tunnel_unit, lifted out of the script.
+ *
+ * The function is the whole contract here -- what it renders and what it
+ * considers up to date -- so it is read out of the file rather than restated
+ * here: a copy in the test would keep passing after the function changed.
+ */
+const tunnelUnitFn = () => {
+  const src = read("oc-sync")
+  const start = src.indexOf("install_tunnel_unit() {")
+  assert(start !== -1, "oc-sync must have an install_tunnel_unit function")
+  const end = src.indexOf("\ndrop_config_remoteforward() {", start)
+  assert(end !== -1, "install_tunnel_unit must end before drop_config_remoteforward")
+  return src.slice(start, end)
+}
+
+/**
+ * Run install_tunnel_unit against a scratch HOME.
+ *
+ * Three things keep it hermetic:
+ *
+ *   - HOME is a temp dir, and TUNNEL_UNIT_DIR is derived from it, so the real
+ *     ~/.config/systemd/user is never written to.
+ *   - systemctl and loginctl are STUBBED. The function enables and starts the
+ *     unit, and on a developer's machine that would start a real tunnel to a
+ *     fake host.
+ *   - the unit is written to the scratch dir and read back from there.
+ */
+const runInstallTunnelUnit = (home, { preflight = false } = {}) => {
+  const stubDir = path.join(home, "stub-bin")
+  mkdirSync(stubDir, { recursive: true })
+  for (const tool of ["systemctl", "loginctl"]) {
+    const stub = path.join(stubDir, tool)
+    writeFileSync(stub, "#!/bin/sh\nexit 0\n")
+    chmodSync(stub, 0o755)
+  }
+  const preflightPath = path.join(home, ".local", "bin", "oc-tunnel-preflight")
+  if (preflight) {
+    mkdirSync(path.dirname(preflightPath), { recursive: true })
+    writeFileSync(preflightPath, read("oc-tunnel-preflight"))
+    chmodSync(preflightPath, 0o700)
+  } else {
+    rmSync(preflightPath, { force: true })
+  }
+  const probe = `
+DRY_RUN=0
+TUNNEL_UNIT_DIR="$HOME/.config/systemd/user"
+PREFLIGHT="$HOME/.local/bin/oc-tunnel-preflight"
+PREFLIGHT_SRC="$1"
+ok() { echo "ok:$*"; }
+bad() { echo "err:$*"; }
+warn() { echo "warn:$*"; }
+${tunnelUnitFn()}
+install_tunnel_unit "host-a" "10022"
+`
+  const result = spawnSync("bash", ["-c", probe], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: home, PATH: `${stubDir}${path.delimiter}${process.env.PATH}` },
+  })
+  const unitFile = path.join(home, ".config", "systemd", "user", "oc-tunnel@host-a.service")
+  return {
+    result,
+    unitFile,
+    unit: existsSync(unitFile) ? readFileSync(unitFile, "utf8") : "",
+    preflightPath,
+  }
+}
+
+check("a tunnel unit never names a preflight that is not installed", () => {
+  // The bug this pins. The unit was rendered with an ExecStartPre line no
+  // matter whether the preflight was there: with the file missing, systemd
+  // fails the unit with 203/EXEC, and with Restart=always it then retries every
+  // 10 seconds forever. That is not "no preflight" but "no tunnel" -- and
+  // every notification from that host dies with it, visibly only in the
+  // remote's journal, on the other side of the hop.
+  //
+  // So the guarantee is: the unit that gets written either names no preflight
+  // at all, or names one that is really there.
+  const home = mkdtempSync(path.join(tmpdir(), "ocsync-unit-preflight-"))
+  try {
+    // 1. The preflight is NOT installed.
+    const missing = runInstallTunnelUnit(home, { preflight: false })
+    assert(missing.unit !== "",
+      `the unit must be written at all: ${missing.result.stdout}${missing.result.stderr}`)
+    assert(!/ExecStartPre=/.test(missing.unit),
+      `a unit that names a missing preflight is dead on arrival: ${missing.unit}`)
+    // The tunnel itself survives: it degrades to what it did before the
+    // preflight existed -- it holds the forward, it just cannot free a stale
+    // port by itself.
+    assert(/^ExecStart=\/usr\/bin\/ssh .*-R 10022:localhost:22 host-a$/m.test(missing.unit),
+      `the unit must still start ssh: ${missing.unit}`)
+    assert(/^Restart=always$/m.test(missing.unit), `the unit must still restart itself: ${missing.unit}`)
+    // And the run says so, instead of leaving the reader to find out.
+    assert(/preflight/i.test(missing.result.stdout),
+      `the run must report the missing preflight: ${missing.result.stdout}${missing.result.stderr}`)
+
+    // 2. The preflight IS installed: the behaviour is exactly what it was.
+    const present = runInstallTunnelUnit(home, { preflight: true })
+    const line = `ExecStartPre=${path.join(home, ".local", "bin", "oc-tunnel-preflight")} host-a 10022`
+    assert(present.unit.includes(`${line}\n`),
+      `the unit must run the preflight with the host and the port: ${present.unit}`)
+    assert(present.unit.indexOf(line) < present.unit.indexOf("ExecStart="),
+      "the preflight must come before ssh claims the port")
+    assert(existsSync(present.preflightPath), "the preflight the unit names must really be there")
+
+    // 3. The preflight goes away again. The unit must not be left pointing at
+    // a file that is not there -- that is the same dead unit, reached by
+    // deleting one file instead of by never installing it.
+    const gone = runInstallTunnelUnit(home, { preflight: false })
+    assert(!/ExecStartPre=/.test(gone.unit),
+      `a unit left naming a removed preflight is dead on arrival: ${gone.unit}`)
+    assert(/wrote /.test(gone.result.stdout),
+      `the unit must be rewritten without the preflight: ${gone.result.stdout}${gone.result.stderr}`)
+
+    // 4. And it converges: a second run with the same state must not rewrite
+    // the unit again, or every sync would restart a working tunnel.
+    const again = runInstallTunnelUnit(home, { preflight: false })
+    assert(/already up to date/.test(again.result.stdout),
+      `the unit must converge: ${again.result.stdout}${again.result.stderr}`)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+check("the preflight is installed by content, and a dry run installs nothing", () => {
+  // A stale copy is exactly the one that misbehaves: an older preflight does
+  // not know how to probe a listener, so the port stays stuck and the tunnel
+  // never comes back. Presence-only installation would never notice.
+  const src = read("oc-sync")
+  const start = src.indexOf("install_tunnel_preflight()")
+  assert(start !== -1, "oc-sync must install the preflight")
+  const fn = src.slice(start, src.indexOf("\nsetup_tunnel_auth\n", start))
+  assert(/cmp -s "\$PREFLIGHT_SRC" "\$PREFLIGHT"/.test(fn),
+    "the installed copy must be compared by content")
+  assert(/DRY_RUN/.test(fn), "a dry run must not install anything")
+
+  // Run the function on its own, against a temp HOME: the whole of oc-sync is
+  // not run here, because it deploys to real machines.
+  const home = mkdtempSync(path.join(tmpdir(), "ocsync-preflight-install-"))
+  try {
+    const probe = `
+DRY_RUN=$1
+PREFLIGHT="$HOME/.local/bin/oc-tunnel-preflight"
+PREFLIGHT_SRC="$2"
+ok() { echo "ok:$*"; }
+bad() { echo "err:$*"; }
+warn() { echo "warn:$*"; }
+${fn}
+install_tunnel_preflight
+`
+    const installed = path.join(home, ".local", "bin", "oc-tunnel-preflight")
+    const dry = spawnSync("bash", ["-c", probe, "_", "1", PREFLIGHT], {
+      encoding: "utf8", env: { ...process.env, HOME: home },
+    })
+    assert(!existsSync(installed), `a dry run must not install anything: ${dry.stdout}${dry.stderr}`)
+    assert(/dry-run/.test(dry.stdout), `the dry run must say what it would do: ${dry.stdout.trim()}`)
+
+    const real = spawnSync("bash", ["-c", probe, "_", "0", PREFLIGHT], {
+      encoding: "utf8", env: { ...process.env, HOME: home },
+    })
+    assert(existsSync(installed), `the preflight must be installed: ${real.stdout}${real.stderr}`)
+    assert(readFileSync(installed, "utf8") === readFileSync(PREFLIGHT, "utf8"),
+      "the installed copy must be the repo copy, byte for byte")
+
+    // A STALE copy is refreshed: presence alone would leave the old one there.
+    writeFileSync(installed, "#!/bin/sh\n# an older preflight\n")
+    const refresh = spawnSync("bash", ["-c", probe, "_", "0", PREFLIGHT], {
+      encoding: "utf8", env: { ...process.env, HOME: home },
+    })
+    assert(readFileSync(installed, "utf8") === readFileSync(PREFLIGHT, "utf8"),
+      `a stale copy must be refreshed by content: ${refresh.stdout}${refresh.stderr}`)
+
+    // A missing SOURCE is not "nothing to do": it is the whole preflight
+    // missing, and the unit would name a file that is not there. The script
+    // was untracked in git, so on a fresh checkout this returned 0 SILENTLY --
+    // not even the warning fired, and every host that synced from a clone got
+    // a unit pointing at a file that would never exist.
+    const missing = spawnSync("bash", ["-c", probe, "_", "0", path.join(home, "no-such-preflight")], {
+      encoding: "utf8", env: { ...process.env, HOME: home },
+    })
+    assert(missing.status !== 0,
+      `a missing source must be reported, not silently skipped: ${missing.stdout}${missing.stderr}`)
+    assert(/oc-tunnel-preflight/.test((missing.stdout || "") + (missing.stderr || "")),
+      `the missing preflight must be named: ${missing.stdout}${missing.stderr}`)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
 
 console.log(`${passed} checks passed${skipped ? `, ${skipped} skipped` : ""}`)
 if (failures.length > 0) {
   console.error(`\n${failures.length} FAILED:`)
   for (const failure of failures) console.error(`  - ${failure}`)
-  process.exit(1)
+  // The exit code, not an immediate exit: the runner still has the mirrored
+  // subtests to report, and each failed check should be named there too.
+  process.exitCode = 1
 }

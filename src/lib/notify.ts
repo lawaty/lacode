@@ -9,6 +9,9 @@
 //
 // Everything here is pure so the policy can be tested without a running server.
 
+import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { isLimitText } from "./pool.ts"
 
 const INTERNAL_TITLE_PREFIXES = [
@@ -75,6 +78,22 @@ export type PermissionReply = (typeof PERMISSION_REPLIES)[number]
  * user-facing part of a notification.
  */
 export const REQUEST_ID_ENV = "LACODE_REQUEST_ID"
+
+/**
+ * The environment variable the correlation key travels in. It names the
+ * session a popup belongs to, and it is not an argument either: the helper's
+ * argv is a published contract, and the key is not the user-facing part of a
+ * notification. It exists so the helper can find the popup again later and
+ * close it.
+ */
+export const NOTIFY_SESSION_ENV = "LACODE_NOTIFY_SESSION"
+
+/**
+ * The environment variable that turns a helper run into a CLOSE request
+ * instead of a notification. The value names the session whose popups are to
+ * be taken down; the helper closes them and sends nothing at all.
+ */
+export const NOTIFY_CLOSE_ENV = "LACODE_NOTIFY_CLOSE"
 
 // ---------------------------------------------------------------------------
 // Terminal errors: what the notification says, and whether it says anything
@@ -235,7 +254,11 @@ export const shouldNotify = (input: {
   // part of working with an agent.
   const notification = {
     notify: true,
-    title: `opencode — ${title}`,
+    // The session's name on its own, with nothing in front of it. The popup's
+    // header is the notification's APP name, and that is "LaCode" -- so a
+    // prefix here would only repeat the app, and it would repeat it wrongly:
+    // the app is not "opencode".
+    title,
     message: notifyMessage(outcome, detail),
     urgency: outcome === "error" ? "critical" : "normal",
   } as const
@@ -412,5 +435,308 @@ export class Notifier {
   // unreachable from outside, which would make the bound untestable.
   lastSentSize() {
     return this.lastSent.size
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The notification state directory, and the cross-process claim
+// ---------------------------------------------------------------------------
+
+/**
+ * Where the ids of this machine's popups are kept, and where the
+ * cross-process claims live.
+ *
+ * Resolved LAZILY, at call time, and never cached: `homedir()` reads HOME when
+ * it is called, so a test that redirects HOME gets its own directory for free.
+ * Computing it once at module load would pin the real one and let a suite
+ * write into the developer's data directory.
+ *
+ * It lives in lib/ rather than in the tunnel because the plugin needs it too,
+ * and `src/plugins/*` may import `src/lib/*` only. The tunnel re-exports it,
+ * so its published surface does not change.
+ */
+export const notificationStateDir = (): string =>
+  process.env.LACODE_NOTIFY_DIR ?? join(homedir(), ".local", "share", "opencode", "lacode", "notify")
+
+/**
+ * The name a correlation key is stored under.
+ *
+ * This rule is a CONTRACT with the bash side (`bin/oc`, `bin/oc-notify-receiver`):
+ * every character outside `[A-Za-z0-9._-]` becomes `_`, and the name is
+ * truncated to 64 characters. Both sides have to produce the identical name,
+ * or the closer looks in a different file than the raiser wrote.
+ */
+export const safeCorrelationKey = (correlationKey: string): string =>
+  correlationKey.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64)
+
+/** The file that holds the notification ids of one correlation key. */
+export const notificationIdFile = (correlationKey: string): string =>
+  join(notificationStateDir(), `${safeCorrelationKey(correlationKey)}.ids`)
+
+// ---------------------------------------------------------------------------
+// The cross-process claim
+// ---------------------------------------------------------------------------
+//
+// WHY THE CLAIM EXISTS
+//
+// opencode publishes its events through a shared store, so EVERY opencode
+// process on the machine that has this plugin loaded sees the same event: the
+// same `session.idle`, the same `permission.asked`. The plugin's cooldown is
+// per PROCESS, so it never caught that -- two processes, one event, two
+// identical popups, seconds apart. The user saw the same thing twice and had
+// no way of telling why.
+//
+// The claim is the one-winner file that says "this process is the one raising
+// it". It lives in the notification state directory, so every process on the
+// machine can see it, and it is taken with an EXCLUSIVE create -- the house
+// pattern for a one-winner file (`src/lib/selfupdate.ts`'s `acquireLock`).
+//
+// The window is five seconds: the same window as the plugin's own cooldown.
+// The claim is the cross-process twin of that cooldown, so it can never
+// swallow a notification the cooldown would have allowed.
+
+/** How long a claim is held for. The plugin's own cooldown window. */
+const CLAIM_WINDOW_MS = 5_000
+
+/**
+ * Signal-0 liveness probe: true if `pid` is running. EPERM means alive but not
+ * ours to signal.
+ *
+ * The same rule as `src/lib/pool.ts`'s `isPidAlive`, which is not exported
+ * there; these three lines are the house rule for "is that pid still running".
+ */
+const isPidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
+/**
+ * The file that holds the claim of one (session, kind) pair.
+ *
+ * The key is the session id and the kind, run through the same sanitising
+ * rule the id files use, so the name can never point outside the state
+ * directory.
+ */
+const claimFile = (sessionID: string, kind: string): string =>
+  join(notificationStateDir(), `claim.${safeCorrelationKey(`${sessionID}.${kind}`)}`)
+
+/**
+ * Take the claim for one (session, kind) pair, and say whether this process
+ * won it.
+ *
+ * True means "you may notify". False means "another process is raising this
+ * right now, keep quiet".
+ *
+ * The rules, in order:
+ *   * the claim does not exist -> take it, with an exclusive create
+ *   * the claim holds OUR pid -> it is our own claim, and our own claim never
+ *     changes our own behaviour: the in-process cooldown is the only gate
+ *   * the claim holds another LIVE pid and is younger than the window ->
+ *     another process is raising this right now -> do not notify
+ *   * anything else -> the claim is stale (its holder is gone, or it outlived
+ *     the window) -> take it over under a takeover lock, after re-reading it
+ *
+ * The takeover is a compare-and-swap, not "unlink, then create": two processes
+ * can judge the same stale claim at once, and an unconditional unlink lets the
+ * slower one delete the fresh claim the faster one just created. The lock makes
+ * exactly one process the unlinker, and the re-read under it refuses to touch a
+ * claim that stopped being stale in the meantime.
+ *
+ * Nothing here throws. A claim that cannot be taken or read degrades to
+ * "notify": a duplicate popup is better than a silent stall.
+ */
+export const claimNotification = (sessionID: string, kind: string): boolean => {
+  const path = claimFile(sessionID, kind)
+  try {
+    mkdirSync(notificationStateDir(), { recursive: true })
+  } catch {
+    // No state directory means no claim. Notify anyway: the duplicate popup is
+    // better than the stall.
+    return true
+  }
+
+  /** "taken" is ours, "held" is somebody else's, "impossible" is nobody's. */
+  const take = (): "taken" | "held" | "impossible" => {
+    try {
+      const fd = openSync(path, "wx")
+      try {
+        writeSync(fd, String(process.pid))
+      } finally {
+        closeSync(fd)
+      }
+      return "taken"
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EEXIST" ? "held" : "impossible"
+    }
+  }
+
+  const first = take()
+  if (first !== "held") {
+    // "taken" is ours. "impossible" means the claim could not be taken at all
+    // -- a read-only directory, a full disk -- so notify: the same rule as
+    // above.
+    return true
+  }
+
+  /**
+   * What the claim at `path` is, relative to this process.
+   *
+   * "gone" and "unknown" are different failures: a vanished file can still be
+   * taken with an exclusive create, while an unreadable one cannot be judged
+   * and must not stop a notification.
+   */
+  const judge = (): "ours" | "held" | "stale" | "gone" | "unknown" => {
+    let raw: string
+    try {
+      raw = readFileSync(path, "utf8").trim()
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? "gone" : "unknown"
+    }
+
+    let holder: number | undefined
+    // The exclusive create and the write that fills it are two steps, and a
+    // reader can land between them. An empty claim is a claim IN PROGRESS, not
+    // an abandoned one.
+    const empty = raw === ""
+    if (!empty) {
+      const parsed = Number.parseInt(raw, 10)
+      holder = Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+    }
+
+    // Our own claim. It must never change our own behaviour.
+    if (holder === process.pid) return "ours"
+
+    let age = Number.POSITIVE_INFINITY
+    try {
+      age = Date.now() - statSync(path).mtimeMs
+    } catch {
+      return "gone"
+    }
+
+    if (empty && age < CLAIM_WINDOW_MS) {
+      // A claim whose holder is still writing its pid: it is being raised right
+      // now, by somebody.
+      return "held"
+    }
+    if (holder !== undefined && isPidAlive(holder) && age < CLAIM_WINDOW_MS) {
+      // Another live process is raising this right now.
+      return "held"
+    }
+
+    // The holder is gone, or the claim outlived the window.
+    return "stale"
+  }
+
+  const judged = judge()
+  if (judged === "ours") return true
+  if (judged === "held") return false
+  if (judged === "unknown") return true
+  // Gone between the exclusive create and the read: the exclusive create below
+  // is still a one-winner election.
+  if (judged === "gone") return take() !== "held"
+
+  // Stale. The unlink must be a compare-and-swap, not an unconditional delete:
+  // a second process may have judged the same claim stale and replaced it with
+  // its own fresh claim in the meantime. The exclusive takeover lock makes one
+  // process the only unlinking candidate, and the claim is judged AGAIN inside
+  // it, so a fresh claim is never mistaken for the stale one.
+  const lockPath = `${path}.takeover`
+  const takeOver = (): (() => void) | undefined => {
+    const create = (): (() => void) | undefined => {
+      try {
+        const fd = openSync(lockPath, "wx")
+        try {
+          writeSync(fd, String(process.pid))
+        } finally {
+          closeSync(fd)
+        }
+        return () => {
+          try {
+            unlinkSync(lockPath)
+          } catch {
+            // Already gone.
+          }
+        }
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "EEXIST" ? undefined : () => {}
+      }
+    }
+
+    const release = create()
+    if (release !== undefined) return release
+
+    // A lock is held only across a few synchronous filesystem calls, so one
+    // that outlives the claim window -- or whose holder is gone -- belongs to a
+    // process that died mid-takeover. Reclaim it once.
+    let lockHolder: number | undefined
+    let lockAge = Number.POSITIVE_INFINITY
+    try {
+      const parsed = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10)
+      lockHolder = Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+      lockAge = Date.now() - statSync(lockPath).mtimeMs
+    } catch {
+      // The lock vanished while we looked at it.
+      return create()
+    }
+    // An empty lock is the exclusive create's own in-progress window, exactly
+    // like an empty claim: young and unreadable means somebody is taking over,
+    // not that the lock is abandoned.
+    if (lockAge < CLAIM_WINDOW_MS && (lockHolder === undefined || isPidAlive(lockHolder))) {
+      return undefined
+    }
+    try {
+      unlinkSync(lockPath)
+    } catch {
+      // Another process reclaimed it first.
+      return undefined
+    }
+    return create()
+  }
+
+  const release = takeOver()
+  // No lock means another process owns the takeover: stay quiet.
+  if (release === undefined) return false
+
+  try {
+    const current = judge()
+    if (current === "ours") return true
+    if (current === "held") return false
+    if (current === "unknown") return true
+    // Still stale under the lock, or gone. Only this process can unlink it.
+    try {
+      unlinkSync(path)
+    } catch {
+      // Already gone.
+    }
+    // The create either succeeds (we notify) or loses to a process that saw
+    // the claim gone and took it that way (we do not). Anything else -- a state
+    // directory that cannot be written -- degrades to notifying.
+    return take() !== "held"
+  } finally {
+    release()
+  }
+}
+
+/**
+ * Give the claim of one (session, kind) pair back.
+ *
+ * The file is removed ONLY while it still holds this process's pid: a claim
+ * another process has since taken must never be removed by the previous
+ * holder. A file that is gone, unreadable, or held by somebody else is left
+ * exactly as it is.
+ */
+export const releaseNotificationClaim = (sessionID: string, kind: string): void => {
+  const path = claimFile(sessionID, kind)
+  try {
+    const parsed = Number.parseInt(readFileSync(path, "utf8").trim(), 10)
+    if (!Number.isFinite(parsed) || parsed <= 0) return
+    if (parsed !== process.pid) return
+    unlinkSync(path)
+  } catch {
+    // Gone, or unreadable: there is nothing of ours to release.
   }
 }

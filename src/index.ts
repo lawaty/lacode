@@ -78,6 +78,8 @@
 import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { applyAgents, buildAgentSet } from "./agents.ts"
 import { applyCommands } from "./commands.ts"
+import { PACKAGE_ROOT } from "./lib/package-root.ts"
+import { readInstalledVersion } from "./lib/selfupdate.ts"
 import { agentPoolHooks } from "./plugins/agent-pool.ts"
 import { contextAutoUpdateHooks } from "./plugins/context-autoupdate.ts"
 import { notifyHooks } from "./plugins/notify.ts"
@@ -110,6 +112,20 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
 
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
     input.client.app.log({ body: { service: "lacode", level, message, extra } }).catch(() => {})
+
+  // WHY THIS LINE EXISTS: nothing in this plugin hot-reloads -- an opencode
+  // process keeps the code it started with -- so this line's own timestamp IS
+  // the moment that process loaded the plugin. Comparing that timestamp with
+  // the build time is what tells you a process is running a stale build, and
+  // the version says which build that is. A plugin that logs no version leaves
+  // the log unable to answer either question.
+  let version: string | undefined
+  try {
+    version = readInstalledVersion(PACKAGE_ROOT)
+  } catch {
+    version = undefined
+  }
+  await log("info", version ? `lacode ${version} started` : "lacode started")
 
   // Everything below can reject -- a factory that arms a timer, a config hook
   // that reads a file -- and a rejected plugin stops opencode from starting. So

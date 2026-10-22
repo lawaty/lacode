@@ -383,7 +383,7 @@ const calls = (fixture) => {
 // cutoffId
 // ---------------------------------------------------------------------------
 
-test("cutoffId is a 12 hex digit prefix that decodes to the cutoff", () => {
+test("[US-33] cutoffId is a 12 hex digit prefix that decodes to the cutoff", () => {
   const now = Date.now()
   const id = cutoffId(now, 7)
   assert.match(id, /^evt_[0-9a-f]{12}$/, "the cutoff is a prefix, not a full id")
@@ -405,7 +405,7 @@ test("cutoffId is a 12 hex digit prefix that decodes to the cutoff", () => {
 // the candidate rules
 // ---------------------------------------------------------------------------
 
-test("an event older than the window is a candidate and a newer one is not", async () => {
+test("[US-33] an event older than the window is a candidate and a newer one is not", async () => {
   await withFixture(async (fixture) => {
     const cutoff = cutoffId(fixture.now, WINDOW_DAYS)
     const ids = candidates(fixture, cutoff, fixture.now - GRACE_HOURS * HOUR_MS)
@@ -416,7 +416,7 @@ test("an event older than the window is a candidate and a newer one is not", asy
   })
 })
 
-test("a session that takes part in the session sync is never touched", async () => {
+test("[US-33] a session that takes part in the session sync is never touched", async () => {
   await withFixture(async (fixture) => {
     // The rule on its own, before the run: nothing of that session is a
     // candidate, so nothing of it can be taken.
@@ -436,7 +436,7 @@ test("a session that takes part in the session sync is never touched", async () 
   })
 })
 
-test("a session that belongs to a workspace is never touched", async () => {
+test("[US-33] a session that belongs to a workspace is never touched", async () => {
   await withFixture(async (fixture) => {
     const cutoff = cutoffId(fixture.now, WINDOW_DAYS)
     const ids = candidates(fixture, cutoff, fixture.now - GRACE_HOURS * HOUR_MS)
@@ -454,7 +454,7 @@ test("a session that belongs to a workspace is never touched", async () => {
   })
 })
 
-test("the grace window keeps a touched session and lets a stale one go", async () => {
+test("[US-33] the grace window keeps a touched session and lets a stale one go", async () => {
   await withFixture(async (fixture) => {
     // The two sessions differ in nothing but the moment they were touched, so
     // what kept one out was the grace window and nothing else.
@@ -476,7 +476,7 @@ test("the grace window keeps a touched session and lets a stale one go", async (
   })
 })
 
-test("an event whose session is gone is prunable, because it is garbage", async () => {
+test("[US-33] an event whose session is gone is prunable, because it is garbage", async () => {
   await withFixture(async (fixture) => {
     const cutoff = cutoffId(fixture.now, WINDOW_DAYS)
     const ids = candidates(fixture, cutoff, fixture.now - GRACE_HOURS * HOUR_MS)
@@ -498,7 +498,7 @@ test("an event whose session is gone is prunable, because it is garbage", async 
 // the run
 // ---------------------------------------------------------------------------
 
-test("--dry-run reports the counts and deletes nothing", async () => {
+test("[US-33] --dry-run reports the counts and deletes nothing", async () => {
   await withFixture(async (fixture) => {
     const before = rowsIn(fixture.dbPath, "event")
     const result = await runTool(fixture, ["--dry-run"])
@@ -516,7 +516,7 @@ test("--dry-run reports the counts and deletes nothing", async () => {
   })
 })
 
-test("a real run deletes exactly the candidate rows and keeps the rest", async () => {
+test("[US-33] a real run deletes exactly the candidate rows and keeps the rest", async () => {
   await withFixture(async (fixture) => {
     const result = await runTool(fixture, [])
     assert.equal(result.code, 0)
@@ -539,7 +539,7 @@ test("a real run deletes exactly the candidate rows and keeps the rest", async (
   })
 })
 
-test("a run never changes the event_sequence table or the session table", async () => {
+test("[US-33] a run never changes the event_sequence table or the session table", async () => {
   await withFixture(async (fixture) => {
     const sessions = rowsIn(fixture.dbPath, "session")
     const sequences = rowsIn(fixture.dbPath, "event_sequence")
@@ -552,7 +552,7 @@ test("a run never changes the event_sequence table or the session table", async 
   })
 })
 
-test("--limit takes at most that many rows and reports the rest", async () => {
+test("[US-33] --limit takes at most that many rows and reports the rest", async () => {
   await withFixture(async (fixture) => {
     const limit = 3
     const result = await runTool(fixture, ["--limit", String(limit)])
@@ -582,7 +582,7 @@ test("--limit takes at most that many rows and reports the rest", async () => {
   })
 })
 
-test("a run leaves one JSON line in the log and a run with nothing to prune leaves none", async () => {
+test("[US-33] a run leaves one JSON line in the log and a run with nothing to prune leaves none", async () => {
   await withFixture(async (fixture) => {
     const result = await runTool(fixture, [])
     assert.equal(result.code, 0)
@@ -616,7 +616,7 @@ test("a run leaves one JSON line in the log and a run with nothing to prune leav
   )
 })
 
-test("--help exits 0 and an unknown flag exits 2", async () => {
+test("[US-33] --help exits 0 and an unknown flag exits 2", async () => {
   await withFixture(async (fixture) => {
     const help = await runTool(fixture, ["--help"])
     assert.equal(help.code, 0)
@@ -630,7 +630,7 @@ test("--help exits 0 and an unknown flag exits 2", async () => {
   })
 })
 
-test("a window longer than the id era must not take the whole table", async () => {
+test("[US-33] a window longer than the id era must not take the whole table", async () => {
   await withFixture(async (fixture) => {
     const before = eventIds(fixture.dbPath).length
     // A thousand days is longer than the whole era, so the cutoff would fall
@@ -659,7 +659,7 @@ test("a window longer than the id era must not take the whole table", async () =
 // the pieces the run is made of
 // ---------------------------------------------------------------------------
 
-test("parseArgs reads the flags the usage names and refuses the ones it does not", () => {
+test("[US-33] parseArgs reads the flags the usage names and refuses the ones it does not", () => {
   assert.deepEqual(parseArgs([]), {
     days: 7,
     graceHours: 1,
@@ -685,14 +685,14 @@ test("parseArgs reads the flags the usage names and refuses the ones it does not
   assert.throws(() => parseArgs(["--days", "soon"]), /--days needs a non-negative number/)
 })
 
-test("parseRows reads the JSON the CLI prints", () => {
+test("[US-33] parseRows reads the JSON the CLI prints", () => {
   assert.deepEqual(parseRows('[{"id":"evt_000000000000"}]'), [{ id: "evt_000000000000" }])
   assert.deepEqual(parseRows("[]"), [])
   assert.deepEqual(parseRows(""), [])
   assert.deepEqual(parseRows("   \n"), [], "a CLI that printed nothing is an empty result, not an error")
 })
 
-test("resolveBinary takes the explicit binary first", async () => {
+test("[US-33] resolveBinary takes the explicit binary first", async () => {
   await withFixture(async (fixture) => {
     const previous = process.env.LACODE_OPENCODE_BIN
     process.env.LACODE_OPENCODE_BIN = fixture.bin
@@ -705,7 +705,7 @@ test("resolveBinary takes the explicit binary first", async () => {
   })
 })
 
-test("runSql runs one statement through the binary and returns its rows", async () => {
+test("[US-33] runSql runs one statement through the binary and returns its rows", async () => {
   await withFixture(async (fixture) => {
     const rows = runSql(fixture.bin, "SELECT count(*) AS c FROM event")
     assert.equal(Number(rows[0].c), fixture.rows.length)
@@ -715,14 +715,14 @@ test("runSql runs one statement through the binary and returns its rows", async 
   })
 })
 
-test("chunkIds cuts a list into the pieces one statement may carry", () => {
+test("[US-33] chunkIds cuts a list into the pieces one statement may carry", () => {
   assert.deepEqual(chunkIds([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]])
   assert.deepEqual(chunkIds([], 2), [])
   assert.deepEqual(chunkIds(null, 2), [])
   assert.deepEqual(chunkIds([1, 2, 3], 0), [[1, 2, 3]], "a size of zero falls back to the tool's own chunk size")
 })
 
-test("summarize puts the counts in one line", () => {
+test("[US-33] summarize puts the counts in one line", () => {
   const numbers = (line) => (line.match(/\d+/g) || []).map(Number).sort((a, b) => a - b)
   assert.deepEqual(numbers(summarize({ rows: 3, bytes: 120, aggregates: 2 })), [2, 3, 120], "the counts are in the line")
   assert.deepEqual(
