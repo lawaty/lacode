@@ -9,7 +9,7 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 // the published package has one plugin, src/index.ts, and the suites test the
 // factories that index.ts composes.
 const PLUGIN = join(HERE, "..", "src", "plugins", "notify.ts")
-const SHIM = join(HERE, "..", "plugins", "notify.ts")
+const SHIM = join(HERE, "..", "plugins", "lacode.ts")
 const LIB = join(HERE, "..", "src", "lib", "notify.ts")
 
 let passed = 0
@@ -28,8 +28,34 @@ const assert = (condition, message) => {
   if (!condition) throw new Error(message)
 }
 
+/**
+ * A fake helper that records the notifications it was asked to deliver.
+ *
+ * A CLOSE REQUEST is not a notification. The real helper (`bin/oc`'s
+ * `send_notify`) checks LACODE_NOTIFY_CLOSE FIRST and sends nothing at all, so
+ * this fake has to do the same: a helper that recorded every invocation would
+ * count every dismissal of a popup as a delivery, and the counts below would be
+ * counting the wrong thing.
+ */
+const fakeHelper = (dir, sent = join(dir, "sent.log")) => {
+  const helper = join(dir, "oc-notify")
+  writeFileSync(
+    helper,
+    `#!/usr/bin/env bash\n[[ -n "\${LACODE_NOTIFY_CLOSE:-}" ]] && exit 0\nprintf '%s\\n' "$*" >> ${sent}\n`,
+    { mode: 0o755 },
+  )
+  return helper
+}
+
 const { Notifier, helperArgv, notifyMessage, questionHeadline, safeTitle, shouldNotify } = await import(LIB)
 const { notifyHooks: Notify } = await import(PLUGIN)
+
+// The plugin claims the (session, kind) pair before it raises a popup, so that
+// two processes never raise the same one. The claim lives in the notification
+// state directory, and a suite must not write into the developer's own data
+// directory -- so it is redirected into a temp one for the length of the run.
+const NOTIFY_STATE_DIR = mkdtempSync(join(tmpdir(), "lacode-notify-"))
+process.env.LACODE_NOTIFY_DIR = NOTIFY_STATE_DIR
 
 // ---------------------------------------------------------------------------
 // Policy: what is worth notifying about
@@ -90,8 +116,7 @@ await check("a critical notification bypasses the cooldown", async () => {
   // cooldown from the transition is still holding.
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   const sent = join(dir, "sent.log")
-  const helper = join(dir, "oc-notify")
-  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+  const helper = fakeHelper(dir, sent)
   const client = {
     logs: [],
     app: { log: async () => {} },
@@ -277,16 +302,17 @@ await check("the plugin module exports exactly one binding", () => {
   assert(exports[0] === "notifyHooks", `unexpected export name ${exports[0]}`)
 })
 
-await check("the dev shim re-exports it under the plugin name, and nothing else", () => {
-  // A plugin file must export exactly one plugin. The shim exists only so
-  // opencode's plugins/ auto-discovery keeps working locally; if it ever grows a
+await check("the single plugin shim re-exports the whole plugin, and nothing else", () => {
+  // A plugin file must export exactly one plugin. This directory is what
+  // bin/oc-sync ships to a host, where opencode auto-discovers every file in
+  // plugins/ and calls every export as a plugin -- so if the shim ever grows a
   // second export, every hook dispatch in the process breaks.
   const shim = readFileSync(SHIM, "utf8")
   const bindings = [...shim.matchAll(/^export\s*\{([^}]*)\}/gm)].flatMap((m) => m[1].split(",").map((s) => s.trim().split(/\s+as\s+/).pop()))
   const direct = [...shim.matchAll(/^export (?:const|function|class|default)\s+/gm)]
   assert(bindings.length === 1 && direct.length === 0,
     `a plugin file must export exactly one plugin, found ${bindings.length + direct.length}`)
-  assert(bindings[0] === "Notify", `unexpected shim export ${bindings[0]}`)
+  assert(bindings[0] === "LaCode", `unexpected shim export ${bindings[0]}`)
 })
 
 await check("the plugin defers to the tested tunnel helper", () => {
@@ -324,7 +350,7 @@ await check("a missing helper warns once, never throws", () => {
 await check("the plugin is registered by directory, not config", async () => {
   // plugins/*.ts is auto-discovered, so no opencode.jsonc entry is needed. This
   // asserts the file is where discovery will find it.
-  assert(existsSync(SHIM), "plugins/notify.ts should exist so opencode auto-discovery finds the shim")
+  assert(existsSync(SHIM), "plugins/lacode.ts should exist so opencode auto-discovery finds the shim")
 })
 
 // ---------------------------------------------------------------------------
@@ -350,8 +376,7 @@ await check("the handler notifies for a root session and ignores a child", async
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   // A stub helper so the handler's spawn target exists and we can observe calls.
   const sent = join(dir, "sent.log")
-  const helper = join(dir, "oc-notify")
-  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+  const helper = fakeHelper(dir, sent)
   mkdirSync(dir, { recursive: true })
 
   const sessions = {
@@ -384,8 +409,7 @@ await check("the handler notifies for a root session and ignores a child", async
 await check("question.asked notifies and names the question", async () => {
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   const sent = join(dir, "sent.log")
-  const helper = join(dir, "oc-notify")
-  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+  const helper = fakeHelper(dir, sent)
 
   const sessions = { root: { id: "root", title: "Fix the login redirect" } }
   const client = makeClient(sessions)
@@ -417,8 +441,7 @@ await check("question.asked notifies and names the question", async () => {
 await check("the idle after a question does not also claim the task finished", async () => {
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   const sent = join(dir, "sent.log")
-  const helper = join(dir, "oc-notify")
-  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+  const helper = fakeHelper(dir, sent)
 
   const sessions = { root: { id: "root", title: "Deploy" } }
   const client = makeClient(sessions)
@@ -460,8 +483,7 @@ await check("a question clears when the session errors instead", async () => {
   // survive it -- otherwise the next idle is judged against a stale question.
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   const sent = join(dir, "sent.log")
-  const helper = join(dir, "oc-notify")
-  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+  const helper = fakeHelper(dir, sent)
 
   const sessions = { root: { id: "root", title: "Deploy" } }
   const client = makeClient(sessions)
@@ -549,8 +571,7 @@ await check("a second question within the cooldown still notifies", async () => 
   // bypass -- a blocked session must not be swallowed.
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   const sent = join(dir, "sent.log")
-  const helper = join(dir, "oc-notify")
-  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+  const helper = fakeHelper(dir, sent)
 
   const client = makeClient({ root: { id: "root", title: "Deploy" } })
   const hooks = await Notify({ client, directory: dir })
@@ -578,8 +599,7 @@ await check("a rejected question stops suppressing later completions", async () 
   // dropped -- the notification stops working for that session entirely.
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   const sent = join(dir, "sent.log")
-  const helper = join(dir, "oc-notify")
-  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+  const helper = fakeHelper(dir, sent)
 
   const client = makeClient({ root: { id: "root", title: "Deploy" } })
   const hooks = await Notify({ client, directory: dir })
@@ -611,8 +631,7 @@ await check("deleting a session clears its parked question and busy marker", asy
   // had asked a question would keep suppressing anything reusing its id.
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   const sent = join(dir, "sent.log")
-  const helper = join(dir, "oc-notify")
-  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+  const helper = fakeHelper(dir, sent)
 
   const client = makeClient({ root: { id: "root", title: "Deploy" } })
   const hooks = await Notify({ client, directory: dir })
@@ -629,6 +648,20 @@ await check("deleting a session clears its parked question and busy marker", asy
   await new Promise((resolve) => setTimeout(resolve, 600))
 
   const lines = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
+  // Exactly two notifications are raised here: the question, and the completion
+  // that follows the deletion. The second one is the point of the check -- the
+  // parked question was cleared, so the completion is announced instead of
+  // being swallowed as "still waiting for you", and the busy marker works
+  // again, so the session counts as having done work.
+  //
+  // The count says NOTHING about the popup record, in either direction.
+  // `announce()` awaits session.get before it records the popup, so a deletion
+  // that lands inside that window is lost and the popup record is created
+  // afterwards: a stray record for a session that is gone. That is a known
+  // trade-off in the plugin (the helper is asked to close it, and the desktop
+  // has nothing to close for a session that no longer exists), so this check
+  // asserts the parked question and the busy marker, and neither the presence
+  // nor the absence of that record.
   assert(lines.length === 2, `state must be cleared on delete: ${JSON.stringify(lines)}`)
 
   delete process.env.OC_NOTIFY_HELPER
@@ -640,8 +673,7 @@ await check("an idle event with no prior work does not notify", async () => {
   // launch of opencode would announce an empty session.
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   const sent = join(dir, "sent.log")
-  const helper = join(dir, "oc-notify")
-  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+  const helper = fakeHelper(dir, sent)
   const sessions = { idle: { id: "idle", title: "New" } }
   const client = makeClient(sessions)
   const hooks = await Notify({ client, directory: dir })
@@ -662,8 +694,7 @@ await check("a title seen before the idle event is used as a fallback", async ()
   // saw so the notification still names the session.
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   const sent = join(dir, "sent.log")
-  const helper = join(dir, "oc-notify")
-  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+  const helper = fakeHelper(dir, sent)
   const client = {
     logs: [],
     app: { log: async () => {} },
@@ -753,7 +784,7 @@ await check("[US-25] the request id reaches the helper as LACODE_REQUEST_ID, and
     await waitFor(argvLog)
 
     assert(
-      JSON.stringify(argvOf(argvLog)) === JSON.stringify(["opencode — Deploy", "Awaiting your permission — run `ls`", "normal", "utilities-terminal", "permission"]),
+      JSON.stringify(argvOf(argvLog)) === JSON.stringify(["Deploy", "Awaiting your permission — run `ls`", "normal", "utilities-terminal", "permission"]),
       `the argv must stay the five published fields, got ${JSON.stringify(argvOf(argvLog))}`,
     )
     assert(readFileSync(envLog, "utf8") === "p1", `the request id must travel in the environment: ${JSON.stringify(readFileSync(envLog, "utf8"))}`)
@@ -766,7 +797,7 @@ await check("[US-25] the request id reaches the helper as LACODE_REQUEST_ID, and
     await waitFor(plainArgvLog)
 
     assert(
-      JSON.stringify(argvOf(plainArgvLog)) === JSON.stringify(["opencode — Other work", "Awaiting your response — A or B?", "normal", "utilities-terminal", "question"]),
+      JSON.stringify(argvOf(plainArgvLog)) === JSON.stringify(["Other work", "Awaiting your response — A or B?", "normal", "utilities-terminal", "question"]),
       `a notification that asks nothing keeps the same argv shape, got ${JSON.stringify(argvOf(plainArgvLog))}`,
     )
     assert(readFileSync(plainEnvLog, "utf8") === "", "no request id may be set for a notification that answers nothing")
@@ -851,6 +882,8 @@ await check("a helper that never answers is reported as a timeout, not waited on
 })
 
 // ---------------------------------------------------------------------------
+
+rmSync(NOTIFY_STATE_DIR, { recursive: true, force: true })
 
 console.log(`${passed} checks passed`)
 if (failures.length > 0) {

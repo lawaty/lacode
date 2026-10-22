@@ -880,7 +880,11 @@ for HOST in "${HOSTS[@]}"; do
       fi
       if [[ -d "$REPO_DIR/plugins" ]]; then
         timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/plugins' >/dev/null 2>&1
-        push "plugins/" "$REPO_DIR/plugins/" "${HOST}:~/.config/opencode/plugins/" || continue
+        # --delete: this directory is the host's entire plugin surface, so a file
+        # left here from an older generation loads as a second plugin on top of
+        # the one the config names. The host must end up with exactly the files
+        # this repo ships.
+        push "plugins/" "$REPO_DIR/plugins/" "${HOST}:~/.config/opencode/plugins/" --delete || continue
       fi
 
       # --- from CONFIG_DIR: this machine's opencode config -------------------
