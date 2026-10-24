@@ -367,6 +367,49 @@ test("[US-29] a sound player that cannot start costs only the sound, never the n
   })
 })
 
+test("[US-29] the chime starts before an actionable notification blocks", async () => {
+  // An actionable send blocks inside notify-send until the user answers, so the
+  // sound has to be started BEFORE that call, not after it. Both stubs append
+  // to one file: the order of the lines is the order the work actually started,
+  // read off the stubs rather than off a clock.
+  await withStubbedChannels(["notify-send", "paplay"], async ({ bin }) => {
+    const sequence = join(bin, "sequence.log")
+    writeFileSync(
+      join(bin, "notify-send"),
+      `#!/bin/sh\nsleep 0.3\nprintf 'notify-send done\\n' >> ${JSON.stringify(sequence)}\nexit 0\n`,
+    )
+    writeFileSync(
+      join(bin, "paplay"),
+      `#!/bin/sh\nprintf 'player\\n' >> ${JSON.stringify(sequence)}\nexit 0\n`,
+    )
+    chmodSync(join(bin, "notify-send"), 0o755)
+    chmodSync(join(bin, "paplay"), 0o755)
+    // The stubbed PATH carries only these binaries, and the notifier's block
+    // needs `sleep`.
+    symlinkSync(existsSync("/bin/sleep") ? "/bin/sleep" : "/usr/bin/sleep", join(bin, "sleep"))
+
+    const result = sendLocal(
+      {
+        title: "Allow the read?",
+        message: "opencode needs permission to read a file",
+        urgency: "normal",
+        icon: "dialog-warning",
+        sound: "permission",
+        requestID: "perm-1",
+      },
+      "linux",
+    )
+
+    assert.equal(result.ok, true, `the notification must be delivered: ${result.detail}`)
+    const events = existsSync(sequence) ? readFileSync(sequence, "utf8").trim().split("\n") : []
+    assert.deepEqual(
+      events,
+      ["player", "notify-send done"],
+      `the chime must start while the actionable send is still blocked, got ${JSON.stringify(events)}`,
+    )
+  })
+})
+
 test("[US-11] a session that went busy and is now idle delivers a done notification", async () => {
   const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Fix the login redirect" } } })
   await busy(emit, "s1")

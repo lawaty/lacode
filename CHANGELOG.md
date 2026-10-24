@@ -7,6 +7,18 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.0.2] — the permission chime plays when the popup appears
+
+### Fixed
+
+- **An actionable notification no longer delays its sound until it is answered.**
+  `sendLocal()` played the chime after `notify-send` returned, but an actionable
+  send (`--action` implies `--wait`) blocks until the user clicks a button or
+  dismisses the popup. The chime therefore played at click time — and never at
+  all when the popup was left alone — which made permission sounds look
+  intermittent. The sound now starts before the notifier runs, and a test pins
+  the order with a blocking fake notifier.
+
 ## [1.0.1] — notification sounds you can hear, and a title that names the workspace
 
 ### Fixed

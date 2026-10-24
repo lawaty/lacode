@@ -709,11 +709,14 @@ export function sendLocal(request: NotifyRequest, platform: string = process.pla
         ? ["-title", title, "-message", body, "-appName", "LaCode", "-priority", normalizeUrgency(request.urgency)]
         : // Never auto-dismissed: the notification waits for the user to close it.
           [title, body, APP_NAME_FLAG, `--urgency=${normalizeUrgency(request.urgency)}`, `--icon=${normalizeIcon(request.icon)}`, NEVER_EXPIRE_FLAG, ...(trackable ? ["--print-id"] : []), ...actionArgs]
+  // The sound starts BEFORE the notifier runs: an actionable send blocks until
+  // the user clicks, so playing it afterwards would delay the chime until the
+  // answer -- and never play it at all when the popup is dismissed later.
+  playSound()
   // `--action` implies `--wait`: the notifier blocks until the user clicks, so
   // the fire-and-forget timeout would kill the prompt before it could be
   // answered. An actionable send waits for the answer instead.
   const result = run(CHANNEL_BINARY[channel], args, actionable ? ACTION_WAIT_MS : 5000)
-  playSound()
   // notify-send prints the NAME of the clicked button on stdout. Empty stdout
   // means the user dismissed the popup without choosing: no action at all.
   //
