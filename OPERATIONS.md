@@ -424,6 +424,35 @@ Remotes are plain rsync copies with no `.git`, so they carry no history. Local i
 only place edits are made; a remote-side change is untracked and will be overwritten by
 the next sync.
 
+### Publishing installs the published version on every host
+
+`npm publish` runs `scripts/sync-hosts.mjs` from `postpublish`, so a release reaches the
+hosts without a separate deploy run. Hosts come from `OC_HOSTS` in
+`~/.config/opencode/.env`, then `~/.oc-hosts` when no `.env` names any.
+
+For each host the script:
+
+- installs the exact published version with
+  `opencode plugin "@lawaty/lacode@<version>" -g -f`;
+- normalizes `~/.config/opencode/opencode.jsonc` to exactly one LaCode entry,
+  `["@lawaty/lacode@<version>", {…existing options…}]`, carrying over the existing
+  omniroute options and writing a `.bak-lacode-sync` backup first;
+- checks that the helper can run: an executable `~/bin/lacode`, or a system node at
+  version 22 or newer. A host that fails only that check is reported
+  `warn (helper cannot run: <detail>; install node>=22 or a ~/bin/lacode wrapper)` and
+  does not fail the publish.
+
+Opt-outs are `LACODE_SYNC=0`, `LACODE_SYNC_DRY_RUN=1` (prints the plan, runs nothing)
+and `LACODE_SYNC_STRICT=1` (a failed host exits non-zero; the default is exit 0).
+
+A host needs `opencode` on `PATH` or at `~/.opencode/bin/opencode`, and a runtime that
+can run the published helper. Ubuntu 22.04's system node 12 cannot parse the ESM bundle,
+so such a host needs the `~/bin/lacode` wrapper around a private node until its system
+node reaches 22.
+
+The desktop end of the tunnel must run `lacode receive`. The node receiver plays the
+sound the payload carries; the legacy `oc-notify-receiver` ignores the sound field.
+
 ## The context map
 
 `context-autoupdate` maintains a map per project at `.opencode/context/`,

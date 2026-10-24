@@ -52,6 +52,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "prepack": "npm run build",
+    "postpublish": "node scripts/sync-hosts.mjs",
     "test": "node --test tests/",
     "benchmark": "node tests/benchmark/run.mjs"
   },
