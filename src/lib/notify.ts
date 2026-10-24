@@ -11,7 +11,7 @@
 
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 import { isLimitText } from "./pool.ts"
 
 const INTERNAL_TITLE_PREFIXES = [
@@ -185,6 +185,7 @@ export type SessionInfo = {
   id?: string
   parentID?: string
   title?: string
+  directory?: string
   time?: { compacting?: number }
 }
 
@@ -226,9 +227,9 @@ export const shouldNotify = (input: {
   // notifications for work the user never asked about individually.
   if (info.parentID) return { notify: false, reason: "subagent" }
 
-  const title = safeTitle(info.title)
+  const sessionTitle = safeTitle(info.title)
 
-  if (INTERNAL_TITLE_PREFIXES.some((prefix) => title.startsWith(prefix))) {
+  if (INTERNAL_TITLE_PREFIXES.some((prefix) => sessionTitle.startsWith(prefix))) {
     return { notify: false, reason: "internal session" }
   }
 
@@ -252,12 +253,14 @@ export const shouldNotify = (input: {
   // A question is a request for the user, not a failure, so it is not critical:
   // critical urgency escalates to a modal on most desktops, and this is a routine
   // part of working with an agent.
+  //
+  // The title is `workspace - session`. The popup's header only names the app
+  // ("LaCode"), so the title has to say which project and which session the
+  // notification belongs to; the workspace is the session directory's basename.
+  const workspace = safeTitle(info.directory ? basename(info.directory) : "", "")
+  const title = workspace ? safeTitle(`${workspace} - ${sessionTitle}`, sessionTitle) : sessionTitle
   const notification = {
     notify: true,
-    // The session's name on its own, with nothing in front of it. The popup's
-    // header is the notification's APP name, and that is "LaCode" -- so a
-    // prefix here would only repeat the app, and it would repeat it wrongly:
-    // the app is not "opencode".
     title,
     message: notifyMessage(outcome, detail),
     urgency: outcome === "error" ? "critical" : "normal",

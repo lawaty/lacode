@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process"
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, utimesSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { test } from "node:test"
 import nodeAssert from "node:assert/strict"
@@ -169,6 +169,86 @@ await check("an error notifies at critical urgency", () => {
 await check("a missing session id never notifies", () => {
   assert(!shouldNotify({ info: undefined, outcome: "done" }).notify, "no info, no notification")
   assert(!shouldNotify({ info: {}, outcome: "done" }).notify, "no id, no notification")
+})
+
+await check("the title names the workspace and the session", () => {
+  const decision = shouldNotify({
+    info: { id: "s1", title: "Fix it", directory: "/home/me/proj" },
+    outcome: "done",
+    sawMessage: true,
+  })
+  assert(decision.notify, "a root session that did work should notify")
+  assert(decision.title === "proj - Fix it", `title should be "proj - Fix it", got ${JSON.stringify(decision.title)}`)
+})
+
+await check("a session with no directory keeps the session-only title", () => {
+  const decision = shouldNotify({
+    info: { id: "s1", title: "Fix it" },
+    outcome: "done",
+    sawMessage: true,
+  })
+  assert(decision.notify, "a root session that did work should notify")
+  assert(decision.title === "Fix it", `title should have no dangling separator, got ${JSON.stringify(decision.title)}`)
+})
+
+await check("an internal session with a directory is still suppressed", () => {
+  const decision = shouldNotify({
+    info: { id: "cm", title: "context (auto update)", directory: "/home/me/proj" },
+    outcome: "done",
+    sawMessage: true,
+  })
+  assert(!decision.notify, "the workspace prefix must not defeat the internal-session check")
+  assert(decision.reason === "internal session", `reason should say internal session, got ${decision.reason}`)
+})
+
+await check("a long title is capped and keeps the workspace prefix", () => {
+  const decision = shouldNotify({
+    info: { id: "s1", title: "x".repeat(200), directory: "/home/me/proj" },
+    outcome: "done",
+    sawMessage: true,
+  })
+  assert(decision.notify, "a root session that did work should notify")
+  assert(decision.title.length <= 90, `title must be capped at 90 chars, got ${decision.title.length}`)
+  assert(decision.title.startsWith("proj - "), `the workspace prefix must survive truncation, got ${JSON.stringify(decision.title)}`)
+})
+
+// A suspended Bluetooth sink eats the first few hundred ms, so the chime must outlast the wake.
+await check("notification sounds outlast a suspended Bluetooth sink wake", async () => {
+  const { readFileSync } = await import("node:fs")
+  const { join } = await import("node:path")
+  const outcomes = ["done", "error", "permission", "question"]
+  for (const outcome of outcomes) {
+    const path = join(HERE, "..", "sounds", `${outcome}.wav`)
+    const data = readFileSync(path)
+    assert(data.subarray(0, 4).toString() === "RIFF", `${outcome}.wav must be RIFF`)
+    assert(data.subarray(8, 12).toString() === "WAVE", `${outcome}.wav must be WAVE`)
+    let i = 12
+    let fmt = null
+    let d = null
+    while (i < data.length) {
+      const cid = data.subarray(i, i + 4).toString()
+      const clen = data.readUInt32LE(i + 4)
+      if (cid === "fmt ") fmt = data.subarray(i + 8, i + 8 + clen)
+      if (cid === "data") d = data.subarray(i + 8, i + 8 + clen)
+      i += 8 + clen + (clen % 2)
+    }
+    assert(fmt && d, `${outcome}.wav must have fmt and data chunks`)
+    const channels = fmt.readUInt16LE(2)
+    const sampleRate = fmt.readUInt32LE(4)
+    const bitsPerSample = fmt.readUInt16LE(14)
+    assert(channels === 1, `${outcome}.wav must be mono`)
+    assert(sampleRate === 22050, `${outcome}.wav must be 22050 Hz`)
+    assert(bitsPerSample === 16, `${outcome}.wav must be 16-bit`)
+    const samples = d.length / 2
+    const duration = samples / sampleRate
+    assert(duration >= 0.8, `${outcome}.wav duration ${duration}s must be >= 0.8 s`)
+    let peak = 0
+    for (let s = 0; s < samples; s++) {
+      const v = Math.abs(d.readInt16LE(s * 2))
+      if (v > peak) peak = v
+    }
+    assert(peak >= 0.8 * 32767, `${outcome}.wav peak ${peak} must be >= ${Math.floor(0.8 * 32767)}`)
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -350,6 +430,86 @@ await check("the helper's argv matches the CLI that was found", () => {
   assert(argv("/x/oc-notify") === JSON.stringify(["T", "M", "normal", "icon", "none"]), `oc-notify keeps TITLE first, got ${argv("/x/oc-notify")}`)
   assert(argv("/x/lacode") === JSON.stringify(["notify", "T", "M", "normal", "icon", "none"]), `the lacode CLI takes the notify subcommand, got ${argv("/x/lacode")}`)
   assert(argv("/pkg/dist/lacode.js") === JSON.stringify(["notify", "T", "M", "normal", "icon", "none"]), `dist/lacode.js is the lacode CLI, got ${argv("/pkg/dist/lacode.js")}`)
+})
+
+await check("a lacode-shaped helper wins over oc-notify and carries the sound", async () => {
+  // Both candidates exist: a bash oc-notify in ~/bin, and the package's own
+  // lacode CLI (dist/lacode.js, or bin/lacode in a checkout). The lacode-shaped
+  // one must win -- the bash path execs bin/oc, whose OC_NOTIFY_ONLY branch
+  // drops the sound name, so it can never play the outcome's sound.
+  //
+  // The package CLI is the real one, so the fake PATH below intercepts what it
+  // would reach: node is forwarded to the real binary (and its argv recorded),
+  // notify-send records the delivery instead of raising a desktop popup, and
+  // paplay is a no-op so the suite stays silent.
+  const dir = mkdtempSync(join(tmpdir(), "notify-helper-order-"))
+  const home = join(dir, "home")
+  const fakeBin = join(dir, "path")
+  const ocNotifyLog = join(dir, "oc-notify.log")
+  const nodeArgsLog = join(dir, "node-args.log")
+  const sentLog = join(dir, "notify-send.log")
+  mkdirSync(join(home, "bin"), { recursive: true })
+  mkdirSync(fakeBin, { recursive: true })
+
+  const bashHelper = join(home, "bin", "oc-notify")
+  writeFileSync(bashHelper, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(ocNotifyLog)}\n`, { mode: 0o755 })
+  writeFileSync(
+    join(fakeBin, "node"),
+    `#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(nodeArgsLog)}\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
+    { mode: 0o755 },
+  )
+  writeFileSync(join(fakeBin, "notify-send"), `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(sentLog)}\nexit 0\n`, { mode: 0o755 })
+  writeFileSync(join(fakeBin, "paplay"), "#!/bin/sh\nexit 0\n", { mode: 0o755 })
+
+  const previous = {
+    HOME: process.env.HOME,
+    PATH: process.env.PATH,
+    OC_NOTIFY_HELPER: process.env.OC_NOTIFY_HELPER,
+    LACODE_SOUND: process.env.LACODE_SOUND,
+    SSH_CLIENT: process.env.SSH_CLIENT,
+    SSH_TTY: process.env.SSH_TTY,
+  }
+  process.env.HOME = home
+  process.env.PATH = `${fakeBin}${process.env.PATH ? `:${process.env.PATH}` : ""}`
+  delete process.env.OC_NOTIFY_HELPER
+  delete process.env.LACODE_SOUND
+  delete process.env.SSH_CLIENT
+  delete process.env.SSH_TTY
+  try {
+    const sessionID = `helper-order-${process.pid}`
+    const client = {
+      logs: [],
+      app: { log: async () => {} },
+      session: { get: async () => ({ data: { id: sessionID, title: "Helper order" } }) },
+    }
+    const hooks = await Notify({ client, directory: dir }, { sound: true })
+    await hooks.event({ event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID } } })
+    await new Promise((resolve) => setTimeout(resolve, 1_500))
+
+    // Scenario A: the bash helper is not the one that ran...
+    const ocNotifyCalls = existsSync(ocNotifyLog) ? readFileSync(ocNotifyLog, "utf8").trim() : ""
+    assert(ocNotifyCalls === "", `the bash oc-notify must lose to the lacode-shaped helper, got ${JSON.stringify(ocNotifyCalls)}`)
+
+    // ...the package lacode CLI did, and it reached the local channel.
+    const sent = existsSync(sentLog) ? readFileSync(sentLog, "utf8").trim() : ""
+    assert(sent.includes("Helper order"), `the lacode-shaped helper should have delivered the notification, got ${JSON.stringify(sent)}`)
+
+    // Scenario B: its argv carries the notify subcommand and the outcome's
+    // sound name as the LAST payload field (the 5th after the subcommand).
+    const args = existsSync(nodeArgsLog) ? readFileSync(nodeArgsLog, "utf8").replace(/\n$/, "").split("\n") : []
+    const expected = ["notify", `${basename(dir)} - Helper order`, notifyMessage("done"), "normal", "utilities-terminal", "done"]
+    assert(
+      args.slice(-expected.length).join("\u0000") === expected.join("\u0000"),
+      `expected the notify subcommand and sound as the last field, got ${JSON.stringify(args)}`,
+    )
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 await check("the notification helper is detached", () => {
@@ -800,7 +960,7 @@ await check("[US-25] the request id reaches the helper as LACODE_REQUEST_ID, and
     await waitFor(argvLog)
 
     assert(
-      JSON.stringify(argvOf(argvLog)) === JSON.stringify(["Deploy", "Awaiting your permission — run `ls`", "normal", "utilities-terminal", "permission"]),
+      JSON.stringify(argvOf(argvLog)) === JSON.stringify([`${basename(dir)} - Deploy`, "Awaiting your permission — run `ls`", "normal", "utilities-terminal", "permission"]),
       `the argv must stay the five published fields, got ${JSON.stringify(argvOf(argvLog))}`,
     )
     assert(readFileSync(envLog, "utf8") === "p1", `the request id must travel in the environment: ${JSON.stringify(readFileSync(envLog, "utf8"))}`)
@@ -813,7 +973,7 @@ await check("[US-25] the request id reaches the helper as LACODE_REQUEST_ID, and
     await waitFor(plainArgvLog)
 
     assert(
-      JSON.stringify(argvOf(plainArgvLog)) === JSON.stringify(["Other work", "Awaiting your response — A or B?", "normal", "utilities-terminal", "question"]),
+      JSON.stringify(argvOf(plainArgvLog)) === JSON.stringify([`${basename(dir)} - Other work`, "Awaiting your response — A or B?", "normal", "utilities-terminal", "question"]),
       `a notification that asks nothing keeps the same argv shape, got ${JSON.stringify(argvOf(plainArgvLog))}`,
     )
     assert(readFileSync(plainEnvLog, "utf8") === "", "no request id may be set for a notification that answers nothing")

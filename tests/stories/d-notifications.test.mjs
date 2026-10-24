@@ -374,6 +374,11 @@ test("[US-11] a session that went busy and is now idle delivers a done notificat
   await settle()
 
   assert.equal(sent.length, 1, `exactly one notification, got ${JSON.stringify(sent)}`)
+  assert.equal(
+    sent[0].title,
+    "lacode-story - Fix the login redirect",
+    `the title must name the workspace and the session: ${JSON.stringify(sent[0].title)}`,
+  )
   assert.match(sent[0].title, /Fix the login redirect/, "the notification must name the session")
   assert.match(sent[0].message, /finished/i, "the message must say the turn is done")
   assert.equal(sent[0].urgency, "normal", "a routine completion must not escalate to a modal")
@@ -1428,7 +1433,7 @@ test("[US-30] a popup the user works in after five seconds fades at once", async
 
 test("[US-30] working in one session's chat leaves another session's popup alone", async () => {
   await withClock(async (clock) => {
-    const { closed, emit } = await notifier({
+    const { closed, sent, emit } = await notifier({
       sessions: { s1: { id: "s1", title: "One" }, s2: { id: "s2", title: "Two" } },
     })
     await busy(emit, "s1")
@@ -1438,6 +1443,18 @@ test("[US-30] working in one session's chat leaves another session's popup alone
     await idle(emit, "s2")
     await settle()
     assert.deepEqual(closed, [], "two popups are up, and neither has been touched")
+    assert.equal(sent.length, 2, `both sessions' done popups were delivered, got ${JSON.stringify(sent)}`)
+    const bySession = new Map(sent.map((notice) => [notice.sessionID, notice]))
+    for (const [sessionID, title] of [
+      ["s1", "One"],
+      ["s2", "Two"],
+    ]) {
+      const notice = bySession.get(sessionID)
+      assert.ok(notice, `session ${sessionID}'s done popup must be delivered: ${JSON.stringify(sent)}`)
+      assert.match(notice.title, new RegExp(title), `the notification must name session ${sessionID}: ${notice.title}`)
+      assert.match(notice.message, /finished/i, `the message must say the turn is done: ${notice.message}`)
+      assert.equal(notice.urgency, "normal", "a routine completion must not escalate to a modal")
+    }
 
     clock.advance(6_000)
     await emit("question.replied", { sessionID: "s1" })
@@ -1449,6 +1466,76 @@ test("[US-30] working in one session's chat leaves another session's popup alone
       `a notification belongs to its session: ${JSON.stringify(closed)}`,
     )
   })
+})
+
+test("[US-30] a popup raised after an earlier interaction does not fade on its own", async () => {
+  // The regression: `interacted` used to stick to the session, so a popup
+  // raised after the user had typed once armed its own five-second dismissal
+  // at raise time and faded with no interaction. The flag belongs to the popup
+  // it was set on; a new popup starts un-interacted.
+  await withClock(async (clock) => {
+    const { sent, closed, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
+    await busy(emit, "s1")
+    await idle(emit, "s1")
+    await settle()
+    assert.equal(sent.length, 1, `the first turn must raise one popup, got ${JSON.stringify(sent)}`)
+    assert.deepEqual(closed, [], "the first popup is up and untouched")
+
+    // The user types while the first popup is live, so it fades. The clock is
+    // past its five seconds first, which is what makes the fade immediate.
+    clock.advance(6_000)
+    await typed(emit, "s1")
+    await settle(50)
+    assert.deepEqual(
+      closed.map((entry) => entry.sessionID),
+      ["s1"],
+      `typing must fade the popup that was live: ${JSON.stringify(closed)}`,
+    )
+
+    // A new turn raises a new popup. Nothing interacts with it.
+    await busy(emit, "s1")
+    await idle(emit, "s1")
+    await settle()
+    assert.equal(sent.length, 2, `the new turn must raise its own popup, got ${JSON.stringify(sent)}`)
+    const closedBefore = closed.length
+
+    // Past six seconds, with no interaction: the new popup must stay. The real
+    // wait lets any dismissal armed at raise time fire, which is exactly the
+    // sticky behaviour this test rules out.
+    clock.advance(6_000)
+    await settle(5_100)
+
+    assert.equal(
+      closed.length,
+      closedBefore,
+      `a popup raised after an earlier interaction must not fade on its own: ${JSON.stringify(closed)}`,
+    )
+  })
+})
+
+test("[US-11] a session parked on a permission does not suppress another session's done popup", async () => {
+  const { sent, emit } = await notifier({
+    sessions: { s1: { id: "s1", title: "Read the config" }, s2: { id: "s2", title: "Build the API" } },
+  })
+  await busy(emit, "s1")
+  await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+  await settle(PERMISSION_SETTLE_MS)
+
+  await busy(emit, "s2")
+  await idle(emit, "s2")
+  await settle()
+
+  const done = sent.filter((notice) => /finished/i.test(notice.message))
+  assert.equal(done.length, 1, `only s2 finished, so exactly one done popup: ${JSON.stringify(sent)}`)
+  assert.equal(done[0].sessionID, "s2", `the done popup must belong to s2: ${JSON.stringify(done[0])}`)
+  assert.match(done[0].title, /Build the API/, `the notification must name s2: ${done[0].title}`)
+  assert.ok(
+    !sent.some((notice) => notice.sessionID === "s1" && /finished/i.test(notice.message)),
+    `a session parked on a permission has not finished, so it contributes no done popup: ${JSON.stringify(sent)}`,
+  )
+
+  await emit("permission.replied", { sessionID: "s1", requestID: "p1", reply: "once" })
+  await settle()
 })
 
 test("[US-30] a session with no popup is never closed", async () => {

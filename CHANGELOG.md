@@ -7,6 +7,33 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.0.1] — notification sounds you can hear, and a title that names the workspace
+
+### Fixed
+
+- **Notification sounds play again.** The plugin preferred the bash `oc-notify`
+  helper, which discards the sound field, so a chime was never played on that
+  path; it now prefers the lacode CLI, whose `sendLocal` plays
+  `sounds/<outcome>.wav`. The bash helper stays as a last-resort fallback.
+- **The four chimes survive a suspended sink.** Each WAV was 0.20–0.32 s at 42%
+  full-scale, which a suspended Bluetooth output swallowed whole while the link
+  woke. They are now 1.0–1.46 s at 90% peak, and a test pins both the duration
+  and the peak so the regression cannot return.
+- **A popup no longer fades on its own.** `interacted` is scoped to the popup it
+  was set on: a new popup starts un-interacted and auto-dismisses only when the
+  user interacts in that session while it is live. Previously every popup in a
+  session the user had ever typed in closed after five seconds.
+- **The published `bin` entry uses the `./dist/…` form** the packaging check
+  requires, so the release tarball passes its own adoption test.
+
+### Changed
+
+- **Notification titles name the workspace as well as the session.** The title
+  is now `{workspace} - {session}`, where the workspace is the basename of the
+  session's directory, falling back to the plugin directory. The popup header
+  stays `LaCode`. Internal cartographer sessions are still suppressed, because
+  the check runs on the session title before the prefix is added.
+
 ## [1.0.0] — images, ordered slot fill, and a limit that fails over
 
 ### Added

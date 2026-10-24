@@ -177,15 +177,19 @@ const SOUND_OFF_VALUES = ["0", "false", "off", "no"]
 
 // Where the notification helper lives, in order:
 //   1. OC_NOTIFY_HELPER -- an explicit override, so a user can point at their own
-//   2. ~/bin/lacode or ~/bin/oc-notify -- what a hand-made install puts on PATH
-//   3. the package's own bin/ -- the author's checkout, where bin/oc-notify exists
-//   4. dist/lacode.js -- the BUILT cli, which is all an npm install ships. The
+//   2. ~/bin/lacode -- what a hand-made install of the CLI puts on PATH
+//   3. dist/lacode.js -- the BUILT cli, which is all an npm install ships. The
 //      shipped package carries compiled dist/, not TypeScript sources, so pointing at
 //      the package's bin/lacode there would hand a broken helper to every
 //      consumer: found, spawned, and dead on arrival with node refusing to strip
 //      types under node_modules. The built CLI is the same program with the
 //      types already gone -- but a different ENTRY: it takes a `notify`
 //      subcommand, so its argv is built differently (see helperArgv below).
+//   4. the package's own bin/lacode -- the author's checkout
+//   5. ~/bin/oc-notify -- the bash helper, kept only as a last-resort fallback:
+//      it execs bin/oc, whose OC_NOTIFY_ONLY path drops the sound name and has
+//      no permission action-button plumbing
+//   6. the package's own bin/oc-notify -- the author's checkout
 // Candidates are anchored on PACKAGE_ROOT rather than on this module's own
 // directory, because bundling moves this file from src/plugins/ to dist/ and a
 // relative hop would resolve outside the package.
@@ -196,10 +200,10 @@ const findHelper = (): string | undefined => {
   const candidates = [
     process.env.OC_NOTIFY_HELPER,
     path.join(home, "bin", "lacode"),
-    path.join(home, "bin", "oc-notify"),
-    path.join(PACKAGE_ROOT, "bin", "oc-notify"),
     path.join(PACKAGE_ROOT, "dist", "lacode.js"),
     path.join(PACKAGE_ROOT, "bin", "lacode"),
+    path.join(home, "bin", "oc-notify"),
+    path.join(PACKAGE_ROOT, "bin", "oc-notify"),
   ].filter((candidate): candidate is string => typeof candidate === "string" && candidate.length > 0)
   for (const candidate of candidates) if (existsSync(candidate)) return candidate
   return undefined
@@ -662,8 +666,8 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       popup.timer = undefined
     }
     // The popup's five seconds are spent, so the clock restarts here. The
-    // `interacted` flag stays: the user is still in the TUI, so the NEXT popup
-    // for this session fades as well.
+    // `interacted` flag belongs to the popup it was set on: a new popup starts
+    // un-interacted and only fades if the user interacts while it is live.
     popup.raisedAt = Date.now()
     const failed = (error: unknown) => void log("warn", `notification dismiss failed: ${String(error)}`, { sessionID })
     try {
@@ -779,7 +783,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       // session.get is authoritative, but an idle event can arrive before the
       // title update lands; fall back to the last title this process saw rather
       // than announcing "session".
-      const titled = info.title ? info : { ...info, title: titles.get(sessionID) }
+      const titled = { ...info, title: info.title ?? titles.get(sessionID), directory: info.directory ?? directory }
       // isRemote mirrors what bin/oc decides for itself, so the message says the
       // useful thing: a remote session needs the tunnel, a local one does not.
       const isRemote = Boolean(process.env.SSH_CLIENT || process.env.SSH_TTY)
@@ -874,11 +878,9 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       // screen, and the record is what lets a later interaction in the TUI
       // fade it.
       //
-      // `interacted` sticks: the user answered something in this session's
-      // chat, so they are watching it, and the NEXT popup for this session
-      // fades as well.
-      const previous = live.get(sessionID)
-      const popup: LivePopup = { raisedAt: Date.now(), interacted: previous?.interacted ?? false }
+      // `interacted` belongs to the popup it was set on: a new popup starts
+      // un-interacted and only fades if the user interacts while it is live.
+      const popup: LivePopup = { raisedAt: Date.now(), interacted: false }
       rememberLive(sessionID, popup)
       // A session the user is working in directly does not need its popups to
       // wait for the X button. This one still gets its own five seconds, so the
