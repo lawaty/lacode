@@ -3,7 +3,7 @@
 // The table was read once per process; this pins the replacement: watch the
 // files the resolution chain consults, reload the table when it ACTUALLY
 // changed, re-bind the variant agents to it, and validate every slot -- a model
-// the provider no longer serves is benched before a spawn is routed to it.
+// the provider does not serve is benched before a spawn is routed to it.
 //
 // Run with: node tests/pool-reload-test.mjs
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"

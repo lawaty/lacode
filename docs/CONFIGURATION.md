@@ -68,8 +68,8 @@ fields are not affected; `permission`, `prompt`, `model`, `description`,
 The hidden pool variants (`explore-1`, `implement-2`, …) inherit
 nothing here — add a line per variant, or drop the global
 deny and scope it to the agents that should not have browser access instead.
-Note that you cannot *spawn* a variant by name: the pool refuses
-`explore-1` and friends and points you at the bare base, so per-variant
+Note that you cannot *spawn* a variant by name: the pool rewrites
+`explore-1` and friends to their base and routes them, so per-variant
 permissions only ever apply to a spawn the plugin routed itself.
 
 The pool files are the exception to the restart rule: editing `pool.txt`,

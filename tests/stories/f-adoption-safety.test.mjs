@@ -295,12 +295,12 @@ test("[US-15] the manifest publishes every entry-point shape a plugin loader may
 /**
  * The `## Getting started` chapter, as text.
  *
- * Deliberately NOT anchored to a `###` heading. The old assertion pinned the
- * exact string "### If the plugin does not load on opencode 1.18.35" and its
- * GitHub anchor, so rewording a heading — which is exactly what a restructure
- * does — failed a test that had nothing to say about wording. These assertions
- * are about the substance a reader needs, so they locate the chapter by its
- * stable top-level heading and then require the concepts to be present.
+ * Deliberately NOT anchored to a `###` heading. Pinning the exact string
+ * "### If the plugin does not load on opencode 1.18.35" and its GitHub anchor
+ * would make rewording a heading — which is exactly what a restructure does —
+ * fail a test that has nothing to say about wording. These assertions are about
+ * the substance a reader needs, so they locate the chapter by its stable
+ * top-level heading and then require the concepts to be present.
  *
  * The chapter is still a meaningful scope: nothing outside `## Getting started`
  * discusses the cache, the `file://` fallback or which versions are verified, so
@@ -312,9 +312,9 @@ test("[US-15] the manifest publishes every entry-point shape a plugin loader may
  * missing" procedure, the version matrix, macOS.
  *
  * These assertions are about a CLAIM being documented, not about which file holds
- * it: the product README was split down to something a person can read end to
- * end, and the detail it used to carry now lives one click away. Slicing only
- * the README would let the suite fail on a restructure that lost nothing, and
+ * it: the product README is split down to something a person can read end to
+ * end, and the detail it carries can live one click away. Slicing only the
+ * README would let the suite fail on a restructure that lost nothing, and
  * passing for the wrong reason if the claims were quietly deleted from both.
  */
 const installChapter = () => {
@@ -517,8 +517,8 @@ test("[US-15] the README documents macOS support, and keeps the Linux-only tooli
   // wording of the heading counts, but deleting the section does not.
   const section = sectionOf(chapter, /macos/i)
 
-  // How notifications get delivered on a Mac, which is the thing that used to
-  // be silently dropped.
+  // How notifications get delivered on a Mac, which must not be silently
+  // dropped.
   assert.match(section, /osascript/, "the macOS section must name the notification channel it uses")
   assert.match(section, /terminal-notifier/, "the macOS section must name the fallback channel")
 
@@ -724,20 +724,20 @@ test("[US-17] with the off switch unset, behaviour is otherwise identical to ena
 // ---------------------------------------------------------------------------
 // US-24 -- the tool grant is DOCUMENTED, not injected
 //
-// LaCode used to inject `tools: { "playwright_*": true }` on the four
-// exploration and implementation tiers, with a comment claiming it rescued a
-// user who had Playwright plus a global `"tools": { "playwright_*": false }`.
+// LaCode must not inject `tools: { "playwright_*": true }` on the four
+// exploration and implementation tiers: a grant there cannot rescue a user who
+// has Playwright plus a global `"tools": { "playwright_*": false }`.
 //
-// That claim was false. opencode folds an agent's `tools` into its permission
+// The grant cannot work. opencode folds an agent's `tools` into its permission
 // list while DECODING the config, before any plugin runs; a plugin's `config`
-// hook mutates the already-decoded object, so the fold never re-runs and the
+// hook mutates the already-decoded object, so the fold never re-runs and an
 // injected value is read by nothing. Verified on opencode 1.18.34/1.18.35 with
 // `opencode debug agent explore`: the same grant written in the USER's own
 // config produces two `playwright_*` entries (deny, then allow -- last wins),
-// while the plugin-injected one produces only the deny.
+// while a plugin-injected one produces only the deny.
 //
-// These tests pin the LIMITATION rather than the removed behaviour, so the dead
-// grant cannot be quietly reintroduced on the belief that it is merely missing.
+// These tests pin the LIMITATION itself, so the dead grant cannot be quietly
+// reintroduced on the belief that it is merely missing.
 // ---------------------------------------------------------------------------
 
 test("[US-24] no injected agent carries a `tools` grant: the host folds agent.tools before the config hook runs, so an injected one is inert", async () => {
@@ -754,8 +754,8 @@ test("[US-24] no injected agent carries a `tools` grant: the host folds agent.to
     assert.ok(!("tools" in cfg.agent[name]), `${name} must not carry a tools field -- it is folded at load time and never read`)
   }
 
-  // The tiers the dead grant used to sit on are named explicitly, so removing
-  // the test above cannot quietly remove the check along with the field.
+  // The tiers the dead grant targeted are named explicitly, so removing the
+  // test above cannot quietly remove the check along with the field.
   for (const name of ["explore", "implement"]) {
     assert.equal(cfg.agent[name]?.tools, undefined, `${name} is the tier the phantom grant targeted`)
   }
@@ -805,8 +805,7 @@ test("[US-24] the limitation is documented for users: README states it above the
   assert.ok(injectedAt !== -1, "the docs must still have an injection section")
   assert.ok(warningAt < injectedAt, "the warning must come BEFORE the injection list, not after it")
 
-  // It must say the thing that is actually true, and not the thing that was
-  // previously claimed.
+  // It must say the thing that is actually true, and not the rejected claim.
   assert.match(readme, /config-load\s+time/, "the README must give the load-time-folding reason, or the grant gets re-added")
   assert.match(readme, /cannot grant tools to its agents/, "the README must state plainly that the plugin cannot do this")
   assert.ok(

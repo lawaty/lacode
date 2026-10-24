@@ -114,8 +114,8 @@ test("[US-1] N exploration spawns over an all-zero-cost preset are never dispatc
   for (const model of models) {
     const price = prices[model]
     assert.ok(price, `models-snapshot.json has never seen ${model}; run tests/refresh-models-snapshot.mjs`)
-    assert.equal(price.cost_input, 0, `${model} is no longer free — this story no longer describes the shipped preset`)
-    assert.equal(price.cost_output, 0, `${model} is no longer free`)
+    assert.equal(price.cost_input, 0, `${model} is not free — this story does not describe the shipped preset`)
+    assert.equal(price.cost_output, 0, `${model} is not free`)
   }
 
   const stub = stubInput()
@@ -169,7 +169,7 @@ test("[US-2] a model hard-coded on a pooled variant is reported as overridden an
   const slots = [{ model: PAID, weight: 1 }]
   const stub = stubInput()
   const hooks = await bootLaCode(stub, { id: "us2-hardcoded", dir: scratch(), models: { slots } })
-  // The author's own opencode.jsonc used to carry a model here; the pool preset
+  // The author's own opencode.jsonc may carry a model here; the pool preset
   // must win, and the stale line must be named rather than silently ignored.
   const cfg = configFor([PAID])
   cfg.agent["explore-1"] = { model: "stale/leftover-model", prompt: "x", permission: {} }
@@ -215,7 +215,7 @@ test("[US-2] an invalid weight falls back to 1 with a warning, and the slot surv
   // spawns before any of them is reused.
   const seen = []
   for (let i = 0; i < 3; i++) seen.push((await spawn(hooks, cfg, { callID: `w${i}`, sessionID: `ws${i}` })).routed)
-  assert.deepEqual(seen, ["explore-1", "explore-2", "explore-3"], `weight 1 each must round-robin, got ${seen}`)
+  assert.deepEqual(seen, ["explore-1", "explore-2", "explore-3"], `weight 1 each must fill slots in declaration order, got ${seen}`)
   await hooks.dispose()
 })
 
@@ -311,13 +311,12 @@ test("[US-3] the harness stores no savings constant and derives every ratio it p
   const code = source.split("\n").filter((line) => !line.trimStart().startsWith("//"))
   const constant = code.find((line) => /\b(save|saving|savings|cheaper|reduction|ratio)\w*\s*[:=]\s*[\d.]+\s*%?/i.test(line))
   assert.equal(constant, undefined, `the harness must not store a savings constant: ${constant}`)
-  // The quote characters are assembled rather than written into the pattern. This
-  // is the same regex it always was, but the coverage guard's scanner understands
-  // comments and strings and NOT regex literals -- so a bare ["'`] here used to
-  // drop it into string mode and make it stop seeing every test declared after
-  // this line in this file. It would have reported US-23 as untested while four
-  // US-23 tests sat in the same file, which is the exact failure the guard exists
-  // to prevent. Written this way, it cannot desync.
+  // The quote characters are assembled rather than written into the pattern. The
+  // coverage guard's scanner understands comments and strings and NOT regex
+  // literals -- so a bare ["'`] here drops it into string mode and makes it stop
+  // seeing every test declared after this line in this file. It reports US-23 as
+  // untested while four US-23 tests sit in the same file, which is the exact
+  // failure the guard exists to prevent. Written this way, it cannot desync.
   const QUOTES = "\"'`"
   const QUOTED_PERCENT = new RegExp(`[${QUOTES}][^${QUOTES}]*\\d+(\\.\\d+)?\\s*%`)
   const literal = code.find((line) => QUOTED_PERCENT.test(line))
@@ -487,10 +486,9 @@ test("[US-23] the pool has no model whitelist: an arbitrary exotic model binds v
   }
 })
 
-test("[US-23] removing the advisory changed nothing: resolution, routing and the two-direction writer rule are untouched", async () => {
-  // The cost advisory is gone, so the proof that deleting it was safe is that the
-  // pool still behaves identically on every axis it used to touch — and silently
-  // on the one it no longer does.
+test("[US-23] the pool's resolution, routing and two-direction writer rule are untouched without the cost advisory", async () => {
+  // With the cost advisory absent, the pool must behave identically on every
+  // axis that advisory touched, and stay silent on the axis it did not.
 
   // 1. Resolution and validation are intact: the only per-model rule left is the
   //    structural `provider/model-id` shape a slot needs to be addressable.

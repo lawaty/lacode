@@ -71,25 +71,27 @@ At most **4 slots**: the plugin injects one hidden variant per base per slot fro
 `src/agents.ts`, so a fifth entry would route spawns at an agent that does not exist.
 Entries past the fourth are dropped with a warning, not silently ignored.
 
-`weight` is a slot's **share of the rotation** — how many turns it takes per cycle — and its
-concurrency ceiling is **twice that**. Two rules, in order:
+`weight` is a slot's active-session budget for one pass: the number of concurrent claims it
+may hold before the next slot is preferred. Its absolute cap is **twice that**. Slots are
+filled in declaration order; preference is order, never weight. Routing runs in two passes:
 
-1. the weighted round-robin run (each slot one position per unit of weight, in list order:
-   `3,2,1,1` → `1,1,1,2,2,3,4`) is walked from a shared cursor, and the first slot that is
-   neither cooling nor at its ceiling takes the spawn, so no slot is drained before the others
-   see work
-2. once **every** slot is at its ceiling, the overflow goes to the least loaded slot, so a
-   burst past the summed ceilings equalises instead of piling up or blocking
+1. pass 1 fills each usable slot up to its weight, in declaration order
+2. once every usable slot has reached its weight, pass 2 repeats the order, filling each
+   usable slot up to twice its weight
 
-So `3,2,1,1` produces `1,1,1,2,2,3,4,…` — ordered preference, with the bottom of the list as
-reserve. The ceiling is deliberately larger than the rotation share, so one full rotation fills
-only half the pool and the run is walked twice before every slot is full; a burst that outruns
-one rotation still lands on the heavy slot rather than falling straight through to overflow.
-Equal weights give a plain round robin in list order.
+A slot is skipped when it is cooling, unavailable, or at its absolute cap. When every
+usable slot is at its absolute cap, overflow goes to the least loaded usable slot; the
+pool never refuses work.
 
-Raise a weight to let a model take more turns — and hold twice as many concurrent sessions;
-lower it to make it more of a reserve. No weight means `1`; anything that is not a number in
-`(0, 100]` warns and means `1`.
+Live claims decide the next slot: a released claim immediately reopens its slot, and there
+is no stored position.
+
+With shipped weights `3,2,1,1`: 7 active sessions in pass 1 and 14 total across both
+passes.
+
+Raise a weight to let a model hold more concurrent sessions in a pass; lower it to make it
+more of a reserve. No weight means `1`; anything that is not a number in `(0, 100]` warns
+and means `1`.
 `tier` is an accepted alias for `weight` — `primary` is weight 2, `overflow` is
 weight 1 — read with a warning, so a host that has not picked up this file keeps two slots' worth
 of headroom.
@@ -139,7 +141,7 @@ restarted from its own terminal.
 **The pool's slot files are the exception.** Editing `presets/free-tier.json`,
 `~/.config/lacode/pool.txt` or `~/.config/lacode/pool.json` is picked up by the
 running process: the table reloads, the variant agents re-bind, and every slot is
-validated with one real request. Swapping a pool model no longer needs a restart;
+validated with one real request. Swapping a pool model takes effect without a restart;
 a model the provider does not serve is benched and named in the log and toast.
 (`opencode.jsonc` itself — providers, agents, permissions — still needs one.)
 
@@ -547,8 +549,7 @@ on the remote host's node 12.22.9 and on this machine's node 26.
 **What is kept is a compact record, not the transcript.** Each retired session
 leaves one entry under `~/.local/share/opencode/lacode/session-archive/` — the
 id, the title, the directory, the project, and when it was created and last
-updated. The transcript itself is not kept: the record tells you what used to
-be in your list, and the messages are gone.
+updated. The transcript itself is not kept: the record lists retired sessions; messages are gone.
 
 **The file does not shrink on its own.** `auto_vacuum` is 0 in these
 databases, so the pages a deleted session frees stay in the file and the
@@ -703,9 +704,9 @@ in `~/.local/share/opencode/` where it is.
 **A pooled spawn went to an unexpected model.** Read the `routed` log line for the `slot=`,
 `weight=`, `ceiling=` and `load=` fields, then check for a `limit.<provider>__<model>.json` file — a
 stale one with a future `until` will keep diverting work. If the model is right but the slot
-is not the one you expected, that is the rotation: routing walks the weighted run from a shared
-cursor and takes the first slot that is neither cooling nor at its ceiling (twice its weight) —
-not the emptiest and not the heaviest.
+is not the one you expected, that is slot preference: routing fills slots in declaration
+order in two passes and takes the first usable slot that is neither cooling nor at its
+absolute cap (twice its weight) — not the emptiest and not the heaviest.
 
 **Everything routes to one provider.** Check for `limit.*.json` files cooling the other.
 A provider-wide `free_tier_limit` cools every slot on that provider at once, which is

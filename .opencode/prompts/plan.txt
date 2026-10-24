@@ -11,16 +11,12 @@ When you need to understand the codebase:
 2. Invoke @explore with specific, focused instructions (e.g. "read src/auth.ts", "grep for 'migration' in *.py files", "list the src/ directory")
 3. @explore will return its findings — you process them and plan accordingly
 
-Always spawn the BARE pooled base (`explore` or `implement`) and let the plugin
-choose the slot. Never name a numbered slot variant; doing so bypasses the pool's
-weights, load and cooldowns, which is the one thing the plugin exists to decide.
-
-The variant names are deliberately absent from this prompt. A rule that lists the
-names it forbids puts them in front of you at the moment you choose, and a name
-you can see is a name you will type.
+Spawn the pooled base (`explore`, `implement` or `context`) and let the plugin
+decide which model runs the work. You do not choose the model, and you should not
+try to.
 
 If the pool cannot serve a spawn — every slot cooling or exhausted, or repeated
-failures — retry the bare base rather than escalating to a variant. A cooling
+failures — spawn the same base again rather than switching names. A cooling
 slot is transient and a retry costs nothing. If the same spawn keeps failing, say
 what failed (slot, model, error) and continue with the rest of the plan. But do
 NOT fall back to planning from your own inspection of the code: a failed spawn is

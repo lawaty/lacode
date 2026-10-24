@@ -203,7 +203,6 @@ test("[US-29] notification sounds distinguish outcomes", async () => {
   assert.deepEqual(
     [...sounds].sort(),
     ["done", "error", "permission", "question"],
-    `each outcome must carry its own tone, all four distinct: ${JSON.stringify(sent)}`,
   )
 })
 
@@ -596,7 +595,10 @@ test("[US-12] a parked question is cleared by a reply, a rejection, or an error"
     // session, the next real completion must announce itself rather than being
     // silently swallowed as "still waiting for you".
     const completions = sent.filter((notice) => /finished/i.test(notice.message))
-    assert.equal(completions.length, 1, `${label}: the next real completion must notify again, got ${JSON.stringify(sent)}`)
+    // A terminal error claims the per-turn completion marker, so the idle that
+    // follows it in the same turn stays quiet; only the error is announced.
+    const expectedCompletions = event === "session.error" ? 0 : 1
+    assert.equal(completions.length, expectedCompletions, `${label}: completion count, got ${JSON.stringify(sent)}`)
     if (event === "session.error") {
       assert.ok(sent.some((n) => /Failed/i.test(n.message)), `${label}: the error itself must be announced, got ${JSON.stringify(sent)}`)
     }
@@ -1029,7 +1031,7 @@ test("[US-25] a permission already answered elsewhere is not a failure", async (
   }
 })
 
-test("[US-25] a stale click for a permission the server no longer has is a no-op, not an answer", async () => {
+test("[US-25] a stale click for a permission the server does not have is a no-op, not an answer", async () => {
   // The request was withdrawn or answered while the popup sat there. The
   // click must not crash anything -- the next prompt must still notify and
   // answer normally -- and it must not be recorded as an answer: no log
@@ -1514,4 +1516,60 @@ test("[US-30] a deleted session's pending dismissal is cancelled", async () => {
 
     assert.deepEqual(closed, [], "a dismissal for a session that is gone closes nothing")
   })
+})
+
+test("[US-11] a repeated idle after the cooldown raises one popup", async () => {
+  await withClock(async (clock) => {
+    const { sent, emit } = await notifier({ sessions: { "r1": { id: "r1", title: "Work" } } })
+    await busy(emit, "r1")
+    await idle(emit, "r1")
+    await settle()
+    assert.equal(sent.length, 1, `first idle must raise one popup, got ${JSON.stringify(sent)}`)
+    clock.advance(6000)
+    await idle(emit, "r1")
+    await settle()
+    assert.equal(sent.length, 1, `a repeated idle must not raise a second popup, got ${JSON.stringify(sent)}`)
+  })
+})
+
+test("[US-11] a new turn gets its own popup", async () => {
+  await withClock(async (clock) => {
+    const { sent, emit } = await notifier({ sessions: { "n1": { id: "n1", title: "Work" } } })
+    await busy(emit, "n1")
+    await idle(emit, "n1")
+    await settle()
+    assert.equal(sent.length, 1, `first turn must raise one popup, got ${JSON.stringify(sent)}`)
+    clock.advance(6000)
+    await busy(emit, "n1")
+    await idle(emit, "n1")
+    await settle()
+    assert.equal(sent.length, 2, `a new turn must raise its own popup, got ${JSON.stringify(sent)}`)
+  })
+})
+
+test("[US-11] an error and the idle that follows it raise one popup, not two", async () => {
+  await withClock(async (clock) => {
+    const { sent, emit } = await notifier({ sessions: { "e1": { id: "e1", title: "Work" } } })
+    await busy(emit, "e1")
+    await emit("session.error", { sessionID: "e1", error: { message: "boom" } })
+    await settle()
+    assert.equal(sent.length, 1, `the error must raise one popup, got ${JSON.stringify(sent)}`)
+    assert.match(sent[0].message, /Failed/i, `the popup must be the error, got ${JSON.stringify(sent)}`)
+    clock.advance(6000)
+    await idle(emit, "e1")
+    await settle()
+    assert.equal(sent.length, 1, `the following idle must not raise a second popup, got ${JSON.stringify(sent)}`)
+  })
+})
+
+test("[US-11] two notify instances in one process do not both raise it", async () => {
+  const A = await notifier({ sessions: { "t1": { id: "t1", title: "Work" } } })
+  const B = await notifier({ sessions: { "t1": { id: "t1", title: "Work" } } })
+  await busy(A.emit, "t1")
+  await busy(B.emit, "t1")
+  await idle(A.emit, "t1")
+  await settle()
+  await idle(B.emit, "t1")
+  await settle()
+  assert.equal(A.sent.length + B.sent.length, 1, `only one instance may raise it, got A=${A.sent.length} B=${B.sent.length}`)
 })

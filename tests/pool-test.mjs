@@ -20,32 +20,31 @@ const cfg = shippedConfig()
 const SHIPPED = JSON.parse(readFileSync(join(HERE, "..", "presets", "free-tier.json"), "utf8")).slots
 const SLOT_MODELS = SHIPPED.map((s) => s.model)
 // presets/free-tier.json's weight is the only routing knob, so the tests talk about the
-// heaviest slot and the lightest slots rather than a tier name the file no longer
-// carries. Which slots those are is the file's business.
+// heaviest slot and the lightest slots rather than a tier name the file does not
+// carry. Which slots those are is the file's business.
 const MAX_WEIGHT = Math.max(...SHIPPED.map((s) => s.weight))
 const MIN_WEIGHT = Math.min(...SHIPPED.map((s) => s.weight))
 const HEAVY_MODELS = SHIPPED.filter((s) => s.weight === MAX_WEIGHT).map((s) => s.model)
 const LIGHT_MODELS = SHIPPED.filter((s) => s.weight === MIN_WEIGHT).map((s) => s.model)
 // A slot holds at most TWICE its weight (src/lib/pool.ts SLOT_CEILING_FACTOR): the
-// weight is its share of the rotation and the ceiling is deliberately larger than that
-// share, so a whole rotation can be walked twice before the pool is full. Written out
-// here as a literal rather than read off the module, because the doubled ceiling is the
-// rule under test, not a value to follow.
+// weight is its active-session budget for one pass and the absolute cap is deliberately
+// larger than that budget, so a slot can fill to twice its weight on the second pass
+// before the pool overflows. Written out here as a literal rather than read off the
+// module, because the doubled cap is the rule under test, not a value to follow.
 const CEILING_FACTOR = 2
 const CEILINGS = SHIPPED.map((s) => s.weight * CEILING_FACTOR)
-// One rotation of the run: a slot takes one turn per unit of its weight, in
-// declaration order, so weights [3,2,1,1] walk 1,1,1,2,2,3,4. Derived from the file, so
-// a preset change is not a test edit.
+// One pass over the slots: each slot fills to its weight in declaration order, so
+// weights [3,2,1,1] walk 1,1,1,2,2,3,4. Derived from the file, so a preset change is
+// not a test edit.
 const RUN = SHIPPED.flatMap((slot, i) => Array(slot.weight).fill(i + 1))
-const ROTATION = RUN.length
-// The summed ceilings are where the weighted phase ends and overflow begins, so the
-// depth needed to see both is derived rather than guessed: a slot cannot reach twice
-// its weight on its own positions in a single rotation, so the weighted phase is
-// exactly two rotations long.
-const CAPACITY = ROTATION * CEILING_FACTOR
+const PASS_SIZE = RUN.length
+// The summed absolute caps are where pass 2 ends and overflow begins, so the depth
+// needed to see both is derived rather than guessed: a slot cannot reach twice its
+// weight in one pass, so the weighted phase is exactly two passes long.
+const CAPACITY = PASS_SIZE * CEILING_FACTOR
 // How far the burst has to go for the overflow to have levelled the pool: it can only
-// ever raise the least loaded slot, so the totals converge on the largest ceiling in
-// the pool and are equal from there on -- and stay within one past it.
+// ever raise the least loaded slot, so the totals converge on the largest absolute cap
+// in the pool and are equal from there on -- and stay within one past it.
 const LEVELED = SLOT_MODELS.length * MAX_WEIGHT * CEILING_FACTOR
 
 const logs = []
@@ -82,15 +81,13 @@ const make = async (id, dir) => {
 const dir1 = mkdtempSync(join(tmpdir(), "agent-pool-solo-"))
 const seq = (calls) => calls.map((c) => c.replace(/^[a-z-]+-/, "")).join(",")
 
-// 1. routing: ORDER FIRST, THEN WEIGHT. The slots are expanded into a weighted
-//    round-robin run -- one position per unit of weight, in declaration order -- and
-//    each spawn scans that run from a persisted cursor, taking the first slot which is
-//    available and still under its ceiling. So the run is walked in order rather than
-//    the heaviest slot being drained first, a slot's ceiling is TWICE its weight (so
-//    the rotation can be walked twice before any slot is full), and only past the
-//    summed ceilings does the overflow spread evenly. Slot numbers, weights and pick
-//    order are presets/free-tier.json's business, so what is pinned here is the
-//    property, not a literal sequence.
+// 1. routing: two-pass ordered fill. Pass 1 walks the usable slots in declaration
+//    order and fills each to its weight; pass 2 repeats the order and fills each to
+//    twice its weight. A slot's absolute cap is TWICE its weight, and only once every
+//    slot is at that cap does overflow go to the least-loaded slot. Live claims decide
+//    the pick, so a released claim immediately reopens its slot and there is no stored
+//    position. Slot numbers, weights and pick order are presets/free-tier.json's
+//    business, so what is pinned here is the property, not a literal sequence.
 const a = await make("solo", dir1)
 const calls = []
 // Deep enough to exhaust every ceiling, then overflow, and then overflow far enough
@@ -114,10 +111,9 @@ assert(
   new Set(numbers).size === SLOT_MODELS.length,
   `all ${SLOT_MODELS.length} slots must be used under ${CONCURRENCY} concurrent, got ${seq(calls)}`,
 )
-// inside the summed ceilings the pick is the NEXT TURN of the run and nothing is
-// skipped: a slot's ceiling is twice its weight, so a slot cannot fill up on the
-// positions it holds in a single rotation, and the weighted phase is the run walked
-// twice from a cold start
+// inside the summed absolute caps the pick follows the two-pass order and nothing is
+// skipped: a slot's absolute cap is twice its weight, so a slot cannot fill up in one
+// pass, and the weighted phase is the pass order walked twice from a cold start
 const countsByModel = (ns) => {
   const m = new Map()
   for (const n of ns) m.set(SLOT_MODELS[n - 1], (m.get(SLOT_MODELS[n - 1]) ?? 0) + 1)
@@ -125,8 +121,8 @@ const countsByModel = (ns) => {
 }
 for (let i = 0; i < CAPACITY; i++) {
   assert(
-    numbers[i] === RUN[i % ROTATION],
-    `spawn ${i + 1} must take turn ${i % ROTATION} of the run (slot ${RUN[i % ROTATION]}), got slot ${numbers[i]} from ${seq(calls)}`,
+    numbers[i] === RUN[i % PASS_SIZE],
+    `spawn ${i + 1} must take position ${i % PASS_SIZE} of the pass order (slot ${RUN[i % PASS_SIZE]}), got slot ${numbers[i]} from ${seq(calls)}`,
   )
 }
 // the ceiling binds every slot to twice its weight, and the ONLY way past it is the
@@ -141,15 +137,15 @@ for (let i = 1; i <= CONCURRENCY; i++) {
     `a slot may pass its ceiling of ${CEILING_FACTOR}x its weight only once EVERY slot is at one, after spawn ${i}: ${SHIPPED.map((slot, j) => `${slot.model}=${prefixLoads[j]}/${CEILINGS[j]}`).join(" ")}`,
   )
 }
-// and the heaviest slot really does hold every position at the top of the run before
-// slot 2 gets one
+// and the leading slot (the heaviest here) holds every position at the top of pass 1
+// before the next slot gets one
 const heavyLead = numbers.slice(0, MAX_WEIGHT)
 assert(
   heavyLead.every((n) => HEAVY_MODELS.includes(SLOT_MODELS[n - 1])),
   `the first ${MAX_WEIGHT} spawns must all be the heaviest slot, got ${seq(calls)}`,
 )
-// collecting twice its weight takes a whole rotation of turns, so a slot can only
-// reach its ceiling on the second pass -- and then it stands at exactly that
+// collecting twice its weight takes both passes, so a slot can only reach its
+// absolute cap on the second pass -- and then it stands at exactly that
 for (const [j, slot] of SHIPPED.entries()) {
   assert(
     (countsByModel(numbers.slice(0, CAPACITY)).get(slot.model) ?? 0) === CEILINGS[j],
@@ -169,22 +165,9 @@ assert(
   `every spawn must be accounted for, got ${seq(calls)}`,
 )
 
-// 2. releasing a claim on a slot hands routing straight back to it: it drops under
-//    its ceiling again, and the cursor is still pointing at that slot's next position
-//    in the run, so the spawn that frees the capacity is the one that gets it back.
-//    The slot is read off the run rather than assumed to be a particular number.
-const heaviestSlot = slotNum(calls[0])
-const heaviestCall = calls.map((v, i) => [slotNum(v), `c${i + 1}`]).filter(([n, id]) => n === heaviestSlot && live.has(id)).pop()[1]
-await releaseCall(heaviestCall)
-const afterRelease = slotNum(await a.spawn("r1", "explore"))
-assert(
-  afterRelease === heaviestSlot,
-  `releasing a claim on slot ${heaviestSlot} (weight ${SHIPPED[heaviestSlot - 1].weight}) must hand routing back to it, got slot ${afterRelease}`,
-)
-
-// 3. releasing the busiest claim hands that slot the next spawn: the freed position in
-//    the run is the next one the cursor reaches. Read the busiest slot off pool_status
-//    rather than assuming which slot the run put on top.
+// The next pick under the two-pass ordered fill, read off live loads: the first slot
+// below its weight (pass 1), else the first below its absolute cap (pass 2), else the
+// least-loaded slot.
 const loads = async () => {
   const m = new Map()
   for (const line of (await a.status()).split("\n")) {
@@ -193,6 +176,40 @@ const loads = async () => {
   }
   return m
 }
+const expectedNext = (byLoad) => {
+  for (let j = 0; j < SLOT_MODELS.length; j++) {
+    if (byLoad.get(SLOT_MODELS[j]) < SHIPPED[j].weight) return j + 1
+  }
+  for (let j = 0; j < SLOT_MODELS.length; j++) {
+    if (byLoad.get(SLOT_MODELS[j]) < CEILINGS[j]) return j + 1
+  }
+  return SLOT_MODELS.reduce(
+    (best, model, j) => (byLoad.get(model) < byLoad.get(SLOT_MODELS[best - 1]) ? j + 1 : best),
+    1,
+  )
+}
+
+// 2. releasing a claim reopens its slot immediately. The next spawn takes the
+//    lowest-index slot below its current pass target, which after the burst is the
+//    released slot itself because every slot is at its absolute cap.
+const heaviestSlot = slotNum(calls[0])
+const heaviestCall = calls.map((v, i) => [slotNum(v), `c${i + 1}`]).filter(([n, id]) => n === heaviestSlot && live.has(id)).pop()[1]
+await releaseCall(heaviestCall)
+const expectedAfterRelease = expectedNext(await loads())
+assert(
+  expectedAfterRelease === heaviestSlot,
+  `the released slot ${heaviestSlot} must be the lowest-index slot below its absolute cap, got ${expectedAfterRelease}`,
+)
+const afterRelease = slotNum(await a.spawn("r1", "explore"))
+assert(
+  afterRelease === expectedAfterRelease,
+  `releasing a claim on slot ${heaviestSlot} (weight ${SHIPPED[heaviestSlot - 1].weight}) must hand routing to the lowest-index slot below its current pass target, got slot ${afterRelease}`,
+)
+live.add("r1")
+
+// 3. the same rule decides the next spawn after the busiest slot is freed: read the
+//    busiest slot off pool_status, release one live claim on it, and let the two-pass
+//    order pick the lowest-index slot below its target.
 const byLoad = await loads()
 const busiestSlot = SLOT_MODELS.findIndex((model) => byLoad.get(model) === Math.max(...byLoad.values())) + 1
 const busiestCall = calls
@@ -200,11 +217,13 @@ const busiestCall = calls
   .filter(([n, id]) => n === busiestSlot && live.has(id))
   .pop()[1]
 await releaseCall(busiestCall)
+const expectedAfterFree = expectedNext(await loads())
 const afterFree = slotNum(await a.spawn("r2", "explore"))
 assert(
-  afterFree === busiestSlot,
-  `the slot whose claim was released should be refilled first, got slot ${afterFree} instead of the freed ${busiestSlot}`,
+  afterFree === expectedAfterFree,
+  `the lowest-index slot below its current pass target should be refilled first, got slot ${afterFree} instead of ${expectedAfterFree}`,
 )
+live.add("r2")
 const back = [await a.spawn("r3", "explore"), await a.spawn("r4", "explore"), await a.spawn("r5", "explore")]
 assert(
   back.every((v) => new RegExp(`^explore-[1-${SLOT_MODELS.length}]$`).test(v)),
@@ -227,50 +246,59 @@ assert(/across 1 process\(es\)/.test(statusOut), "solo process should report one
 const dir3 = mkdtempSync(join(tmpdir(), "agent-pool-share-"))
 const x = await make("proc-x", dir3)
 const y = await make("proc-y", dir3)
-// Enough spawns to walk every slot's positions in the run -- one full rotation, each
-// heavy slot's whole share -- so the first process reaches every slot before the second
-// one starts, and the two together stand the pool at exactly its summed ceilings. That
-// is the depth this wants: a deeper burst would say LESS, because past the summed
-// ceilings the overflow levels the loads and a heavy slot stops out-holding a light
-// one. Scales with the slot count: a fixed literal only covered the four-slot pool.
-const xCalls = []
-for (let i = 1; i <= ROTATION; i++) xCalls.push(await x.spawn(`x${i}`, "explore"))
-const xNums = xCalls.map(slotNum)
+// x takes the first slot to its weight and then starts the second slot: those live
+// claims are what y must see.
+const FIRST_X = SHIPPED[0].weight + 1
+const xFirst = []
+for (let i = 1; i <= FIRST_X; i++) xFirst.push(await x.spawn(`x${i}`, "explore"))
 assert(
-  new Set(xNums).size === SLOT_MODELS.length,
-  `first process should reach all ${SLOT_MODELS.length} slots, got ${seq(xCalls)}`,
+  xFirst.map(slotNum).join(",") === RUN.slice(0, FIRST_X).join(","),
+  `the first process should fill pass 1 in declaration order through the second slot, got ${seq(xFirst)}`,
 )
-const yCalls = []
-for (let i = 1; i <= ROTATION; i++) yCalls.push(await y.spawn(`y${i}`, "explore"))
-// Both processes route over one shared run, each advancing the cursor the other one
-// reads and seeing the other's claims in the shared dir. Which slot y starts on
-// depends on x's residual load, so the load check below is what proves sharing; here
-// only that every pick is a declared slot.
+// From a cold start y would also take slot 1; seeing x's live claim that fills slot 1
+// to its weight, y must move to the first slot still below its weight.
+const xFirstTally = countsByModel(xFirst.map(slotNum))
+const expectedY = SHIPPED.findIndex((slot) => (xFirstTally.get(slot.model) ?? 0) < slot.weight) + 1
+assert(expectedY !== 1, "the first process must fill slot 1 so the second cannot start there")
+const yFirst = await y.spawn("y1", "explore")
 assert(
-  [...xCalls, ...yCalls].every((c) => /^explore-\d+$/.test(c)),
-  `routing must stay in the pool, got ${[...xCalls, ...yCalls].join(",")}`,
+  slotNum(yFirst) === expectedY,
+  `the second process must see the first process's live claims and route to the first slot below its weight (slot ${expectedY}), got ${yFirst}`,
+)
+// Finish both processes at one full pass each: seven claims apiece, spread over the
+// declaration order.
+const xCalls = [...xFirst]
+for (let i = FIRST_X + 1; i <= PASS_SIZE; i++) xCalls.push(await x.spawn(`x${i}`, "explore"))
+const yCalls = [yFirst]
+for (let i = 2; i <= PASS_SIZE; i++) yCalls.push(await y.spawn(`y${i}`, "explore"))
+const allCalls = [...xCalls, ...yCalls]
+assert(
+  new Set(allCalls.map(slotNum)).size === SLOT_MODELS.length,
+  `both processes together should reach all ${SLOT_MODELS.length} slots, got ${seq(allCalls)}`,
+)
+assert(
+  allCalls.every((c) => /^explore-\d+$/.test(c)),
+  `routing must stay in the pool, got ${allCalls.join(",")}`,
 )
 const crossStatus = await x.status()
 const loadOf = (model) => {
   const line = crossStatus.split("\n").find((l) => l.includes(model))
   return line ? Number(/load=(\d+)/.exec(line)[1]) : NaN
 }
-// The spawns are spread over the weights, so the invariants are what hold for any
-// slot count: every claim is visible to both processes, slots of equal weight stay
-// load-balanced among themselves, and the heaviest slots hold more than the
-// lightest. Which slot is 1 is presets/free-tier.json's business.
+// Every claim x holds is visible to y. The two passes together stand each slot at
+// twice its weight, so equal-weight slots stay load-balanced, and the heaviest slot
+// holds more than the lightest. Which slot is 1 is presets/free-tier.json's business.
 const loadList = SLOT_MODELS.map(loadOf)
 
 const report = SHIPPED.map((s, i) => `${s.model}(w${s.weight})=${loadList[i]}`).join(" ")
 const heavyLoads = HEAVY_MODELS.map(loadOf)
 const lightLoads = LIGHT_MODELS.map(loadOf)
 assert(
-  loadList.reduce((a, b) => a + b, 0) === 2 * ROTATION,
-  `all ${2 * ROTATION} claims must be shared, got ${report}`,
+  loadList.reduce((a, b) => a + b, 0) === 2 * PASS_SIZE,
+  `all ${2 * PASS_SIZE} claims must be shared, got ${report}`,
 )
-// Slots of the same weight hold the same number of positions in the run, so they take
-// the same number of turns: loads stay within one of each other, equal when the group
-// is an even size, off by one otherwise.
+// Slots of the same weight hold the same number of claims after both passes, so their
+// loads stay within one of each other.
 const spread = (xs) => Math.max(...xs) - Math.min(...xs)
 assert(spread(heavyLoads) <= 1, `the heaviest slots must stay load-balanced, got ${report}`)
 assert(spread(lightLoads) <= 1, `the lightest slots must stay load-balanced, got ${report}`)
@@ -280,12 +308,12 @@ assert(
 )
 assert(/across 2 process\(es\)/.test(crossStatus), "status should count both processes")
 assert(
-  new RegExp(`proc-x \\(this process\\): ${ROTATION} claim\\(s\\)`).test(crossStatus) &&
-    new RegExp(`proc-y: ${ROTATION} claim\\(s\\)`).test(crossStatus),
+  new RegExp(`proc-x \\(this process\\): ${PASS_SIZE} claim\\(s\\)`).test(crossStatus) &&
+    new RegExp(`proc-y: ${PASS_SIZE} claim\\(s\\)`).test(crossStatus),
   "status should break load down per process",
 )
 await x.finish("x1")
-const afterOneRelease = ROTATION - 1
+const afterOneRelease = PASS_SIZE - 1
 assert(
   new RegExp(`proc-x \\(this process\\): ${afterOneRelease} claim\\(s\\)`).test(await x.status()),
   "release in one process must be visible to itself",
@@ -295,7 +323,7 @@ assert(
   "release in one process must be visible to the other process",
 )
 assert(
-  new RegExp(`proc-y \\(this process\\): ${ROTATION} claim\\(s\\)`).test(await y.status()),
+  new RegExp(`proc-y \\(this process\\): ${PASS_SIZE} claim\\(s\\)`).test(await y.status()),
   "a peer release must not disturb this process's own count",
 )
 
@@ -324,11 +352,11 @@ const realNow = Date.now
 Date.now = () => realNow() + 11 * 60 * 1000
 const afterTtl = await a.spawn("t1", "explore")
 Date.now = realNow
-// Everything has aged out, so the pool is idle again and the run resumes from where
-// the cursor was left, which for this preset is the heaviest slot
+// Everything has aged out, so the pool is idle again and routing restarts at the first
+// slot in declaration order.
 assert(
-  HEAVY_MODELS.includes(SLOT_MODELS[slotNum(afterTtl) - 1]),
-  `TTL should empty the pool, got ${afterTtl}`,
+  slotNum(afterTtl) === 1,
+  `TTL should empty the pool and restart routing at slot 1, got ${afterTtl}`,
 )
 
 // 9. untouched: non-task tool, non-pool spawn, malformed args
@@ -339,23 +367,36 @@ assert((await a.spawn("x2", "build")) === "build", "non-pool spawn must not be r
 await a.hooks["tool.execute.before"]({ tool: "task", sessionID: "s1", callID: "x5" }, {})
 await a.finish("nonexistent")
 
-// 9b. a slot variant named by hand is REFUSED, not counted and not rewritten.
-//     Naming one is how a caller reaches a provider without asking the pool, and
-//     counting it was never enough: it evades the ceiling, which is the number
-//     that bounds the damage. The refusal must also escape the routing catch --
-//     swallowed into "spawn unchanged" it would admit the spawn it forbids.
-let refused = null
+// 9b. a slot variant named by hand is COERCED to its base, routed through the
+//     pool, and acquires a claim -- not refused. Naming one is how a caller
+//     would try to pick a provider and skip the ordered fill; the pool rewrites
+//     it to the bare base so routing and the absolute cap still own slot choice.
+const state9b = pool.state({ id: "solo", dir: dir1, modelsFile: PRESET })
+const before9b = logs.length
+let thrown9b = null
+const out9b = { args: { subagent_type: "explore-2", prompt: "x" } }
 try {
-  await a.spawn("x3", "explore-2")
+  await a.hooks["tool.execute.before"]({ tool: "task", sessionID: "s1", callID: "x3" }, out9b)
 } catch (error) {
-  refused = String(error?.message ?? error)
+  thrown9b = error
 }
-assert(refused !== null, "naming a slot variant must be refused outright")
-assert(refused.includes('Spawn "explore"'), `the refusal must name the bare base to use, got: ${refused}`)
+assert(thrown9b === null, "naming a slot variant must not throw")
 assert(
-  !/\/(usr|etc|bin)/.test(refused),
-  `the refusal must be a message, not a path leak: ${refused}`,
+  /^explore-[1-4]$/.test(out9b.args.subagent_type),
+  `naming a slot variant must be coerced and routed to a real pool variant, got: ${out9b.args.subagent_type}`,
 )
+const claim9b = state9b.own.get(pool.claimKey("s1", "x3"))
+assert(claim9b, "a coerced spawn must acquire a claim")
+assert(claim9b.v === "explore", `the claim must be for the base "explore", got: ${claim9b.v}`)
+assert(
+  Number.isInteger(claim9b.k) && claim9b.k >= 1 && claim9b.k <= SLOT_MODELS.length,
+  `the claim must carry a valid slot, got: ${claim9b.k}`,
+)
+const rewriteLogs9b = logs.slice(before9b).filter((l) => l.startsWith("warn") && l.includes("rewrote a hand-named pool slot"))
+assert(rewriteLogs9b.length > 0, "the coercion must be logged as a warning")
+for (const l of rewriteLogs9b) {
+  assert(!l.includes("explore-2"), `the rewrite warning must not contain the coerced variant name, got: ${l}`)
+}
 
 // 10. config invariants: every pooled base has one hidden variant per slot in
 //     presets/free-tier.json, each running that slot's model -- and none of them
@@ -445,7 +486,7 @@ for (const base of ["explore", "implement", "context"]) {
 
 // 11. every pool model is free (0/0 cost) per the vendored models.dev snapshot.
 //     Refreshing it is part of changing the pool: the snapshot is the record of
-//     what each model cost when it was picked, and a model missing from it has not
+//     what each model cost when picked, and a model missing from it has not
 //     been checked at all. Regenerate with the helper, which reads the current
 //     presets/free-tier.json so nothing has to be listed twice:
 //       node tests/refresh-models-snapshot.mjs

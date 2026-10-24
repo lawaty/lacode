@@ -15,11 +15,7 @@ line. Criteria that cannot be observed without a running server are not in this
 document; everything here is testable offline with a stub client and a
 `mkdtempSync` state directory.
 
-**Terminology.** A *slot* is one entry in `presets/free-tier.json`, carrying a
-model and a `weight`. A *base* is a pooled agent type (`explore`), and its slot
-holders are `<base>-<slot>`, hidden in `opencode.jsonc`. A *claim* is a running
-spawn recorded in `claims.<pid>.json`. A *context map* is the five-file
-`.opencode/context/` codemap described in Epic G.
+**Terminology.** A *slot* is one entry in `presets/free-tier.json`, carrying a model and a `weight`. A slot's `weight` is its active-session budget for one pass: the number of concurrent claims it may hold before the next slot is preferred. A *pass* is one declaration-order sweep of the slot list; the pool runs at most two passes, and a slot's absolute cap is twice its weight. Preference is by declaration order, never by weight. A *base* is a pooled agent type (`explore`), and its slot holders are `<base>-<slot>`, hidden in `opencode.jsonc`. A *claim* is a running spawn recorded in `claims.<pid>.json`. A *context map* is the five-file `.opencode/context/` codemap described in Epic G.
 
 ---
 
@@ -96,16 +92,18 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given every model is cooling, When a spawn is routed, Then the least-loaded slot is chosen anyway (degrade, never block).
 - [ ] Given a limit error names a reset time, When the cooldown is recorded, Then the stated reset is used instead of a guessed backoff.
 
-### US-5: Weighted round-robin gives every slot a turn per cycle
-**As a** user, **I want** weights to say how many turns each slot takes per rotation cycle, **so that** no provider is drained to its limit while the others sit idle.
+### US-5: Slots fill in declaration order, in up to two passes
+**As a** user, **I want** work to prefer the first slot and spill to later slots only when the earlier ones are full, **so that** a healthy preferred model is used before fallbacks and no slot is used while an earlier usable slot has room.
 
 **Story ID(s) for tests:** US-5
 **Acceptance criteria:**
-- [ ] Given a heavy slot and a light slot, When spawns are routed below both ceilings, Then the rotation walks the list in order with each slot taking as many consecutive turns as its weight says, rather than the heavy slot being filled and refilled first.
-- [ ] Given a slot is at its ceiling (twice its weight) or cooling, When its turn comes up in the rotation, Then the turn is skipped and the rotation resumes at the following turn.
-- [ ] Given every slot is at its ceiling, When another spawn is routed, Then it goes to the least-loaded slot as overflow.
-- [ ] Given all slots carry equal weight, When spawns are routed, Then the picks round-robin in declaration order.
-- [ ] Given per-slot load is read, When it is asserted, Then a slot's load never exceeds its ceiling (twice its weight) except by overflow.
+- [ ] Given live claims, When the pool has room in the first pass, Then the lowest-index usable slot whose load is below its weight is chosen, and a slot declared later is not used until every earlier usable slot has reached its weight.
+- [ ] Given every usable slot has reached its weight, When another spawn is routed, Then the second pass begins at the lowest-index slot and fills each usable slot up to twice its weight.
+- [ ] Given a slot is cooling or unavailable, When its position in the pass comes up, Then it is skipped and the pass continues to the next slot.
+- [ ] Given a claim is released, When the next spawn is routed, Then the slot that freed capacity is preferred again in declaration order; no stored position keeps it waiting.
+- [ ] Given every usable slot is at its absolute cap, When another spawn is routed, Then it goes to the least-loaded usable slot as overflow, and the pool never refuses work.
+- [ ] Given all slots carry equal weight, When spawns are routed, Then the same ordered two-pass fill applies.
+- [ ] Given per-slot load is read, When it is asserted, Then a slot's load never exceeds twice its weight except through overflow.
 
 ### US-6: Live pool visibility
 **As a** user, **I want** to see per-slot load and which model is cooling and why, **so that** I understand where my subagents are going.
@@ -115,7 +113,8 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given claims are held by several processes, When the status view is requested, Then it shows every process's claims and the aggregate load per slot.
 - [ ] Given a model is cooling with a stated reason, When the status view is requested, Then the model is listed as cooling together with that reason.
 - [ ] Given a claim file is older than the dead-file threshold, When the status view is computed, Then the stale claim is pruned rather than counted.
-- [ ] Given a slot is at its ceiling, When the status view is requested, Then it is not marked as the slot the next spawn would take, because the rotation's turns are skipped for a full slot until it frees a claim — unless no other slot is available and under its ceiling, in which case that full slot is the next one.
+- [ ] Given a slot is at its absolute cap, When the status view is requested, Then it is not marked as the slot the next spawn would take while any usable slot is below its current pass target; when every usable slot is at its absolute cap, the least-loaded slot is marked next.
+- [ ] Given the pool is filling, When the status view is requested, Then it shows whether the next spawn belongs to the first pass, the second pass, or overflow.
 
 ### US-7: Non-free models still work
 **As a** user who wants a paid model in the pool, **I want** to supply any model list, **so that** the pool is not restricted to free tiers.
@@ -320,7 +319,7 @@ The popup belongs to its session: working in one chat closes that chat's popup a
 - [ ] Given a body containing `"`, `'`, `;`, `$(…)` or backticks, When the macOS send runs, Then it reaches `display notification` byte-for-byte as data and nothing is executed.
 - [ ] Given a machine has no notifier for its platform, When a notification is sent, Then the result is a failed delivery with a reason and no exception, and `lacode doctor` names the channel that would run — or reports that there is none — instead of reporting a binary that is not used there.
 - [ ] Given the CLI runs on macOS, When the send does not complete, Then it is still bounded by a timeout, exactly as on Linux.
-- [ ] Given the notification hop, When it is documented, Then the doc leads with the shipped path — the npm-installed plugin, a direct ssh hop (`ControlMaster`) set up by `lacode tunnel setup`, and the portable `lacode receive` forced command that delivers through the platform channel (`notify-send` or `osascript`) — and marks the reverse-forward scripts (`bin/oc`, `bin/oc-notify`, `bin/oc-notify-receiver`, `bin/oc-sync`) as the author's legacy tooling, so a Mac user is not sent to debug a script that was never meant to run on their machine.
+- [ ] Given the notification hop, When it is documented, Then the doc leads with the shipped path — the npm-installed plugin, a direct ssh hop (`ControlMaster`) set up by `lacode tunnel setup`, and the portable `lacode receive` forced command that delivers through the platform channel (`notify-send` or `osascript`) — and marks the reverse-forward scripts (`bin/oc`, `bin/oc-notify`, `bin/oc-notify-receiver`, `bin/oc-sync`) as the author's own scripts, so a Mac user is not sent to debug a script that was never meant to run on their machine.
 - [ ] Given a machine without GNU `timeout` or with bash older than 4.0, When `bin/oc-sync` runs, Then it refuses **before** touching anything, names each missing prerequisite, and names the `lacode` subcommand to use instead. It must never report a misleading cause: the host list is read with `mapfile`, so without it the run dies at "no hosts configured" — a confident wrong answer that sends the reader to edit `.env`.
 - [ ] Given `bin/oc-notify-receiver` runs where `notify-send` does not exist, When it is invoked, Then it exits non-zero and names both the missing channel and the portable path, because its stderr reaches whoever opened the ssh connection and nobody else, and a bare "command not found" reads as a desktop that quietly stopped notifying.
 - [ ] Given the payload is parsed, When the receiver splits `$SSH_ORIGINAL_COMMAND`, Then it splits on newlines only using constructs that exist in bash 3.2 as well as bash 5, and the suite **proves the split by running the receiver** rather than by finding the word `mapfile` in the file. Under bash 3.2 — the version macOS ships — a bash-4-only builtin leaves every field at its default, so the popup says "LaCode" with an empty body and no error anywhere: the same silent blank notification the argv bug causes, reached through a different door.
@@ -511,8 +510,8 @@ table was filled in.
 | US-3 | A | `tests/stories/a-cost-control.test.mjs` (harness: `tests/benchmark/run.mjs`) |
 | US-23 | A | `tests/stories/a-cost-control.test.mjs` |
 | US-4 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/pool-limits-test.mjs` |
-| US-5 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/pool-test.mjs`, `tests/pool-models-test.mjs` |
-| US-6 | B | `tests/stories/b-provider-resilience.test.mjs` |
+| US-5 | B | `tests/stories/b-slot-fill.test.mjs`, `tests/stories/b-provider-resilience.test.mjs`, `tests/pool-test.mjs`, `tests/pool-models-test.mjs` |
+| US-6 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/stories/b-slot-fill.test.mjs` |
 | US-7 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/pool-models-test.mjs` |
 | US-28 | B | `tests/stories/i-omniroute.test.mjs` |
 | US-31 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/stories/c-hang-recovery.test.mjs` |

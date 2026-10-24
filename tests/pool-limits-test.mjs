@@ -36,13 +36,22 @@ const escape = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")
 const FOREIGN = { provider: "fixture-provider", modelID: "fixture-model" }
 
 const logs = []
-const client = { app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) } }
 let aborted = []
 const realFetch = globalThis.fetch
 globalThis.fetch = async (url) => {
   const m = /\/session\/([^/]+)\/abort/.exec(String(url))
   if (m) aborted.push(m[1])
   return new Response("true", { status: 200 })
+}
+const client = {
+  app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) },
+  session: {
+    abort: async ({ path }) => {
+      const res = await fetch(`http://localhost/session/${path.id}/abort`, { method: "POST" })
+      const text = (await res.text()).trim()
+      return { data: text === "true" ? true : text === "false" ? false : undefined, response: res, error: undefined, request: undefined }
+    },
+  },
 }
 
 const { agentPoolHooks: AgentPool } = await import(PLUGIN)
@@ -406,6 +415,39 @@ const dirB = scratch()
   })
   assert(aborted.length === before, `an unrelated session's limit must not abort a claim, got ${JSON.stringify(aborted.slice(before))}`)
   assert(readFileSync(join(dir, "claims.p17.json"), "utf8") !== "{}", "the unrelated error must leave the claim in flight")
+}
+
+// 18b. when abort returns HTTP 401, the claim must be held for retry (not released),
+//     the abort must be attempted, the model must still cool, and logs must say "held for retry"
+{
+  const dir = scratch()
+  const q2 = await mk("p18b", dir)
+  const baseline = await q2.spawn("q1")
+  const slot = SLOTS[Number(/-(\d+)$/.exec(baseline)[1]) - 1]
+  await q2.hooks.event({ event: { type: "session.created", properties: { info: { id: "child-q2", parentID: "s1" } } } })
+  const before = aborted.length
+  const realFetch401 = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    const m = /\/session\/([^/]+)\/abort/.exec(String(url))
+    if (m) aborted.push(m[1])
+    return new Response("unauthorized", { status: 401 })
+  }
+  await q2.hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { role: "assistant", sessionID: "child-q2", providerID: slot.provider, modelID: slot.modelID, error: rateError("Rate limit exceeded") },
+      },
+    },
+  })
+  globalThis.fetch = realFetch401
+  assert(
+    aborted.length === before + 1 && aborted.at(-1) === "child-q2",
+    `a limit on a claimed session must attempt the abort even if it fails, got ${JSON.stringify(aborted.slice(before))}`,
+  )
+  assert(readFileSync(join(dir, "claims.p18b.json"), "utf8") !== "{}", "the claim must be held for retry when abort fails")
+  assert(logs.some((l) => l.includes("held for retry")), `must log held for retry, got ${logs.slice(-5).join(" | ")}`)
+  assert(/COOLING/.test(await q2.status()), "the model must still cool on limit")
 }
 
 // 18. the limit MATCHER and the limit NAMES must agree. isLimitText() decides

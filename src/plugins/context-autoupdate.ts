@@ -75,9 +75,9 @@ const NO_BULK_READS = [
 const toPosix = (value: string) => value.split(path.sep).join("/")
 
 // The author's opencode.jsonc is the only place the one-writer permission rule
-// can live, and this module no longer sits next to it (it lives in src/plugins/,
-// one directory deeper, and in an installed package there is no opencode.jsonc at
-// all). So walk up from here rather than assuming "..": repo checkout
+// can live, and this module lives in src/plugins/ (one directory deeper; in an
+// installed package there is no opencode.jsonc at all). So walk up from here
+// rather than assuming "..": repo checkout
 // (src/plugins -> repo root) is found in one step, an installed package finds
 // nothing in three and verifyWriterRule returns undefined, which is the correct
 // answer for a user who has no config of their own.
@@ -175,8 +175,8 @@ const retireSession = async (
 
     // The delete is the whole point of this function: without it the session
     // stays in the user's list. It is VERIFIED rather than assumed, because a
-    // delete that fails used to be swallowed and left an empty entry behind
-    // that the user could open and find nothing in.
+    // failed delete is reported, not swallowed, and would otherwise leave an
+    // empty entry behind that the user could open and find nothing in.
     //
     // The session is read back rather than trusting the delete's return value,
     // because what matters is whether the row is gone, not what the endpoint
@@ -329,7 +329,7 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           "",
           NO_BULK_READS,
           "",
-          'Follow the incremental-update procedure in your system prompt. Update a context file only if this work introduced or revealed information that will materially help future agents: a new boundary or module, a new or moved canonical entry point, a changed workflow, a new convention, an architectural decision, a new dependency between subsystems, a renamed or moved subsystem, or a previously undocumented invariant. Do not edit documentation merely because source files changed. If nothing material changed, make no edits and report "no update needed". Also keep `.opencode/context/active.md` current: record work that is in flight, and mark a task finished — with the date it finished — when it is.',
+          'Follow the incremental-update procedure in your system prompt. Update a context file only if this work introduced or revealed information that will materially help future agents: a new boundary or module, a new or moved canonical entry point, a changed workflow, a new convention, an architectural decision, a new dependency between subsystems, a renamed or moved subsystem, or an invariant not yet recorded. Do not edit documentation merely because source files changed. If nothing material changed, make no edits and report "no update needed". Also keep `.opencode/context/active.md` current: record work that is in flight, and mark a task finished — with the date it finished — when it is.',
         ].join("\n")
 
   return {
@@ -421,9 +421,10 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
         let started: Promise<unknown>
         // From here the session EXISTS and the user can see it in their list.
         // Everything that follows must end in retiring it, or an empty session
-        // is left behind forever: anything that threw between the create and
-        // the prompt used to strand one, and a stranded session opens as an
-        // empty entry with nothing in it. See retireSession for why the
+        // is left behind forever: a throw between the create and the prompt
+        // strands one, and a stranded session opens as an empty entry with
+        // nothing in it. Retirement covers the whole gap, so the prompt does
+        // not strand a session. See retireSession for why the
         // cartographer cannot simply be nested away instead.
         try {
           pool.acquire(state, "context", slot, target, claimKey, target)

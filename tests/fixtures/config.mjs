@@ -1,12 +1,10 @@
 // Self-contained config for the pool suites.
 //
-// WHY THIS EXISTS: the author's personal `opencode.jsonc` used to
-// live in this repo, and the pool tests read it directly. When the package moved
-// out of `~/.config/opencode`, that file stayed behind with the author, so the
-// tests read a path that only exists on one machine and broke for every consumer
-// and on every fresh checkout.
+// WHY THIS EXISTS: the pool tests need a self-contained config. The author's
+// personal `opencode.jsonc` is not in this repo, so reading it directly breaks
+// for every consumer and on every fresh checkout.
 //
-// The package no longer ships an `opencode.jsonc` at all: `src/index.ts` injects
+// The package does not ship an `opencode.jsonc` at all: `src/index.ts` injects
 // its agent set (`src/agents.ts` `buildAgentSet()`) into whatever config the user
 // has. So the honest, self-contained stand-in for "the config the pool binds
 // into" is exactly that injected set, laid over a minimal provider block --

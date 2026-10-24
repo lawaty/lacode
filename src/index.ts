@@ -82,6 +82,9 @@ import { PACKAGE_ROOT } from "./lib/package-root.ts"
 import { readInstalledVersion } from "./lib/selfupdate.ts"
 import { agentPoolHooks } from "./plugins/agent-pool.ts"
 import { contextAutoUpdateHooks } from "./plugins/context-autoupdate.ts"
+import type { ImagePasteOptions } from "./plugins/image-paste.ts"
+import { imagePasteHooks } from "./plugins/image-paste.ts"
+import { scrubSlotNames } from "./lib/prompt-guard.ts"
 import { notifyHooks } from "./plugins/notify.ts"
 import { omniRouteHooks } from "./plugins/omniroute.ts"
 import { selfUpdateHooks } from "./plugins/selfupdate.ts"
@@ -95,6 +98,7 @@ export type LacodeOptions = {
   dir?: string
   modelsFile?: string
   selfUpdate?: boolean
+  imagePaste?: ImagePasteOptions
   [key: string]: unknown
 }
 
@@ -105,6 +109,8 @@ const inertHooks: Hooks = {
   dispose: async () => {},
 }
 
+let promptDriftWarned = false
+
 const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   const opts = (options ?? {}) as LacodeOptions
 
@@ -112,6 +118,12 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
 
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
     input.client.app.log({ body: { service: "lacode", level, message, extra } }).catch(() => {})
+
+  const warnPromptDrift = async () => {
+    if (promptDriftWarned) return
+    promptDriftWarned = true
+    await log("warn", "a system prompt named a pool slot variant; stripped it before the model saw it. Remove the literal from the prompt source.")
+  }
 
   // WHY THIS LINE EXISTS: nothing in this plugin hot-reloads -- an opencode
   // process keeps the code it started with -- so this line's own timestamp IS
@@ -145,6 +157,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   const notifier = (await settled("notify", () => notifyHooks(input, options))) ?? inertHooks
   const selfupdate = (await settled("self-update", () => selfUpdateHooks(input, options))) ?? inertHooks
   const omniroute = (await settled("omniroute", () => omniRouteHooks(input, options))) ?? inertHooks
+  const imagepaste = (await settled("image-paste", () => imagePasteHooks(input, opts.imagePaste as PluginOptions | undefined))) ?? inertHooks
 
   // Order is the whole design: the pool must see variant agents that already
   // exist, and the agent set must exist before the pool writes models into it.
@@ -187,12 +200,30 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
     "tool.execute.before": pool["tool.execute.before"],
     "tool.execute.after": pool["tool.execute.after"],
     tool: pool.tool,
+    "command.execute.before": imagepaste["command.execute.before"],
     dispose: async () => {
       await pool.dispose?.()
       await autoupdate.dispose?.()
       await notifier.dispose?.()
       await selfupdate.dispose?.()
       await omniroute.dispose?.()
+      await imagepaste.dispose?.()
+    },
+    "experimental.chat.system.transform": async (_input, output) => {
+      if (!Array.isArray(output?.system)) return
+      let changed = false
+      for (let i = 0; i < output.system.length; i++) {
+        const text = output.system[i]
+        if (typeof text !== "string") continue
+        const scrubbed = scrubSlotNames(text)
+        if (scrubbed !== text) {
+          output.system[i] = scrubbed
+          changed = true
+        }
+      }
+      if (changed) {
+        await warnPromptDrift()
+      }
     },
   } satisfies Hooks
 }) satisfies Plugin

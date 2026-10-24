@@ -49,7 +49,16 @@ Date.now = () => REAL + clock
 
 const mk = async (id, dir) => {
   const logs = []
-  const client = { app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) } }
+  const client = {
+    app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) },
+    session: {
+      abort: async ({ path }) => {
+        const res = await fetch(`http://localhost/session/${path.id}/abort`, { method: "POST" })
+        const text = (await res.text()).trim()
+        return { data: text === "true" ? true : text === "false" ? false : undefined, response: res, error: undefined, request: undefined }
+      },
+    },
+  }
   const hooks = await AgentPool({ client, serverUrl: new URL("http://127.0.0.1:59999") }, { id, dir })
   await hooks.config(cfg)
   return {

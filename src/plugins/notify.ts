@@ -9,12 +9,15 @@ import {
   PERMISSION_REPLIES,
   REQUEST_ID_ENV,
   Notifier,
+  claimCompletion,
   claimNotification,
   errorDetail,
   helperArgv,
   isUnrecognizedError,
+  markCompletion,
   permissionHeadline,
   questionHeadline,
+  releaseCompletion,
   releaseNotificationClaim,
   shouldNotify,
   type Outcome,
@@ -77,8 +80,8 @@ import { PACKAGE_ROOT } from "../lib/pool.ts"
 // over the ssh tunnel -- so it is asked to close and it closes there. One code
 // path, two topologies.
 //
-// ONE POPUP PER SESSION PER KIND, because the same thing used to arrive
-// twice. Two independent causes, both real:
+// ONE POPUP PER SESSION PER KIND: duplicate popups have two independent causes,
+// both real:
 //
 //   * opencode raises ONE `permission.asked` per pattern it wants, and they
 //     arrive together -- four file reads inside 300ms. A popup per request is
@@ -177,7 +180,7 @@ const SOUND_OFF_VALUES = ["0", "false", "off", "no"]
 //   2. ~/bin/lacode or ~/bin/oc-notify -- what a hand-made install puts on PATH
 //   3. the package's own bin/ -- the author's checkout, where bin/oc-notify exists
 //   4. dist/lacode.js -- the BUILT cli, which is all an npm install ships. The
-//      shipped package no longer carries the TypeScript sources, so pointing at
+//      shipped package carries compiled dist/, not TypeScript sources, so pointing at
 //      the package's bin/lacode there would hand a broken helper to every
 //      consumer: found, spawned, and dead on arrival with node refusing to strip
 //      types under node_modules. The built CLI is the same program with the
@@ -819,7 +822,19 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         void log("debug", "suppressed: cooldown", { sessionID })
         return
       }
-      // The cross-process claim.
+      // Cross-process dedupe. Two mechanisms, chosen by outcome:
+      //
+      //   * done: a per-session completion marker held until the session goes
+      //     busy again (a new turn) or is deleted. It is a marker, not a lock:
+      //     any existing file suppresses, whatever pid it names and however old
+      //     it is, so a repeat done and the done that follows an error in the
+      //     same turn both stay quiet.
+      //   * error: keeps the original 5 s cross-process claim (every distinct
+      //     error announces; the claim's same-pid "ours" exemption is why two
+      //     errors in one process both notify), and overwrites the completion
+      //     marker so a following done stays quiet.
+      //   * question / permission: the original 5 s claim, because a blocked
+      //     session must announce promptly.
       //
       // opencode publishes its events through a shared store, so EVERY
       // opencode process on this machine that has this plugin loaded sees the
@@ -827,16 +842,25 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       // the identical popup twice, seconds apart. The cooldown above cannot
       // catch that -- it is per process.
       //
-      // The claim is the one-winner file that says "this process is the one
-      // raising it". It is taken AFTER the cooldown and BEFORE the popup is
-      // recorded and delivered: a process that lost the claim must not record
-      // a popup it never raised, and must not deliver one.
+      // The claim/marker is taken AFTER the cooldown and BEFORE the popup is
+      // recorded and delivered: a process that lost it must not record a popup
+      // it never raised, and must not deliver one.
       //
-      // Our own claim never changes our own behaviour, so a single process
-      // does exactly what it did before.
-      if (!claimNotification(sessionID, kind)) {
+      // Our own claim never changes our own behaviour for question/permission,
+      // so a single process does exactly what it did before for those. The done
+      // marker is different: it deliberately suppresses a same-process repeat.
+      if (outcome === "done") {
+        if (!claimCompletion(sessionID, "done")) {
+          void log("debug", "suppressed: completion already announced", { sessionID })
+          return
+        }
+      } else if (!claimNotification(sessionID, kind)) {
         void log("debug", "suppressed: another process is raising this", { sessionID, kind })
         return
+      } else if (outcome === "error") {
+        // An error always announces, but it marks the turn so the done that follows
+        // it in the same turn stays quiet.
+        markCompletion(sessionID, "error")
       }
       const message = isRemote ? `${decision.message} (remote)` : decision.message
       // The outcome IS the sound name: four outcomes, four bundled WAVs, one each,
@@ -866,15 +890,13 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       let sent: { ok: boolean; detail?: string; action?: string } = { ok: false }
       try {
         sent = await deliver(decision.title, message, decision.urgency, sound, requestID, sessionID)
+      } catch (error) {
+        if (outcome === "done" || outcome === "error") releaseCompletion(sessionID)
+        throw error
       } finally {
-        // The claim is released once the popup is on its way. The window is the
-        // same five seconds the cooldown uses, so the claim is never held
-        // longer than the thing it mirrors, and the state directory stays
-        // bounded: the release removes the file only while it still holds
-        // THIS process's pid, so a claim another process has since taken is
-        // never removed by the previous holder.
-        scheduleClaimRelease(sessionID, kind)
+        if (outcome !== "done") scheduleClaimRelease(sessionID, kind)
       }
+      if ((outcome === "done" || outcome === "error") && !sent.ok) releaseCompletion(sessionID)
       // An actionable notification only returns once the user clicks or the wait
       // ends, so an action means the click answered the permission. With no action
       // the popup was raised and dismissed without a choice, which is still a
@@ -914,6 +936,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           const { sessionID, status } = event.properties
           if (status.type === "busy" && sessionID) {
             rememberActive(sessionID)
+            releaseCompletion(sessionID)
             // NOT an interaction. The runtime raises `busy` whenever the
             // session STARTS EXECUTING -- a retry, a resumption, an automatic
             // continuation -- so it says the machine is working, not that
@@ -987,7 +1010,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         // The permission gap. Everything above was about a session handing control back
         // or asking a question; this is the other silent stall -- opencode blocks
         // on a permission decision and says nothing, which is why a directory
-        // prompt used to look like a hung agent.
+        // prompt is not treated as a hung agent.
         //
         // The event is `permission.asked`, read off the wire deliberately: the
         // pinned SDK types offer `permission.updated` with `type`/`pattern`
@@ -1104,6 +1127,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
             // popup about a session that no longer exists is a popup about
             // nothing.
             forgetPermissionPopup(sessionID)
+            releaseCompletion(sessionID)
           }
           return
         }

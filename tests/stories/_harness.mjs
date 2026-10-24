@@ -101,7 +101,7 @@ export const fakeClock = (start = 1_700_000_000_000) => {
  * `created` collects `session.create` calls (context-autoupdate borrows a slot
  * that way, bypassing the task hook entirely).
  */
-export const stubInput = ({ sessions = {}, directory = "/tmp/lacode-story", created = [], prompts = [], messages = [], deleted = [] } = {}) => {
+export const stubInput = ({ sessions = {}, directory = "/tmp/lacode-story", created = [], prompts = [], messages = [], deleted = [], sessionMessages = {} } = {}) => {
   const lines = []
   const client = {
     app: {
@@ -124,11 +124,19 @@ export const stubInput = ({ sessions = {}, directory = "/tmp/lacode-story", crea
       // user's session list. Both are observable here.
       messages: async ({ path: p }) => {
         messages.push(p.id)
+        if (sessionMessages[p.id]) {
+          return { data: sessionMessages[p.id] }
+        }
         return { data: [{ info: { id: "m1" }, parts: [{ type: "text", text: `transcript for ${p.id}` }] }] }
       },
       delete: async ({ path: p }) => {
         deleted.push(p.id)
         return { data: true }
+      },
+      abort: async ({ path }) => {
+        const res = await fetch(`http://localhost/session/${path.id}/abort`, { method: "POST" })
+        const text = (await res.text()).trim()
+        return { data: text === "true" ? true : text === "false" ? false : undefined, response: res, error: undefined, request: undefined }
       },
     },
   }
@@ -143,6 +151,7 @@ export const stubInput = ({ sessions = {}, directory = "/tmp/lacode-story", crea
     prompts,
     messages,
     deleted,
+    sessionMessages,
   }
 }
 

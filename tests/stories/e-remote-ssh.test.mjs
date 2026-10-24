@@ -442,7 +442,7 @@ test("[US-13] the notification crosses the hop as ONE delimited argument, never 
   // field itself is always there, because a wire whose field count changes
   // between senders is not a contract.
   //
-  // Seven fields since the popup became closable (US-30): the seventh is the
+  // Seven fields because the popup is closable (US-30): the seventh is the
   // correlation key, empty when there is none. The field count never changes,
   // so a six-field payload from an older sender still works against this
   // receiver, and a seven-field payload still reaches an older receiver, which
@@ -614,7 +614,7 @@ test("[US-14] an unreachable host fails without blocking or throwing out of the 
 })
 
 test("[US-14] a failing hop never produces a desktop notification on the remote host", async () => {
-  // The remote has no desktop session. If the fallback ever became a direct
+  // The remote has no desktop session. If the fallback ever becomes a direct
   // notify-send, a notification raised here would die on a headless box -- the
   // exact failure the tunnel exists to prevent. A stub ssh that fails models a
   // hop that is down without needing a network.
@@ -1033,10 +1033,11 @@ test("[US-26] the notification-hop doc leads with the shipped direct-ssh path, n
 test("[US-26] bin/oc-sync refuses before reading the host list when bash or GNU timeout is missing", async () => {
   // Criterion: on a machine without GNU `timeout` or with bash older than 4.0,
   // the deploy script must refuse BEFORE touching anything, name each missing
-  // prerequisite, and name the `lacode` subcommand to use instead. The failure
-  // it replaces is the misleading one: `mapfile` does not exist on bash 3.2, so
-  // the host list comes back empty and the script used to say "no hosts
-  // configured" -- sending the reader to edit .env over a missing interpreter.
+  // prerequisite, and name the `lacode` subcommand to use instead. The
+  // misleading failure mode is the one to guard against: `mapfile` does not
+  // exist on bash 3.2, so the host list comes back empty, and the script must
+  // not say "no hosts configured" -- that sends the reader to edit .env over a
+  // missing interpreter.
   //
   // This workstation has no bash 3.x binary. The behavioural half therefore
   // uses `bash --posix` on a PATH with no `timeout` (and a Darwin `uname`, which

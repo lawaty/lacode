@@ -460,9 +460,8 @@ const NEVER_EXPIRE_FLAG = "--expire-time=0"
  * The app name the popup is raised under.
  *
  * On KDE Plasma the popup's header IS the notification's app name, and
- * notify-send reports its OWN name when none is given -- so the popup used to
- * say "notify-send" at the top, claiming to be a program the user never ran.
- * Naming the app is what makes the header say "LaCode".
+ * notify-send reports its own name when none is given, so the app name is set
+ * explicitly to make the header say "LaCode".
  *
  * The macOS branch does not need it: terminal-notifier takes `-appName`, and
  * it already says LaCode.
@@ -865,10 +864,10 @@ export function forward(
 /**
  * Print what the current environment resolves to. Diagnostics, never a gate.
  *
- * `channel` is the field that has to be true: `lacode doctor` used to report
+ * `channel` is the field that has to be true: `lacode doctor` reports
  * only whether `notify-send` was installed, which on a Mac is a fact about a
  * binary that has nothing to do with whether a notification appears, and
- * therefore answered the wrong question while looking like an answer.
+ * therefore answers the wrong question while looking like an answer.
  */
 export function describe(env: NodeJS.ProcessEnv = process.env, platform: string = process.platform) {
   const tunnel = resolveTunnel(env)

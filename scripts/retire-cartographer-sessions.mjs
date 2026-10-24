@@ -1,10 +1,9 @@
 // Retire the cartographer's sessions from opencode's session list.
 //
-// The autoupdate plugin already retires each session it creates, by writing the
-// transcript out and then deleting the session. But the feature landed after
-// 120 runs had already piled up, and a run that failed between the session
-// creation and the prompt used to strand an empty one. Both are history now,
-// and this tool clears them.
+// The autoupdate plugin retires each session it creates, by writing the
+// transcript out and then deleting the session. A run that fails between the
+// session creation and the prompt can leave an empty session behind, and this
+// tool clears any such session still in the list.
 //
 // It talks to the opencode server over its HTTP API -- the same interface the
 // plugin uses -- because that is where the session list lives. The database is

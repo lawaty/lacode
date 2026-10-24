@@ -6,6 +6,64 @@ All notable changes to LaCode are recorded here. The format follows
 
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
+
+## [1.0.0] — images, ordered slot fill, and a limit that fails over
+
+### Added
+
+- **Image attachments from the clipboard or from files.** `/image-in-cb` reads
+  the system clipboard through `wl-paste`/`xclip` on Linux, `pngpaste` on macOS,
+  or PowerShell on Windows, and `/image` attaches one or more image files. Paths
+  honour quotes, `~` and globs; identical bytes are deduped within a message;
+  each file is capped at 4 MiB, at 10 images, and at 20 MiB total. Images are
+  archived content-addressed under `~/.local/share/opencode/lacode/images` and
+  delivered to the model as `FilePart`s. Configure with `imagePaste`
+  (`enabled`, `maxBytes`, `maxImages`, `dir`) or `LACODE_IMAGE_DIR`.
+- **A system-prompt guard against slot-variant names.** Every system string is
+  scrubbed by `scrubSlotNames()` before the model sees it, so a stale prompt
+  cannot teach the model `explore-1` and friends. The transform logs once when
+  it has to strip a literal.
+
+### Changed
+
+- **Slot routing fills slots in declaration order in up to two passes.** A
+  slot's `weight` is its active-session budget for one pass. Pass 1 fills each
+  usable slot to its weight in declaration order; once every usable slot has
+  reached its weight, pass 2 fills each to twice its weight. Live claims decide
+  the next slot, a released claim immediately reopens its slot, and overflow
+  goes to the least-loaded usable slot. There is no stored position.
+- **A hand-named slot variant is coerced to its base, not refused.** The task
+  hook rewrites `explore-1` to `explore` before routing, so a caller cannot pin
+  a provider or skip ordered fill. Injected agent prompts no longer name
+  variants, and `expert` is explicitly opt-in.
+- **Rate-limit failover uses the authenticated plugin client.** Aborting a
+  limited child goes through `client.session.abort`, not a bare `fetch`, so an
+  `opencode serve` protected by `OPENCODE_SERVER_USERNAME/PASSWORD` no longer
+  answers 401 and leaves the child running. A failed abort holds the claim for
+  the reaper to retry instead of releasing the slot while the session lives.
+- **A limit on a pooled child with no local claim is identified and handled.**
+  The failover path reads the session's `parentID` and user message to recognise
+  a pooled variant (`implement-1`, `explore-2`, `context-N`), cools that slot,
+  and aborts the child. Root, non-pooled, and unidentifiable sessions are left
+  alone.
+
+### Fixed
+
+- **A limited or hung session no longer survives its slot.** The rate-limit path
+  aborts it immediately, including the transient-outage path in
+  `message.updated`, and a failed abort no longer frees the slot.
+- **`pool_status` says a cooling slot is unavailable.** A cooling slot is marked
+  `UNAVAILABLE (COOLING …)`, and the summary reads `unavailable/cooling: …`.
+- **A `done` popup is raised once per idle period, and an `error` suppresses the
+  `done` that follows it in the same turn.** The per-session completion marker
+  is cleared when the session goes busy again or is deleted.
+
+### Documented
+
+- README documents `/image`, `/image-in-cb`, `imagePaste`, the `latest` dist-tag
+  for 1.0.0, and the ordered two-pass fill. `OPERATIONS.md`, `presets/README.md`
+  and the preset comments describe the same routing rule.
+
 ## [0.11.0] — the old sessions and the old event rows are swept away on their own, and a pool edit takes effect without a restart
 
 ### Added
@@ -703,7 +761,9 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/lawaty/lacode/compare/v0.11.0...v1.0.0
+[0.11.0]: https://github.com/lawaty/lacode/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/lawaty/lacode/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/lawaty/lacode/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/lawaty/lacode/compare/v0.7.1...v0.8.0

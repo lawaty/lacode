@@ -20,12 +20,9 @@
 // pool slot for each of the 3 pooled bases (build, plan, explore, implement,
 // context).
 //
-// NOT INJECTED, 1 field: `tools`. It used to carry a
-// `{ "playwright_*": true }` grant on the four explore/implement bases, and that
-// grant was DEAD CODE -- an earlier version of this comment claimed it rescued a
-// user who had Playwright plus a global `"tools": { "playwright_*": false }`, and
-// it did not. The reason is load-time folding, and it is structural: a plugin
-// cannot inject tool grants at all.
+// NOT INJECTED, 1 field: `tools`. No `{ "playwright_*": true }` grant is
+// injected on the explore/implement bases, because a plugin cannot inject tool
+// grants at all. The reason is load-time folding, and it is structural.
 //
 //   opencode decodes every agent through an `AgentConfig` schema transform that
 //   rewrites `tools` into `permission` entries (folding `write`/`edit`/`patch`
@@ -127,9 +124,12 @@ Every question of the form "what does this file do", "where is X handled", or
   that proves it. Never one whole refactor handed over in a single piece —
   see \`# Task size\` below.
 
-Spawn the BARE pooled base — \`explore\`, \`implement\` or \`context\`. The pool
-refuses a \`-N\` variant, and a refusal means spawn the bare base, never a
-different number.
+Spawn the pooled base — \`explore\`, \`implement\` or \`context\`. The plugin decides
+which model runs the work; do not try to choose one yourself.
+
+\`expert\` is not part of the pool and is expensive: spawn it only when the user
+explicitly asks for it. Never escalate to it on your own, and never as a
+fallback when a pooled spawn fails.
 
 # When the pool is unavailable
 
@@ -138,12 +138,12 @@ pool cannot serve a spawn — every slot cooling or exhausted, spawns repeatedly
 failing, or a runtime message saying no slot is available — that is not a reason
 to do the work yourself, and not a reason to stop and ask.
 
-**Retry.** A refused or cooling slot is transient and costs you nothing but a
-turn. Spawn the bare base again. Do not escalate to a numbered variant after a
-refusal — the refusal means the pool has a routing problem, not that you
-picked the wrong number.
+**Retry.** A cooling model is transient and costs you nothing but a turn. Spawn
+the same base again. If a spawn fails, do not switch to a different name — a
+failure means the pool has a routing problem, not that you picked the wrong one.
 
-Retry is always available and never wrong, which is why it is the default. But
+Retry is always available
+ and never wrong, which is why it is the default. But
 "never wrong" is not "sufficient": looping silently against a pool with every
 model cooling goes nowhere and burns the slot doing it. So separate the two
 failures. **Transient** — a cooldown, a rate limit, one slot at its ceiling —
@@ -151,7 +151,8 @@ means retry. **Persistent or structural** — every slot cooling, the same spawn
 failing repeatedly with the same error, a malformed model id — means stop
 retrying and *report* it: say what failed (slot, model, error) and continue
 with whatever else the task needs, or ask the user. Surface the failure; do not
-spin on it and do not let it end the whole task.
+spin on it and do not let it end the whole task. Do not escalate to \`expert\` as
+a workaround; it is opt-in by the user.
 
 **Never fall back to reading, grepping, exploring or implementing on your own.**
 Do not "just quickly" inspect a file because a spawn failed. A failed spawn is
@@ -268,8 +269,11 @@ When you need to understand the codebase:
 2. Invoke @explore with specific, focused instructions (e.g. "read src/auth.ts", "grep for 'migration' in *.py files", "list the src/ directory")
 3. @explore will return its findings — you process them and plan accordingly
 
-Spawn the BARE pooled base (\`explore\`, \`implement\`, \`context\`); the pool
-refuses \`-N\` variants, and a refusal means spawn the bare base, not another number.
+Spawn the pooled base (\`explore\`, \`implement\`, \`context\`); the plugin decides
+which model runs the work. Do not try to choose one yourself.
+
+\`expert\` is not part of the pool and is expensive: spawn it only when the user
+explicitly asks for it.
 
 If the pool cannot serve a spawn — every slot cooling or exhausted, or repeated
 failures — do NOT fall back to reading or planning from your own inspection.
@@ -597,7 +601,7 @@ Trigger: \`.opencode/context/\` exists and work has just been done here.
    - an architectural decision
    - a new dependency between subsystems
    - a renamed or relocated subsystem
-    - a previously undocumented invariant
+   - an invariant not yet recorded in the map
 
 Do not update documentation merely because source files changed. Do not
 rewrite files wholesale. Do not make timestamp-only edits. Do not add a fact
@@ -924,7 +928,7 @@ export function buildAgentSet(): Record<string, AgentDef> {
       const variant: AgentDef = {
         ...def,
         description:
-          `Hidden pool variant ${base}-${slot}: slot ${slot}. Its model is NOT set here -- `
+          `Hidden pool slot ${slot} for ${base}. Its model is NOT set here -- `
           + "LaCode injects it from the resolved pool preset at config time, so the preset is the "
           + `only place a pool model is written down. Spawn '${base}' and let the pool route.`,
         hidden: true,
@@ -938,9 +942,10 @@ export function buildAgentSet(): Record<string, AgentDef> {
         // and by default-agent resolution. A variant left as `mode: "subagent"`
         // is therefore listed to the model under its own name -- "explore-1:
         // Hidden pool variant explore-1" -- and the model copies that name
-        // straight into its next spawn. The pool then refuses it, because
-        // naming a variant is how a caller would pick the provider and skip the
-        // rotation. The refusal is right; the leak that provokes it is not.
+        // straight into its next spawn. The task hook coerces a hand-named
+        // variant back to its base, because naming one is how a caller would
+        // pick the provider and skip ordered slot fill and the slot ceiling. The coercion is right; the
+        // leak that provokes it is not.
         //
         // `mode` is the only field that filter respects, and setting it here is
         // safe: the task tool never reads an agent's mode -- it resolves the

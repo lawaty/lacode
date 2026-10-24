@@ -49,7 +49,16 @@ globalThis.fetch = async (url) => {
 }
 
 const logs = []
-const client = { app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) } }
+const client = {
+  app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) },
+  session: {
+    abort: async ({ path }) => {
+      const res = await fetch(`http://localhost/session/${path.id}/abort`, { method: "POST" })
+      const text = (await res.text()).trim()
+      return { data: text === "true" ? true : text === "false" ? false : undefined, response: res, error: undefined, request: undefined }
+    },
+  },
+}
 const { agentPoolHooks: AgentPool } = await import(join(HERE, "..", "src", "plugins", "agent-pool.ts"))
 const pool = await import(join(HERE, "..", "src", "lib", "pool.ts"))
 
@@ -76,7 +85,7 @@ const mk = async (id, dir) => {
 const settle = () => new Promise((r) => setTimeout(r, 120))
 
 // 1. a hung task is reaped by the timer alone -- with NO further task spawns.
-//    This is the production failure: reaping used to hang off tool.execute.before.
+//    This is the production failure: reaping is owned by the timer, not tool.execute.before.
 {
   aborted.length = 0
   clock = 0

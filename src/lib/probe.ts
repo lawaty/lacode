@@ -18,7 +18,7 @@ import {
 //
 // The cooldown files are a COMPUTED GUESS about when a provider reopens. A
 // provider-wide quota runs on a curve that reaches six hours, and a window guessed
-// long is a slot that stays out of the rotation long after the provider recovered —
+// long is a slot that stays out of the pool long after the provider recovered —
 // while every delegated spawn queues behind the survivors. Nothing in the pool can
 // tell the difference, because the only evidence it has is the failure it already
 // recorded.
@@ -94,7 +94,7 @@ export type ProbeOutcome = {
 export type ProbeReport = {
   /** Every model this run touched, in probe order. */
   outcomes: ProbeOutcome[]
-  /** Models that answered and are back in the rotation. */
+  /** Models that answered and are back in the pool. */
   cleared: string[]
   /** Models still limited after the probe, with the window they kept. */
   kept: string[]
@@ -229,7 +229,7 @@ const probeOne = async (client: ProbeClient, opts: ProbeOptions, model: string, 
     if (isModelMissingText(text)) {
       // The provider does not serve this model id. Unlike a quota this does not
       // lift on its own, so bench it for the quota cap instead of leaving a dead
-      // slot in the rotation; a later probe re-admits it if it comes back.
+      // slot in the pool; a later probe re-admits it if it comes back.
       recordStrike(s, model, MODEL_MISSING_REASON, MODEL_MISSING_COOLDOWN_MS)
     } else {
       // A window the provider STATED is the provider correcting a guess, so it is

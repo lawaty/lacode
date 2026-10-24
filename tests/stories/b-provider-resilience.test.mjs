@@ -30,9 +30,10 @@ test.after(cleanupAll)
 
 /** Boot a pool whose slots are exactly the given { model, weight } list. */
 const bootPool = async (slots, id, options = {}) => {
-  const stub = stubInput()
+  const { stubOptions = {}, ...rest } = options
+  const stub = stubInput(stubOptions)
   const dir = scratch()
-  const hooks = await bootLaCode(stub, { id, dir, models: { slots }, ...options })
+  const hooks = await bootLaCode(stub, { id, dir, models: { slots }, ...rest })
   const cfg = configFor(slots.map((s) => s.model))
   await hooks.config(cfg)
   return { stub, dir, hooks, cfg, models: slots.map((s) => s.model) }
@@ -83,9 +84,9 @@ const spawnChild = async (hooks, cfg, { callID, sessionID = "parent", childID })
 /** The models the status view reports as cooling, read off its summary line. */
 const coolingModels = async (hooks) => {
   const status = await hooks.tool.pool_status.execute({}, {})
-  const line = status.output.split("\n").find((l) => l.startsWith("cooling: "))
+  const line = status.output.split("\n").find((l) => /^(unavailable\/)?cooling: /.test(l))
   if (!line) return []
-  return line.replace("cooling: ", "").split(", ").map((entry) => entry.split(" for ")[0])
+  return line.replace(/^(unavailable\/)?cooling: /, "").split(", ").map((entry) => entry.split(" for ")[0])
 }
 
 // ---------------------------------------------------------------------------
@@ -96,8 +97,8 @@ test("[US-4] a rate-limit-shaped error marks the model cooling and writes a cool
   const clock = fakeClock()
   const { dir, hooks, models, stub } = await bootPool([{ model: "prov/one", weight: 2 }], "us4-strike")
 
-  // Deliberately NOT the shape the plugin used to assume (data.message): the
-  // error text lives under responseBody, which is what a gateway actually sends.
+  // Deliberately NOT the top-level `data.message` shape: the plugin must read
+  // the error text under responseBody, which is what a gateway actually sends.
   await emit(hooks, "message.updated", {
     info: {
       role: "assistant",
@@ -174,9 +175,9 @@ test("[US-4] when every model is cooling the pool still routes instead of refusi
 test("[US-4] when every model is cooling the spawn lands on the least-loaded slot, not on the busier one", async () => {
   // The degraded pick is a LEAST-LOADED pick, not an arbitrary one. Two slots
   // carrying different load make the difference visible: the emptier one has to
-  // take the spawn. "Some slot" and "the first slot in the run" both satisfy a
-  // check that only asks whether the spawn went anywhere -- so the load has to
-  // be made unequal first, or the choice is invisible.
+  // take the spawn. "Some slot" and "the first slot in declaration order" both
+  // satisfy a check that only asks whether the spawn went anywhere -- so the load
+  // has to be made unequal first, or the choice is invisible.
   const slots = [
     { model: "prov/busy", weight: 3 },
     { model: "prov/light", weight: 1 },
@@ -195,7 +196,7 @@ test("[US-4] when every model is cooling the spawn lands on the least-loaded slo
   assert.equal(await loadOf("prov/busy"), 3, "the heavy slot must hold three claims")
   assert.equal(await loadOf("prov/light"), 1, "the light slot must hold one claim")
 
-  // Now every model is cooling, so the rotation can pick nothing at all.
+  // Now every model is cooling, so the ordered fill can pick nothing at all.
   for (const model of models) {
     const [provider, id] = [model.slice(0, model.indexOf("/")), model.slice(model.indexOf("/") + 1)]
     await emit(hooks, "message.updated", {
@@ -254,8 +255,8 @@ test("[US-4] a Retry-After header is honoured when the error text states no rese
 // stalled request aborted on timeout -- is transient, not a limit. It must take
 // the same short, flat cooldown as "Endpoint is unavailable" and never the
 // escalating strike path, or a congested model stays benched long after the
-// outage has passed. The recogniser used to see only limit text and 429, so a
-// real 503 fell straight through and benched nothing.
+// outage has passed. The recogniser must treat a 5xx as transient, not only
+// limit text and 429, so a real 503 cannot fall straight through and bench nothing.
 
 test("[US-4] a gateway 503 carrying a queue-budget message benches the model flat, and it is selectable again after the cooldown", async () => {
   const clock = fakeClock()
@@ -266,7 +267,8 @@ test("[US-4] a gateway 503 carrying a queue-budget message benches the model fla
   const { dir, hooks, cfg, models } = await bootPool(slots, "us4-gateway-503")
 
   // The real message captured from the pool: a 503 whose body is a queue budget,
-  // not a rate limit. The old recogniser saw status 503 != 429 and returned.
+  // not a rate limit. The recogniser must judge the queue-budget message, not
+  // return merely because status 503 != 429.
   await emit(hooks, "message.updated", {
     info: {
       role: "assistant",
@@ -390,39 +392,40 @@ test("[US-4] an unrelated benign error benches nothing", async () => {
 // US-5 — weighted preference
 // ---------------------------------------------------------------------------
 
-test("[US-5] a heavy slot holds more turns in the run than a light one, which still takes its own", async () => {
-  // Not a drain order. The slots are expanded into a run -- one position per unit
-  // of weight, in declaration order -- so weights [3,1] produce [1,1,1,2] and the
-  // light slot's single position is still inside it, after the heavy one's three.
+test("[US-5] pass 1 fills a heavy slot to its weight, and a light one still takes its own", async () => {
+  // Ordered fill, not highest-weight-first. Pass 1 walks the slots in declaration
+  // order and fills each to its weight, so weights [3,1] give slot 1 three
+  // spawns before slot 2 takes its one. The absolute cap (twice the weight) is
+  // pass 2's budget and does not change that order.
   const { hooks, cfg } = await bootPool(
     [
       { model: "prov/heavy", weight: 3 },
       { model: "prov/light", weight: 1 },
     ],
-    "us5-run-shape",
+    "us5-pass-shape",
   )
   const routed = await burst(hooks, cfg, 4)
   assert.deepEqual(routed, ["explore-1", "explore-1", "explore-1", "explore-2"], `got ${routed}`)
   await hooks.dispose()
 })
 
-test("[US-5] the run is walked in order, so a light slot ahead of a heavier one is served first", async () => {
-  // The rule is order-first: each spawn takes the first slot in the run which is
-  // available and under its ceiling, so the run [1,2,2] gives slot 1 its turn and
-  // slot 2 the two after it. Weight-as-priority would answer 2,2,1 here instead.
+test("[US-5] ordered fill walks the slots in declaration order, so a light slot ahead of a heavier one is served first", async () => {
+  // The rule is declaration order: pass 1 fills each slot to its weight in order,
+  // so weights [1,2] serve slot 1 first and slot 2 the two after it.
+  // Weight-as-priority would answer 2,2,1 here instead.
   const { hooks, cfg } = await bootPool(
     [
       { model: "prov/one", weight: 1 },
       { model: "prov/two", weight: 2 },
     ],
-    "us5-run-order",
+    "us5-pass-order",
   )
   const routed = await burst(hooks, cfg, 3)
   assert.deepEqual(routed, ["explore-1", "explore-2", "explore-2"], `got ${routed}`)
   await hooks.dispose()
 })
 
-test("[US-5] past every ceiling, the spawn overflows to the least-loaded slot", async () => {
+test("[US-5] past every weight, pass 2 fills the slots again before overflow", async () => {
   const { hooks, cfg } = await bootPool(
     [
       { model: "prov/a", weight: 1 },
@@ -431,30 +434,30 @@ test("[US-5] past every ceiling, the spawn overflows to the least-loaded slot", 
     "us5-overflow",
   )
   const routed = await burst(hooks, cfg, 3)
-  assert.deepEqual(routed.slice(0, 2), ["explore-1", "explore-2"], `weighted phase first, got ${routed}`)
-  // Third: both are full, so it must spread rather than pile on slot 1.
-  assert.match(routed[2], /^explore-[12]$/, `overflow must still route, got ${routed[2]}`)
-  assert.notEqual(routed[2], routed[1], "overflow must go to the OTHER slot so load stays even")
+  assert.deepEqual(routed.slice(0, 2), ["explore-1", "explore-2"], `pass 1 first, got ${routed}`)
+  // Third: both are at their weight but under their absolute cap, so pass 2
+  // reopens the slots in declaration order rather than overflowing.
+  assert.match(routed[2], /^explore-[12]$/, `pass 2 must still route, got ${routed[2]}`)
+  assert.notEqual(routed[2], routed[1], "pass 2 must reopen the slots in declaration order, not pile on the last one")
   await hooks.dispose()
 })
 
-test("[US-5] a slot at its ceiling has its turn skipped and the rotation resumes at the following turn", async () => {
-  // The ceiling is twice a slot's weight, and the run gives a slot one turn per
-  // unit of weight, so a slot reaches its ceiling after exactly two rotations
-  // of the run. Every slot therefore fills at the same moment, and this pool's
-  // OWN claims can never leave one slot full while another still has room --
-  // the turn that would have been skipped is never the turn that comes up.
-  // The asymmetry comes from a second process, which is how a slot really gets
-  // full in a busy pool: another opencode holding claims on that model.
+test("[US-5] a slot at its absolute cap is skipped and the pass continues to the next slot", async () => {
+  // Both passes walk the slots in declaration order. A slot at its absolute cap
+  // (twice its weight) is skipped in both, so the pass continues to the next
+  // slot with room instead of stalling on the capped one. This pool's OWN claims
+  // cannot create that asymmetry -- they fill every slot evenly -- so it comes
+  // from a second process, which is how a slot really reaches its cap in a busy
+  // pool: another opencode holding claims on that model.
   const slots = [
     { model: "prov/full", weight: 1 },
     { model: "prov/room", weight: 2 },
   ]
-  const { hooks, cfg, dir } = await bootPool(slots, "us5-skip-full-turn")
+  const { hooks, cfg, dir } = await bootPool(slots, "us5-skip-full-slot")
 
-  // A sibling opencode process holds two claims on the first slot. Its ceiling
-  // is twice its weight (2 x 1 = 2), so that slot is FULL; the second one still
-  // has room.
+  // A sibling opencode process holds two claims on the first slot. Its absolute
+  // cap is twice its weight (2 x 1 = 2), so that slot is at its cap; the second
+  // one still has room.
   writeFileSync(
     join(dir, "claims.sibling.json"),
     JSON.stringify({
@@ -463,41 +466,35 @@ test("[US-5] a slot at its ceiling has its turn skipped and the rotation resumes
     }),
   )
 
-  // The run is 1,2,2 and the rotation opens on the full slot's turn. That turn
-  // must be skipped, not served.
+  // The pass opens on the capped slot. It must be skipped, not served.
   const { routed } = await spawn(hooks, cfg, { callID: "skip", sessionID: "skip" })
-  assert.equal(routed, "explore-2", `a full slot's turn must be skipped, got ${routed}`)
+  assert.equal(routed, "explore-2", `a slot at its absolute cap must be skipped, got ${routed}`)
 
-  // And the rotation resumed at the following turn: the cursor sits on the
-  // turn AFTER the one that was served (position 2 of the run 1,2,2), not on
-  // the turn the full slot would have consumed (which would leave it at 1).
-  const cursor = JSON.parse(readFileSync(join(dir, "cursor.json"), "utf8"))
-  assert.equal(cursor.seq, 2, `the skipped turn must not be consumed: the rotation must resume after the turn it served, got ${JSON.stringify(cursor)}`)
-
-  // And it keeps turning rather than stalling on the full slot.
+  // And it keeps filling the next slot rather than stalling on the capped one.
   const next = await spawn(hooks, cfg, { callID: "next", sessionID: "next" })
-  assert.equal(next.routed, "explore-2", `the rotation must keep turning past the full slot, got ${next.routed}`)
+  assert.equal(next.routed, "explore-2", `the pass must continue past the capped slot, got ${next.routed}`)
   await hooks.dispose()
 })
 
-test("[US-5] equal weights round-robin in declaration order", async () => {
+test("[US-5] equal weights fill pass 1 then pass 2 in declaration order", async () => {
   const slots = ["prov/a", "prov/b", "prov/c"].map((model) => ({ model, weight: 1 }))
-  const { hooks, cfg } = await bootPool(slots, "us5-roundrobin")
+  const { hooks, cfg } = await bootPool(slots, "us5-ordered-fill")
   const routed = await burst(hooks, cfg, 6)
   assert.deepEqual(routed, ["explore-1", "explore-2", "explore-3", "explore-1", "explore-2", "explore-3"], `got ${routed}`)
   await hooks.dispose()
 })
 
-test("[US-5] no slot exceeds its ceiling except through overflow", async () => {
+test("[US-5] no slot exceeds its absolute cap except through overflow", async () => {
   const slots = [
     { model: "prov/heavy", weight: 3 },
     { model: "prov/mid", weight: 2 },
     { model: "prov/light", weight: 1 },
   ]
-  const { hooks, cfg } = await bootPool(slots, "us5-ceiling-bound")
-  // Exactly the summed CEILINGS -- twice each weight. One rotation would still leave
-  // room (the ceiling is deliberately larger than the rotation share), so the pool has
-  // to be driven all the way to the doubled ceiling for this bound to bite.
+  const { hooks, cfg } = await bootPool(slots, "us5-cap-bound")
+  // Exactly the summed absolute caps -- twice each weight. One pass would still
+  // leave room (the absolute cap is deliberately larger than the per-pass
+  // weight), so the pool has to be driven all the way to the doubled cap for
+  // this bound to bite.
   const ceiling = (s) => s.weight * 2
   const capacity = slots.reduce((sum, s) => sum + ceiling(s), 0)
   await burst(hooks, cfg, capacity)
@@ -611,21 +608,21 @@ test("[US-6] a claim file older than the dead-file threshold is pruned, not coun
   await hooks.dispose()
 })
 
-test("[US-6] the slot the next spawn would take is marked, and with every slot at its ceiling it is the least-loaded one", async () => {
+test("[US-6] the slot the next spawn would take is marked, and with every slot at its absolute cap it is the least-loaded one", async () => {
   const slots = [
     { model: "prov/a", weight: 1 },
     { model: "prov/b", weight: 1 },
   ]
   const { hooks, cfg } = await bootPool(slots, "us6-next")
-  // Fill both weight-1 slots to their DOUBLED ceiling of 2, so both are genuinely
-  // full and the next spawn is an overflow decision.
+  // Fill both weight-1 slots to their DOUBLED absolute cap of 2, so both are
+  // genuinely at capacity and the next spawn is an overflow decision.
   await burst(hooks, cfg, 4)
 
-  // Both slots are at their ceiling, so the next spawn is an overflow decision.
+  // Both slots are at their absolute cap, so the next spawn is an overflow decision.
   const status = await hooks.tool.pool_status.execute({}, {})
   const marked = status.output.split("\n").filter((l) => l.includes("<- next"))
   assert.equal(marked.length, 1, `exactly one slot may be marked as next:\n${status.output}`)
-  assert.match(marked[0], /FULL/, `with every slot at its ceiling, the next spawn takes the least-loaded one:\n${marked[0]}`)
+  assert.match(marked[0], /FULL/, `with every slot at its absolute cap, the next spawn takes the least-loaded one:\n${marked[0]}`)
 
   // And the mark is not decoration: the next real spawn lands on that slot.
   const markedIndex = Number(/slot (\d)/.exec(marked[0])[1])
@@ -636,24 +633,24 @@ test("[US-6] the slot the next spawn would take is marked, and with every slot a
   const { hooks: fresh, cfg: freshCfg } = await bootPool(slots, "us6-next-open")
   const open = await fresh.tool.pool_status.execute({}, {})
   assert.match(open.output.split("\n").find((l) => l.includes("<- next")), /prov\/a/, `an idle pool marks slot 1:\n${open.output}`)
-  assert.doesNotMatch(open.output.split("\n").find((l) => l.includes("<- next")), /FULL/, "an idle slot is not at its ceiling")
+  assert.doesNotMatch(open.output.split("\n").find((l) => l.includes("<- next")), /FULL/, "an idle slot is not at its absolute cap")
   await hooks.dispose()
   await fresh.dispose()
 })
 
-test("[US-6] a slot at its ceiling is not marked as the slot the next spawn would take", async () => {
-  // The status view previews the next pick, so the mark must be the slot the
-  // rotation would really use. A full slot's turn is skipped, so the mark
-  // belongs to the slot that still has room -- pointing it at the full slot
-  // would send the reader looking at the wrong one.
+test("[US-6] a slot at its absolute cap is not marked as the slot the next spawn would take", async () => {
+  // The status view previews the next pick, so the mark must be the slot ordered
+  // fill would really use. A slot at its absolute cap is skipped by both passes,
+  // so the mark belongs to the slot that still has room -- pointing it at the
+  // full slot would send the reader looking at the wrong one.
   const slots = [
     { model: "prov/full", weight: 1 },
     { model: "prov/room", weight: 2 },
   ]
   const { hooks, cfg } = await bootPool(slots, "us6-next-not-full")
 
-  // Four claims: two on the light slot (its ceiling is 2 x 1 = 2, so it is
-  // FULL) and two on the heavy one (its ceiling is 2 x 2 = 4, so it has room).
+  // Four claims: two on the light slot (its absolute cap is 2 x 1 = 2, so it is
+  // FULL) and two on the heavy one (its absolute cap is 2 x 2 = 4, so it has room).
   await burst(hooks, cfg, 4)
 
   const status = await hooks.tool.pool_status.execute({}, {})
@@ -662,7 +659,7 @@ test("[US-6] a slot at its ceiling is not marked as the slot the next spawn woul
   const room = slotLine("prov/room")
 
   assert.match(full, /load=2\/2 FULL/, `the full slot must be shown as full:\n${status.output}`)
-  assert.doesNotMatch(full, /<- next/, `a slot at its ceiling must not be marked as the next one:\n${status.output}`)
+  assert.doesNotMatch(full, /<- next/, `a slot at its absolute cap must not be marked as the next one:\n${status.output}`)
   assert.match(room, /load=2\/4/, `the other slot must still have room:\n${status.output}`)
   assert.match(room, /<- next/, `the mark must be on the slot that still has room:\n${status.output}`)
   assert.doesNotMatch(room, /FULL/, `the marked slot must not be the full one:\n${status.output}`)
@@ -747,12 +744,12 @@ test("[US-7] the shipped preset's slots are all routable and all whitelisted on 
   await hooks.dispose()
 })
 
-// The regression: the pool used to charge a missing whitelist as if it were an
-// empty one and create it anyway. A user who installed LaCode with an open
-// provider lost every non-pool model on every provider the pool touched, with
-// nothing in the config to show for it. Asserting "the pool models are present"
-// cannot see this bug -- the old code satisfied that too -- so every test here
-// asks about the KEY, not its contents.
+// The regression guard: the pool must not charge a missing whitelist as if it
+// were an empty one and create it anyway. Creating one would delete every
+// non-pool model on every provider the pool touched, with nothing in the config
+// to show for it. Asserting "the pool models are present" cannot see this bug
+// -- creating an empty whitelist satisfies that too -- so every test here asks
+// about the KEY, not its contents.
 
 test("[US-7] a provider configured with no whitelist is left with none: creating one would delete every model the user runs on it", async () => {
   const cfg = { provider: { someprovider: {} }, agent: {}, command: {} }
@@ -911,10 +908,10 @@ test("[US-31] a limit that hangs is aborted and its claim released", async () =>
 
 test("[US-31] the retry after a limit lands on a slot that is not on cooldown", async () => {
   const net = stubFetch()
-  // Weights 2 and 1, so the rotation's run is [1,1,2] and the turn AFTER the
-  // first spawn comes BACK to prov/one. Only the cooldown can move the retry
-  // off it: with equal weights the retry would land on the other slot anyway,
-  // and the cooldown would prove nothing.
+  // Weights 2 and 1, so ordered fill would return to prov/one for the next
+  // spawn while it is still under its weight. Only the cooldown can move the
+  // retry off it: with equal weights the retry would land on the other slot
+  // anyway, and the cooldown would prove nothing.
   const slots = [
     { model: "prov/one", weight: 2 },
     { model: "other/two", weight: 1 },
@@ -930,7 +927,7 @@ test("[US-31] the retry after a limit lands on a slot that is not on cooldown", 
   })
   assert.ok(existsSync(limitFile(dir, "prov/one")), `prov/one must be cooling, got: ${readdirSync(dir).join(", ")}`)
 
-  // The caller's retry. The rotation would have offered prov/one again.
+  // The caller's retry. Ordered fill would have offered prov/one again.
   const retry = await spawn(hooks, cfg, { subagent: "explore", callID: "c2", sessionID: "parent-2" })
   assert.notEqual(retry.routed, first.routed, `the retry must leave the cooled slot, got ${retry.routed}`)
   assert.notEqual(retry.model, first.model, `the retry must not use the cooled model ${first.model}, got ${retry.model}`)
@@ -1010,7 +1007,7 @@ test("[US-31] a context limit is not a quota, so nothing is cooled and nothing i
   await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-context" })
 
   // The prompt was too long. That is the user's own request, not the
-  // provider's allowance, so the model stays in the rotation and the task
+  // provider's allowance, so the model stays usable for routing and the task
   // keeps running.
   await emit(hooks, "message.updated", {
     info: {
@@ -1037,9 +1034,9 @@ test("[US-31] a context limit is not a quota, so nothing is cooled and nothing i
 test("[US-31] a transient outage is cooled flat, not for the quota window", async () => {
   const clock = fakeClock()
   const net = stubFetch()
-  // Weights 2 and 1, so the rotation's run is [1,1,2] and the turn AFTER the
-  // first spawn comes BACK to prov/one -- the same shape as the reroute test
-  // above, so only a cooldown can move the retry off it.
+  // Weights 2 and 1, so ordered fill would return to prov/one for the next
+  // spawn -- the same shape as the reroute test above, so only a cooldown can
+  // move the retry off it.
   const slots = [
     { model: "prov/one", weight: 2 },
     { model: "other/two", weight: 1 },
@@ -1145,8 +1142,9 @@ test("[US-31] an outage that names its provider is not a strike either, so the n
 
   // An OUTAGE that NAMES ITS PROVIDER: the status carries the provider, so the
   // fault is provider-wide and takes the coolProvider() path rather than the
-  // per-model one. This is the path that used to file the outage as a strike,
-  // because every slot on the provider was cooled through recordStrike().
+  // per-model one. This is the path that must file the outage under its own
+  // reason, not as a strike: every slot on the provider must be cooled through
+  // coolProvider(), not recordStrike().
   await emit(hooks, "session.status", {
     sessionID: "child-outage-provider",
     status: { type: "retry", message: "Endpoint is unavailable", action: { provider: "prov" } },
@@ -1242,6 +1240,74 @@ test("[US-31] a terminal limit on a session the pool never bound is logged and a
   const claims = readFileSync(join(dir, "claims.us31-session-error-unbound.json"), "utf8")
   assert.notEqual(claims, "{}", `the in-flight claim must survive, got ${claims}`)
   assert.match(claims, /child-real/, `the real claim must still be in flight, got ${claims}`)
+
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-31] a terminal limit on an unbound pooled child is identified, cooled, and aborted", async () => {
+  const clock = fakeClock()
+  const net = stubFetch()
+  const slots = [
+    { model: "prov/one", weight: 2 },
+    { model: "other/two", weight: 1 },
+  ]
+  const { dir, hooks, cfg, stub } = await bootPool(slots, "us31b-unbound-pooled", {
+    stubOptions: {
+      sessions: {
+        "orphan-child": { parentID: "parent" },
+      },
+      sessionMessages: {
+        "orphan-child": [
+          { info: { role: "user", agent: "implement-1", model: { providerID: "prov", modelID: "one" } } },
+        ],
+      },
+    },
+  })
+
+  await emit(hooks, "session.error", {
+    sessionID: "orphan-child",
+    error: { name: "APIError", data: { statusCode: 429, responseBody: "Rate limit exceeded" } },
+  })
+
+  const file = limitFile(dir, "prov/one")
+  assert.ok(existsSync(file), `a cooldown file must be written for prov/one, got: ${readdirSync(dir).join(", ")}`)
+  const strike = JSON.parse(readFileSync(file, "utf8"))
+  assert.ok(strike.reason)
+  assert.equal(strike.strikes, 1)
+  assert.deepEqual(net.aborted, ["orphan-child"], `the session must be aborted, got ${JSON.stringify(net.aborted)}`)
+  assert.ok(
+    stub.text().some((line) => line.includes("implement-1") && line.includes("prov/one")),
+    `the log must name the pooled agent/model:\n${stub.text().join("\n")}`,
+  )
+
+  // root session left alone
+  const before = net.aborted.length
+  await emit(hooks, "session.error", {
+    sessionID: "root-session",
+    error: { name: "APIError", data: { statusCode: 429, responseBody: "Rate limit exceeded" } },
+  })
+  assert.equal(net.aborted.length, before)
+
+  // non-pooled agent left alone
+  const before2 = net.aborted.length
+  // Need to set up session info for non-pooled
+  stub.client.session.get = async ({ path: p }) => {
+    if (p.id === "nonpooled-child") return { data: { parentID: "parent" } }
+    if (p.id === "root-session") return { data: {} }
+    if (p.id === "orphan-child") return { data: { parentID: "parent" } }
+    return { data: undefined }
+  }
+  stub.client.session.messages = async ({ path: p }) => {
+    if (p.id === "orphan-child") return { data: [{ info: { role: "user", agent: "implement-1", model: { providerID: "prov", modelID: "one" } } }] }
+    if (p.id === "nonpooled-child") return { data: [{ info: { role: "user", agent: "general", model: { providerID: "prov", modelID: "one" } } }] }
+    return { data: [] }
+  }
+  await emit(hooks, "session.error", {
+    sessionID: "nonpooled-child",
+    error: { name: "APIError", data: { statusCode: 429, responseBody: "Rate limit exceeded" } },
+  })
+  assert.equal(net.aborted.length, before2)
 
   net.restore()
   await hooks.dispose()

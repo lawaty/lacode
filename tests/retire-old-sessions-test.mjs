@@ -380,9 +380,8 @@ test("[US-32] a limit takes the oldest candidates whole, so a child never outliv
     { id: "old-child", parent_id: "old-parent" },
     { id: "old-other", parent_id: null },
   ]
-  // The flat cut the tool used to take is the orphan the recursive query was
-  // written to prevent: the parent goes, and the child stays behind pointing
-  // at a parent_id that no longer exists.
+  // A flat cut takes only the parent and orphans the child: the parent goes,
+  // and the child stays behind pointing at a parent_id that does not exist.
   assert.deepEqual(rows.slice(0, 1).map((row) => row.id), ["old-parent"])
   assert.deepEqual(
     selectSessions(rows, 1).map((row) => row.id),

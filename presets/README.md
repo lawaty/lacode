@@ -63,7 +63,7 @@ else means the flat form.
 | Field | Required | Meaning |
 |-------|----------|---------|
 | `model` | yes | `provider/model-id`, split on the **first** slash only |
-| `weight` | no | turns taken per rotation (the slot's share of the rotation); its concurrency ceiling is twice that. Absent = 1 |
+| `weight` | no | active-session budget for one pass; its absolute cap is twice that. Absent = 1 |
 
 `$comment` is a JSON-legal array of strings and is ignored by the loader; the
 bundled preset uses it to explain itself in place.
@@ -81,7 +81,7 @@ The loader checks shape and nothing else:
 - at most `MAX_SLOTS` (4) slots; extra entries are **dropped with a warning**,
   because one hidden variant agent per base per slot exists and a fifth slot
   would route at an agent that does not exist
-- `tier` is accepted as a deprecated alias for `weight` (`primary` → 2,
+- `tier` is accepted as an alias for `weight` (`primary` → 2,
   `overflow` → 1) and warns
 
 **Cost is never validated.** Any provider/model-id string is accepted, including
@@ -92,28 +92,26 @@ because the pool requires it.
 
 ## Weight, precisely
 
-A weight is the number of turns a slot takes per rotation — its share of the
-work — and its concurrency ceiling is **twice that weight**: a weight-3 slot may
-hold 6 concurrent sessions. Routing is **order-first weighted round-robin**:
+A weight is a slot's active-session budget for one pass: the number of
+concurrent claims it may hold before the next slot is preferred. Its absolute
+cap is **twice that weight** — a weight-3 slot may hold 6 concurrent sessions.
+Slots are filled in declaration order; preference is order, never weight.
 
-1. the slot list is expanded into a run in which each slot appears once per
-   unit of its weight — `[3,2,1,1]` becomes `1,1,1,2,2,3,4` — and the next
-   spawn takes the turn a persistent cursor (a file in the pool directory,
-   shared by every opencode process) points at
-2. a turn whose slot is cooling or already at its ceiling is **skipped**, and
-   the rotation resumes at the following turn
-3. once **every** slot is at its ceiling, overflow goes to the least loaded slot —
-   a burst past the summed ceilings degrades to even spreading and never blocks
+Routing runs in two passes:
 
-Weight is no longer a priority: a heavy slot is not drained to its ceiling
-before the others see any work. Every slot gets a turn each cycle, so a fast
-provider with a large usage window is used early in the cycle while it is
-still fast — instead of one provider being refilled until it hits its limit
-and its 429s displace every agent type at once.
+1. pass 1 fills each usable slot up to its weight, in declaration order
+2. once every usable slot has reached its weight, pass 2 repeats the order,
+   filling each usable slot up to twice its weight
 
-Equal weights give a plain round robin in list order. List order is the
-rotation itself, so put the models you want taking the earlier turns of a
-cycle at the top and the ones you want taking the later turns at the bottom.
+A slot is skipped when it is cooling, unavailable, or at its absolute cap.
+When every usable slot is at its absolute cap, overflow goes to the least
+loaded usable slot; the pool never refuses work.
+
+Live claims decide the next slot: a released claim immediately reopens its
+slot, and there is no stored position.
+
+Equal weights give a plain pass in list order. List order is preference, so
+put the slots you want preferred first at the top of the list.
 
 Spreading at least two providers across the slots is worth doing deliberately: a
 provider-wide rate limit takes out every slot on that provider at once.

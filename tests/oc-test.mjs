@@ -228,12 +228,12 @@ check("oc-sync rejects an unknown flag", () => {
 // ---------------------------------------------------------------------------
 // The repo and the config dir are two trees
 //
-// The regression: this repo used to BE the opencode config dir, so
-// CONFIG_DIR defaulted to $REPO_DIR and every path in the sync set was a
-// repo path. They were split — the package lives in the repo, the personal
-// config (opencode.jsonc, AGENTS.md, commands/, rules/) lives beside it — and
-// plain `oc-sync --with-config` then died on `opencode.jsonc not found` while
-// `bin/oc` was synced from a directory that no longer had one.
+// The repo is not the opencode config dir, so CONFIG_DIR must not default to
+// $REPO_DIR and every path in the sync set must be sourced from the tree that
+// owns it. The package lives in the repo, the personal config (opencode.jsonc,
+// AGENTS.md, commands/, rules/) lives beside it, and plain `oc-sync
+// --with-config` dies on `opencode.jsonc not found` when a package path is read
+// out of a directory that does not have one.
 // ---------------------------------------------------------------------------
 
 const resolveConfigDir = (home) => execFileSync("bash", ["-c",
@@ -351,7 +351,7 @@ check("oc sends the notification as ONE newline-delimited argument, not as argv"
   assert(/local payload=/.test(hop), "the hop should assemble a single payload variable")
   assert(/payload="\$\{title\}"\$'\\n'/.test(hop), "the payload should join the fields with newlines")
   assert(/-- "\$payload"/.test(hop), "the hop should pass exactly that one argument after --")
-  assert(!/"\$title" "\$msg"/.test(hop), "the hop must no longer pass four separate arguments")
+  assert(!/"\$title" "\$msg"/.test(hop), "the hop must pass one self-delimiting argument")
 })
 
 check("the hop payload strips the delimiter from the fields it joins on", () => {
@@ -371,9 +371,9 @@ check("oc uses the dedicated tunnel key, never a personal key", () => {
 })
 
 check("oc's failure message names the real cause", () => {
-  // Every line here was a real cause of silence. The wording used to point at
-  // ~/.ssh/config, which is no longer where the tunnel lives -- so the advice
-  // sent people to the wrong file while the actual fault was a systemd unit.
+  // Every line here was a real cause of silence. The wording points at the
+  // tunnel unit on the desktop, remote.env, and oc-sync -- the files and
+  // commands that carry the fault -- not at ~/.ssh/config.
   const src = read("oc")
   assert(/systemctl --user status oc-tunnel@/.test(src), "should point at the tunnel unit on the desktop")
   assert(/remote\.env/.test(src), "should mention the per-host marker file that carries the port and user")
@@ -405,7 +405,7 @@ check("the tunnel port is resolved per host, from the same marker file", () => {
   assert(/read_notify_env OC_TUNNEL_PORT/.test(src), "the port should come from the marker file too")
 })
 
-check("oc no longer notifies on start, and does not duplicate the finished case", () => {
+check("oc notifies only on crash", () => {
   // A start notification interrupts to say nothing: no result, no title, nothing
   // to act on. The success case belongs to the plugin, which knows the session
   // name and whether work actually finished -- `oc` exiting 0 only means the
@@ -475,9 +475,10 @@ check("receiver reads the payload from SSH_ORIGINAL_COMMAND, never from $1..$4",
   // arguments of its own, so "$1" is always empty and every field fell back to
   // its default -- an empty popup on the desktop with nothing in the logs.
   //
-  // Deliberately NOT pinned to `mapfile`. This used to assert the literal text
-  // "mapfile -t fields", which made it a test about one implementation of
-  // "split on newlines" rather than about the split. That is how the script
+  // Deliberately NOT pinned to `mapfile`. The guard asserts the split property,
+  // not the literal text "mapfile -t fields", so the test covers any
+  // implementation of splitting on newlines rather than one spelling of it. That
+  // is how the script
   // could sit on a bash-4 builtin while every desktop it was installed on ran
   // bash 3.2 -- macOS ships 3.2, and there `mapfile` is "command not found",
   // `fields` stays unset, and all four fields silently fall back to their
@@ -872,7 +873,7 @@ exit 0
   assert(/distinct=passed/.test(out), `distinct hosts must pass: ${out}`)
 }, { skip: NO_OC_SYNC })
 
-check("oc-sync removes the RemoteForward that used to race the unit", () => {
+check("oc-sync removes the RemoteForward that races the unit", () => {
   // Left in place, the config line wins the port on every login and then drops
   // the tunnel the moment that terminal closes -- which is the original bug.
   const src = read("oc-sync")

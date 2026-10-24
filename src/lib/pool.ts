@@ -13,22 +13,13 @@ import { PACKAGE_ROOT } from "./package-root.ts"
 // share one load counter.
 //
 // Every slot carries a `weight` (the preset), and that is the only knob. A slot's
-// weight is its SHARE OF THE ROTATION, and how many claims it may hold at once is a
-// deliberate multiple of that share (slotCeiling: twice the weight), so the ceiling is
-// never what makes a slot busy. WHICH slot comes next is an ORDER-FIRST weighted round
-// robin: the slots are expanded into a run in which each one
-// appears once per unit of its weight ([3,2,1,1] -> [1,1,1,2,2,3,4]), the next spawn
-// takes the first slot in that run which is available and still under its ceiling, and
-// a cursor shared by every opencode process remembers where it got to. So weight says
-// how OFTEN a slot is preferred and the cursor says WHICH turn comes next: a heavy
-// slot is not drained before the others see any work, and two processes sharing the
-// pool keep rotating instead of each restarting the run. Equal weights therefore give a
-// plain round robin in declaration order, and 2 over 2 / 1 over 1 reproduces the old
-// primary/overflow cycle exactly.
-//
-// Once NO slot is both available and under its ceiling nothing can gate anything, so
-// the overflow goes to the least loaded slot -- the pool never blocks, and a burst past
-// the summed ceilings degrades to even spreading rather than piling on slot 1.
+// weight is its active-session budget for one pass, and its absolute cap is twice
+// that budget (slotCeiling: SLOT_CEILING_FACTOR x weight). Routing fills in
+// declaration order: pass 1 walks the usable slots and fills each to its weight,
+// then pass 2 walks them again and fills each to its absolute cap. When every
+// usable slot is at its cap, the overflow goes to the least-loaded usable slot --
+// the pool never blocks, and a burst past the summed caps degrades to even spreading
+// rather than piling on slot 1.
 //
 // This module holds the state and the decision; src/plugins/agent-pool.ts owns
 // the hooks (task routing, limit detection, hang reaping) and
@@ -71,21 +62,19 @@ export const UNAVAILABLE_COOLDOWN_MS = 60 * 1000
  * long as the first one.
  */
 export const UNAVAILABLE_REASON = "endpoint-unavailable"
-// A weight counts the turns a slot takes per rotation, and its ceiling is a small
-// multiple of that (SLOT_CEILING_FACTOR), so this bounds both the ceiling and the
-// total pool capacity (4 slots at MAX_WEIGHT, each ceilinged at SLOT_CEILING_FACTOR
+// A weight is a slot's active-session budget for one pass, and its absolute cap is
+// a small multiple of that (SLOT_CEILING_FACTOR), so this bounds both the cap and
+// the total pool capacity (4 slots at MAX_WEIGHT, each capped at SLOT_CEILING_FACTOR
 // times that). Past it the number stops describing concurrency and becomes a way to
 // silence load balancing entirely, which is a config error rather than a value to
 // honour.
 export const MAX_WEIGHT = 100
-// Weight is the slot's share of the rotation -- roundRobinSequence gives it one
-// position per unit, so it decides how OFTEN the slot is preferred. The ceiling is
-// deliberately larger than that share (twice it), so a full weighted rotation can be
-// traversed twice before the pool is full: a heavy slot keeps its proportional share
-// while a burst that outruns one rotation still lands on it instead of falling
-// straight through to the overflow path.
+// The number of passes routing makes through the slot list, and therefore the
+// multiple of weight that forms each slot's absolute cap. Pass 1 fills every usable
+// slot to its weight; pass 2 fills it to SLOT_CEILING_FACTOR x weight. A burst that
+// outruns pass 2 lands on the least-loaded usable slot instead of falling through.
 export const SLOT_CEILING_FACTOR = 2
-/** How many claims a slot may hold at once: twice its share of the rotation. */
+/** How many active sessions a slot may hold at once: SLOT_CEILING_FACTOR times its per-pass budget. */
 export const slotCeiling = (slot: Slot) => slot.weight * SLOT_CEILING_FACTOR
 // opencode.jsonc -- and, for an installed package, the agent set injected by
 // src/index.ts -- declares exactly one hidden variant per base per slot, and a
@@ -233,10 +222,10 @@ export type ModelsSource = { slots: Slot[]; problems: string[]; origin: string }
 // validated on its own: one bad slot is dropped with a warning, the rest still
 // route, unless nothing survives and the built-in defaults take over.
 //
-// Weight is the slot's share of the rotation, and its ceiling is twice that, so a bad
-// one warns and falls back to 1 rather than dropping the slot -- losing a model because
-// of a typo in a count would cost real capacity. A slot with no weight at all is weight
-// 1, i.e. one turn per rotation and a ceiling of two claims.
+// Weight is the slot's per-pass active-session budget, and its absolute cap is twice
+// that, so a bad one warns and falls back to 1 rather than dropping the slot -- losing
+// a model because of a typo in a count would cost real capacity. A slot with no weight
+// at all is weight 1, i.e. a budget of one session in each of the two passes.
 export function parseSlots(parsed: unknown, origin: string): SlotFile {
   const problems: string[] = []
   const entries = (parsed as { slots?: unknown })?.slots
@@ -407,11 +396,11 @@ export function ensureUserConfigDir(): boolean {
   }
 }
 
-// `weight` is the slot's share of the rotation, one turn per unit and a ceiling of
+// `weight` is the slot's active-session budget for one pass, with a ceiling of
 // twice that; absent means 1. `tier` is the pre-weight spelling, accepted as a
 // deprecated alias
 // (primary -> 2, overflow -> 1) so a host that has not been re-deployed keeps two
-// slots' worth of headroom instead of silently collapsing to one turn each.
+// slots' worth of headroom instead of silently collapsing to a budget of one each.
 function readWeight(entry: unknown, at: string, model: string, problems: string[]): number {
   const raw = (entry as { weight?: unknown })?.weight
   if (raw === undefined) {
@@ -455,7 +444,7 @@ const LIMIT_PATTERNS = [
 //
 // The CONTEXT family is excluded on purpose. "context limit reached" is a
 // prompt that is too long, not a provider that has run out of allowance, and
-// benching a model for it would take a healthy provider out of rotation over
+// benching a model for it would take a healthy provider out of the pool over
 // the user's own prompt.
 const LIMIT_REACHED_PATTERN = /\blimits?[\s_-]?(?:reached|exceeded)\b|\breached\s+(?:your|the|its)\s+limit\b/i
 const CONTEXT_LIMIT_PATTERN = /(?:context|token|length|window|prompt|char|character|byte|size)\s*(?:limit|length|size|window)/i
@@ -745,7 +734,6 @@ export const STATE_SWEEP_INTERVAL_MS = 60 * 60 * 1000
  * This is the same policy with no activity required, safe to call on a timer.
  * It deliberately does NOT touch:
  *   * this process's own claims file -- rewritten on every publish
- *   * `cursor.json` -- live rotation state, never stale by age
  *   * a cooldown that is still running
  *   * a LAPSED cooldown still inside its strike-decay window, because deleting
  *     that throws the strike count away and restarts the backoff at 1 (the same
@@ -964,8 +952,8 @@ export function readLimits(s: State): Map<string, Strike> {
         // Lapsed, but recent enough that a new failure is still the same streak.
         // Keep the record -- strikes intact -- so the NEXT failure escalates
         // instead of restarting at strike 1. Only its absence from `cooling`
-        // re-admits the model; deleting the file here (the old behaviour) threw
-        // the strike count away and reset the backoff on every lapse.
+        // re-admits the model; deleting the file here threw the strike count
+        // away and reset the backoff on every lapse.
         if (countsAsStrike) memory.set(strike.model, strike)
       } else {
         unlinkSync(path)
@@ -990,11 +978,11 @@ export function readLimits(s: State): Map<string, Strike> {
  * coolUnavailable()'s flat window and never enters the strike memory.
  *
  * It is enforced HERE rather than in the callers so that no caller can get it
- * wrong: the provider path (coolProvider) cools every slot on a provider and
- * used to route an outage through this function like any other failure, which
- * filed it as strike 1. The next REAL limit on that model then started at
- * strike 2 and took twice the window -- a healthy provider benched for the
- * quota window over a moment's outage.
+ * wrong: the provider path (coolProvider) cools every slot on a provider, and
+ * an outage is cooled flat and never counted as a strike. Routing one through
+ * this function like any other failure would file it as strike 1, so the next
+ * REAL limit on that model would start at strike 2 and take twice the window --
+ * a healthy provider benched for the quota window over a moment's outage.
  */
 export function recordStrike(s: State, model: string, reason: string, stated?: number) {
   if (!s.dirReady) return
@@ -1004,7 +992,7 @@ export function recordStrike(s: State, model: string, reason: string, stated?: n
   if (reason === UNAVAILABLE_REASON) return coolUnavailable(s, model)
   const now = Date.now()
   // Read the prior count from the whole memory map, not from `cooling`: a lapsed
-  // cooldown is no longer cooling but its strike streak still counts (readLimits).
+  // cooldown is not cooling but its strike streak still counts (readLimits).
   const prior = s.strikes.get(model)
   const strikes = prior && now - prior.last < STRIKE_DECAY_MS ? prior.strikes + 1 : 1
   const quota = isQuotaReason(reason)
@@ -1185,139 +1173,62 @@ export function snapshot(s: State): Snapshot {
 
 const loadOf = (counts: Map<string, number>, model: string) => counts.get(model) ?? 0
 
-// True while the slot still has room under its own ceiling (slotCeiling, i.e. twice
-// its rotation share), i.e. while that ceiling can still gate anything. A cooling slot
-// is never picked regardless of this.
+// True while the slot still has room under its absolute cap (slotCeiling, i.e. twice
+// its per-pass budget). A cooling slot is never picked regardless of this.
 export const underCeiling = (slot: Slot, counts: Map<string, number>) => loadOf(counts, slot.model) < slotCeiling(slot)
 
 /**
- * The weighted round-robin run, expanded from the slot list: every slot occupies one
- * position per unit of its weight, in declaration order. Weights `[3,2,1,1]` become
- * `[1,1,1,2,2,3,4]`. A heavier slot therefore holds more positions in the run, which
- * is how it is preferred more often -- without having to be filled to its ceiling
- * first, which is what the old highest-weight-wins rule did.
- *
- * Pure and exported so the shape can be unit tested without touching the disk. A
- * fractional weight contributes its whole part: a position in the run is a whole turn,
- * and it is the ceiling, not this expansion, that bounds how much a slot may hold.
- */
-export function roundRobinSequence(slots: Slot[]): number[] {
-  const seq: number[] = []
-  for (const slot of slots) for (let turn = 0; turn < slot.weight; turn++) seq.push(slot.index)
-  return seq
-}
-
-// Where in the run the next spawn starts looking.
-//
-// It has to be SHARED by every opencode process, not kept per process: a private
-// cursor would restart the rotation in each one, and a pool whose processes all start
-// at the top is the starvation this run is here to remove. So the cursor lives in the
-// claim dir next to the limit files, written atomically the same way.
-//
-// Read-modify-write races between processes are deliberately NOT locked: the worst a
-// lost update can do is let two processes pick the same slot, which is exactly what
-// happened before any cursor existed. The value is an optimisation of the rotation,
-// never a correctness requirement, so an unwritable dir, a missing file, or corrupt
-// JSON all degrade to "start at the top" and nothing is ever thrown at opencode.
-const CURSOR_FILE = "cursor.json"
-
-function readCursor(s: State): number {
-  try {
-    const parsed = JSON.parse(readFileSync(join(s.dir, CURSOR_FILE), "utf8")) as { seq?: unknown }
-    if (typeof parsed.seq === "number" && Number.isInteger(parsed.seq) && parsed.seq >= 0) return parsed.seq
-  } catch {
-    /* no cursor yet, or one this process cannot make sense of: start at the top */
-  }
-  return 0
-}
-
-function writeCursor(s: State, seq: number) {
-  if (!s.dirReady) return
-  const path = join(s.dir, CURSOR_FILE)
-  try {
-    writeFileSync(`${path}.tmp`, JSON.stringify({ seq }))
-    renameSync(`${path}.tmp`, path)
-  } catch {
-    /* the run simply restarts at the top on the next spawn */
-  }
-}
-
-/**
- * Pick the slot for the next spawn.
- *
- * ORDER FIRST, THEN WEIGHT. The old rule took the heaviest slot that still had room
- * under its ceiling, which re-decided the same way on every spawn: slot 1 filled to its
- * number while slots 2 and 3 idled, and a burst past that ceiling fell straight through
- * to the overflow path. Here the slots are expanded into a weighted round-robin run
- * (roundRobinSequence) and the scan walks that run from the shared cursor, taking the
- * first slot which is available AND under its ceiling. A slot that is cooling or full
- * is skipped rather than ending the scan, so the rotation keeps turning past a busy or
- * benched slot instead of stalling on it.
- *
- * The ceiling is TWICE a slot's weight (slotCeiling), deliberately larger than its
- * share of the rotation, so a full weighted rotation can be traversed twice before the
- * pool is full. Round robin decides which slot is PREFERRED next; the ceiling, not
- * weight alone, decides how many a slot may hold.
- *
- * Falling off the end of the run is the old overflow path, kept as it was: the least
- * loaded usable slot, or the least loaded slot of all when every one of them is cooling.
- * The pool never refuses work.
- */
-/**
  * The next slot the pool would hand a spawn.
  *
- * Selection walks a weighted round-robin run from a persisted cursor, so picking a
- * slot CONSUMES its turn. `advance: false` is a pure preview: pool_status calls it
- * to show where the next spawn would land, and observing the rotation must not be
- * what moves it, or merely looking at the pool would shift every spawn after it.
+ * Two ordered passes over the usable slots, in declaration order. Pass 1 gives each
+ * usable slot its weight -- its active-session budget for one pass -- and returns the
+ * first slot still below that budget. Pass 2 runs once every usable slot has reached
+ * its weight, and returns the first slot still below its absolute cap (slotCeiling,
+ * twice the weight). Preference is declaration order throughout.
+ *
+ * When every usable slot is at its absolute cap, the overflow goes to the least-loaded
+ * usable slot; if every slot is cooling, the least-loaded slot of all. The pool never
+ * refuses work.
  */
-export function pickSlot(s: State, snap: Snapshot, options?: { advance?: boolean }): Slot {
-  const advance = options?.advance !== false
+export type PoolPass = 1 | 2 | "overflow"
+
+export function pickSlot(s: State, snap: Snapshot): Slot {
   const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
-  // Built over the FULL slot list, not the usable subset: the run must not change
-  // length every time a model goes into cooldown, or a slot appearing and
-  // disappearing would silently rewind the cursor's rotation.
-  const seq = roundRobinSequence(slots)
-  if (seq.length > 0) {
-    const byIndex = new Map(slots.map((slot) => [slot.index, slot]))
-    const start = readCursor(s) % seq.length
-    for (let step = 0; step < seq.length; step++) {
-      const at = (start + step) % seq.length
-      const slot = byIndex.get(seq[at])
-      if (slot && isAvailable(s, slot.model, snap.cooling) && underCeiling(slot, snap.counts)) {
-        // Resume AFTER the turn just taken, so a slot that holds several positions in
-        // the run is never handed two of them back to back.
-        if (advance) writeCursor(s, at + 1)
-        return slot
-      }
-    }
-  }
   const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
-  // If EVERY slot is cooling, fall back to all of them rather than to none. This
-  // is fail-open on purpose -- see the note on isAvailable -- and the two cost the
-  // same thing: a request goes to a provider already known to be unhealthy, and
-  // gets a fast, self-cooling rejection instead of no request at all.
   const pool = usable.length > 0 ? usable : slots
-  // No slot is BOTH available and under its ceiling, so nothing can gate the
-  // pick: spread the overflow over the least loaded slot rather than refusing
-  // the work. The condition is not "every slot is at its ceiling" -- a slot
-  // that is cooling but still under its ceiling frees the others.
+  for (const slot of usable) {
+    if (loadOf(snap.counts, slot.model) < slot.weight) return slot
+  }
+  for (const slot of usable) {
+    if (loadOf(snap.counts, slot.model) < slotCeiling(slot)) return slot
+  }
+  // Every usable slot is at its absolute cap, so nothing gates the pick: spread the
+  // overflow over the least-loaded usable slot rather than refusing the work. The
+  // condition is not "every slot is at its cap" -- a slot that is cooling frees the
+  // others.
   return pool.reduce((best, slot) => (loadOf(snap.counts, slot.model) < loadOf(snap.counts, best.model) ? slot : best), pool[0])
+}
+
+/** Which fill pass routing is in: 1 until every usable slot reaches its weight, 2
+ * until every usable slot reaches its absolute cap, then overflow. */
+export function poolPass(s: State, snap: Snapshot): PoolPass {
+  const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
+  const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
+  if (usable.some((slot) => loadOf(snap.counts, slot.model) < slot.weight)) return 1
+  if (usable.some((slot) => loadOf(snap.counts, slot.model) < slotCeiling(slot))) return 2
+  return "overflow"
 }
 
 export function agentFor(base: string, slot: number) {
   return `${base}-${slot}`
 }
 
-// The base name if `name` is one of the pool's own slot variants -- `explore-2`,
+// The base name if `name` is a hand-named pool slot variant -- `explore-2`,
 // `implement-4`, and so on -- otherwise undefined.
 //
 // A variant is only ever the OUTPUT of routing: a caller spawns the bare base and
-// the pool picks the slot. Naming a variant is the one way to reach a provider
-// without asking the pool, and it is not a small one: it bypasses the round-robin
-// rotation AND the slot's ceiling, so naming slot 1 eight times puts eight concurrent
-// claims on a weight-3 slot whose ceiling is six. Counting such a spawn, as this once
-// did, cannot help -- the ceiling is precisely what it evades.
+// the pool picks the slot. The task hook coerces a hand-named variant back to its
+// base precisely so routing still owns slot choice and no provider can be pinned.
 export function manualVariant(name: string): string | undefined {
   const direct = /^(.*)-([1-9][0-9]*)$/.exec(name)
   if (!direct) return undefined

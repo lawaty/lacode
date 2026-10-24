@@ -156,19 +156,25 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
 
   // A successful POST is NOT proof the session died: this endpoint answers 200 and
   // body "true" for a session id that does not exist, and it answers 200 for a
-  // 404/500 upstream. So the response is checked, and the reason a kill failed is
-  // carried back rather than swallowed -- otherwise a failure is indistinguishable
-  // from a success and the zombie outlives its claim.
+  // 404/500 upstream. So the response is checked via the already-authenticated
+  // plugin client, and the reason a kill failed is carried back rather than
+  // swallowed -- otherwise a failure is indistinguishable from a success and the
+  // zombie outlives its claim. Failure when the response is not ok (return HTTP
+  // status) or when result.data === false ("server reported the session was not
+  // aborted").
   const abortSession = async (sessionID: string): Promise<{ ok: boolean; why: string }> => {
-    if (!serverUrl) return { ok: false, why: "no serverUrl: this process has no HTTP server to abort through" }
     try {
-      const res = await fetch(new URL(`/session/${sessionID}/abort`, serverUrl).toString(), {
-        method: "POST",
+      const result = await client.session.abort({
+        path: { id: sessionID },
+        query: { directory },
         signal: AbortSignal.timeout(ABORT_TIMEOUT_MS),
       })
-      if (!res.ok) return { ok: false, why: `gateway answered HTTP ${res.status}` }
-      const body = (await res.text()).trim()
-      if (body === "false") return { ok: false, why: "server reported the session was not aborted" }
+      if (!result.response?.ok) {
+        return { ok: false, why: `server answered HTTP ${result.response?.status ?? "?"}` }
+      }
+      if (result.data === false) {
+        return { ok: false, why: "server reported the session was not aborted" }
+      }
       return { ok: true, why: "" }
     } catch (error) {
       return { ok: false, why: String(error) }
@@ -202,6 +208,61 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     return undefined
   }
 
+  type PooledSession = { agent: string; slot: number; model: string }
+  // Identify a pooled child session that has no local claim (e.g. created before
+  // a plugin reload or whose session.created binding was missed). Uses the
+  // opencode session API to inspect parentage and the user message's agent/model.
+  const identifyPooledSession = async (sessionID: string): Promise<PooledSession | undefined> => {
+    try {
+      const info = await client.session
+        .get({ path: { id: sessionID }, query: { directory } })
+        .then((r) => r.data as { parentID?: string } | undefined)
+        .catch(() => undefined)
+      if (!info?.parentID) return undefined // root/user session: leave alone
+      const msgs = await client.session
+        .messages({ path: { id: sessionID }, query: { directory } })
+        .then(
+          (r) =>
+            r.data as
+              | Array<{ info?: { role?: string; agent?: string; model?: { providerID?: string; modelID?: string } } }>
+              | undefined,
+        )
+        .catch(() => undefined)
+      if (!Array.isArray(msgs)) return undefined
+      const userMsg = msgs.find((m) => m?.info?.role === "user")
+      if (!userMsg?.info) return undefined
+      const agent = userMsg.info.agent
+      if (typeof agent !== "string") return undefined
+      const modelInfo = userMsg.info.model
+      const userModel = modelInfo?.providerID && modelInfo?.modelID ? `${modelInfo.providerID}/${modelInfo.modelID}` : undefined
+
+      // Determine if this is a pooled variant/base we care about. Once the slot
+      // table is known, only a variant the pool actually offers is accepted; a
+      // hand-named variant or base counts only while the table is still empty.
+      if (s.known.size > 0 && !s.known.has(agent)) return undefined
+      if (s.known.size === 0 && pool.manualVariant(agent) === undefined && !(pool.BASES.includes(agent) && userModel)) {
+        return undefined
+      }
+
+      const slots = s.slots.length > 0 ? s.slots : pool.FALLBACK_SLOTS
+      if (!slots || slots.length === 0) return undefined
+
+      let slot: (typeof slots)[number] | undefined
+      const variantBase = pool.manualVariant(agent)
+      if (variantBase) {
+        const idx = Number(agent.slice(agent.lastIndexOf("-") + 1))
+        if (!Number.isFinite(idx)) return undefined
+        slot = slots.find((sl) => sl.index === idx)
+      } else if (pool.BASES.includes(agent) && userModel) {
+        slot = slots.find((sl) => sl.model === userModel)
+      }
+      if (!slot) return undefined
+      return { agent, slot: slot.index, model: slot.model }
+    } catch {
+      return undefined
+    }
+  }
+
   // A usage limit HANGS rather than failing: opencode keeps retrying the same
   // refused model, so the claim it is holding never comes back and the reaper
   // would only condemn it after STUCK_MIN_AGE_MS of age -- minutes the caller
@@ -210,9 +271,61 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
   // returns to the caller and the next spawn routes to a slot that answers, in
   // seconds instead of minutes. Scoped to the claim that owns the session so an
   // unrelated session's error never kills someone else's work.
-  const failOver = async (sessionID: string | undefined, model: string, reason: string) => {
+  const failOver = async (
+    sessionID: string | undefined,
+    model: string,
+    reason: string,
+    opts?: { stated?: number; cool?: boolean },
+  ) => {
     const entry = claimFor(sessionID)
+    if (entry) {
+      // Owned-claim path: abort the session the limit names and release the claim
+      // so the caller can re-route now. A failed abort holds the claim for retry.
+      const { key, claim } = entry
+      const kill = await abortSession(sessionID)
+      if (kill.ok) {
+        pool.release(s, key)
+        await log(
+          "warn",
+          `limit (${reason}) on ${model}; aborted in-flight ${claim.v} session ${sessionID} to fail over now`,
+          { base: claim.v, model: claim.m, slot: claim.k, session: sessionID, aborted: true, reason },
+        )
+        return
+      }
+      await log(
+        "warn",
+        `limit (${reason}) on ${model}; abort failed (${kill.why}); claim on slot ${claim.k} held for retry`,
+        { base: claim.v, model: claim.m, slot: claim.k, session: sessionID, aborted: false, reason },
+      )
+      return
+    }
     if (!entry) {
+      // No-claim path
+      if (opts?.cool !== false && sessionID) {
+        const pooled = await identifyPooledSession(sessionID)
+        if (pooled) {
+          pool.recordStrike(s, pooled.model, reason, opts?.stated)
+          const kill = await abortSession(sessionID)
+          await log(
+            "warn",
+            `limit (${reason}) on ${pooled.model}; aborted pooled ${pooled.agent} session ${sessionID} (slot ${pooled.slot}) to fail over now`,
+            { base: pooled.agent, model: pooled.model, slot: pooled.slot, session: sessionID, aborted: kill.ok, reason },
+          )
+          return
+        }
+      } else if (opts?.cool === false && sessionID) {
+        // If opts?.cool === false (provider-wide cooling already happened), still identify and abort the pooled session, but do not call recordStrike again.
+        const pooled = await identifyPooledSession(sessionID)
+        if (pooled) {
+          const kill = await abortSession(sessionID)
+          await log(
+            "warn",
+            `limit (${reason}) on ${pooled.model}; aborted pooled ${pooled.agent} session ${sessionID} (slot ${pooled.slot}) to fail over now`,
+            { base: pooled.agent, model: pooled.model, slot: pooled.slot, session: sessionID, aborted: kill.ok, reason },
+          )
+          return
+        }
+      }
       // A limit on a session the pool never bound is not ours to kill: the
       // plugin sees every session in the process, including the user's own and
       // other processes'. A child is bound at session.created, before any
@@ -221,16 +334,6 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       await log("warn", `limit (${reason}) on ${model} for session ${sessionID ?? "?"}, which has no pool claim; nothing aborted`)
       return
     }
-    const { key, claim } = entry
-    const kill = await abortSession(sessionID)
-    pool.release(s, key)
-    await log(
-      "warn",
-      kill.ok
-        ? `limit (${reason}) on ${model}; aborted in-flight ${claim.v} session ${sessionID} to fail over now`
-        : `limit (${reason}) on ${model}; released in-flight ${claim.v} claim after a failed abort (${kill.why})`,
-      { base: claim.v, model: claim.m, slot: claim.k, session: sessionID, aborted: kill.ok, reason },
-    )
   }
 
   const reapStuck = async () => {
@@ -367,7 +470,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     return [
       ...report.outcomes.map((outcome) =>
         outcome.ok
-          ? `${outcome.model}: answered — cooldown cleared (it had ${formatWindow(outcome.hadSeconds)} left), back in the rotation`
+            ? `${outcome.model}: answered — cooldown cleared (it had ${formatWindow(outcome.hadSeconds)} left), back in the pool`
           : outcome.reason === pool.MODEL_MISSING_REASON
             ? `${outcome.model}: not served by the provider (${outcome.reason}) — benched${
                 outcome.leftSeconds > 0 ? `, ${formatWindow(outcome.leftSeconds)} left` : ""
@@ -658,7 +761,12 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             }
             // The provider is benched, but the task already retrying on it is not:
             // abort it now rather than leave it to burn the whole retry budget.
-            await failOver(sessionID, provider ?? own?.claim.m ?? "?", named)
+            if (provider) {
+              await failOver(sessionID, provider ?? own?.claim.m ?? "?", named, { stated: undefined, cool: false })
+            } else {
+              const stated = outage ? undefined : pool.statedCooldown(message)
+              await failOver(sessionID, own?.claim.m ?? "?", named, { stated, cool: !own })
+            }
           }
           return
         }
@@ -681,6 +789,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           if (!limited && !outage) return
           const own = claimFor(sessionID)
           const named = outage ? pool.UNAVAILABLE_REASON : pool.limitReason(haystack) ?? "rate-limited"
+          let stated: number | undefined
           if (own) {
             if (outage) {
               const transient = pool.coolUnavailable(s, own.claim.m)
@@ -688,7 +797,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
                 await log("warn", `cooling ${own.claim.m} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason}) after a terminal error`)
               }
             } else {
-              const stated = pool.statedCooldown(haystack) ?? pool.retryAfterMs(error?.data?.responseHeaders)
+              stated = pool.statedCooldown(haystack) ?? pool.retryAfterMs(error?.data?.responseHeaders)
               const strike = pool.recordStrike(s, own.claim.m, named, stated)
               if (strike) {
                 await log("warn", `limit on ${own.claim.m} (${named}); cooling it for ${Math.round((strike.until - Date.now()) / 1000)}s from a terminal session.error`, {
@@ -699,7 +808,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
               }
             }
           }
-          await failOver(sessionID, own?.claim.m ?? "?", named)
+          await failOver(sessionID, own?.claim.m ?? "?", named, { stated, cool: !own })
           return
         }
 
@@ -752,9 +861,13 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         // would escalate the cooldown past the outage -- see pool.coolUnavailable).
         // A gateway 5xx, a queue budget, or a timeout is the same kind of fault
         // and takes the same flat path; a real limit still escalates below.
+        const ownMsg = claimFor(info.sessionID)
         if (pool.isUnavailableText(haystack) || (!limited && transientGateway)) {
           const transient = pool.coolUnavailable(s, model)
           if (transient) await log("warn", `cooling ${model} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason})`)
+          // The caller already cooled the model, so only the abort/release side
+          // of failover applies; a stuck session must not keep retrying it.
+          await failOver(info.sessionID, model, transient?.reason ?? pool.UNAVAILABLE_REASON, { cool: false })
           return
         }
         const stated = pool.statedCooldown(haystack) ?? pool.retryAfterMs((info.error as { data?: { responseHeaders?: Record<string, string> } }).data?.responseHeaders)
@@ -763,7 +876,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         if (strike) await log("warn", `cooling ${model} for ${Math.round((strike.until - Date.now()) / 1000)}s (${reason ?? "rate-limited"}, strike ${strike.strikes})`)
         // The model is benched; the task already in flight on it is not. Abort it
         // so the caller re-routes now instead of after the ~5-minute hang reaper.
-        await failOver(info.sessionID, model, reason ?? "rate-limited")
+        await failOver(info.sessionID, model, reason ?? "rate-limited", { stated, cool: !ownMsg })
       } catch (error) {
         await log("error", `limit detection failed: ${String(error)}`)
       }
@@ -771,7 +884,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
 
     "tool.execute.before": async (input, output) => {
       if (input.tool !== "task") return
-      const requested = output.args?.subagent_type
+      let requested = output.args?.subagent_type
       if (typeof requested !== "string") {
         // A task spawn with no subagent_type never reaches the routing below:
         // opencode runs the default subagent, which carries no pool model, so
@@ -785,32 +898,21 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         return
       }
 
-      // Refused here, ahead of routing and deliberately OUTSIDE the try below.
+      // Coerced here, ahead of routing and deliberately OUTSIDE the try below.
       // That catch exists so a routing slip never costs the caller a spawn; a
-      // refusal is not a slip, and swallowing it into "spawn unchanged" would let
-      // the very spawn this forbids go through -- with a claim on a slot the pool
-      // never chose, above the ceiling that slot was meant to enforce.
+      // coercion is not a slip, and swallowing it into "spawn unchanged" would
+      // leave the hand-named slot in place instead of routing through pickSlot.
+      // A hand-named pool slot variant (e.g. a variant of a pooled base) is
+      // rewritten to its base so routing proceeds through pickSlot and the pool
+      // owns slot choice. The variant's NAME is deliberately absent from the
+      // log line, for the same reason the routing log omits it.
       const manual = pool.manualVariant(requested)
       if (manual) {
-        // The variant's NAME is deliberately absent from this line and from the
-        // error below, for the same reason the routing log omits it.
-        //
-        // This error is the TOOL RESULT the model reads at the exact moment it
-        // is choosing what to spawn next. Naming the name it just used puts a
-        // valid-looking agent name back in front of it, in the decision point,
-        // and the refusal becomes the thing that TEACHES the name. The log
-        // alone was enough to take the refusal rate from 100% to 36%; the error
-        // is the stronger channel still, because it arrives without a
-        // deliberate read. The base is named instead, because the base is what
-        // the model should type.
-        await log("warn", `refused manual spawn of a pool slot variant; spawn "${manual}" instead`, {
+        await log("warn", `rewrote a hand-named pool slot to its base; the pool owns slot choice`, {
           base: manual,
         })
-        throw new Error(
-          `That agent is a pool slot variant and cannot be spawned by name. Naming it lets the caller pick the provider: ` +
-            `it skips the round-robin rotation and the slot's ceiling, so one provider takes every concurrent claim. ` +
-            `Spawn "${manual}" and let the pool choose the slot.`,
-        )
+        requested = manual
+        output.args.subagent_type = manual
       }
 
       try {
@@ -825,15 +927,13 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             await warnOnce(`variant ${variant} missing from config; spawn left unchanged`)
             return
           }
-          pool.acquire(s, requested, slot, input.sessionID, pool.claimKey(input.sessionID, input.callID))
-          output.args.subagent_type = variant
           // The variant's NAME is deliberately absent from this line.
           //
           // This log is read by the very agent it routes. Printing "routed explore
           // -> explore-2" hands the model a valid-looking agent name in the exact
-          // place it is deciding what to spawn, and the refusals that follow show
-          // it copying those names straight back: `implement-4` 23 times,
-          // `implement-2` 20, `explore-2` 12 -- one occurrence per routed spawn.
+          // place it is deciding what to spawn, and a model that sees one copies
+          // it straight back: `implement-4` 23 times, `implement-2` 20,
+          // `explore-2` 12 -- one occurrence per routed spawn.
           // The slot index and the model say everything an operator needs and give
           // the model nothing to echo.
           await log("info", `routed ${requested} to slot ${slot.index} on ${slot.model}`, {
@@ -843,6 +943,9 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             ceiling: pool.slotCeiling(slot),
             load: (snap.counts.get(slot.model) ?? 0) + 1,
           })
+          output.args.subagent_type = variant
+          // Invariant: a claim is held only for a rout that completes.
+          pool.acquire(s, requested, slot, input.sessionID, pool.claimKey(input.sessionID, input.callID))
           return
         }
 
@@ -874,7 +977,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     tool: {
       pool_recheck: tool({
         description:
-          "Probe the models the pool has benched and re-admit the ones that answer. Each probe is a real request on that exact model, so it settles what a cooldown can only guess: if the model replies, its cooldown is cleared and it is back in the rotation; if it is still limited, the existing cooldown stands; if the provider does not serve it at all, it is benched so routing stops choosing it. Pass `models` to validate those even when they are not cooling. Call it after editing the pool, after resetting a quota in the provider's own console, when the pool feels short of capacity, or to check now instead of waiting for the next automatic pass.",
+          "Probe the models the pool has benched and re-admit the ones that answer. Each probe is a real request on that exact model, so it settles what a cooldown can only guess: if the model replies, its cooldown is cleared and it is back in the pool; if it is still limited, the existing cooldown stands; if the provider does not serve it at all, it is benched so routing stops choosing it. Pass `models` to validate those even when they are not cooling. Call it after editing the pool, after resetting a quota in the provider's own console, when the pool feels short of capacity, or to check now instead of waiting for the next automatic pass.",
         args: {
           models: tool.schema
             .array(tool.schema.string())
@@ -890,12 +993,13 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
 
       pool_status: tool({
         description:
-          "Show live pool load across every opencode process, per free model and per agent type, each slot's load against its ceiling, the slot marked <- next that the next spawn would take, and which models are cooling after a rate limit or a stuck task. Check it before launching many parallel subagents.",
+          "Show live pool load across every opencode process, per free model and per agent type, each slot's load against its ceiling, the slot marked <- next that the next spawn would take, and which models are cooling after a rate limit or a stuck task; COOLING/UNAVAILABLE = not routable. Check it before launching many parallel subagents.",
         args: {},
         async execute() {
           pool.refreshCatalog(s, serverUrl)
           const slots = pool.ensureSlots(s, (m) => void warnOnce(m))
           const snap = pool.snapshot(s)
+          const pass = pool.poolPass(s, snap)
           const now = Date.now()
           const byModel = new Map<string, { total: number; bases: Map<string, number> }>()
           const add = (model: string, base: string) => {
@@ -909,15 +1013,14 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
 
           // Which slot the next pooled spawn would actually take, so a surprising routing
           // decision can be read off the status instead of guessed at from load alone.
-          // advance:false -- looking must not consume the rotation's next turn.
-          const next = pool.pickSlot(s, snap, { advance: false })
+          const next = pool.pickSlot(s, snap)
           const line = (slot: pool.Slot) => {
             const entry = byModel.get(slot.model)
             const users = entry && entry.bases.size > 0 ? [...entry.bases].map(([b, n]) => `${b}x${n}`).join(" ") : "idle"
             const strike = snap.cooling.get(slot.model)
             const status = s.catalog.get(slot.model)
             const notes = [
-              strike ? `COOLING ${Math.ceil((strike.until - now) / 1000)}s (${strike.reason}, strike ${strike.strikes})` : "",
+              strike ? `UNAVAILABLE (COOLING ${Math.ceil((strike.until - now) / 1000)}s, ${strike.reason}, strike ${strike.strikes})` : "",
               status && status !== "active" && status !== "unknown" ? `catalog:${status}` : "",
             ].filter(Boolean)
             const marker = slot.index === next.index ? " <- next" : ""
@@ -941,7 +1044,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           return {
             title: `agent-pool: ${total} task(s) in flight, ${coolingNow.length} model(s) cooling`,
             output: [
-              `shared pool over ${slots.length} model(s) from ${s.origin}; bases: ${pool.BASES.join(", ")}\nround robin in slot order, each slot taking as many turns as its weight says, so no slot is starved while another drains (FULL = at ceiling, used only when no other slot is available and under its ceiling)`,
+              `shared pool over ${slots.length} model(s) from ${s.origin}; pass ${pass}; bases: ${pool.BASES.join(", ")}\ntwo ordered passes in slot order: pass 1 fills each slot to its weight, pass 2 to its ceiling, then overflow goes to the least-loaded slot (FULL = at ceiling, used only when no other slot is available and under its ceiling)`,
               ...slots.map(line),
               "",
               "by process:",
@@ -969,7 +1072,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
                 : "pool config watch: off (watchMs: 0).",
               coolingNow.length === 0
                 ? "no models cooling down."
-                : `cooling: ${coolingNow.map(([m, st]) => `${m} for ${Math.ceil((st.until - now) / 1000)}s`).join(", ")}`,
+                : `unavailable/cooling: ${coolingNow.map(([m, st]) => `${m} for ${Math.ceil((st.until - now) / 1000)}s`).join(", ")}`,
             ].join("\n"),
           }
         },

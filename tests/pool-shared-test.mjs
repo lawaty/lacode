@@ -60,18 +60,16 @@ const BASES = ["explore", "implement", "context"]
 // for that slot) comes back unrouted, so return -1 rather than throwing.
 const slotOf = (variant) => (variant === null || variant === undefined ? -1 : Number(/-(\d+)$/.exec(variant)?.[1] ?? -1))
 // Slot numbers per weight, so these checks hold whatever weights and order
-// presets/free-tier.json lists its slots in. pickSlot compares weights, not
-// position: what "a workhorse slot" and "a reserve slot" mean is the file's.
+// presets/free-tier.json lists its slots in. Routing fills in declaration order;
+// weight is each slot's active-session budget for one pass, so the heavy/light
+// groups describe capacity and overflow rather than preference.
 const MAX_WEIGHT = Math.max(...SHIPPED.map((s) => s.weight))
 const slotsOfWeight = (weight) => SHIPPED.flatMap((s, i) => (s.weight === weight ? [i + 1] : []))
 const HEAVY_SLOTS = slotsOfWeight(MAX_WEIGHT)
 const LIGHT_SLOTS = slotsOfWeight(Math.min(...SHIPPED.map((s) => s.weight)))
 const ALL_SLOTS = SHIPPED.map((_, i) => i + 1)
 const firstOf = (xs) => xs[0]
-// How deep the heaviest slot goes before a lightest one is engaged, derived from the
-// ratio rule rather than written as a literal: handover happens at
-// weight * PRIORITY_MARGIN / weight - PRIORITY_MARGIN claims.
-// The summed ceilings are where the weighted phase ends and the overflow begins.
+// The summed absolute caps are where the two passes end and the overflow begins.
 const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
 
 // 1. slot N is the same model for every base, so the pool is genuinely shared
@@ -92,7 +90,7 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   }
 }
 
-// 2. alternating base types interleave across slots rather than each taking one
+// 2. alternating base types share one ordered fill rather than each taking a slot
 {
   const t = await mk("shared-1", scratch())
   const picks = []
@@ -109,13 +107,15 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   for (let i = 0; i < picks.length; i++) soloPicks.push(slotOf(await solo.spawn(`s${i}`, BASES[0])))
   assert(
     picks.join(",") === soloPicks.join(","),
-    `mixed base types must follow the same shared cycle, got ${picks.join(",")}, want ${soloPicks.join(",")}`,
+    `mixed base types must follow the same ordered fill, got ${picks.join(",")}, want ${soloPicks.join(",")}`,
   )
-  // An idle pool starts on its heaviest slots, so the leading picks are heavy ones
-  // until the heavy slots reach their ceilings.
+  // An idle pool fills the first declared slot to its weight before moving on,
+  // so the leading picks are on that slot while it is below budget.
+  const first = firstOf(ALL_SLOTS)
+  assert(picks[0] === first, `an idle pool must start on the first declared slot, got ${picks[0]}`)
   assert(
-    HEAVY_SLOTS.includes(picks[0]) && HEAVY_SLOTS.includes(picks[1]),
-    `an idle pool must start on the heaviest slots, got ${picks.slice(0, 2).join(",")}`,
+    picks[1] === (SHIPPED[0].weight > 1 ? first : ALL_SLOTS[1]),
+    `ordered fill must keep filling the first slot until its weight, got ${picks.slice(0, 2).join(",")}`,
   )
   assert(new Set(picks).size === ALL_SLOTS.length, "every slot must be used when base types alternate")
 }
@@ -124,13 +124,13 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
 //    implement onto the same shared slots instead of its own
 {
   const t = await mk("shared-2", scratch())
-  for (let i = 0; i < CAPACITY; i++) await t.spawn(`x${i}`, "explore") // deep enough to exhaust every ceiling
+  for (let i = 0; i < CAPACITY; i++) await t.spawn(`x${i}`, "explore") // deep enough to exhaust every absolute cap
   const afterExplore = slotOf(await t.spawn("x4", "implement"))
   assert(
     afterExplore === firstOf(LIGHT_SLOTS),
-    `implement must land on the lightest slot, got ${afterExplore}`,
+    `implement must land on the least-loaded slot, got ${afterExplore}`,
   )
-  assert(!HEAVY_SLOTS.includes(afterExplore), `implement must not be handed an explore-loaded heavy slot`)
+  assert(!HEAVY_SLOTS.includes(afterExplore), `implement must not be handed a slot with more load`)
 }
 
 // 4. pool_status attributes load per model and names the agent types using it
@@ -153,8 +153,8 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   pool.init(state, () => {})
   const snap = pool.snapshot(state)
   const slot = pool.pickSlot(state, snap)
-  // an idle pool hands out its heaviest slot, whichever one the file put first
-  assert(HEAVY_SLOTS.includes(slot.index), `an idle pool should hand out a heaviest slot, got ${slot.index}`)
+  // an idle pool starts on the first declared slot
+  assert(slot.index === ALL_SLOTS[0], `an idle pool should hand out the first declared slot, got ${slot.index}`)
   const agent = pool.agentFor("context", slot.index)
   assert(agent === `context-${slot.index}`, `borrowed agent name wrong: ${agent}`)
   assert(cfg.agent[agent] !== undefined, `${agent} must exist in config`)
@@ -163,18 +163,44 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   let busy = pool.snapshot(state)
   assert(busy.counts.get(slot.model) === 1, "the borrowed slot must show as loaded")
   assert(busy.own.get(key).g === "ses_borrow", "the claim must target the working session for the reaper")
-  // A second borrow must not land on the busy slot while another slot is
-  // eligible. With a single heavy slot there is nothing to switch to: the only
-  // other slots are lighter and stay empty until the heavy one reaches its ceiling,
-  // so handing out the same heavy slot again is the pool behaving as
-  // designed, not a routing failure.
+  // Pass 1 keeps the first declared slot until it reaches its weight, so a
+  // second borrow stays on it while it is still below budget; only after the
+  // budget is reached does the next declared slot take over.
   const slot2 = pool.pickSlot(state, pool.snapshot(state))
-  if (HEAVY_SLOTS.length > 1) {
-    assert(slot2.index !== slot.index, `second borrow should avoid the busy slot, got ${slot2.index}`)
-  }
+  const secondExpected = SHIPPED[0].weight > 1 ? slot.index : ALL_SLOTS[1]
+  assert(slot2.index === secondExpected, `second borrow should follow the ordered fill, got ${slot2.index}, want ${secondExpected}`)
   pool.release(state, key)
   busy = pool.snapshot(state)
   assert(busy.counts.get(slot.model) === undefined, "release must clear the borrowed slot")
+}
+
+// 5b. cross-process: a sibling's live claim is load, so it decides the next slot.
+//     Releasing that claim reopens its slot on the next pick.
+{
+  const dir = scratch()
+  const state = pool.state({
+    id: "cross-process",
+    dir,
+    models: {
+      slots: [
+        { model: "fixture/cross-a", weight: 1 },
+        { model: "fixture/cross-b", weight: 1 },
+      ],
+    },
+  })
+  pool.init(state, () => {})
+  const sibling = spawn(process.execPath, ["-e", "setTimeout(()=>{},60000)"])
+  const now = Date.now()
+  const claim = { v: "explore", k: 1, m: "fixture/cross-a", t: now, hb: now, s: "ses_sibling" }
+  writeFileSync(join(dir, `claims.${sibling.pid}.json`), JSON.stringify({ "sibling:call": claim }))
+  // The first slot is at its weight, so pass 1 moves to the next declared slot.
+  const next = pool.pickSlot(state, pool.snapshot(state))
+  assert(next.model === "fixture/cross-b", `a live sibling claim must decide the next slot, got ${next.model}`)
+  // The sibling releases its claim: pass 1 reopens the first slot at once.
+  writeFileSync(join(dir, `claims.${sibling.pid}.json`), "{}")
+  const reopened = pool.pickSlot(state, pool.snapshot(state))
+  assert(reopened.model === "fixture/cross-a", `a released sibling claim must reopen its slot, got ${reopened.model}`)
+  sibling.kill()
 }
 
 // 6. a cooled model is skipped by every base type, not just explore
@@ -225,10 +251,11 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   assert(pool.isAvailable(state, cooledAbsent, state.cooling) === false, "a cooling model must be unavailable even when the catalog is silent")
 }
 
-// 8. pickSlot: a catalog-gated slot leaves the candidate set, so the next-heaviest
-//    available slot takes the spawn by weight. When EVERY slot is gated the pool
-//    still returns one -- it never refuses work (src/lib/pool.ts:709-714): the usable
-//    set is empty, so the full slot list is used and the heaviest declared slot wins.
+// 8. pickSlot: a catalog-gated slot leaves the candidate set, so the first usable
+//    slot in declaration order takes the spawn. When EVERY slot is gated the pool
+//    still returns one -- it never refuses work (src/lib/pool.ts pickSlot): the
+//    usable set is empty, so the full slot list is used and, every load being equal,
+//    the first declared slot wins.
 {
   const state = pool.state({
     id: "gate",
@@ -243,26 +270,25 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   })
   pool.init(state, () => {})
   const idle = pool.pickSlot(state, pool.snapshot(state))
-  assert(idle.model === "fixture/gate-a", `an idle pool must pick the heaviest declared slot, got ${idle.model}`)
-  // retire the heaviest: the weight-2 slot is the next heaviest available
+  assert(idle.model === "fixture/gate-a", `an idle pool must pick the first declared slot, got ${idle.model}`)
+  // retire the first slot: the next usable slot in declaration order takes over
   state.catalog.set("fixture/gate-a", "deprecated")
   const gated = pool.pickSlot(state, pool.snapshot(state))
-  assert(gated.model === "fixture/gate-b", `a gated heaviest slot must fall through to the next heaviest, got ${gated.model}`)
+  assert(gated.model === "fixture/gate-b", `a gated slot must fall through to the next usable slot, got ${gated.model}`)
   // every slot retired: no usable slot, so the full list is the pool and -- every
-  // slot being under its ceiling -- the heaviest declared slot (index 1) is returned.
+  // slot being at the same load -- the first declared slot (index 1) is returned.
   state.catalog.set("fixture/gate-b", "deprecated")
   state.catalog.set("fixture/gate-c", "disabled")
   const fallback = pool.pickSlot(state, pool.snapshot(state))
   assert(
     fallback.model === "fixture/gate-a" && fallback.index === 1,
-    `when every slot is unusable pickSlot must still return a slot (heaviest declared, index 1), got ${fallback.index}:${fallback.model}`,
+    `when every slot is unusable pickSlot must still return a slot (first declared, index 1), got ${fallback.index}:${fallback.model}`,
   )
 }
 
-// 9. pickSlot tie-breaking: equal weights keep declaration order -- the property the
-//    pool.ts comment above pickSlot calls "a plain round robin". The earlier-declared
-//    slot wins a tie, and only once it reaches its own ceiling does the equal-weight
-//    sibling take over.
+// 9. pickSlot declaration order: equal weights fill in declaration order. Pass 1
+//    gives each slot its weight -- the earlier-declared slot wins until it reaches
+//    its budget -- then pass 2 returns to the earlier slot up to its absolute cap.
 {
   const state = pool.state({
     id: "tie",
@@ -275,11 +301,9 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
     },
   })
   pool.init(state, () => {})
-  // Slot 1 and 2, weight 2, ceiling 4.
-  // Spawns 1, 2, 3, 4 should all go to slot 1.
-  // Spawn 5 should go to slot 2.
-  // Slot 1 and 2, weight 2, ceiling 4.
-  // Spawns 1, 2 should go to slot 1, spawns 3, 4 should go to slot 2.
+  // Slots 1 and 2, weight 2, absolute cap 4.
+  // Pass 1: spawns 1 and 2 go to slot 1, spawns 3 and 4 go to slot 2.
+  // Pass 2: spawn 5 returns to slot 1 in declaration order.
   for (let i = 0; i < 2; i++) {
     const slot = pool.pickSlot(state, pool.snapshot(state))
     assert(slot.index === 1, `slot 1 should take the first 2 spawns, got slot ${slot.index}`)
@@ -291,7 +315,7 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
     pool.acquire(state, "explore", slot, `s${i}`, `tie-${i}`)
   }
   const fifth = pool.pickSlot(state, pool.snapshot(state))
-  assert(fifth.index === 1, `once slot 2 hits its ceiling slot 1 takes over again, got slot ${fifth.index}`)
+  assert(fifth.index === 1, `once both slots reach their weight, pass 2 returns to slot 1, got slot ${fifth.index}`)
 }
 
 // The shared state directory is cleaned by traffic alone -- dead claims and
@@ -299,6 +323,8 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
 // which only happens on a spawn. So an idle machine carries a dead process's
 // claims file and every lapsed cooldown forever. sweepStateDir is that same
 // policy with no activity required, which is the only cleanup an idle box gets.
+// It keeps this process's own claims file, a live sibling's claims file, a
+// running cooldown, and a lapsed cooldown still inside its strike-decay window.
 {
   const dir = scratch()
   const s = pool.state({ id: "sweeper", dir })
@@ -343,11 +369,10 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   writeFileSync(join(dir, `claims.${deadPid}.json`), "{}") // dead pid: reclaimed at once
   writeFileSync(join(dir, `claims.${alivePid}.json`), "{}") // live pid: kept
   write(pool.selfFile(s.id), "{}") // our own: never ours to delete
-  write("cursor.json", '{"i":1}')
   write("limit.active.json", strike(3600_000, 0)) // still cooling: kept
   write("limit.decay.json", strike(-1000, -1000, 2)) // lapsed, inside decay: kept (strike memory)
   write("limit.stale.json", strike(-1000, -40 * 60_000, 3)) // lapsed past decay: removed
-  write("old.tmp", "partial", 120_000) // partial write: removed
+  write("stale.tmp", "partial", 120_000) // partial write: removed
   write("new.tmp", "partial") // too fresh to judge: kept
 
   const removed = pool.sweepStateDir(s)
@@ -357,11 +382,10 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   assert(gone(`claims.${deadPid}.json`), "a dead pid's claims file must be reclaimed")
   assert(kept(`claims.${alivePid}.json`), "a LIVE pid's claims file must never be swept")
   assert(kept(pool.selfFile(s.id)), "our own claims file must never be swept")
-  assert(kept("cursor.json"), "cursor.json is live rotation state, never stale by age")
   assert(kept("limit.active.json"), "a running cooldown must be kept")
   assert(kept("limit.decay.json"), "a lapsed cooldown inside its strike-decay window must be kept, or the backoff restarts at 1")
   assert(gone("limit.stale.json"), "a cooldown lapsed past strike decay must be swept")
-  assert(gone("old.tmp"), "a stale .tmp from a half-written file must be swept")
+  assert(gone("stale.tmp"), "a stale .tmp from a half-written file must be swept")
   assert(kept("new.tmp"), "a fresh .tmp is not yet knowable; it must be left alone")
   assert(!gone("claims.dead.json"), "a non-numeric owner is not a pid; only its age may remove it")
   assert(Array.isArray(removed) && removed.includes("limit.stale.json"), "sweepStateDir must report what it removed")

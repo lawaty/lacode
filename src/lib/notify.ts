@@ -9,7 +9,7 @@
 //
 // Everything here is pure so the policy can be tested without a running server.
 
-import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs"
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { isLimitText } from "./pool.ts"
@@ -738,5 +738,63 @@ export const releaseNotificationClaim = (sessionID: string, kind: string): void 
     unlinkSync(path)
   } catch {
     // Gone, or unreadable: there is nothing of ours to release.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The per-session completion marker
+// ---------------------------------------------------------------------------
+
+const completionFile = (sessionID: string): string =>
+  join(notificationStateDir(), `completion.${safeCorrelationKey(sessionID)}`)
+
+/**
+ * One terminal popup per idle period, across processes. This is a marker, not
+ * a lock: an existing file means a done/error popup was already raised for this
+ * session, whatever pid it names and however old it is. The plugin deletes it
+ * when the session goes busy (a new turn) or is deleted.
+ */
+export const claimCompletion = (sessionID: string, kind: string): boolean => {
+  const path = completionFile(sessionID)
+  try {
+    mkdirSync(notificationStateDir(), { recursive: true })
+    const fd = openSync(path, "wx")
+    try {
+      writeFileSync(fd, `${process.pid} ${kind}\n`)
+    } finally {
+      closeSync(fd)
+    }
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false
+    // Cannot take or read the marker: a duplicate popup beats a silent stall.
+    return true
+  }
+}
+
+/** Delete the completion marker for a session. Safe if absent; ignores errors. */
+export const releaseCompletion = (sessionID: string): void => {
+  try {
+    unlinkSync(completionFile(sessionID))
+  } catch {
+    // already gone, or the state dir is not writable
+  }
+}
+
+/**
+ * Record that a terminal popup was announced for this session without gating
+ * the caller. An error always announces, but it must still keep the done that
+ * follows it in the same turn quiet, so it overwrites any marker left by an
+ * earlier outcome.
+ */
+export const markCompletion = (sessionID: string, kind: string): void => {
+  try {
+    mkdirSync(notificationStateDir(), { recursive: true })
+    const path = completionFile(sessionID)
+    const tmp = `${path}.${process.pid}.tmp`
+    writeFileSync(tmp, `${process.pid} ${kind}\n`)
+    renameSync(tmp, path)
+  } catch {
+    // The marker is an optimisation; failing to write it must not block the popup.
   }
 }

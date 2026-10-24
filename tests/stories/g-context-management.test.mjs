@@ -504,9 +504,9 @@ test("[US-20] a cartographer run that fails is retired too, so a failing loop ca
 test("[US-20] a run that never starts is retired too, so no empty session is left behind", async () => {
   const { stub, hooks } = await bootAutoupdate()
   // The session is created BEFORE the run starts, so anything that throws
-  // between the two used to strand a session with no messages in it -- an
-  // entry in the user's list that opens as nothing at all. The retirement has
-  // to cover the whole gap, not just the turn.
+  // between the two must not strand a session with no messages in it -- an
+  // entry in the user's list that opens as nothing at all. The retirement
+  // guard covers the whole gap, not just the turn.
   stub.client.session.prompt = () => {
     throw new Error("could not reach the server")
   }
@@ -556,9 +556,9 @@ test("[US-21] only the cartographer is granted the map by permission, and it may
   assert.deepEqual(granted, ["context"], `only the cartographer may be granted the map by rule; these others are: ${granted.join(", ")}`)
 
   // The stronger half, and the one this story exists for: the agents that CAN
-  // write files elsewhere cannot write the map. This used to fail for build
-  // and implement, which both held a blanket "edit": "allow" and relied on
-  // the prompt alone to keep them out of the map.
+  // write files elsewhere cannot write the map. The guard ensures build and
+  // implement cannot reach the map through a blanket "edit": "allow" while
+  // relying on the prompt alone to keep them out.
   for (const name of Object.keys(cfg.agent)) {
     if (name.startsWith("context")) continue
     assert.equal(canWriteMap(cfg.agent[name].permission), false, `${name} must not be able to write the map`)
@@ -602,7 +602,7 @@ test("[US-21] every agent that can write files carries a narrow-last deny on bot
   const SPELLINGS = ["*/.opencode/context/**", ".opencode/context/**"]
 
   // Every agent that can write anything is a potential second writer, and the
-  // three that used to be gaps are named explicitly so a regression names itself.
+  // three gap agents are named explicitly so a regression names itself.
   const writers = ["build", "implement"]
   for (const [slot, w] of [1, 2, 3, 4].map((n) => [`implement-${n}`, cfg.agent[`implement-${n}`]])) {
     assert.ok(w, `${slot} must exist`)
@@ -709,7 +709,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
     assert.equal(problem, undefined, `the shipped agent table must be clean for project root ${root}: ${problem}`)
   }
 
-  // The author's personal opencode.jsonc is no longer part of this repo (the
+  // The author's personal opencode.jsonc is not part of this repo (the
   // package injects its agent table instead of shipping one), so there is no
   // "live config" left to cross-check. The shippedFile loop above already pins
   // the contract that matters: the table the package injects is clean.
@@ -717,7 +717,7 @@ test("[US-21] the writer rule is checked in both directions: the map is writable
   // Direction 2 bites: a gap agent holding a blanket grant is reported, naming
   // the agent and the rule that wins for the map. The blanket is written by
   // hand rather than taken from the shipped table, because the shipped table is
-  // exactly the thing that must no longer contain one.
+  // exactly the thing that must not contain one.
   const blanket = verifyWriterRule(
     configFile({
       build: { permission: { edit: "allow" } },

@@ -72,7 +72,7 @@ context file only if this work introduced or revealed information that will
 materially help future agents — a new boundary or module, a new or moved
 canonical entry point, a changed workflow, a new convention, an architectural
 decision, a new dependency between subsystems, a renamed or moved subsystem,
-or a previously undocumented invariant.
+or an invariant not yet recorded.
 
 Do not edit documentation just because source files changed. No
 timestamp-only edits. If nothing material changed, make no edits and report
@@ -167,11 +167,11 @@ The pool is ONE global slot table shared by every pooled base (explore, implemen
 2. Resolve the instruction above into a target slot table. These are the rules the loader enforces — never write a file that breaks one:
    - one slot per line: \`<provider>/<model-id>  [weight]\`
    - at most ${MAX_SLOTS} slots, and a model may appear only once
-   - weight is optional (default 1) and must be a number in (0, ${MAX_WEIGHT}]. It is the slot's share of the rotation — how many turns it takes per cycle — and its concurrency ceiling is twice that. NOT a priority; pick order follows line order.
+   - weight is optional (default 1) and must be a number in (0, ${MAX_WEIGHT}]. It is the slot's active-session budget for one pass — how many turns it takes per cycle — and its concurrency ceiling is twice that. NOT a priority; pick order follows line order.
    - \`#\` starts a comment (whole-line or trailing); blank lines are ignored.
    If the instruction names a model ambiguously, or would need more than ${MAX_SLOTS} slots, stop and ask rather than guessing.
 
-3. Write the WHOLE file, not a patch. This file is an override, not an edit target: any slot you drop disappears, and slot numbers are line positions, so a partial write silently renumbers the rotation. Keep the existing comment header. If the write fails on a missing directory, create \`~/.config/lacode\` first and retry.
+3. Write the WHOLE file, not a patch. This file is an override, not an edit target: any slot you drop disappears, and slot numbers are line positions, so a partial write silently renumbers slots. Keep the existing comment header. If the write fails on a missing directory, create \`~/.config/lacode\` first and retry.
 
 4. Report the before → after slot table and the resolved path. The running process watches the pool files: it reloads the table, re-binds the variant agents and validates every slot, so no restart is needed. If a slot names a model the provider does not serve, it will be benched and named in the log and toast — report that instead of claiming the swap succeeded.
 
@@ -197,6 +197,16 @@ $ARGUMENTS
 Report the tool's output as it came back, then add one short line naming what changed: re-admitted, still limited, or benched because the provider does not serve the model. If a model was benched as \`model-missing\`, say so and name the replacement in \`~/.config/lacode/pool.txt\` — but change nothing yourself.`,
   },
 
+  "image-in-cb": {
+    description:
+      "Attach the clipboard image to this message — macOS needs pngpaste, Linux needs wl-paste or xclip.",
+    template: "$ARGUMENTS",
+  },
+
+  "image": {
+    description: "Attach one or more image files to this message",
+    template: "$ARGUMENTS",
+  },
 }
 
 /** Add every command the user's config does not already define (US-16). */

@@ -1,16 +1,17 @@
-// US-5 -- a slot variant named by hand cannot be used to reach a provider
-// without asking the pool.
+// US-5 -- a slot variant named by hand is COERCED to its base, not refused.
 //
-// This is the hole the counting behaviour left open: naming a variant skips the
-// rotation AND the ceiling, so the damage is not that one slot takes an extra
-// turn, it is that a slot bounded at twice its weight takes without limit. These
-// tests pin the refusal, and pin the properties it must not break on the way:
-// bare bases still route, a routed spawn still costs exactly one claim, and
-// agents that merely LOOK like a variant are left alone.
+// Naming a variant is how a caller would try to choose the provider and skip
+// the ordered fill, so the gate must not leave the hand-named slot in place. It
+// is rewritten to the bare base before routing: the variant is the OUTPUT of
+// routing, and the pool owns the slot choice. These tests pin the coercion and
+// the properties it must not break: the spawn is routed to a real slot, exactly
+// one claim is taken for the right base, repeated hand-named spawns still fill
+// in order, and agents that merely LOOK like a variant are left alone.
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { bootLaCode, cleanupAll, configFor, scratch, spawn, stubInput } from "./_harness.mjs"
+import { bootLaCode, cleanupAll, configFor, PRESET, scratch, stubInput } from "./_harness.mjs"
+import * as pool from "../../src/lib/pool.ts"
 
 test.after(cleanupAll)
 
@@ -22,9 +23,15 @@ const boot = async (id) => {
   const hooks = await bootLaCode(stub, { id, dir, models: POOL })
   const cfg = configFor(["gate/a", "gate/b"])
   await hooks.config(cfg)
+  // The plugin's state is a Symbol.for global keyed by id + dir + model source,
+  // so this is the very state the hooks use and the test can read the claim a
+  // spawn just took.
+  const state = pool.state({ id, dir, modelsFile: PRESET, models: POOL })
   return {
     hooks,
     cfg,
+    state,
+    lines: stub.lines,
     /** Route a spawn, reporting a refusal rather than throwing it. */
     async trySpawn(subagent, callID) {
       const out = { args: { subagent_type: subagent, prompt: "x" } }
@@ -35,6 +42,7 @@ const boot = async (id) => {
         return { ok: false, message: String(error?.message ?? error) }
       }
     },
+    claim: (callID) => state.own.get(pool.claimKey("s", callID)),
     status: async () => (await hooks.tool.pool_status.execute({}, {})).output,
     text: () => stub.text().join("\n"),
   }
@@ -50,7 +58,7 @@ const boot = async (id) => {
 // pickers, the "agent not found" message and default-agent resolution -- and by
 // nothing else. A variant that is hidden but still a subagent is therefore
 // listed to the model under its own name, and the model copies that name
-// straight into its next spawn, where the pool refuses it.
+// straight into its next spawn, where the pool now coerces it.
 //
 // Permission patterns compile to anchored regexes (* -> .*) and the LAST match
 // wins; a name that matches no rule is "ask", not "deny".
@@ -75,38 +83,71 @@ const listedTo = (cfg, callerName) =>
     .filter(([name]) => taskAction(cfg.agent?.[callerName], name) !== "deny")
     .map(([name]) => name)
 
-test("[US-5] a hand-named slot variant is refused, and the refusal names the bare base", async () => {
-  const t = await boot("gate-refuse")
-  for (const variant of ["explore-1", "explore-2", "implement-1", "context-2"]) {
-    const r = await t.trySpawn(variant, `c-${variant}`)
-    assert.equal(r.ok, false, `${variant} must be refused`)
-    assert.match(r.message, /cannot be spawned by name/, `${variant}: ${r.message}`)
-    assert.match(r.message, /Spawn "(explore|implement|context)"/, `${variant} must point at the bare base, got: ${r.message}`)
+test("[US-5] a hand-named slot variant is coerced to its base and routed by the pool", async () => {
+  const t = await boot("gate-coerce")
+  const cases = [
+    ["explore-1", "explore"],
+    ["explore-2", "explore"],
+    ["implement-1", "implement"],
+    ["context-2", "context"],
+  ]
+  for (const [variant, base] of cases) {
+    const callID = `c-${variant}`
+    const r = await t.trySpawn(variant, callID)
+    assert.equal(r.ok, true, `${variant} must be coerced, not thrown: ${r.message ?? ""}`)
+    assert.match(
+      r.agent,
+      new RegExp(`^${base}-[1-${pool.MAX_SLOTS}]$`),
+      `${variant} must be routed to a real ${base} slot, got ${r.agent}`,
+    )
+    assert.ok(t.cfg.agent?.[r.agent], `${r.agent} must exist in the config, so it is a real pool slot`)
+    // The routed slot is bound to a declared pool model, not left as the
+    // hand-named variant.
+    assert.ok(
+      ["gate/a", "gate/b"].includes(t.cfg.agent[r.agent].model),
+      `${r.agent} must be bound to a declared pool model, got ${t.cfg.agent[r.agent].model}`,
+    )
+    // Exactly one claim, for the base, on a real slot.
+    const claim = t.claim(callID)
+    assert.ok(claim, `${variant}: the routed spawn must take a claim`)
+    assert.equal(claim.v, base, `${variant}: the claim must be for the base "${base}", not "${claim.v}"`)
+    assert.ok(
+      Number.isInteger(claim.k) && claim.k >= 1 && claim.k <= pool.MAX_SLOTS,
+      `${variant}: claim slot ${claim.k} is not a valid pool slot`,
+    )
   }
+  assert.equal(t.state.own.size, cases.length, `one claim per routed spawn, got ${t.state.own.size}`)
   await t.hooks.dispose()
 })
 
-test("[US-5] a refused variant leaves no claim behind, so the ceiling is untouched", async () => {
-  const t = await boot("gate-no-claim")
-  // Six refusals against a weight-3 slot whose ceiling is now 6 (twice the weight).
-  // Before the refusal this recorded the claims anyway: the ceiling was counted and
-  // then ignored.
-  for (let i = 1; i <= 6; i++) await t.trySpawn("explore-1", `n${i}`)
-  const status = await t.status()
-  assert.match(status, /0 claim\(s\) in flight/, `a refused spawn must claim nothing, got:\n${status}`)
-  assert.match(status, /gate\/a\s+load=0\/6/, `the slot must be untouched, got:\n${status}`)
+test("[US-5] repeating a hand-named variant fills slots in order", async () => {
+  const t = await boot("gate-order")
+  const routed = []
+  for (let i = 1; i <= 5; i++) {
+    const r = await t.trySpawn("explore-1", `rr${i}`)
+    assert.equal(r.ok, true, `a coerced spawn must route: ${r.message ?? ""}`)
+    routed.push(r.agent)
+  }
+  // Weights 3 and 2 make pass 1 fill slot 1 to 3 and slot 2 to 2. Naming the
+  // same variant five times must still follow that ordered fill instead of
+  // pinning one provider.
+  assert.deepEqual(routed, ["explore-1", "explore-1", "explore-1", "explore-2", "explore-2"], `got ${routed}`)
+  assert.equal(new Set(routed).size, 2, `a hand-named variant must not pin one slot: ${routed}`)
+  const claims = routed.map((_, i) => t.claim(`rr${i + 1}`))
+  assert.deepEqual(claims.map((claim) => claim.v), Array(5).fill("explore"), "every claim must be for the bare base")
+  assert.deepEqual(claims.map((claim) => claim.k), [1, 1, 1, 2, 2], "the claims must follow the ordered fill's slots")
   await t.hooks.dispose()
 })
 
 test("[US-5] a bare base still routes, and costs exactly one claim", async () => {
   const t = await boot("gate-still-routes")
-  // The refusal must not swallow the plugin's OWN rewrite: if tool.execute.before
-  // were re-entered on the rewritten name, every routed spawn would double-claim
-  // or refuse itself. Five spawns across a summed ceiling of five.
+  // The coercion must not swallow the plugin's OWN rewrite: if tool.execute.before
+  // were re-entered on the rewritten name, every routed spawn would double-claim.
+  // Five spawns across a summed ceiling of five.
   const routed = []
   for (let i = 1; i <= 5; i++) {
     const r = await t.trySpawn("explore", `r${i}`)
-    assert.equal(r.ok, true, `a bare base must route, not be refused: ${r.message ?? ""}`)
+    assert.equal(r.ok, true, `a bare base must route: ${r.message ?? ""}`)
     routed.push(r.agent)
   }
   assert.deepEqual(routed, ["explore-1", "explore-1", "explore-1", "explore-2", "explore-2"], `got ${routed}`)
@@ -116,7 +157,7 @@ test("[US-5] a bare base still routes, and costs exactly one claim", async () =>
 
 test("[US-5] an agent that merely looks like a variant is left alone", async () => {
   const t = await boot("gate-lookalikes")
-  // The refusal must match the pool's OWN variant naming, not any name with a
+  // The coercion must match the pool's OWN variant naming, not any name with a
   // trailing number. `explorex`, `task-3` and `context-manager` are not variants.
   for (const name of ["explorex", "task-3", "context-manager", "explore-0", "expert-1"]) {
     const r = await t.trySpawn(name, `l-${name}`)
@@ -126,44 +167,38 @@ test("[US-5] an agent that merely looks like a variant is left alone", async () 
   await t.hooks.dispose()
 })
 
-test("[US-5] the refusal is logged, so a blocked spawn is never silent", async () => {
+test("[US-5] the coercion is logged with the base, and never with the variant", async () => {
   const t = await boot("gate-logged")
-  await t.trySpawn("implement-1", "log-1")
-  assert.match(t.text(), /refused manual spawn of a pool slot variant/, `got:\n${t.text()}`)
-  await t.hooks.dispose()
-})
-
-test("[US-5] the refusal does not name the variant it refused", async () => {
-  const t = await boot("gate-no-name")
-  // The refusal is the TOOL RESULT the model reads at the moment it chooses
-  // what to spawn next. If it repeats the name the model just used, the
-  // refusal is the thing that TEACHES the name -- and a model that can see a
-  // list of slot names will copy them straight back, which is how the pool
-  // ended up refusing most of its spawns. Naming the BASE is enough to be
-  // actionable, because the base is what the model should type.
-  for (const variant of ["explore-1", "implement-3", "context-2"]) {
-    const r = await t.trySpawn(variant, `n-${variant}`)
-    assert.equal(r.ok, false, `${variant} must be refused`)
-    assert.ok(!r.message.includes(variant), `the refusal must not repeat "${variant}": ${r.message}`)
-    assert.match(r.message, /Spawn "(explore|implement|context)"/, `the refusal must point at the bare base: ${r.message}`)
-  }
-  const log = t.text()
-  for (const variant of ["explore-1", "implement-3", "context-2"]) {
-    assert.ok(!log.includes(variant), `the log must not carry "${variant}", got:\n${log}`)
+  const cases = [
+    ["explore-1", "explore"],
+    ["implement-3", "implement"],
+    ["context-2", "context"],
+  ]
+  for (const [variant] of cases) await t.trySpawn(variant, `log-${variant}`)
+  const rewrites = t.lines.filter(
+    (line) => line.level === "warn" && /rewrote a hand-named pool slot/.test(line.message),
+  )
+  assert.equal(rewrites.length, cases.length, `one coercion warning per spawn, got:\n${t.text()}`)
+  const log = JSON.stringify(t.lines)
+  for (const [variant, base] of cases) {
+    const line = rewrites.find((entry) => entry.extra?.base === base)
+    assert.ok(line, `the coercion must name the base "${base}", got:\n${t.text()}`)
+    assert.ok(!line.message.includes(variant), `the warning message must not repeat "${variant}": ${line.message}`)
+    assert.ok(!log.includes(variant), `the captured log must not carry "${variant}", got:\n${log}`)
   }
   await t.hooks.dispose()
 })
 
 test("[US-5] a slot variant is not in the agent list the model is shown, and the bare base is", async () => {
   const t = await boot("gate-invisible")
-  // The refusal above is CORRECT: naming a variant is how a caller would pick
-  // the provider and skip the rotation. But it should almost never happen, and
-  // the reason it happened constantly is a leak, not a bad caller. opencode
-  // builds the system prompt's agent list from the registry without reading
-  // `hidden`, so every variant was listed to the model under its own name --
+  // The coercion is correct: naming a variant is how a caller would pick the
+  // provider and skip the ordered fill. But it should almost never happen, and the
+  // reason it happened constantly is a leak, not a bad caller. opencode builds
+  // the system prompt's agent list from the registry without reading `hidden`,
+  // so every variant was listed to the model under its own name --
   // "explore-1: Hidden pool variant explore-1" -- and the model copied those
   // names into its next spawn. The variants are the OUTPUT of routing; a model
-  // that can see them will use them, and the pool will refuse every one.
+  // that can see them will use them, and the pool will coerce every one.
   //
   // `mode: "primary"` is the only field that filter respects, and it is safe:
   // the task tool resolves an agent by name and never reads its mode.

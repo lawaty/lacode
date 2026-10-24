@@ -1,15 +1,15 @@
 // The build.
 //
-// WHY IT EXISTS: the package used to ship raw TypeScript from `src/`, which is
-// fine in a working tree and fatal in an installed one. Node strips types
-// natively from 22.18, but it EXPLICITLY REFUSES to do that for files under
-// node_modules — so `lacode --help` on a global install died with
-// ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING, and so would any
-// `import "@lawaty/lacode"` from plain node. Bun (opencode itself is a Bun
-// single-file executable) is happy to strip types inside node_modules, which is
-// why the plugin half kept working and hid the defect. A package cannot depend
-// on its consumer's loader being lenient, so the sources are compiled to plain
-// JavaScript here and `dist/` is what ships.
+// WHY IT EXISTS: the package ships compiled `dist/`, not raw TypeScript from
+// `src/`, because raw sources are fine in a working tree and fatal in an
+// installed one. Node strips types natively from 22.18, but it EXPLICITLY
+// REFUSES to do that for files under node_modules — so `lacode --help` on a
+// global install dies with ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING, and so
+// would any `import "@lawaty/lacode"` from plain node. Bun (opencode itself is
+// a Bun single-file executable) is happy to strip types inside node_modules,
+// which is why the plugin half keeps working and hides the defect. A package
+// cannot depend on its consumer's loader being lenient, so the sources are
+// compiled to plain JavaScript here and `dist/` is what ships.
 //
 // ONE BUNDLE PER ENTRY POINT, not one bundle plus chunks: every entry point is
 // bundled on its own so the relative `.ts` import specifiers inside `src/` never

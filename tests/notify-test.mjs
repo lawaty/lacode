@@ -52,10 +52,13 @@ const fakeHelper = (dir, sent = join(dir, "sent.log")) => {
 
 const {
   Notifier,
+  claimCompletion,
+  markCompletion,
   claimNotification,
   helperArgv,
   notifyMessage,
   questionHeadline,
+  releaseCompletion,
   safeCorrelationKey,
   safeTitle,
   shouldNotify,
@@ -512,8 +515,8 @@ await check("a question clears when the session errors instead", async () => {
   await new Promise((resolve) => setTimeout(resolve, 600))
 
   const lines = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
-  assert(lines.length === 3, `question, error, then the real completion: ${JSON.stringify(lines)}`)
-  assert(lines[2].includes("Task finished"), `the last one is a real completion: ${lines[2]}`)
+  // question + error only (the done that follows in the same turn is suppressed by the marker)
+  assert(lines.length === 2, `question and error only (done suppressed by marker): ${JSON.stringify(lines)}`)
 
   delete process.env.OC_NOTIFY_HELPER
   rmSync(dir, { recursive: true, force: true })
@@ -521,8 +524,9 @@ await check("a question clears when the session errors instead", async () => {
 
 await check("a failed delivery is logged as a failure, not as notified", async () => {
   // The bug this guards: oc-notify exits 0 even when the tunnel is unreachable,
-  // and the plugin used to log "notified" regardless. Five notifications were
-  // logged as sent while nothing reached the desktop.
+  // and the plugin must not log "notified" regardless of the helper's exit
+  // status. Five notifications would otherwise be logged as sent while nothing
+  // reaches the desktop.
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   const helper = join(dir, "oc-notify")
   writeFileSync(helper, "#!/usr/bin/env bash\necho 'oc: could not reach the local desktop' >&2\nexit 0\n", {
@@ -671,7 +675,7 @@ await check("deleting a session clears its parked question and busy marker", asy
   // that lands inside that window is lost and the popup record is created
   // afterwards: a stray record for a session that is gone. That is a known
   // trade-off in the plugin (the helper is asked to close it, and the desktop
-  // has nothing to close for a session that no longer exists), so this check
+  // has nothing to close for a session that does not exist), so this check
   // asserts the parked question and the busy marker, and neither the presence
   // nor the absence of that record.
   assert(lines.length === 2, `state must be cleared on delete: ${JSON.stringify(lines)}`)
@@ -1046,6 +1050,157 @@ test("a stale claim is taken over", async () => {
     nodeAssert.equal(won, true, "an abandoned claim must not stop the notification")
     nodeAssert.equal(readFileSync(path, "utf8"), String(process.pid), "the takeover must install the winner's pid")
   } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// The per-session completion marker
+// ---------------------------------------------------------------------------
+
+test("completion: first claim wins, second loses (same or different kind)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-completion-basic-"))
+  const sessionID = `basic-${process.pid}-${Date.now()}`
+  try {
+    const first = await withClaimDir(dir, () => claimCompletion(sessionID, "done"))
+    nodeAssert.equal(first, true, "first claim should win")
+    const secondSame = await withClaimDir(dir, () => claimCompletion(sessionID, "done"))
+    nodeAssert.equal(secondSame, false, "second same-kind claim should lose")
+    const secondDiff = await withClaimDir(dir, () => claimCompletion(sessionID, "error"))
+    nodeAssert.equal(secondDiff, false, "different kind still loses: marker is per session")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("completion: release allows re-claim", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-completion-release-"))
+  const sessionID = `release-${process.pid}-${Date.now()}`
+  try {
+    await withClaimDir(dir, () => claimCompletion(sessionID, "done"))
+    await withClaimDir(dir, () => releaseCompletion(sessionID))
+    const again = await withClaimDir(dir, () => claimCompletion(sessionID, "done"))
+    nodeAssert.equal(again, true, "after release a new claim should win")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("completion: different sessions do not interfere", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-completion-sessions-"))
+  const a = `sa-${process.pid}-${Date.now()}`
+  const b = `sb-${process.pid}-${Date.now()}`
+  try {
+    const r1 = await withClaimDir(dir, () => claimCompletion(a, "done"))
+    const r2 = await withClaimDir(dir, () => claimCompletion(b, "done"))
+    nodeAssert.equal(r1, true, "first session should claim")
+    nodeAssert.equal(r2, true, "second session should claim")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("completion: a foreign dead pid marker still suppresses", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-completion-foreign-"))
+  const sessionID = `foreign-${process.pid}-${Date.now()}`
+  try {
+    mkdirSync(dir, { recursive: true })
+    const path = join(dir, `completion.${safeCorrelationKey(sessionID)}`)
+    writeFileSync(path, "999999999 done\n")
+    const won = await withClaimDir(dir, () => claimCompletion(sessionID, "done"))
+    nodeAssert.equal(won, false, "an existing marker suppresses regardless of pid")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("completion: a missing state directory is created and the claim succeeds", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "lacode-completion-missing-"))
+  const dir = join(parent, "nested", "state")
+  const sessionID = `missing-${process.pid}-${Date.now()}`
+  try {
+    const won = await withClaimDir(dir, () => claimCompletion(sessionID, "done"))
+    nodeAssert.equal(won, true, "claim should succeed when dir is created")
+    nodeAssert.ok(existsSync(dir), "state directory should be created")
+  } finally {
+    rmSync(parent, { recursive: true, force: true })
+  }
+})
+
+test("completion: markCompletion creates a marker when absent", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-completion-mark-"))
+  const sessionID = `mark-${process.pid}-${Date.now()}`
+  try {
+    await withClaimDir(dir, () => markCompletion(sessionID, "error"))
+    const claimed = await withClaimDir(dir, () => claimCompletion(sessionID, "done"))
+    nodeAssert.equal(claimed, false, "a marker written by markCompletion suppresses a later claim")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("completion: markCompletion overwrites an existing marker", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-completion-mark-overwrite-"))
+  const sessionID = `markow-${process.pid}-${Date.now()}`
+  try {
+    await withClaimDir(dir, () => claimCompletion(sessionID, "done"))
+    await withClaimDir(dir, () => markCompletion(sessionID, "error"))
+    const claimed = await withClaimDir(dir, () => claimCompletion(sessionID, "done"))
+    nodeAssert.equal(claimed, false, "claim still returns false after overwrite")
+    const path = join(dir, `completion.${safeCorrelationKey(sessionID)}`)
+    const content = readFileSync(path, "utf8")
+    nodeAssert.ok(content.includes("error"), `marker content should include error: ${content}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+const writeCompletionHelper = (dir) => {
+  const helper = join(dir, "completion-helper.mjs")
+  writeFileSync(
+    helper,
+    `import { existsSync, writeFileSync } from "node:fs"
+import { pathToFileURL } from "node:url"
+
+const [library, sessionID, kind, ready, go] = process.argv.slice(2)
+const { claimCompletion } = await import(pathToFileURL(library).href)
+writeFileSync(ready, "")
+const deadline = Date.now() + 10_000
+const slice = new Int32Array(new SharedArrayBuffer(4))
+while (!existsSync(go)) {
+  if (Date.now() > deadline) process.exit(2)
+  Atomics.wait(slice, 0, 0, 1)
+}
+process.stdout.write(claimCompletion(sessionID, kind) ? "won" : "lost")
+`,
+  )
+  return helper
+}
+
+test("two processes claiming one completion produce exactly one winner", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-completion-race-"))
+  const sessionID = `race-${process.pid}-${Date.now()}`
+  const kind = "done"
+  const go = join(dir, "go")
+  const helper = writeCompletionHelper(dir)
+  const first = startClaimer(helper, dir, sessionID, kind, "a", go)
+  const second = startClaimer(helper, dir, sessionID, kind, "b", go)
+  try {
+    await Promise.all([waitForFile(join(dir, "ready-a")), waitForFile(join(dir, "ready-b"))])
+    writeFileSync(go, "")
+    const results = await Promise.all([first.done, second.done])
+    for (const result of results) {
+      nodeAssert.equal(result.code, 0, `claimer failed: ${result.stderr}`)
+    }
+    const winners = results.filter((result) => result.stdout === "won")
+    nodeAssert.equal(
+      winners.length,
+      1,
+      `exactly one process may win the completion claim, got ${winners.length}: ${JSON.stringify(results.map((r) => r.stdout))}`,
+    )
+  } finally {
+    first.child.kill()
+    second.child.kill()
     rmSync(dir, { recursive: true, force: true })
   }
 })
