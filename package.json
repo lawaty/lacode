@@ -38,7 +38,7 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "lacode": "./dist/lacode.js"
+    "lacode": "dist/lacode.js"
   },
   "files": [
     "dist",
