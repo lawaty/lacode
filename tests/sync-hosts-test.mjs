@@ -56,6 +56,11 @@ if (command.includes("HELPER_OK")) {
   process.exit(0)
 }
 
+if (command.includes("find") && command.includes("plugins")) {
+  process.stdout.write(process.env.FAKE_SSH_PLUGINS_LISTING || "lacode.ts\nother-plugin.js\n")
+  process.exit(0)
+}
+
 if (/^cat\s+>/.test(command)) {
   const body = fs.readFileSync(0, "utf8")
   const state = process.env.FAKE_SSH_STATE
@@ -246,4 +251,32 @@ test("sync-hosts keeps a host with a runnable helper as ok", (t) => {
   assert.equal(result.status, 0, result.stderr)
   assert.match(result.stdout, /host-a: ok/)
   assert.match(result.stdout, /summary: 1 ok, 0 warn, 0 skipped, 0 failed/)
+})
+
+test("sync-hosts disables stale lacode shims in plugins/", (t) => {
+  const { log, env } = setup(t, { env: { FAKE_SSH_PLUGINS_LISTING: "lacode.ts\nother-plugin.js\n" } })
+  const result = run({ ...env, OC_HOSTS: "host-a" })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /shim disabled: lacode\.ts/)
+
+  const sshCalls = calls(log)
+  const move = sshCalls.find((args) => /^mv\s+/.test(args[args.length - 1]) && args[args.length - 1].includes("lacode.ts"))
+  assert.ok(move, "a move is issued for lacode.ts")
+  assert.match(move[move.length - 1], /lacode-plugin-shim\.disabled-/, "the move targets the disabled backup path")
+
+  const otherMove = sshCalls.find((args) => /^mv\s+/.test(args[args.length - 1]) && args[args.length - 1].includes("other-plugin.js"))
+  assert.equal(otherMove, undefined, "the other plugin file is not moved")
+})
+
+test("sync-hosts reports no stale shim when the listing has no lacode file", (t) => {
+  const { log, env } = setup(t, { env: { FAKE_SSH_PLUGINS_LISTING: "other-plugin.js\n" } })
+  const result = run({ ...env, OC_HOSTS: "host-a" })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /no stale shim/)
+
+  const sshCalls = calls(log)
+  const move = sshCalls.find((args) => /^mv\s+/.test(args[args.length - 1]))
+  assert.equal(move, undefined, "no move command is issued")
 })

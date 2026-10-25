@@ -24,11 +24,20 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { chmodSync, existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { ROOT, cleanupAll, fakeClock, scratch, settle, stubInput } from "./_harness.mjs"
 
 test.after(cleanupAll)
+
+// Each test builds fresh notifyHooks instances, and the fix gives each instance
+// its own claim token. Claims are cross-process state, so a claim left by one
+// test would otherwise suppress the same session/kind in the next test. Every
+// test is an independent world: start it with no claims.
+test.beforeEach(() => {
+  rmSync(process.env.LACODE_NOTIFY_DIR, { recursive: true, force: true })
+  mkdirSync(process.env.LACODE_NOTIFY_DIR, { recursive: true })
+})
 
 const { notifyHooks } = await import(join(ROOT, "src", "plugins", "notify.ts"))
 // The transport, for the contracts that are about a CHANNEL rather than about
@@ -625,18 +634,22 @@ test("[US-12] a parked question is cleared by a reply, a rejection, or an error"
     ["question.rejected", "rejected"],
     ["session.error", "errored"],
   ]) {
-    const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
-    await busy(emit, "s1")
-    await emit("question.asked", { sessionID: "s1", questions: [{ question: "Reversible?" }] })
+    // Each iteration is its own instance, and the fix gives each instance its
+    // own claim token. A unique session keeps this loop about clearing the
+    // parked question, not about competing with the previous iteration's claim.
+    const sessionID = `s1-${label}`
+    const { sent, emit } = await notifier({ sessions: { [sessionID]: { id: sessionID, title: "Add a migration" } } })
+    await busy(emit, sessionID)
+    await emit("question.asked", { sessionID, questions: [{ question: "Reversible?" }] })
     await settle()
     sent.length = 0
 
     // Only the error iteration carries a payload, and it must be an
     // unrecognized one: a recognized error would stay silent by design, and
     // the assertion below is that THIS error is announced.
-    await emit(event, event === "session.error" ? { sessionID: "s1", error: { message: "boom" } } : { sessionID: "s1" })
+    await emit(event, event === "session.error" ? { sessionID, error: { message: "boom" } } : { sessionID })
     await settle()
-    await idle(emit, "s1")
+    await idle(emit, sessionID)
     await settle()
 
     // The criterion is that the pending entry is GONE: whatever unblocked the
@@ -880,7 +893,7 @@ test("[US-25] the handler cannot approve or deny: it registers no permission.ask
   }
   const before = JSON.stringify(payload)
   await hooks.event({ event: { type: "permission.asked", properties: payload } })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
   assert.equal(JSON.stringify(payload), before, "the event payload must not be mutated")
 })
 
@@ -905,7 +918,7 @@ test("[US-25] a deliberately perturbing handler fails the read-only assertion", 
   await hooks.event({
     event: { type: "permission.asked", properties: { id: "p1", sessionID: "s1", permission: "external_directory", patterns: ["/etc/*"] } },
   })
-  await settle()
+  await settle(PERMISSION_SETTLE_MS)
   untouched()
 
   // What an over-reaching handler would do, and what the same assertion says.
@@ -979,18 +992,22 @@ test("[US-25] clicking a button answers the permission exactly once, addressed t
   // reply is addressed by the request id the event carried, which is the
   // only thing the server can match an answer against.
   for (const action of ["once", "always", "reject"]) {
+    // Each action is its own instance, and the fix gives each instance its own
+    // claim token. A unique session keeps this loop about the three replies,
+    // not about a second instance competing for the previous action's claim.
+    const sessionID = `s1-${action}`
     const { sent, emit, replies } = await notifier({
-      sessions: { s1: { id: "s1", title: "Read the config" } },
+      sessions: { [sessionID]: { id: sessionID, title: "Read the config" } },
       result: { ok: true, action },
     })
-    await busy(emit, "s1")
-    await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+    await busy(emit, sessionID)
+    await emit("permission.asked", { id: "p1", sessionID, permission: "read", patterns: ["*.env"], metadata: {} })
     await settle(PERMISSION_SETTLE_MS)
 
     assert.equal(sent.length, 1, `${action}: the notification was delivered, got ${JSON.stringify(sent)}`)
     assert.deepEqual(
       replies,
-      [{ path: { id: "s1", permissionID: "p1" }, body: { response: action } }],
+      [{ path: { id: sessionID, permissionID: "p1" }, body: { response: action } }],
       `${action}: exactly one reply, with the clicked name as the response: ${JSON.stringify(replies)}`,
     )
   }
@@ -1061,13 +1078,17 @@ test("[US-25] a permission already answered elsewhere is not a failure", async (
       },
     ],
   ]) {
+    // Each 404 shape is its own instance, and the fix gives each instance its
+    // own claim token. A unique session keeps this loop about the two response
+    // shapes, not about competing with the previous shape's claim.
+    const sessionID = `s1-${label.replace(/\s+/g, "-")}`
     const { stub, emit, replies } = await notifier({
-      sessions: { s1: { id: "s1", title: "Read the config" } },
+      sessions: { [sessionID]: { id: sessionID, title: "Read the config" } },
       result: { ok: true, action: "once" },
       respond,
     })
-    await busy(emit, "s1")
-    await emit("permission.asked", { id: "p1", sessionID: "s1", permission: "read", patterns: ["*.env"], metadata: {} })
+    await busy(emit, sessionID)
+    await emit("permission.asked", { id: "p1", sessionID, permission: "read", patterns: ["*.env"], metadata: {} })
     await settle(PERMISSION_SETTLE_MS)
 
     assert.equal(replies.length, 1, `${label}: the reply route was still addressed: ${JSON.stringify(replies)}`)
@@ -1700,6 +1721,16 @@ test("[US-11] two notify instances in one process do not both raise it", async (
   await idle(A.emit, "t1")
   await settle()
   await idle(B.emit, "t1")
+  await settle()
+  assert.equal(A.sent.length + B.sent.length, 1, `only one instance may raise it, got A=${A.sent.length} B=${B.sent.length}`)
+})
+
+test("[US-12] two notify instances in one process do not both raise a question", async () => {
+  const A = await notifier({ sessions: { "t1": { id: "t1", title: "Work" } } })
+  const B = await notifier({ sessions: { "t1": { id: "t1", title: "Work" } } })
+  await A.emit("question.asked", { sessionID: "t1", questions: [{ question: "Q?" }] })
+  await settle()
+  await B.emit("question.asked", { sessionID: "t1", questions: [{ question: "Q?" }] })
   await settle()
   assert.equal(A.sent.length + B.sent.length, 1, `only one instance may raise it, got A=${A.sent.length} B=${B.sent.length}`)
 })

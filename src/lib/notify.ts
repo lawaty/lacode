@@ -537,7 +537,10 @@ const claimFile = (sessionID: string, kind: string): string =>
  * The rules, in order:
  *   * the claim does not exist -> take it, with an exclusive create
  *   * the claim holds OUR pid -> it is our own claim, and our own claim never
- *     changes our own behaviour: the in-process cooldown is the only gate
+ *     changes our own behaviour: the in-process cooldown is the only gate.
+ *     Two instances of this plugin in the SAME process share a pid, so the
+ *     claim also carries an instance token; a claim whose token differs from
+ *     ours is held by another instance in this process, not by us
  *   * the claim holds another LIVE pid and is younger than the window ->
  *     another process is raising this right now -> do not notify
  *   * anything else -> the claim is stale (its holder is gone, or it outlived
@@ -552,7 +555,7 @@ const claimFile = (sessionID: string, kind: string): string =>
  * Nothing here throws. A claim that cannot be taken or read degrades to
  * "notify": a duplicate popup is better than a silent stall.
  */
-export const claimNotification = (sessionID: string, kind: string): boolean => {
+export const claimNotification = (sessionID: string, kind: string, instanceId: string = ""): boolean => {
   const path = claimFile(sessionID, kind)
   try {
     mkdirSync(notificationStateDir(), { recursive: true })
@@ -567,7 +570,7 @@ export const claimNotification = (sessionID: string, kind: string): boolean => {
     try {
       const fd = openSync(path, "wx")
       try {
-        writeSync(fd, String(process.pid))
+        writeSync(fd, `${process.pid} ${instanceId} ${kind}`)
       } finally {
         closeSync(fd)
       }
@@ -600,18 +603,21 @@ export const claimNotification = (sessionID: string, kind: string): boolean => {
       return (error as NodeJS.ErrnoException).code === "ENOENT" ? "gone" : "unknown"
     }
 
+    const fields = raw.split(/\s+/).filter((entry) => entry.length > 0)
     let holder: number | undefined
-    // The exclusive create and the write that fills it are two steps, and a
-    // reader can land between them. An empty claim is a claim IN PROGRESS, not
-    // an abandoned one.
     const empty = raw === ""
     if (!empty) {
-      const parsed = Number.parseInt(raw, 10)
+      const parsed = Number.parseInt(fields[0] ?? "", 10)
       holder = Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
     }
-
-    // Our own claim. It must never change our own behaviour.
-    if (holder === process.pid) return "ours"
+    if (holder === process.pid) {
+      const hasToken = fields.length >= 3
+      const fileToken = hasToken ? (fields[1] ?? "") : ""
+      if (hasToken && instanceId !== "" && fileToken !== instanceId) {
+        return "held"
+      }
+      return "ours"
+    }
 
     let age = Number.POSITIVE_INFINITY
     try {

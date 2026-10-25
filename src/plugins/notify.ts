@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
 import * as path from "node:path"
 import type { Hooks } from "@opencode-ai/plugin"
@@ -297,6 +298,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   const soundOn = !SOUND_OFF_VALUES.includes(soundEnv) && opts.sound !== false
 
   const notifier = new Notifier(COOLDOWN_MS)
+  const instanceId = randomUUID()
   // Sessions this process has actually seen do work in. Distinguishes "finished
   // after a turn" from "an idle event for a session that was merely opened".
   const active = new Set<string>()
@@ -858,7 +860,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           void log("debug", "suppressed: completion already announced", { sessionID })
           return
         }
-      } else if (!claimNotification(sessionID, kind)) {
+      } else if (!claimNotification(sessionID, kind, instanceId)) {
         void log("debug", "suppressed: another process is raising this", { sessionID, kind })
         return
       } else if (outcome === "error") {

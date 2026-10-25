@@ -20,6 +20,7 @@ const failures = []
 
 const check = async (name, fn) => {
   try {
+    resetNotificationState()
     await fn()
     passed++
   } catch (error) {
@@ -71,6 +72,15 @@ const { notifyHooks: Notify } = await import(PLUGIN)
 // directory -- so it is redirected into a temp one for the length of the run.
 const NOTIFY_STATE_DIR = mkdtempSync(join(tmpdir(), "lacode-notify-"))
 process.env.LACODE_NOTIFY_DIR = NOTIFY_STATE_DIR
+
+// Every check builds a fresh notifyHooks instance, and the fix gives each
+// instance its own claim token. Claims are cross-process state, so one check's
+// claim would otherwise be treated as a competing instance in the next check.
+// Each check is an independent world: start it with no claims.
+const resetNotificationState = () => {
+  rmSync(NOTIFY_STATE_DIR, { recursive: true, force: true })
+  mkdirSync(NOTIFY_STATE_DIR, { recursive: true })
+}
 
 // ---------------------------------------------------------------------------
 // Policy: what is worth notifying about
@@ -1072,9 +1082,9 @@ if (failures.length > 0) {
 // The cross-process claim: one winner, and only for a stale claim
 // ---------------------------------------------------------------------------
 //
-// The claim is a file, so the guarantee is only real across processes. These
-// tests spawn real ones; a test that calls claimNotification twice in one
-// process would prove nothing about the bug, which is two processes judging
+// The claim is a file, so the guarantee is only real across processes. The race
+// tests below spawn real ones; a test that calls claimNotification twice in one
+// process would prove nothing about that bug, which is two processes judging
 // the same stale claim at once.
 
 const claimPath = (dir, sessionID, kind) =>
@@ -1208,7 +1218,54 @@ test("a stale claim is taken over", async () => {
   try {
     const won = await withClaimDir(dir, () => claimNotification(sessionID, kind))
     nodeAssert.equal(won, true, "an abandoned claim must not stop the notification")
-    nodeAssert.equal(readFileSync(path, "utf8"), String(process.pid), "the takeover must install the winner's pid")
+    nodeAssert.equal(readFileSync(path, "utf8"), `${process.pid}  done`, "the takeover must install the winner's pid")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// The same process, two instances: the claim carries an instance token
+// ---------------------------------------------------------------------------
+
+test("claimNotification: same pid, different instance token -> second loses", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-claim-instance-diff-"))
+  const sessionID = `inst-diff-${process.pid}-${Date.now()}`
+  const kind = "question"
+  try {
+    const first = await withClaimDir(dir, () => claimNotification(sessionID, kind, "token-A"))
+    const second = await withClaimDir(dir, () => claimNotification(sessionID, kind, "token-B"))
+    nodeAssert.equal(first, true, "the first instance must win the claim")
+    nodeAssert.equal(second, false, "a claim held by another instance in this process must not be taken")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("claimNotification: same pid, same instance token -> own claim unchanged", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-claim-instance-same-"))
+  const sessionID = `inst-same-${process.pid}-${Date.now()}`
+  const kind = "question"
+  try {
+    const first = await withClaimDir(dir, () => claimNotification(sessionID, kind, "token-A"))
+    const second = await withClaimDir(dir, () => claimNotification(sessionID, kind, "token-A"))
+    nodeAssert.equal(first, true, "the first claim must be taken")
+    nodeAssert.equal(second, true, "our own claim must never change our own behaviour")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("claimNotification: legacy two-field file, same pid -> returns true", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-claim-instance-legacy-"))
+  const sessionID = `inst-legacy-${process.pid}-${Date.now()}`
+  const kind = "question"
+  const path = claimPath(dir, sessionID, kind)
+  try {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path, `${process.pid} ${kind}`)
+    const won = await withClaimDir(dir, () => claimNotification(sessionID, kind, "token-A"))
+    nodeAssert.equal(won, true, "a legacy claim without a token must be treated as our own")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

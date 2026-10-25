@@ -441,6 +441,10 @@ For each host the script:
   version 22 or newer. A host that fails only that check is reported
   `warn (helper cannot run: <detail>; install node>=22 or a ~/bin/lacode wrapper)` and
   does not fail the publish.
+- disables leftover auto-discovered LaCode shims in `~/.config/opencode/plugins/` by
+  moving each to `~/.config/opencode/lacode-plugin-shim.disabled-<epoch>-<name>`,
+  because opencode auto-loads that directory and two loaded instances duplicate
+  question/permission notifications.
 
 Opt-outs are `LACODE_SYNC=0`, `LACODE_SYNC_DRY_RUN=1` (prints the plan, runs nothing)
 and `LACODE_SYNC_STRICT=1` (a failed host exits non-zero; the default is exit 0).

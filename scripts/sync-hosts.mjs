@@ -42,6 +42,9 @@ const REMOTE_READ = `cat "${REMOTE_CONFIG}"`
 const REMOTE_BACKUP = `cp -a "${REMOTE_CONFIG}" "${REMOTE_CONFIG}.bak-lacode-sync"`
 const REMOTE_WRITE = `cat > "${REMOTE_CONFIG}"`
 
+const REMOTE_PLUGINS_DIR = "$HOME/.config/opencode/plugins"
+const REMOTE_LIST_PLUGINS = `find "${REMOTE_PLUGINS_DIR}" -maxdepth 1 -type f -printf '%f\\n' 2>/dev/null`
+
 // After the install and config normalization: can this host actually run the
 // published helper? A `~/bin/lacode` wrapper is accepted as-is; otherwise the
 // system node must be >= 22 (the ESM bundle cannot be parsed by node 12).
@@ -226,64 +229,86 @@ function runSsh(host, remote, input, timeout = SSH_TIMEOUT_MS) {
   }
 }
 
+function disableShims(host) {
+  const listing = runSsh(host, REMOTE_LIST_PLUGINS)
+  const names = listing.ok
+    ? listing.output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    : []
+  const shims = names.filter((name) => /lacode/i.test(name))
+  const disabled = []
+  const epoch = Math.floor(Date.now() / 1000)
+  for (const name of shims) {
+    const move = runSsh(
+      host,
+      `mv "$HOME/.config/opencode/plugins/${name}" "$HOME/.config/opencode/lacode-plugin-shim.disabled-${epoch}-${name}"`,
+    )
+    if (move.ok) disabled.push(name)
+  }
+  return disabled
+}
+
 function syncHost(host, version) {
   const install = runSsh(host, installRemote(version), undefined, INSTALL_TIMEOUT_MS)
   if (install.output.includes("NO_OPENCODE")) return { host, status: "skipped", reason: "no opencode" }
   if (install.timedOut) return { host, status: "failed", reason: "install timed out" }
   if (!install.ok) return { host, status: "failed", reason: `install exit ${install.status ?? "unknown"}` }
 
+  const disabledShims = disableShims(host)
+
   const read = runSsh(host, REMOTE_READ)
-  if (!read.ok) return { host, status: "failed", reason: "cannot read config" }
+  if (!read.ok) return { host, status: "failed", reason: "cannot read config", shims: disabledShims }
 
   let config
   try {
     config = JSON.parse(read.output)
   } catch {
-    return { host, status: "failed", reason: "config not normalized (unparseable)" }
+    return { host, status: "failed", reason: "config not normalized (unparseable)", shims: disabledShims }
   }
 
   const next = normalizeConfig(config, version)
-  if (!next) return { host, status: "failed", reason: "config not normalized (unparseable)" }
+  if (!next) return { host, status: "failed", reason: "config not normalized (unparseable)", shims: disabledShims }
 
   if (JSON.stringify(config) !== JSON.stringify(next)) {
     const backup = runSsh(host, REMOTE_BACKUP)
-    if (!backup.ok) return { host, status: "failed", reason: "backup failed" }
+    if (!backup.ok) return { host, status: "failed", reason: "backup failed", shims: disabledShims }
 
     const body = JSON.stringify(next, null, 2) + "\n"
     const write = runSsh(host, REMOTE_WRITE, body)
-    if (!write.ok) return { host, status: "failed", reason: "write failed" }
+    if (!write.ok) return { host, status: "failed", reason: "write failed", shims: disabledShims }
   }
 
   const verify = runSsh(host, REMOTE_READ)
-  if (!verify.ok) return { host, status: "failed", reason: "verification failed" }
+  if (!verify.ok) return { host, status: "failed", reason: "verification failed", shims: disabledShims }
 
   let after
   try {
     after = JSON.parse(verify.output)
   } catch {
-    return { host, status: "failed", reason: "verification failed (unparseable)" }
+    return { host, status: "failed", reason: "verification failed (unparseable)", shims: disabledShims }
   }
 
   const expected = `${PACKAGE}@${version}`
   const plugin = after && Array.isArray(after.plugin) ? after.plugin : []
   const lacode = plugin.filter(isLacodeEntry)
   if (lacode.length !== 1 || specifierOf(lacode[0]) !== expected) {
-    return { host, status: "failed", reason: "verification failed" }
+    return { host, status: "failed", reason: "verification failed", shims: disabledShims }
   }
 
   const capability = runSsh(host, REMOTE_HELPER_CHECK)
-  if (capability.output.includes("HELPER_OK")) return { host, status: "ok" }
+  if (capability.output.includes("HELPER_OK")) return { host, status: "ok", shims: disabledShims }
   if (capability.output.includes("HELPER_UNUSABLE")) {
     return {
       host,
       status: "warn",
       reason: `helper cannot run: ${helperDetail(capability.output)}; install node>=22 or a ~/bin/lacode wrapper`,
+      shims: disabledShims,
     }
   }
   return {
     host,
     status: "warn",
     reason: "helper cannot run: capability check failed; install node>=22 or a ~/bin/lacode wrapper",
+    shims: disabledShims,
   }
 }
 
@@ -295,6 +320,8 @@ function printDryRun(hosts, version) {
     console.log(`  ${formatSsh(host, REMOTE_BACKUP)}`)
     console.log(`  ${formatSsh(host, REMOTE_WRITE)}`)
     console.log(`  ${formatSsh(host, REMOTE_READ)}`)
+    console.log(`  ${formatSsh(host, REMOTE_LIST_PLUGINS)}`)
+    console.log(`  ${formatSsh(host, 'mv "$HOME/.config/opencode/plugins/<shim>" "$HOME/.config/opencode/lacode-plugin-shim.disabled-<epoch>-<shim>"')}`)
     console.log(`  ${formatSsh(host, REMOTE_HELPER_CHECK)}`)
   }
   console.log(`dry run: ${hosts.length} host${hosts.length === 1 ? "" : "s"}, nothing was run`)
@@ -328,6 +355,14 @@ export function main(env = process.env) {
 
   console.log("")
   for (const result of results) {
+    if (Array.isArray(result.shims)) {
+      const shims = result.shims
+      if (shims.length > 0) {
+        for (const name of shims) console.log(`${result.host}: shim disabled: ${name}`)
+      } else {
+        console.log(`${result.host}: no stale shim`)
+      }
+    }
     if (result.status === "ok") console.log(`${result.host}: ok`)
     else if (result.status === "warn") console.log(`${result.host}: warn (${result.reason})`)
     else if (result.status === "skipped") console.log(`${result.host}: skipped (${result.reason})`)

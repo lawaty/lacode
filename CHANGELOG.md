@@ -7,6 +7,26 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.0.3] — one notification even when the plugin is loaded twice
+
+### Fixed
+
+- **A question or permission popup is raised once when two LaCode instances share
+  a process.** opencode auto-discovers every file under
+  `~/.config/opencode/plugins/`, so a host that also lists `@lawaty/lacode` in
+  `opencode.jsonc` loaded two copies. `done` was already deduplicated by the
+  completion marker, but the notification claim treated any claim holding our
+  own pid as ours — indistinguishable between two instances in one process. The
+  claim now carries a per-instance token, so the second instance loses while the
+  same instance may still raise a new prompt.
+
+### Changed
+
+- **Publishing syncs the published version to every host.** `postpublish` runs
+  `scripts/sync-hosts.mjs`: it installs `@lawaty/lacode@<version>`, normalises
+  each host's config to a single LaCode entry (preserving its options), disables
+  stale auto-discovered shims, and warns when a host cannot run the helper.
+
 ## [1.0.2] — the permission chime plays when the popup appears
 
 ### Fixed
