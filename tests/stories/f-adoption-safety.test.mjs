@@ -187,8 +187,11 @@ test("[US-15] every entry point the manifest publishes is built JavaScript, not 
     assert.ok(!target.endsWith(".ts"), `${subpath} must not publish TypeScript: node refuses to strip types under node_modules (${target})`)
     assert.ok(!target.includes("node_modules"), `${subpath} must not point into node_modules (${target})`)
     assert.ok(!target.startsWith("./src/"), `${subpath} must point at the build, not the sources (${target})`)
-    assert.ok(target.startsWith("./dist/"), `${subpath} must point into dist/ (${target})`)
-    assert.ok(pkg.files.includes(target.replace(/^\.\/([^/]+)\/.*$/, "$1")), `files must ship ${target}, or the tarball has a dangling entry point`)
+    // npm normalizes a leading "./" away on publish (bin becomes
+    // "dist/lacode.js"); both forms point into the built tree, so accept both
+    // rather than forcing the manifest back into a form npm rewrites.
+    assert.ok(target.startsWith("./dist/") || target.startsWith("dist/"), `${subpath} must point into dist/ (${target})`)
+    assert.ok(pkg.files.includes(target.replace(/^(?:\.\/)?([^/]+)\/.*$/, "$1")), `files must ship ${target}, or the tarball has a dangling entry point`)
 
     const file = join(ROOT, target)
     assert.ok(existsSync(file), `${subpath} -> ${target} does not exist; run \`npm run build\``)
