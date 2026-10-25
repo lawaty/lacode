@@ -57,7 +57,7 @@ a work list rather than a map:
 | `contexts.md` | The major subsystems. For each: what it is for, where to start reading it, what it depends on, what must not change while you are in there. Read this for a subsystem question. |
 | `conventions.md` | Repository-specific rules: naming, module layout, error handling, testing, persistence. Read this before writing code, not after. |
 | `workflows.md` | The few runtime flows worth tracing end to end — how a request becomes a mutation, how a plugin hook reaches the thing it hooks. Read this when you need to know what actually happens at runtime. |
-| `decisions.md` | Architectural decisions that the repository's own decision log does not already record. Concise, variable length. |
+| `decisions.md` | Architectural constraints that bind future work and that the repository's own decision log does not already record. Each entry states the constraint and points at the page or path that owns it. Capped at 120 non-blank lines; decision records and deliberation are not copied here. |
 | `active.md` | The active backlog: work in flight, grouped by the ISO week each task was opened in. A task that is not marked `[x]` is open and is never removed; a task that is finished and dated is kept for a week after it was finished, then dropped. The plugin enforces that window — see [How it stays current](#how-it-stays-current). Not a navigation file: there is no question it is the answer to. |
 
 The project's root `AGENTS.md` is the standing-instructions home: the client's
@@ -67,8 +67,51 @@ no prescribed structure. It has exactly one writer — the hidden `instructions`
 agent, reachable only from the `/agent-instructions` command.
 
 Files the user or the plan explicitly names always win over the map. The map is
-a shortcut to the right starting point, not an authority: when it disagrees with
-the source, the source is right and the map is wrong.
+a shortcut to the right starting point, not an authority. When it disagrees with
+**code**, the code is right and the map is wrong. When it disagrees with a
+**project page**, neither side is automatically right: the map may be current
+and the page stale (that has happened). The disagreement is reported and marked
+`[disputed]`; the page's owner resolves it. The cartographer never silently
+overwrites either side.
+
+## The entry contract
+
+Every navigation entry has one shape, in every file:
+
+```markdown
+- [binding] The operative rule, in at most three non-blank lines. — See `docs/DESIGN.md` §The two halves (verified 2026-10-26)
+```
+
+- **A provenance marker.** `[binding]` is a constraint established against the
+  source and exempt from age expiry. `[provisional]` is an inference or an
+  unverified claim and expires 30 days after `verified`. `[disputed]` records a
+  map/page disagreement and is kept, reported, and exempt from age until the
+  owner resolves it. There is no second confidence dialect.
+- **The rule, not the deliberation.** No Context / Decision / Consequences /
+  Alternatives blocks, status lines, or decision records. A reader needs the
+  constraint, not the meeting that produced it.
+- **A pointer.** A fact whose home is a page cites the page **and** its section
+  (`docs/DESIGN.md §Retention`). A fact whose home is code cites the path, with
+  an optional line or symbol. No pointer means the content has no source in the
+  tree — it is reported as unarchived, never emitted as though it were derived.
+- **A verification date.** `(verified YYYY-MM-DD)` drives both the lifecycle and
+  the drift check.
+
+Every file has a hard cap, counted in **non-blank lines**: architecture 150,
+contexts 200, conventions 150, workflows 150, decisions 120, active 60. Lines
+are the unit because they are what a reader pays for, they bound an entry that
+wraps to three lines, and the validator can count them exactly; an entry count
+does not bound cost, and a token count needs a tokenizer and is model-specific.
+The cap is enforced by a post-generation validator, not only by the prompt.
+
+The lifecycle generalises the window `active.md` already had. A finished backlog
+task is dropped after 7 days. A `[provisional]` entry in any navigation file is
+dropped 30 days after its `verified` date unless it is re-verified. `[binding]`
+and `[disputed]` never expire by age. An entry whose cited source no longer
+exists is **never** auto-dropped: it may be the only copy, so it is reported as
+unarchived and kept. Only provisional entries whose source still resolves are
+eligible for the sweep. The arithmetic lives in `src/lib/map-schema.ts`; the
+cartographer writes the shape, code decides what has aged out.
 
 The map is **local and untracked**. It describes *your* checkout on *this*
 machine, so committing it would churn on every session that edits a file, and
@@ -110,6 +153,18 @@ a new or moved entry point, a changed workflow, a new convention, an
 architectural decision, an undocumented invariant — and to report
 "no update needed" otherwise.
 
+After the turn ends, the plugin applies the per-file lifecycle and then audits
+the map. The audit is **report-only**: it never rewrites a claim and never
+deletes an entry whose source is gone. It checks the schema, each file's line
+budget, dangling paths and `§sections`, a numeric claim absent from its cited
+source, a possible negation conflict, a source modified after its `verified`
+date, tables and fenced blocks (restatements), duplicate rules across files,
+archive-of-record language, and whether each file still answers its charter. A
+failure is a loud `error` in the log; it is what turns the prompt's rules into a
+gate. The deterministic half is `src/lib/map-schema.ts`; the semantic drift pass
+is the cartographer's, and it reports a page disagreement instead of picking a
+side.
+
 If the map is missing entirely, nothing breaks: agents run the check, find no
 `.opencode/context/`, and explore from scratch. What tells them to run the check
 is an entry appended to your config's `instructions` array: your own entries are
@@ -138,17 +193,25 @@ your source.
 If you have defined a command of the same name, yours wins and is left exactly
 as you wrote it — the same merge-without-clobber rule the agents follow.
 
-`active.md` is the one file in the directory the plugin maintains rather than
-the cartographer. The cartographer records what happened — work in flight, and a
+`active.md` is the file the plugin maintains as a backlog rather than as a
+navigation map. The cartographer records what happened — work in flight, and a
 task marked finished with the date it finished — and the plugin decides what is
 still worth keeping: the file is regrouped by week and a task that was finished
 more than a week ago is dropped. The arithmetic lives in
 `src/lib/active-backlog.ts`, not in the cartographer's prompt, because a rule a
 model applies is a rule the model applies when it feels like it, and the failure
-is silent — the backlog just grows. The plugin normalizes the file on every
-edit of it and once when the session starts, so a hand edit is grouped and
-pruned whether the cartographer ran or not, and the file is rewritten only when
-its canonical form differs from what is on disk, so the write cannot loop.
+is silent — the backlog just grows. The plugin normalizes the file on every edit
+of it and once when the session starts, so a hand edit is grouped and pruned
+whether the cartographer ran or not, and the file is rewritten only when its
+canonical form differs from what is on disk, so the write cannot loop.
+
+The same code owns the navigation files' lifecycle, but it may only **drop** an
+entry that is `[provisional]`, past its 30-day window, and whose cited source
+still exists. It never drops a binding constraint or disputed entry, and it
+never drops an entry with no source — that is the one case where the map may be
+the only copy. The plugin is not a second writer of the map in the permission
+sense: `context` is still the only **agent** that writes it. The lifecycle is
+housekeeping by code, the same category as the backlog window.
 
 ## One writer
 
@@ -226,14 +289,21 @@ to check is that permission rule, not the map's content.
 | `auto update finished` | The run completed and changed at least one map file. |
 | `auto update finished without changing the map` | Nothing landed. Either nothing needed saying, or the cartographer could not write. |
 | `auto update failed: …` | The run errored. The paths it was given are queued again for the next window, so the work is not lost. |
+| `map lifecycle: dropped N expired provisional entr… from <file>` | The code sweep dropped an entry past its 30-day window. Binding and disputed entries are never dropped. |
+| `context map validation passed` | Every file is in schema and within budget, every pointer resolves, and the drift checks found nothing. |
+| `context map validation failed: N issue(s)` | The run's map is off schema or over budget, cites a missing path/section, restates a page, or has a possible contradiction. The map is **not** rewritten; the log names up to 20 issues and the paths to fix. |
 | `context map is not writable: …` | Your config's one-writer rule does not match the path opencode evaluates. Nothing will update until you fix it. |
 | `context map has more than one writer: …` | An agent other than `context` would be granted the map. The offending agent and the winning rule are named. |
 
 ## Reference
 
 - The agent and command definitions, as injected: `src/agents.ts`, `src/commands.ts`.
-- The idle/edit trigger: `src/plugins/context-autoupdate.ts`.
+- The prompt the model actually runs, in one place: `src/lib/cartographer-prompt.ts`; the tracked copy is `.opencode/prompts/context.txt`, and a test pins equality.
+- The idle/edit trigger and the post-run audit wiring: `src/plugins/context-autoupdate.ts`.
+- The schema, budget, lifecycle and deterministic drift check: `src/lib/map-schema.ts`.
+- The active backlog's window: `src/lib/active-backlog.ts`.
 - The one-writer rule check: `src/lib/writer-rule.ts`.
+- Fixtures and their report: `tests/fixtures/context-map/`, `scripts/context-map-fixture.mjs`.
 - The behavioural contracts, with acceptance criteria a test asserts:
   [USER-STORIES.md](USER-STORIES.md), US-19 to US-22.
 - Tests: `tests/stories/g-context-management.test.mjs`.

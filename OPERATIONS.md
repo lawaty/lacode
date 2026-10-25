@@ -436,7 +436,12 @@ For each host the script:
   `opencode plugin "@lawaty/lacode@<version>" -g -f`;
 - normalizes `~/.config/opencode/opencode.jsonc` to exactly one LaCode entry,
   `["@lawaty/lacode@<version>", {…existing options…}]`, carrying over the existing
-  omniroute options and writing a `.bak-lacode-sync` backup first;
+  omniroute options and writing a `.bak-lacode-sync` backup first. The file is
+  JSONC, so comments and trailing commas are accepted;
+- syncs the allowlisted providers from the local
+  `~/.local/share/opencode/auth.json` to each host's auth store
+  (`OC_AUTH_PROVIDERS`, default `opencode-go opencode`), keeps host-only
+  providers, and writes the remote file atomically with a timestamped backup;
 - checks that the helper can run: an executable `~/bin/lacode`, or a system node at
   version 22 or newer. A host that fails only that check is reported
   `warn (helper cannot run: <detail>; install node>=22 or a ~/bin/lacode wrapper)` and
@@ -446,13 +451,15 @@ For each host the script:
   because opencode auto-loads that directory and two loaded instances duplicate
   question/permission notifications.
 
-Opt-outs are `LACODE_SYNC=0`, `LACODE_SYNC_DRY_RUN=1` (prints the plan, runs nothing)
-and `LACODE_SYNC_STRICT=1` (a failed host exits non-zero; the default is exit 0).
+Opt-outs are `LACODE_SYNC=0`, `LACODE_SYNC_DRY_RUN=1` (prints the plan and contacts
+**no** host, even when a local auth store exists), `LACODE_SYNC_NO_WAIT=1` (skip the
+registry wait) and `LACODE_SYNC_STRICT=1` (a failed host exits non-zero; the default is
+exit 0). `LACODE_SYNC_WAIT_SECONDS` changes the registry wait (default 600).
 
-A host needs `opencode` on `PATH` or at `~/.opencode/bin/opencode`, and a runtime that
-can run the published helper. Ubuntu 22.04's system node 12 cannot parse the ESM bundle,
-so such a host needs the `~/bin/lacode` wrapper around a private node until its system
-node reaches 22.
+A host needs `opencode` at `~/.opencode/bin/opencode` (or a remote `$OC` override), and
+a runtime that can run the published helper. Ubuntu 22.04's system node 12 cannot parse
+the ESM bundle, so such a host needs the `~/bin/lacode` wrapper around a private node
+until its system node reaches 22.
 
 The desktop end of the tunnel must run `lacode receive`. The node receiver plays the
 sound the payload carries; the legacy `oc-notify-receiver` ignores the sound field.
@@ -541,6 +548,31 @@ and once at session start. A line that vanishes from `active.md` was aged out by
 that rule, not lost — the boundary is strict, so a task finished exactly seven
 days ago is still kept. A task that is finished but carries no date cannot age
 out at all, and stays until it is dated or removed.
+
+### The entry contract, budgets and validation
+
+Every navigation entry is `- [binding|provisional|disputed] <rule, ≤3 lines> —
+See `<path>`[ §Section] (verified YYYY-MM-DD)`. The marker is the provenance:
+binding constraints and disputed claims are exempt from age; a provisional entry
+is dropped 30 days after `verified` unless it is re-verified. Each file has a
+hard cap in non-blank lines (architecture 150, contexts 200, conventions 150,
+workflows 150, decisions 120, active 60), enforced by a post-generation audit,
+not only by the prompt. The audit is **report-only**: it never rewrites a claim
+and never deletes an entry whose source is gone. It reports over-budget and
+off-schema files, dangling paths and sections, a numeric claim absent from its
+cited source, a possible negation conflict, a source modified after its
+`verified` date, tables/fenced blocks/verbatim spans (restatements), duplicate
+rules across files, archive-of-record language, and a file that no longer
+answers its charter. The code half is `src/lib/map-schema.ts`; a map/page
+disagreement is reported for the page's owner, because the map may be the side
+that is right and the page stale.
+
+The lifecycle is generalised, but it is deliberately narrow about deletion: it
+can drop only a provisional entry that is past its window **and** whose cited
+source still exists. A binding constraint never expires by age, and an entry with
+no resolvable source is kept and reported as unarchived — it may be the only
+copy. `context` remains the only agent that writes the map; the sweep is
+housekeeping by code, the same category as the backlog window.
 
 ## Session retention
 

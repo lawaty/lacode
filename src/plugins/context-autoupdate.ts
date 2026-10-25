@@ -4,6 +4,7 @@ import * as path from "node:path"
 import type { Hooks, PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
 import { ACTIVE_BACKLOG_FILE, normalizeBacklog } from "../lib/active-backlog.ts"
+import { auditMap, formatViolations, maintainMap } from "../lib/map-schema.ts"
 import { verifyWriterRule } from "../lib/writer-rule.ts"
 
 // Auto-maintains .opencode/context/ in every project.
@@ -70,6 +71,17 @@ const NO_BULK_READS = [
   "corpora. They are megabytes each and describe no architecture. Read the source",
   "that PRODUCES or CONSUMES them instead. If a payload must be sampled, use",
   "`head -c 2000` or `wc -c` — never `cat` or a bare `grep -r` across one.",
+].join(" ")
+
+// The one-line contract repeated in the user message. The full rules live in
+// the system prompt; this is here because the user message is what names the
+// files that changed, and a schema reminder next to it is cheap compared with a
+// 465-line file that has to be regenerated.
+const ENTRY_CONTRACT = [
+  "Every navigation entry uses the schema in your system prompt:",
+  "`- [binding|provisional|disputed] <rule, at most three lines> — See `<path>`[ §Section] (verified YYYY-MM-DD)`.",
+  "Stay inside each file's line budget. Point at the page or path that owns a fact; do not restate it.",
+  "After writing, run the drift pass: report a contradiction, never overwrite the page or silently pick a side.",
 ].join(" ")
 
 const toPosix = (value: string) => value.split(path.sep).join("/")
@@ -295,10 +307,71 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
     }
   }
 
-  // The window applies from the moment the session starts, not only after
-  // somebody edits the file: a task that aged out while the project was
-  // closed is still a task that aged out.
-  void normalizeActiveBacklog()
+  /**
+   * Apply the lifecycle of EVERY map file, not just the backlog.
+   *
+   * This is the same split active-backlog.ts already made, generalised: the
+   * cartographer records what is true, and code decides what is still worth
+   * keeping. Only PROVISIONAL entries whose cited source still exists can be
+   * dropped, and only after their window; a binding constraint never expires
+   * by age, and an entry with no resolvable source is kept (it may be the only
+   * copy) and reported by the audit below. The write is idempotent, so a second
+   * pass over a clean map changes nothing and cannot loop.
+   *
+   * Never throws: housekeeping must not fail the run that triggered it.
+   */
+  const applyLifecycle = async () => {
+    try {
+      const result = maintainMap(root, contextAbs)
+      for (const file of result.files) {
+        if (file.removed.length === 0) continue
+        await log(
+          "info",
+          `map lifecycle: dropped ${file.removed.length} expired provisional entr${file.removed.length === 1 ? "y" : "ies"} from ${file.file}`,
+          { file: file.file, removed: file.removed.map((entry) => entry.text) },
+        )
+      }
+      return result
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Validate the map and REPORT. This function never writes a map file and
+   * never resolves a disagreement: an over-budget or off-schema map is a loud
+   * error, and a map/page contradiction is reported with both sides named so
+   * the owning page can fix it. The observed failure had the map right and the
+   * page stale; silently preferring either side would have propagated an error.
+   */
+  const reportMapAudit = async (mode: "bootstrap" | "update") => {
+    try {
+      const audit = auditMap(root, contextAbs)
+      if (audit.ok) {
+        await log("info", "context map validation passed", { mode, files: audit.files.length })
+        return audit
+      }
+      const byKind: Record<string, number> = {}
+      for (const violation of audit.violations) {
+        byKind[violation.kind] = (byKind[violation.kind] ?? 0) + 1
+      }
+      await log("error", `context map validation failed: ${audit.violations.length} issue(s)`, {
+        mode,
+        byKind,
+        issues: formatViolations(audit.violations, 20),
+        note: "reported, not rewritten; fix the entry or its source and run /context-update",
+      })
+      return audit
+    } catch (error) {
+      await log("warn", `context map validation could not run: ${String(error)}`, { mode })
+      return undefined
+    }
+  }
+
+  // The lifecycle applies from the moment the session starts, not only after
+  // somebody edits a file: an entry that aged out while the project was closed
+  // is still an entry that aged out.
+  void applyLifecycle()
 
   const listed = (files: string[]) => {
     const shown = files.slice(0, MAX_FILES_LISTED)
@@ -319,7 +392,9 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           "",
           NO_BULK_READS,
           "",
-          "Follow the bootstrap procedure in your system prompt: progressive exploration, then write the five context files within their size targets. Also create `.opencode/context/active.md` with its heading and no tasks. When the project already has architecture or decision documentation, link to it instead of duplicating it. Write conclusions, not inventories.",
+          ENTRY_CONTRACT,
+          "",
+          "Follow the bootstrap procedure in your system prompt: progressive exploration, then write the five context files within their line budgets. Also create `.opencode/context/active.md` with its heading and no tasks. When the project already has architecture or decision documentation, link to it instead of duplicating it. Write conclusions, not inventories.",
         ].join("\n")
       : [
           "Incremental context update. Project root: " + directory,
@@ -328,6 +403,8 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           listed(files),
           "",
           NO_BULK_READS,
+          "",
+          ENTRY_CONTRACT,
           "",
           'Follow the incremental-update procedure in your system prompt. Update a context file only if this work introduced or revealed information that will materially help future agents: a new boundary or module, a new or moved canonical entry point, a changed workflow, a new convention, an architectural decision, a new dependency between subsystems, a renamed or moved subsystem, or an invariant not yet recorded. Do not edit documentation merely because source files changed. If nothing material changed, make no edits and report "no update needed". Also keep `.opencode/context/active.md` current: record work that is in flight, and mark a task finished — with the date it finished — when it is.',
         ].join("\n")
@@ -492,6 +569,20 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
                 considered: files.length,
                 changed: 0,
                 hint: "either nothing needed updating, or the cartographer could not write -- check the one-writer permission rule",
+              })
+            }
+            // Apply the per-file lifecycle and validate what landed. The audit
+            // is REPORT-ONLY: it never rewrites a claim and never deletes an
+            // entry whose source is gone. An over-budget or off-schema map is a
+            // loud error here, which is what turns a prompt rule into a gate.
+            await applyLifecycle()
+            const audit = await reportMapAudit(mode)
+            if (audit && !audit.ok) {
+              // The map is left on disk for inspection, but the run is not a
+              // clean success: a caller reading the log can distinguish a map
+              // that passed the contract from one that did not.
+              await log("error", `auto ${mode} finished with ${audit.violations.length} map validation issue(s)`, {
+                sessionID: target,
               })
             }
           })

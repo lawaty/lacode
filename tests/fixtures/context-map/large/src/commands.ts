@@ -1,0 +1,1 @@
+export const parse = (command: string) => command

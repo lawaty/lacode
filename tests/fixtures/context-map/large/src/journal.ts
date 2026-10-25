@@ -1,0 +1,1 @@
+export const append = (entry: string) => entry

@@ -44,11 +44,14 @@ your system prompt.
 Otherwise follow the bootstrap procedure in your system prompt: progressive
 exploration (README → existing docs → manifests → top-level structure → build
 and framework config → entry points → selective source), then write the five
-context files inside their size targets. Also create
-\`.opencode/context/active.md\` with its heading and no tasks.
+context files inside their line budgets, using the entry schema (provenance
+marker, rule of at most three lines, \`— See <path>[ §Section] (verified
+YYYY-MM-DD)\`). Also create \`.opencode/context/active.md\` with its heading and no
+tasks.
 
-Remember: write conclusions, not inventories. Link to the project's existing
-documentation instead of duplicating it.
+Remember: write conclusions, not inventories. Point at the project's existing
+documentation instead of restating it. Run the drift pass and report a
+contradiction rather than silently choosing a side.
 
 Report what you created or updated, what you deliberately left out, and
 anything that contradicts the code or existing docs.`,
@@ -76,7 +79,11 @@ or an invariant not yet recorded.
 
 Do not edit documentation just because source files changed. No
 timestamp-only edits. If nothing material changed, make no edits and report
-"no update needed".`,
+"no update needed".
+
+Every new or changed entry uses the schema in your system prompt and stays
+under the file's line budget. If a file is already over budget, consolidate
+before adding.`,
   },
 
   "context-review": {
@@ -86,20 +93,29 @@ timestamp-only edits. If nothing material changed, make no edits and report
     subtask: true,
     template: `Context review.
 
-Everything outside \`.opencode/context/\` is read-only for this run. Do not
-modify source code under any circumstances.
+Follow the review procedure and entry schema in your system prompt. Everything
+outside \`.opencode/context/\` is read-only for this run. Do not modify source
+code under any circumstances.
 
 Audit the context files and the backlog for:
 
-- stale information — verify claims against the actual code
-- contradictions between context files, or between the map and the code
-- excessive size — consolidate toward the per-file targets in your system
-  prompt
+- schema — every entry has one provenance marker, at most three lines, a
+  pointer, and a \`(verified YYYY-MM-DD)\` date
+- budget — every file is within its non-blank-line cap; consolidate rather
+  than exceed it
+- stale information — verify claims against the actual code and the cited page
+- contradictions between context files, or between the map and a page — mark
+  \`[disputed]\` and report both sides; never silently prefer one
+- dangling pointers — every cited path and §section must exist
+- unarchived content — an entry with no source in the tree; report it and keep
+  it, because it may be the only copy
+- restatement — a table, a fenced block, or a long verbatim span copied from a
+  page
 - duplicated information — one canonical place per fact; link to the
   project's own docs rather than restating them
 - missing canonical entry points for significant subsystems
-- unsupported assumptions — anything stated as fact that you cannot verify,
-  or that lacks a confidence marker
+- unsupported assumptions — anything that is not \`[binding]\` or \`[disputed]\`
+  should be \`[provisional]\`
 - backlog tasks that are finished but carry no date — the retention window
   cannot age those out, so they stay forever
 

@@ -69,6 +69,13 @@ if (command.includes(" plugin ") && command.includes("@lawaty/lacode@")) {
   process.exit(0)
 }
 
+if (command.includes("python3 -c")) {
+  const body = fs.readFileSync(0, "utf8")
+  if (process.env.FAKE_SSH_AUTH_LOG) fs.writeFileSync(process.env.FAKE_SSH_AUTH_LOG, body)
+  process.stdout.write((process.env.FAKE_SSH_AUTH_OUTPUT || "IDENTICAL") + "\n")
+  process.exit(0)
+}
+
 if (command.includes("HELPER_OK")) {
   process.stdout.write((process.env.FAKE_SSH_HELPER || "HELPER_OK") + "\n")
   process.exit(0)
@@ -142,7 +149,8 @@ function setup(t, options = {}) {
     ],
   }
   const fixturePath = join(root, "fixture.jsonc")
-  writeFileSync(fixturePath, JSON.stringify(fixture, null, 2) + "\n")
+  if (options.fixtureText !== undefined) writeFileSync(fixturePath, options.fixtureText)
+  else writeFileSync(fixturePath, JSON.stringify(fixture, null, 2) + "\n")
 
   const ssh = join(bin, "ssh")
   writeFileSync(ssh, FAKE_SSH)
@@ -173,6 +181,21 @@ function setup(t, options = {}) {
   delete env.LACODE_SYNC_WAIT_SECONDS
   delete env.LACODE_SYNC_STRICT
   delete env.OC_HOSTS
+  delete env.OC_AUTH_FILE
+  delete env.OC_AUTH_PROVIDERS
+  delete env.FAKE_SSH_AUTH_LOG
+  delete env.FAKE_SSH_AUTH_OUTPUT
+  // Always point at a local auth file inside the scratch root (absent unless a
+  // test supplies one), so a developer's real ~/.local auth store can never
+  // leak a key into the suite.
+  env.OC_AUTH_FILE = join(root, "missing-auth.json")
+  if (options.auth) {
+    const authPath = join(root, "auth.json")
+    writeFileSync(authPath, JSON.stringify(options.auth, null, 2) + "\n")
+    env.OC_AUTH_FILE = authPath
+    env.FAKE_SSH_AUTH_LOG = join(root, "auth.log")
+    if (options.authOutput) env.FAKE_SSH_AUTH_OUTPUT = options.authOutput
+  }
   if (options.noOpencode) env.FAKE_SSH_NO_OPENCODE = "1"
   if (options.npmFailFirst) env.FAKE_NPM_FAIL_FIRST = "1"
   if (options.installFailFirst) env.FAKE_SSH_INSTALL_FAIL_FIRST = "1"
@@ -429,4 +452,86 @@ test("sync-hosts reports no stale shim when the listing has no lacode file", (t)
   const sshCalls = calls(log)
   const move = sshCalls.find((args) => /^mv\s+/.test(args[args.length - 1]))
   assert.equal(move, undefined, "no move command is issued")
+})
+
+test("sync-hosts dry run with a local auth store contacts no host", (t) => {
+  const { log, env } = setup(t, { auth: { opencode: { key: "sk-test-do-not-log" } } })
+  const result = run({
+    ...env,
+    OC_HOSTS: "host-a host-b",
+    LACODE_SYNC_DRY_RUN: "1",
+    LACODE_SYNC_NO_WAIT: "1",
+  })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /dry run: 2 hosts, nothing was run/)
+  assert.match(result.stdout, /auth: would sync 1 provider \(opencode\); dry run contacts no host/)
+  assert.equal(calls(log).length, 0, "dry run must not invoke ssh, even with a local auth store")
+  assert.equal(existsSync(join(env.FAKE_SSH_STATE, "auth.log")), false, "no auth envelope is sent")
+})
+
+test("sync-hosts syncs credentials when the run is real", (t) => {
+  const { log, env } = setup(t, {
+    auth: {
+      opencode: { key: "sk-test-do-not-log" },
+      openrouter: { key: "sk-other-do-not-log" },
+    },
+    authOutput: "UPDATED:opencode",
+  })
+  const result = run({ ...env, OC_HOSTS: "host-a", LACODE_SYNC_NO_WAIT: "1" })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /host-a: ok/)
+  assert.match(result.stdout, /host-a: auth: updated opencode/)
+
+  const authCalls = calls(log).filter((args) => String(args[args.length - 1]).includes("python3 -c"))
+  assert.equal(authCalls.length, 1, "the auth helper is invoked once for the host")
+  const envelope = JSON.parse(readFileSync(env.FAKE_SSH_AUTH_LOG, "utf8"))
+  assert.deepEqual(Object.keys(envelope.providers).sort(), ["opencode", "openrouter"])
+  assert.deepEqual(envelope.replace, ["opencode-go", "opencode"])
+  assert.equal(envelope.dryRun, false)
+})
+
+test("sync-hosts accepts a real opencode.jsonc with comments and trailing commas", (t) => {
+  const fixtureText = `{
+  // opencode writes JSONC, not JSON
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    ["file:///home/lawaty/Projects/lacode/dist/index.js", { "omniroute": { "enabled": true } }],
+    "@lawaty/lacode@0.0.0", // appended by the installer
+  ],
+}
+`
+  const { env } = setup(t, { fixtureText })
+  const result = run({ ...env, OC_HOSTS: "host-a", LACODE_SYNC_NO_WAIT: "1" })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /host-a: ok/, result.stdout)
+  const written = JSON.parse(readFileSync(join(env.FAKE_SSH_STATE, "written.jsonc"), "utf8"))
+  const entries = written.plugin.filter((entry) => JSON.stringify(entry).includes("@lawaty/lacode"))
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0][0], EXPECTED)
+  assert.deepEqual(entries[0][1], { omniroute: { enabled: true } })
+})
+
+test("sync-hosts exits 1 under LACODE_SYNC_STRICT when a host fails", (t) => {
+  const { env } = setup(t, { installExit: 1, installStderr: "boom\n" })
+  const result = run({
+    ...env,
+    OC_HOSTS: "host-a",
+    LACODE_SYNC_NO_WAIT: "1",
+    LACODE_SYNC_STRICT: "1",
+  })
+
+  assert.equal(result.status, 1, result.stdout)
+  assert.match(result.stdout, /summary: 0 ok, 0 warn, 0 skipped, 1 failed/)
+})
+
+test("sync-hosts honours the LACODE_SYNC kill switch without touching a host", (t) => {
+  const { log, env } = setup(t, { auth: { opencode: { key: "sk-test-do-not-log" } } })
+  const result = run({ ...env, OC_HOSTS: "host-a", LACODE_SYNC: "0" })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /lacode sync: disabled/)
+  assert.equal(calls(log).length, 0)
 })

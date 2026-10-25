@@ -1,0 +1,1 @@
+export class AtlasError extends Error {}

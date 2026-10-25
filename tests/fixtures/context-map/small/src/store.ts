@@ -1,0 +1,1 @@
+export const apply = (mutation: string) => mutation

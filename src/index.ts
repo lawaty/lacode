@@ -34,6 +34,12 @@
 //       next start). `false` disables it; `LACODE_NO_SELFUPDATE=1` does the same
 //       from the environment.
 //
+//     feedbackHint?: boolean
+//       The one-time, local feedback note on the first interactive start.
+//       Absent or true = show at most once; `false` or
+//       `LACODE_NO_FEEDBACK_HINT=1` disables it. It makes no network request and
+//       writes only ~/.local/share/opencode/lacode/feedback.json.
+//
 //     omniroute?: object
 //       Optional OmniRoute (local OpenAI-compatible gateway) integration. Absent
 //       or `{ enabled: false }` changes nothing. When `enabled: true`, lacode
@@ -82,6 +88,7 @@ import { PACKAGE_ROOT } from "./lib/package-root.ts"
 import { readInstalledVersion } from "./lib/selfupdate.ts"
 import { agentPoolHooks } from "./plugins/agent-pool.ts"
 import { contextAutoUpdateHooks } from "./plugins/context-autoupdate.ts"
+import { feedbackHooks } from "./plugins/feedback.ts"
 import type { ImagePasteOptions } from "./plugins/image-paste.ts"
 import { imagePasteHooks } from "./plugins/image-paste.ts"
 import { scrubSlotNames } from "./lib/prompt-guard.ts"
@@ -98,6 +105,7 @@ export type LacodeOptions = {
   dir?: string
   modelsFile?: string
   selfUpdate?: boolean
+  feedbackHint?: boolean
   imagePaste?: ImagePasteOptions
   [key: string]: unknown
 }
@@ -156,6 +164,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   const autoupdate = (await settled("context-autoupdate", () => contextAutoUpdateHooks(input, options))) ?? inertHooks
   const notifier = (await settled("notify", () => notifyHooks(input, options))) ?? inertHooks
   const selfupdate = (await settled("self-update", () => selfUpdateHooks(input, options))) ?? inertHooks
+  const feedback = (await settled("feedback", () => feedbackHooks(input, options))) ?? inertHooks
   const omniroute = (await settled("omniroute", () => omniRouteHooks(input, options))) ?? inertHooks
   const imagepaste = (await settled("image-paste", () => imagePasteHooks(input, opts.imagePaste as PluginOptions | undefined))) ?? inertHooks
 
@@ -206,6 +215,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       await autoupdate.dispose?.()
       await notifier.dispose?.()
       await selfupdate.dispose?.()
+      await feedback.dispose?.()
       await omniroute.dispose?.()
       await imagepaste.dispose?.()
     },

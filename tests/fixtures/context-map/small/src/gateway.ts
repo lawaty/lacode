@@ -1,0 +1,1 @@
+export const admit = (request: string) => request

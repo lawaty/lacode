@@ -1,0 +1,1 @@
+export const compact = (prefix: string) => prefix

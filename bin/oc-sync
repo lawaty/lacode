@@ -27,9 +27,9 @@
 #   bin/oc-sync                 sync `oc` AND the whole opencode setup to every host
 #   bin/oc-sync --scripts-only  sync only `oc`, skipping the config
 #   bin/oc-sync --no-config     alias for --scripts-only
-#   bin/oc-sync --with-auth     also copy MISSING provider credentials into each host's
-#                               opencode auth.json (merge-only: never overwrites a key a
-#                               host already has, and never prints one)
+#   bin/oc-sync --with-auth     sync credentials (default on)
+#   bin/oc-sync --no-auth       skip credential sync entirely
+#   credentials sync by default (allowlist: opencode-go, opencode); --no-auth skips them
 #   bin/oc-sync --dry-run ...   show what would change, write nothing
 #   bin/oc-sync --host NAME ... limit to one host
 #
@@ -112,7 +112,7 @@ SSH_BASE=(ssh -n "${SSH_SSH_OPTS[@]}")
 SSH_STDIN=(ssh "${SSH_SSH_OPTS[@]}")
 
 WITH_CONFIG=1
-WITH_AUTH=0
+WITH_AUTH=1
 DRY_RUN=0
 ONLY_HOST=""
 
@@ -121,6 +121,7 @@ while [[ $# -gt 0 ]]; do
     --with-config|--config) WITH_CONFIG=1 ;;
     --scripts-only|--no-config) WITH_CONFIG=0 ;;
     --with-auth) WITH_AUTH=1 ;;
+    --no-auth|--without-auth) WITH_AUTH=0 ;;
     --dry-run|-n)  DRY_RUN=1 ;;
     --host)        ONLY_HOST="${2:-}"; shift ;;
     -h|--help)     awk '/^# Usage:/{p=1;next} /^# (Host details|Why it is|Credentials|$)/{if(p)exit} p{sub(/^# ?/,"");print}' "$0"; exit 0 ;;
@@ -731,6 +732,7 @@ DONE=()
 # never written to a temp file here and never appears in a command line (where
 # it would land in the remote shell history and in this process's argv).
 AUTH_FILE="${OC_AUTH_FILE:-$HOME/.local/share/opencode/auth.json}"
+AUTH_PROVIDERS="${OC_AUTH_PROVIDERS:-opencode-go opencode}"
 
 # Names only: provider -> its key, for the ones listed in $2. Used to build the
 # payload without ever printing a key.
@@ -746,6 +748,27 @@ except FileNotFoundError:
     sys.exit(3)
 out = {k: v for k, v in auth.items() if (not want or k in want) and isinstance(v, dict) and v.get("key")}
 print(json.dumps(out))
+PY
+}
+
+# Build the single-line JSON envelope sent to the remote helper:
+# {"replace":[...],"providers":{...}}. Never prints a key.
+auth_payload() {
+  AUTH_PROVIDERS="$AUTH_PROVIDERS" python3 - "$AUTH_FILE" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+replace = os.environ.get("AUTH_PROVIDERS", "").split()
+try:
+    with open(path) as fh:
+        auth = json.load(fh)
+except FileNotFoundError:
+    sys.exit(3)
+out = {}
+if isinstance(auth, dict):
+    for k, v in auth.items():
+        if isinstance(v, dict) and v.get("key"):
+            out[k] = v
+print(json.dumps({"replace": replace, "providers": out}))
 PY
 }
 
@@ -783,49 +806,101 @@ remote_auth_merge() {
     printf 'DRY=%q\n' "$DRY_RUN"
     printf 'AUTH="$HOME/.local/share/opencode/auth.json"\n'
     printf 'emit() { echo "oc-auth|$1"; }\n'
-    printf 'mkdir -p "$(dirname "$AUTH")" || { emit "err:could not create auth dir"; exit 0; }\n'
     printf "PAYLOAD=\$(cat <<'PAYLOAD_EOF'\n"
     printf '%s\n' "$payload"
     printf 'PAYLOAD_EOF\n)\n'
     cat <<'REMOTE_TAIL'
 [ -n "$PAYLOAD" ] || { emit "warn:empty payload, nothing merged"; exit 0; }
-if [ "$DRY" = "1" ]; then
-  PROVIDERS="$(printf '%s' "$PAYLOAD" | python3 -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin))))')"
-  emit "ok:[dry-run] would add $PROVIDERS to ~auth.json"
-  exit 0
-fi
 # Merge in python so a malformed payload cannot truncate the file: the existing
 # store is read, updated, and only then written via a temp file + rename, which
 # is atomic, so a crash mid-write leaves the original intact.
-printf '%s' "$PAYLOAD" | python3 -c '
+DRY="$DRY" python3 -c '
 import json, os, shutil, sys, time
-auth_path = os.path.expanduser("~/.local/share/opencode/auth.json")
-new = json.load(sys.stdin)
-if not isinstance(new, dict) or not new:
-    print("REJECT:payload is not a non-empty object"); raise SystemExit(0)
+raw = sys.stdin.read()
 try:
-    cur = json.load(open(auth_path))
+    data = json.loads(raw)
+except Exception as e:
+    print("REJECT:bad payload (%s)" % e); raise SystemExit(0)
+if not isinstance(data, dict):
+    print("REJECT:payload is not an object"); raise SystemExit(0)
+replace = data.get("replace", [])
+providers = data.get("providers", {})
+if not isinstance(replace, list) or not all(isinstance(x, str) for x in replace):
+    print("REJECT:replace must be a list of strings"); raise SystemExit(0)
+if not isinstance(providers, dict):
+    print("REJECT:providers must be an object"); raise SystemExit(0)
+replace_set = set(replace)
+auth_path = os.path.expanduser("~/.local/share/opencode/auth.json")
+# missing file or unreadable/invalid JSON -> {}
+try:
+    with open(auth_path) as fh:
+        cur = json.load(fh)
     if not isinstance(cur, dict):
-        raise ValueError("existing auth.json is not an object")
+        cur = {}
 except FileNotFoundError:
     cur = {}
+except Exception:
+    cur = {}
+updated = []
+added = []
+kept = []
+new_cur = dict(cur)
+for pid, val in providers.items():
+    if not isinstance(val, dict) or not val.get("key"):
+        continue
+    if pid in cur:
+        if pid in replace_set and cur[pid] != val:
+            new_cur[pid] = val
+            updated.append(pid)
+        else:
+            kept.append(pid)
+    else:
+        new_cur[pid] = val
+        added.append(pid)
+changed = bool(updated or added)
+dry = os.environ.get("DRY") == "1"
+if not changed:
+    print("IDENTICAL")
+    raise SystemExit(0)
+if dry:
+    for pid in sorted(updated):
+        print("WOULD-UPDATE:" + pid)
+    for pid in sorted(added):
+        print("WOULD-ADD:" + pid)
+    for pid in sorted(kept):
+        print("KEPT:" + pid)
+    raise SystemExit(0)
+# write only when something changed
+auth_dir = os.path.dirname(auth_path)
+try:
+    os.makedirs(auth_dir, exist_ok=True)
 except Exception as e:
-    print("REJECT:existing auth.json unreadable (%s)" % e); raise SystemExit(0)
-# never overwrite: a key the host already has wins over ours
-added = [k for k in new if k not in cur]
-kept = [k for k in new if k in cur]
-cur.update({k: v for k, v in new.items() if k in added})
-shutil.copy2(auth_path, auth_path + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+    print("REJECT:could not create auth dir (%s)" % e); raise SystemExit(0)
+if os.path.exists(auth_path):
+    try:
+        shutil.copy2(auth_path, auth_path + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+    except Exception:
+        pass
 tmp = auth_path + ".tmp"
-with open(tmp, "w") as fh:
-    json.dump(cur, fh, indent=2)
-    fh.write("\n")
-os.chmod(tmp, 0o600)
-os.replace(tmp, auth_path)
-print("ADDED:" + " ".join(sorted(added)))
-if kept:
-    print("KEPT:" + " ".join(sorted(kept)))
-'
+try:
+    with open(tmp, "w") as fh:
+        json.dump(new_cur, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, auth_path)
+except Exception as e:
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    print("REJECT:write failed (%s)" % e); raise SystemExit(0)
+for pid in sorted(updated):
+    print("UPDATED:" + pid)
+for pid in sorted(added):
+    print("ADDED:" + pid)
+for pid in sorted(kept):
+    print("KEPT:" + pid)
+' <<< "$PAYLOAD"
 rc=$?
 [ $rc -eq 0 ] || emit "err:merge helper failed"
 REMOTE_TAIL
@@ -835,47 +910,59 @@ REMOTE_TAIL
 sync_auth() {
   local host="$1"
   if [[ ! -f "$AUTH_FILE" ]]; then
-    warn "no local auth.json at $AUTH_FILE; run 'opencode auth login' first"
-    FAILED+=("$host")
-    return 1
-  fi
-  local have payload
-  have="$(remote_auth_providers "$host")"
-  local -a missing=()
-  local provider
-  for provider in $(auth_subset | python3 -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin))))'); do
-    case " $have " in *" $provider "*) ;; *) missing+=("$provider") ;; esac
-  done
-  if [[ ${#missing[@]} -eq 0 ]]; then
-    ok "auth: host already has ${have:-no providers}, nothing to add"
+    warn "auth: no local auth.json at $AUTH_FILE; skipping credentials"
     return 0
   fi
-  payload="$(auth_subset "${missing[@]}")" || { bad "could not read $AUTH_FILE"; FAILED+=("$host"); return 1; }
+  local payload
+  payload="$(auth_payload)" || { bad "auth: could not read $AUTH_FILE"; FAILED+=("$host"); return 1; }
+  if [[ -z "$payload" ]]; then
+    warn "auth: empty payload, nothing to sync"
+    return 0
+  fi
   local out
-  out="$(remote_auth_merge "$host" "$payload")" || { bad "auth merge failed on $host"; FAILED+=("$host"); return 1; }
+  out="$(remote_auth_merge "$host" "$payload")" || { bad "auth: merge failed on $host"; FAILED+=("$host"); return 1; }
   local line reported=0
+  local updated="" added="" kept="" would_update="" would_add="" identical=0 reject=""
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    local msg="${line#oc-sync|}"
-    case "$msg" in
-      ok:*)   ok "auth: ${msg#ok:}"; reported=1 ;;
-      warn:*) warn "auth: ${msg#warn:}"; reported=1 ;;
-      err:*)  bad "auth: ${msg#err:}"; FAILED+=("$host"); reported=1 ;;
+    case "$line" in
+      oc-auth\|*)
+        local msg="${line#oc-auth|}"
+        case "$msg" in
+          ok:*)   ok "auth: ${msg#ok:}"; reported=1 ;;
+          warn:*) warn "auth: ${msg#warn:}"; reported=1 ;;
+          err:*)  bad "auth: ${msg#err:}"; FAILED+=("$host"); reported=1 ;;
+        esac
+        ;;
+      UPDATED:*) updated="${updated} ${line#UPDATED:}" ;;
+      ADDED:*) added="${added} ${line#ADDED:}" ;;
+      KEPT:*) kept="${kept} ${line#KEPT:}" ;;
+      WOULD-UPDATE:*) would_update="${would_update} ${line#WOULD-UPDATE:}" ;;
+      WOULD-ADD:*) would_add="${would_add} ${line#WOULD-ADD:}" ;;
+      IDENTICAL) identical=1 ;;
+      REJECT:*) reject="${reject} ${line#REJECT:}" ;;
     esac
   done <<< "$out"
-  # The python helper reports the outcome on plain lines (ADDED:/KEPT:/REJECT:),
-  # not through emit, so they arrive unprefixed. A missing REJECT means the merge
-  # ran; silence entirely means it did not, and must not be reported as success.
-  local added kept
-  added="$(sed -n 's/^ADDED://p' <<< "$out")"
-  kept="$(sed -n 's/^KEPT://p' <<< "$out")"
-  if grep -q '^REJECT:' <<< "$out"; then
-    bad "auth: merge rejected on $host (${out%%$'\n'*})"
+  if [[ -n "$reject" ]]; then
+    bad "auth: merge rejected on $host (${reject# })"
     FAILED+=("$host")
     return 1
   fi
-  [[ -n "$added" ]] && ok "auth: added $added$([ -n "$kept" ] && printf ' (kept existing: %s)' "$kept")"
-  if [[ $reported -eq 0 && -z "$added" ]]; then
+  local pending_update="$updated" pending_add="$added"
+  local verb="updated" verb_add="added"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    pending_update="$would_update"; pending_add="$would_add"
+    verb="would update"; verb_add="would add"
+  fi
+  local parts=""
+  [[ -n "${pending_update// }" ]] && parts="${verb} ${pending_update# }"
+  [[ -n "${pending_add// }" ]] && parts="${parts:+$parts; }${verb_add} ${pending_add# }"
+  if [[ -n "$parts" ]]; then
+    ok "auth: $parts"
+  else
+    ok "auth: already identical"
+  fi
+  if [[ $reported -eq 0 && -z "${updated// }" && -z "${added// }" && -z "${would_update// }" && -z "${would_add// }" && $identical -eq 0 ]]; then
     bad "auth: merge produced no confirmation on $host - treat as not applied"
     FAILED+=("$host")
     return 1
@@ -1074,7 +1161,7 @@ if [[ $WITH_CONFIG -eq 0 ]]; then
 fi
 if [[ $WITH_AUTH -eq 0 ]]; then
   echo
-  echo "  note: credentials were not touched; re-run with --with-auth to add any provider keys a host is missing"
+  echo "  note: credentials were not touched; omit --no-auth to keep every host's auth.json identical"
 fi
 [[ ${#FAILED[@]} -gt 0 ]] && exit 1
 exit 0

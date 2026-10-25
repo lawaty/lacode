@@ -1,0 +1,1 @@
+export const read = (id: string) => id

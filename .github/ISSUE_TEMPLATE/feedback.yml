@@ -1,0 +1,29 @@
+name: Feedback
+description: A quick note about using LaCode. No bug required.
+title: "[feedback] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        No telemetry, no tracking. This is just a place to say how it went.
+  - type: textarea
+    id: trying-to-do
+    attributes:
+      label: What were you trying to do?
+      description: The task or workflow you had in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: confused-or-annoyed
+    attributes:
+      label: What confused or annoyed you?
+      description: Anything unclear, surprising, or more work than it should be.
+    validations:
+      required: false
+  - type: textarea
+    id: change-or-remove
+    attributes:
+      label: What would you change or remove?
+      description: Rough ideas are welcome.
+    validations:
+      required: false

@@ -195,6 +195,35 @@ check("oc-sync defaults to --with-config", () => {
   assert(!/^WITH_CONFIG=0$/m.test(src), "WITH_CONFIG should not initialise to 0")
 })
 
+check("oc-sync defaults to --with-auth", () => {
+  const src = read("oc-sync")
+  assert(/^WITH_AUTH=1$/m.test(src), "WITH_AUTH should initialise to 1")
+  assert(!/^WITH_AUTH=0$/m.test(src), "WITH_AUTH should not initialise to 0")
+})
+
+check("oc-sync accepts --no-auth and --without-auth", () => {
+  const src = read("oc-sync")
+  assert(/--no-auth\|--without-auth\)\s+WITH_AUTH=0/.test(src), "the opt-out must set WITH_AUTH=0")
+})
+
+check("oc-sync keeps --with-auth as an on switch", () => {
+  const src = read("oc-sync")
+  assert(/--with-auth\)\s+WITH_AUTH=1/.test(src), "--with-auth must set WITH_AUTH=1")
+})
+
+check("oc-sync auth allowlist defaults to opencode-go and opencode", () => {
+  const src = read("oc-sync")
+  assert(/AUTH_PROVIDERS="\$\{OC_AUTH_PROVIDERS:-opencode-go opencode\}"/.test(src),
+    "allowlist must default to opencode-go opencode")
+})
+
+check("oc-sync remote helper reports UPDATED/ADDED and uses os.replace", () => {
+  const src = read("oc-sync")
+  assert(/UPDATED:/.test(src), "helper must print UPDATED:")
+  assert(/ADDED:/.test(src), "helper must print ADDED:")
+  assert(/os\.replace/.test(src), "helper must use os.replace")
+})
+
 check("oc-sync still offers a scripts-only opt-out", () => {
   const src = read("oc-sync")
   assert(/--scripts-only\|--no-config\)\s+WITH_CONFIG=0/.test(src), "the opt-out must set WITH_CONFIG=0")
@@ -975,6 +1004,7 @@ check("--help exits 0 and prints usage", () => {
   })
   assert(result.status === 0, `--help exited ${result.status}`)
   assert(/--scripts-only/.test(result.stdout), "help should document the opt-out")
+  assert(/--no-auth/.test(result.stdout), "help should document --no-auth")
 })
 
 // ---------------------------------------------------------------------------

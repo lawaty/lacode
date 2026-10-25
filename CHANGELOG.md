@@ -7,6 +7,61 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.1.0] — a map contract, feedback, and host credential sync
+
+### Added
+
+- **A one-time feedback hint, the `lacode feedback` command, and GitHub issue
+  templates.** The hint is local only: no telemetry, no analytics, and it sends
+  nothing anywhere. It shows at most once, only when a TUI sink exists, and a
+  toast that fails does not consume it. Opt out with `feedbackHint: false` or
+  `LACODE_NO_FEEDBACK_HINT=1`; the flag is
+  `~/.local/share/opencode/lacode/feedback.json`.
+- **The post-publish host sync now syncs provider credentials.** After
+  `npm publish`, `scripts/sync-hosts.mjs` copies the allowlisted providers from
+  the local opencode auth store (`OC_AUTH_PROVIDERS`, default
+  `opencode-go opencode`) to each host, keeps host-only providers, and writes
+  the remote `auth.json` atomically with a timestamped backup.
+
+### Changed
+
+- **The context map has one entry schema, a per-file budget and a per-file
+  lifecycle.** Every navigation entry is a provenance marker (`[binding]`,
+  `[provisional]` or `[disputed]`), a rule of at most three non-blank lines, and
+  a `— See <path>[ §Section] (verified YYYY-MM-DD)` pointer. No Context /
+  Decision / Consequences / Alternatives blocks. Every file has a hard cap in
+  non-blank lines (architecture 150, contexts 200, conventions 150, workflows
+  150, decisions 120, active 60). The 30-day provisional window generalises the
+  active backlog's 7-day finished-task window; binding and disputed entries are
+  exempt, and an entry whose source is gone is never auto-dropped.
+- **The prompt now lives in `src/lib/cartographer-prompt.ts`,** with the tracked
+  copy at `.opencode/prompts/context.txt`; a test pins equality so a reviewer
+  reads the text the model actually runs.
+
+### Fixed
+
+- **`LACODE_SYNC_DRY_RUN=1` no longer contacts a host.** It used to print the
+  plan and then SSH to every host to exercise the credential helper when a local
+  auth store existed, which sent provider credentials during a “dry run”. It now
+  reads only the local plan and prints the auth summary; no SSH and no `npm view`.
+- **The post-publish host sync accepts a real `opencode.jsonc`.** Comments and
+  trailing commas no longer make a host fail as “config not normalized
+  (unparseable)”.
+- **A constraints file is no longer a deliberation ledger.** `decisions.md` is
+  capped, decision-record blocks are a schema violation, and the prompt tells
+  the cartographer to state the constraint and point at the page that owns it.
+- **Restatement and drift are now reported instead of silently trusted.** After
+  every run the map is audited for dangling paths/sections, a numeric claim
+  absent from its cited source, a possible negation conflict, a source modified
+  after `verified`, tables/fenced blocks/verbatim spans, duplicate rules,
+  archive-of-record language and charter degeneration. The audit is
+  **report-only**: it never rewrites a claim and never deletes content with no
+  source, because the map may be the only copy and the page may be the stale
+  side. A failure is a loud `context map validation failed` error.
+- **The lifecycle no longer belongs to one file.** `active.md` still uses its
+  seven-day finished-task window; every other file now expires provisional
+  entries after 30 days, and only when the cited source still resolves.
+
 ## [1.0.3] — one notification even when the plugin is loaded twice
 
 ### Fixed

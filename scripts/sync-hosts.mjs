@@ -73,6 +73,84 @@ function stripAnsi(text) {
   return String(text).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
 }
 
+/**
+ * The remote config is `opencode.jsonc`, not JSON: comments and trailing commas
+ * are valid and common. `JSON.parse` rejects both, which marked a perfectly good
+ * host as "unparseable" and skipped it. This is a small JSONC reader for the two
+ * extensions opencode uses; it deliberately does NOT accept JavaScript values
+ * (single-quoted strings, unquoted keys), because those are not JSONC.
+ */
+function stripJsonComments(text) {
+  let out = ""
+  let inString = false
+  let escaped = false
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]
+    const next = text[i + 1]
+    if (inString) {
+      out += char
+      if (escaped) escaped = false
+      else if (char === "\\") escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') {
+      inString = true
+      out += char
+      continue
+    }
+    if (char === "/" && next === "/") {
+      while (i < text.length && text[i] !== "\n") i++
+      out += "\n"
+      continue
+    }
+    if (char === "/" && next === "*") {
+      i += 2
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++
+      i += 1
+      continue
+    }
+    out += char
+  }
+  return out
+}
+
+function stripTrailingCommas(text) {
+  let out = ""
+  let inString = false
+  let escaped = false
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]
+    if (inString) {
+      out += char
+      if (escaped) escaped = false
+      else if (char === "\\") escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') {
+      inString = true
+      out += char
+      continue
+    }
+    if (char === ",") {
+      let j = i + 1
+      while (j < text.length && /\s/.test(text[j])) j++
+      if (text[j] === "}" || text[j] === "]") {
+        i = j - 1
+        continue
+      }
+    }
+    out += char
+  }
+  return out
+}
+
+/** Parse an `opencode.jsonc` body. Exported so the suite can pin the JSONC cases. */
+export function parseJsonc(text) {
+  return JSON.parse(stripTrailingCommas(stripJsonComments(String(text))))
+}
+
 /** The last non-empty line of the install's stderr, or stdout when stderr is empty.
  *  ANSI escape sequences are stripped before a line is considered, and lines that
  *  become empty after stripping are skipped. */
@@ -322,7 +400,191 @@ function disableShims(host) {
   return disabled
 }
 
-function syncHost(host, version) {
+// Remote python helper: reads/writes ~/.local/share/opencode/auth.json under the
+// remote $HOME. The JSON envelope arrives on stdin, so provider keys never touch
+// the command line (where they would land in a remote process table/history).
+// This string must stay free of single quotes: it is wrapped in them for `-c`.
+const AUTH_HELPER = `import json, os, sys, shutil, time
+
+envelope = json.load(sys.stdin)
+replace = envelope.get("replace", [])
+providers = envelope.get("providers", {})
+dry_run = bool(envelope.get("dryRun", False))
+
+replace_set = set(replace)
+
+auth_path = os.path.expanduser("~/.local/share/opencode/auth.json")
+
+try:
+    with open(auth_path) as fh:
+        cur = json.load(fh)
+    if not isinstance(cur, dict):
+        cur = {}
+except FileNotFoundError:
+    cur = {}
+except Exception:
+    cur = {}
+
+updated = []
+added = []
+kept = []
+new_cur = dict(cur)
+
+for pid, val in providers.items():
+    if not isinstance(val, dict) or not val.get("key"):
+        continue
+    if pid in cur:
+        if pid in replace_set and cur.get(pid) != val:
+            new_cur[pid] = val
+            updated.append(pid)
+        else:
+            kept.append(pid)
+    else:
+        new_cur[pid] = val
+        added.append(pid)
+
+changed = bool(updated or added)
+
+if not changed:
+    # Nothing to write. Report a kept provider the allowlist does not own, so a
+    # run that only has host-local credentials still says what it protected;
+    # otherwise the answer is just IDENTICAL.
+    for pid in sorted(kept):
+        if pid not in replace_set:
+            print("KEPT:" + pid)
+    print("IDENTICAL")
+    raise SystemExit(0)
+
+if dry_run:
+    for pid in sorted(updated):
+        print("WOULD-UPDATE:" + pid)
+    for pid in sorted(added):
+        print("WOULD-ADD:" + pid)
+    for pid in sorted(kept):
+        print("KEPT:" + pid)
+    raise SystemExit(0)
+
+auth_dir = os.path.dirname(auth_path)
+try:
+    os.makedirs(auth_dir, exist_ok=True)
+except Exception as e:
+    print("REJECT:could not create auth dir (%s)" % e)
+    raise SystemExit(0)
+
+if os.path.exists(auth_path):
+    try:
+        shutil.copy2(auth_path, auth_path + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+    except Exception:
+        pass
+
+tmp = auth_path + ".tmp"
+try:
+    with open(tmp, "w") as fh:
+        json.dump(new_cur, fh, indent=2)
+        fh.write(chr(10))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, auth_path)
+except Exception as e:
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    print("REJECT:write failed (%s)" % e)
+    raise SystemExit(0)
+
+for pid in sorted(updated):
+    print("UPDATED:" + pid)
+for pid in sorted(added):
+    print("ADDED:" + pid)
+for pid in sorted(kept):
+    print("KEPT:" + pid)
+`
+
+/** Read the local auth store once per run. Missing file -> null (auth skipped). */
+function loadLocalAuth(env = process.env) {
+  const file = env.OC_AUTH_FILE || path.join(homedir(), ".local", "share", "opencode", "auth.json")
+  let raw
+  try {
+    raw = readFileSync(file, "utf8")
+  } catch {
+    return null
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
+  const out = {}
+  for (const key of Object.keys(parsed)) {
+    const value = parsed[key]
+    if (value && typeof value === "object" && !Array.isArray(value) && typeof value.key === "string" && value.key) {
+      out[key] = value
+    }
+  }
+  return out
+}
+
+/** Sync provider credentials for one host. Returns { ok, text }. */
+function syncAuth(host, auth, opts = {}) {
+  const dryRun = !!(opts && opts.dryRun)
+  const replace = (opts && Array.isArray(opts.replace))
+    ? opts.replace
+    : String((process.env.OC_AUTH_PROVIDERS || "opencode-go opencode")).split(/\s+/).filter(Boolean)
+  const envelope = { replace: replace, providers: auth || {}, dryRun: dryRun }
+  const result = runSsh(host, `python3 -c '${AUTH_HELPER}'`, JSON.stringify(envelope))
+  if (!result.ok) {
+    const detail = String(result.stderr || result.stdout || "").trim().split(/\r?\n/).filter(Boolean)
+    const last = detail.length ? detail[detail.length - 1].slice(0, DETAIL_LIMIT) : ""
+    return { ok: false, text: last ? `auth: ssh failed: ${last}` : "auth: ssh failed" }
+  }
+  const lines = String(result.output || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  const updated = []
+  const added = []
+  const kept = []
+  const wouldUpdate = []
+  const wouldAdd = []
+  let identical = false
+  let reject = ""
+  for (const line of lines) {
+    if (line.indexOf("UPDATED:") === 0) updated.push(line.slice("UPDATED:".length))
+    else if (line.indexOf("ADDED:") === 0) added.push(line.slice("ADDED:".length))
+    else if (line.indexOf("KEPT:") === 0) kept.push(line.slice("KEPT:".length))
+    else if (line.indexOf("WOULD-UPDATE:") === 0) wouldUpdate.push(line.slice("WOULD-UPDATE:".length))
+    else if (line.indexOf("WOULD-ADD:") === 0) wouldAdd.push(line.slice("WOULD-ADD:".length))
+    else if (line === "IDENTICAL") identical = true
+    else if (line.indexOf("REJECT:") === 0) reject += " " + line.slice("REJECT:".length)
+  }
+  if (reject.trim()) {
+    return { ok: false, text: `auth: ${reject.trim()}` }
+  }
+  if (result.status !== 0) {
+    return { ok: false, text: "auth: helper failed" }
+  }
+  const confirmed =
+    identical ||
+    kept.length > 0 ||
+    updated.length > 0 ||
+    added.length > 0 ||
+    wouldUpdate.length > 0 ||
+    wouldAdd.length > 0
+  if (!confirmed) {
+    return { ok: false, text: "auth: helper produced no confirmation; treat as not applied" }
+  }
+  const pu = dryRun ? wouldUpdate : updated
+  const pa = dryRun ? wouldAdd : added
+  const verb = dryRun ? "would update" : "updated"
+  const verbAdd = dryRun ? "would add" : "added"
+  let parts = ""
+  if (pu.length > 0) parts = `${verb} ${pu.join(" ")}`
+  if (pa.length > 0) parts = parts ? `${parts}; ${verbAdd} ${pa.join(" ")}` : `${verbAdd} ${pa.join(" ")}`
+  if (parts) return { ok: true, text: `auth: ${parts}` }
+  return { ok: true, text: "auth: already identical" }
+}
+
+function syncHost(host, version, auth, opts = {}) {
+  if (auth === undefined) auth = loadLocalAuth(process.env)
   const firstInstall = runSsh(host, installRemote(version), undefined, INSTALL_TIMEOUT_MS)
   if (firstInstall.output.includes("NO_OPENCODE")) return { host, status: "skipped", reason: "no opencode" }
   if (firstInstall.timedOut) return { host, status: "failed", reason: "install timed out" }
@@ -353,7 +615,7 @@ function syncHost(host, version) {
   if (!read.ok) return { host, status: "failed", reason: "cannot read config", shims: disabledShims, retried }
   let config
   try {
-    config = JSON.parse(read.output)
+    config = parseJsonc(read.output)
   } catch {
     return { host, status: "failed", reason: "config not normalized (unparseable)", shims: disabledShims, retried }
   }
@@ -372,7 +634,7 @@ function syncHost(host, version) {
   if (!verify.ok) return { host, status: "failed", reason: "verification failed", shims: disabledShims, retried }
   let after
   try {
-    after = JSON.parse(verify.output)
+    after = parseJsonc(verify.output)
   } catch {
     return { host, status: "failed", reason: "verification failed (unparseable)", shims: disabledShims, retried }
   }
@@ -384,8 +646,23 @@ function syncHost(host, version) {
     return { host, status: "failed", reason: "verification failed", shims: disabledShims, retried }
   }
 
+  let authText = null
+  let authFailed = false
+  if (auth) {
+    const replace = (opts && Array.isArray(opts.replace))
+      ? opts.replace
+      : String((process.env.OC_AUTH_PROVIDERS || "opencode-go opencode")).split(/\s+/).filter(Boolean)
+    const authResult = syncAuth(host, auth, { replace: replace, dryRun: !!(opts && opts.dryRun) })
+    authText = authResult.text
+    authFailed = !authResult.ok
+  }
+
+  if (authFailed) {
+    return { host, status: "warn", reason: authText, shims: disabledShims, retried, auth: null }
+  }
+
   const capability = runSsh(host, REMOTE_HELPER_CHECK)
-  if (capability.output.includes("HELPER_OK")) return { host, status: "ok", shims: disabledShims, retried }
+  if (capability.output.includes("HELPER_OK")) return { host, status: "ok", shims: disabledShims, retried, auth: authText }
   if (capability.output.includes("HELPER_UNUSABLE")) {
     return {
       host,
@@ -393,6 +670,7 @@ function syncHost(host, version) {
       reason: `helper cannot run: ${helperDetail(capability.output)}; install node>=22 or a ~/bin/lacode wrapper`,
       shims: disabledShims,
       retried,
+      auth: authText,
     }
   }
   return {
@@ -401,6 +679,7 @@ function syncHost(host, version) {
     reason: "helper cannot run: capability check failed; install node>=22 or a ~/bin/lacode wrapper",
     shims: disabledShims,
     retried,
+    auth: authText,
   }
 }
 
@@ -414,12 +693,14 @@ function printDryRun(hosts, version) {
     console.log(`  ${formatSsh(host, REMOTE_READ)}`)
     console.log(`  ${formatSsh(host, REMOTE_LIST_PLUGINS)}`)
     console.log(`  ${formatSsh(host, 'mv "$HOME/.config/opencode/plugins/<shim>" "$HOME/.config/opencode/lacode-plugin-shim.disabled-<epoch>-<shim>"')}`)
+    console.log(`  ${formatSsh(host, "python3 -c '<auth helper>'")}`)
     console.log(`  ${formatSsh(host, REMOTE_HELPER_CHECK)}`)
   }
   console.log(`dry run: ${hosts.length} host${hosts.length === 1 ? "" : "s"}, nothing was run`)
 }
 
 export { cleanupRemote }
+export { loadLocalAuth, syncAuth, syncHost, hostList, splitHosts }
 
 export function main(env = process.env) {
   const disabled = env.LACODE_SYNC
@@ -434,11 +715,15 @@ export function main(env = process.env) {
     return 0
   }
 
+  const auth = loadLocalAuth(env)
+
   const version = readPackageVersion(env)
   if (!version) {
     console.log("lacode sync: package version is unknown; skipping")
     return 0
   }
+
+  const replace = (env.OC_AUTH_PROVIDERS || "opencode-go opencode").split(/\s+/).filter(Boolean)
 
   const seconds = waitSeconds(env)
 
@@ -449,12 +734,24 @@ export function main(env = process.env) {
       console.log(`dry run: would wait for ${PACKAGE}@${version} in the registry (up to ${seconds}s)`)
     }
     printDryRun(hosts, version)
+    // A dry run must not touch a host. It used to call `syncAuth()` for every
+    // host whenever a local auth store existed, which opened real SSH
+    // connections and sent provider credentials under a "runs nothing" banner.
+    // Print the local half of the plan instead; provider NAMES only, never keys.
+    if (auth) {
+      const providers = Object.keys(auth).sort()
+      console.log(
+        `auth: would sync ${providers.length} provider${providers.length === 1 ? "" : "s"} (${providers.join(", ") || "none"}); dry run contacts no host`,
+      )
+    } else {
+      console.log("auth: no local auth store; nothing would be synced")
+    }
     return 0
   }
 
   if (!noWait(env)) waitForRegistry(version, seconds)
 
-  const results = hosts.map((host) => syncHost(host, version))
+  const results = hosts.map((host) => syncHost(host, version, auth, { replace: replace }))
 
   console.log("")
   for (const result of results) {
@@ -469,8 +766,11 @@ export function main(env = process.env) {
     if (result.status === "ok") {
       console.log(`${result.host}: ok`)
       if (result.retried) console.log(`${result.host}: retried after clearing the installer cache`)
-    } else if (result.status === "warn") console.log(`${result.host}: warn (${result.reason})`)
-    else if (result.status === "skipped") console.log(`${result.host}: skipped (${result.reason})`)
+      if (result.auth) console.log(`${result.host}: ${result.auth}`)
+    } else if (result.status === "warn") {
+      console.log(`${result.host}: warn (${result.reason})`)
+      if (result.auth) console.log(`${result.host}: ${result.auth}`)
+    } else if (result.status === "skipped") console.log(`${result.host}: skipped (${result.reason})`)
     else console.log(`${result.host}: failed (${result.reason})`)
   }
 

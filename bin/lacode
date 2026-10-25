@@ -7,6 +7,7 @@
 //   lacode version
 //   lacode update [--check]
 //   lacode doctor
+//   lacode feedback
 //   lacode receive            (the forced-command end of a direct hop)
 //   lacode tunnel setup       (print the wiring for a direct hop)
 //
@@ -33,6 +34,7 @@ import { describe, forward, notify, normalizeSound, parsePayload, resolveTunnel,
 import { PACKAGE_ROOT } from "../src/lib/package-root.ts"
 import { checkForUpdate, refreshCache } from "../src/lib/selfupdate.ts"
 import { formatVersion, readVersionReport } from "../src/lib/version.ts"
+import { DISCUSSIONS_URL, ISSUES_URL } from "../src/lib/feedback.ts"
 
 // Two forms of this file exist and both must work. Run from a checkout it IS
 // TypeScript-in-Node, exactly like the opencode plugins: node strips the types on
@@ -71,6 +73,10 @@ const USAGE = `lacode — portable notifications and remote exec for LaCode
 
   lacode doctor
       Print what the environment resolves to. Diagnostics only.
+
+  lacode feedback
+      Print where to report a bug, ask a question, or say how you use LaCode.
+      Nothing is opened and nothing is sent.
 
   lacode version
       Report WHICH LaCode is speaking and WHICH one opencode actually loads.
@@ -170,6 +176,17 @@ switch (command) {
       // nothing will ever pop up here either.
       console.log("\nNo local notification channel: `lacode notify` on this machine has nothing to deliver with, and every send will be reported as failed rather than shown.")
     }
+    process.exit(0)
+    break
+  }
+
+  case "feedback": {
+    console.log("Bugs and feature requests:")
+    console.log(`  ${ISSUES_URL}`)
+    console.log('Questions and "how are you using it":')
+    console.log(`  ${DISCUSSIONS_URL}`)
+    console.log("")
+    console.log("No browser is opened and nothing is sent.")
     process.exit(0)
     break
   }

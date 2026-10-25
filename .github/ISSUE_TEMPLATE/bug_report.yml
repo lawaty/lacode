@@ -1,0 +1,46 @@
+name: Bug report
+description: Something in LaCode is broken or behaves unexpectedly.
+title: "[bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please remove API keys, tokens and private paths
+        before posting logs.
+  - type: input
+    id: opencode-version
+    attributes:
+      label: OpenCode version
+      description: Output of `opencode --version`.
+      placeholder: "1.18.34"
+    validations:
+      required: true
+  - type: input
+    id: lacode-version
+    attributes:
+      label: LaCode version
+      description: Output of `lacode version`, or the version pinned in your plugin entry.
+      placeholder: "1.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, and what did LaCode do instead?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant opencode output, with anything private removed.
+      render: text
+    validations:
+      required: false
