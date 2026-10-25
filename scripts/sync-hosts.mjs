@@ -35,6 +35,10 @@ const PACKAGE = "@lawaty/lacode"
 const SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 const INSTALL_TIMEOUT_MS = 120000
 const SSH_TIMEOUT_MS = 30000
+const VIEW_TIMEOUT_MS = 30000
+const WAIT_INTERVAL_MS = 15000
+const DEFAULT_WAIT_SECONDS = 600
+const DETAIL_LIMIT = 160
 const DISABLED_VALUES = new Set(["0", "false", "off", "no"])
 
 const REMOTE_CONFIG = "$HOME/.config/opencode/opencode.jsonc"
@@ -62,6 +66,75 @@ function installRemote(version) {
 function helperDetail(output) {
   const match = /HELPER_UNUSABLE[ \t]*(\S+)/.exec(output)
   return match ? match[1] : "unknown"
+}
+
+/** Strip ANSI escape sequences (CSI color/style codes and similar) from a string. */
+function stripAnsi(text) {
+  return String(text).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+}
+
+/** The last non-empty line of the install's stderr, or stdout when stderr is empty.
+ *  ANSI escape sequences are stripped before a line is considered, and lines that
+ *  become empty after stripping are skipped. */
+function installDetail(result) {
+  const stderr = String(result.stderr || "")
+  const stdout = String(result.stdout || "")
+  const source = stderr.trim() ? stderr : stdout
+  const lines = source
+    .split(/\r?\n/)
+    .map((line) => stripAnsi(line).trim())
+    .filter(Boolean)
+  if (lines.length === 0) return ""
+  return lines[lines.length - 1].slice(0, DETAIL_LIMIT)
+}
+
+/** The remote cleanup command issued after a failed install attempt. */
+function cleanupRemote(version) {
+  return `rm -rf "$HOME/.cache/opencode/packages/@lawaty/lacode@${version}" "$HOME"/.bun/install/cache/@lawaty* 2>/dev/null || true`
+}
+
+/**
+ * npm publish returns 202 while the tarball is still being processed, so the
+ * exact version is not resolvable for a while afterwards. Poll the registry
+ * until it is, rather than sending every host into a 404.
+ */
+function registryHasVersion(version) {
+  const result = spawnSync("npm", ["view", `${PACKAGE}@${version}`, "version"], {
+    encoding: "utf8",
+    timeout: VIEW_TIMEOUT_MS,
+  })
+  if (result.error || result.status !== 0) return false
+  return String(result.stdout || "").trim() === version
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+function waitSeconds(env) {
+  const raw = env.LACODE_SYNC_WAIT_SECONDS
+  if (raw === undefined || String(raw).trim() === "") return DEFAULT_WAIT_SECONDS
+  const seconds = Number(raw)
+  if (!Number.isFinite(seconds) || seconds < 0) return DEFAULT_WAIT_SECONDS
+  return Math.floor(seconds)
+}
+
+function noWait(env) {
+  return String(env.LACODE_SYNC_NO_WAIT ?? "").trim() === "1"
+}
+
+function waitForRegistry(version, seconds) {
+  if (registryHasVersion(version)) return true
+
+  console.log(`waiting for ${PACKAGE}@${version} in the registry (up to ${seconds}s)`)
+  const deadline = Date.now() + seconds * 1000
+  while (Date.now() < deadline) {
+    sleepSync(Math.min(WAIT_INTERVAL_MS, deadline - Date.now()))
+    if (registryHasVersion(version)) return true
+  }
+
+  console.log(`warn: ${version} not in the registry after ${seconds}s; attempting anyway`)
+  return false
 }
 
 function readPackageVersion(env = process.env) {
@@ -225,6 +298,8 @@ function runSsh(host, remote, input, timeout = SSH_TIMEOUT_MS) {
     ok: result.status === 0 && !result.error,
     status: result.status,
     timedOut: Boolean(result.error && result.error.code === "ETIMEDOUT"),
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
     output: (result.stdout || "") + (result.stderr || ""),
   }
 }
@@ -248,60 +323,76 @@ function disableShims(host) {
 }
 
 function syncHost(host, version) {
-  const install = runSsh(host, installRemote(version), undefined, INSTALL_TIMEOUT_MS)
-  if (install.output.includes("NO_OPENCODE")) return { host, status: "skipped", reason: "no opencode" }
-  if (install.timedOut) return { host, status: "failed", reason: "install timed out" }
-  if (!install.ok) return { host, status: "failed", reason: `install exit ${install.status ?? "unknown"}` }
+  const firstInstall = runSsh(host, installRemote(version), undefined, INSTALL_TIMEOUT_MS)
+  if (firstInstall.output.includes("NO_OPENCODE")) return { host, status: "skipped", reason: "no opencode" }
+  if (firstInstall.timedOut) return { host, status: "failed", reason: "install timed out" }
+
+  let install = firstInstall
+  let retried = false
+  if (!install.ok) {
+    // One cleanup, then a single retry. Never pre-clean on a healthy host.
+    runSsh(host, cleanupRemote(version), undefined, SSH_TIMEOUT_MS)
+    const retry = runSsh(host, installRemote(version), undefined, INSTALL_TIMEOUT_MS)
+    retried = true
+    install = retry
+    if (retry.output.includes("NO_OPENCODE")) return { host, status: "skipped", reason: "no opencode", retried }
+    if (retry.timedOut) return { host, status: "failed", reason: "install timed out", retried }
+  }
+
+  if (install.output.includes("NO_OPENCODE")) return { host, status: "skipped", reason: "no opencode", retried }
+  if (install.timedOut) return { host, status: "failed", reason: "install timed out", retried }
+  if (!install.ok) {
+    const detail = installDetail(install)
+    const exitReason = `install exit ${install.status ?? "unknown"}`
+    return { host, status: "failed", reason: detail ? `${exitReason}: ${detail}` : exitReason, retried }
+  }
 
   const disabledShims = disableShims(host)
 
   const read = runSsh(host, REMOTE_READ)
-  if (!read.ok) return { host, status: "failed", reason: "cannot read config", shims: disabledShims }
-
+  if (!read.ok) return { host, status: "failed", reason: "cannot read config", shims: disabledShims, retried }
   let config
   try {
     config = JSON.parse(read.output)
   } catch {
-    return { host, status: "failed", reason: "config not normalized (unparseable)", shims: disabledShims }
+    return { host, status: "failed", reason: "config not normalized (unparseable)", shims: disabledShims, retried }
   }
 
   const next = normalizeConfig(config, version)
-  if (!next) return { host, status: "failed", reason: "config not normalized (unparseable)", shims: disabledShims }
-
+  if (!next) return { host, status: "failed", reason: "config not normalized (unparseable)", shims: disabledShims, retried }
   if (JSON.stringify(config) !== JSON.stringify(next)) {
     const backup = runSsh(host, REMOTE_BACKUP)
-    if (!backup.ok) return { host, status: "failed", reason: "backup failed", shims: disabledShims }
-
+    if (!backup.ok) return { host, status: "failed", reason: "backup failed", shims: disabledShims, retried }
     const body = JSON.stringify(next, null, 2) + "\n"
     const write = runSsh(host, REMOTE_WRITE, body)
-    if (!write.ok) return { host, status: "failed", reason: "write failed", shims: disabledShims }
+    if (!write.ok) return { host, status: "failed", reason: "write failed", shims: disabledShims, retried }
   }
 
   const verify = runSsh(host, REMOTE_READ)
-  if (!verify.ok) return { host, status: "failed", reason: "verification failed", shims: disabledShims }
-
+  if (!verify.ok) return { host, status: "failed", reason: "verification failed", shims: disabledShims, retried }
   let after
   try {
     after = JSON.parse(verify.output)
   } catch {
-    return { host, status: "failed", reason: "verification failed (unparseable)", shims: disabledShims }
+    return { host, status: "failed", reason: "verification failed (unparseable)", shims: disabledShims, retried }
   }
 
   const expected = `${PACKAGE}@${version}`
   const plugin = after && Array.isArray(after.plugin) ? after.plugin : []
   const lacode = plugin.filter(isLacodeEntry)
   if (lacode.length !== 1 || specifierOf(lacode[0]) !== expected) {
-    return { host, status: "failed", reason: "verification failed", shims: disabledShims }
+    return { host, status: "failed", reason: "verification failed", shims: disabledShims, retried }
   }
 
   const capability = runSsh(host, REMOTE_HELPER_CHECK)
-  if (capability.output.includes("HELPER_OK")) return { host, status: "ok", shims: disabledShims }
+  if (capability.output.includes("HELPER_OK")) return { host, status: "ok", shims: disabledShims, retried }
   if (capability.output.includes("HELPER_UNUSABLE")) {
     return {
       host,
       status: "warn",
       reason: `helper cannot run: ${helperDetail(capability.output)}; install node>=22 or a ~/bin/lacode wrapper`,
       shims: disabledShims,
+      retried,
     }
   }
   return {
@@ -309,6 +400,7 @@ function syncHost(host, version) {
     status: "warn",
     reason: "helper cannot run: capability check failed; install node>=22 or a ~/bin/lacode wrapper",
     shims: disabledShims,
+    retried,
   }
 }
 
@@ -326,6 +418,8 @@ function printDryRun(hosts, version) {
   }
   console.log(`dry run: ${hosts.length} host${hosts.length === 1 ? "" : "s"}, nothing was run`)
 }
+
+export { cleanupRemote }
 
 export function main(env = process.env) {
   const disabled = env.LACODE_SYNC
@@ -346,10 +440,19 @@ export function main(env = process.env) {
     return 0
   }
 
+  const seconds = waitSeconds(env)
+
   if (env.LACODE_SYNC_DRY_RUN === "1") {
+    if (noWait(env)) {
+      console.log(`dry run: would not wait for ${PACKAGE}@${version} in the registry (LACODE_SYNC_NO_WAIT=1)`)
+    } else {
+      console.log(`dry run: would wait for ${PACKAGE}@${version} in the registry (up to ${seconds}s)`)
+    }
     printDryRun(hosts, version)
     return 0
   }
+
+  if (!noWait(env)) waitForRegistry(version, seconds)
 
   const results = hosts.map((host) => syncHost(host, version))
 
@@ -363,8 +466,10 @@ export function main(env = process.env) {
         console.log(`${result.host}: no stale shim`)
       }
     }
-    if (result.status === "ok") console.log(`${result.host}: ok`)
-    else if (result.status === "warn") console.log(`${result.host}: warn (${result.reason})`)
+    if (result.status === "ok") {
+      console.log(`${result.host}: ok`)
+      if (result.retried) console.log(`${result.host}: retried after clearing the installer cache`)
+    } else if (result.status === "warn") console.log(`${result.host}: warn (${result.reason})`)
     else if (result.status === "skipped") console.log(`${result.host}: skipped (${result.reason})`)
     else console.log(`${result.host}: failed (${result.reason})`)
   }

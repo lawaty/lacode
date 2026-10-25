@@ -47,7 +47,25 @@ if (log) fs.appendFileSync(log, JSON.stringify(args) + "\n")
 const command = args[args.length - 1] || ""
 
 if (command.includes(" plugin ") && command.includes("@lawaty/lacode@")) {
-  process.stdout.write(process.env.FAKE_SSH_NO_OPENCODE === "1" ? "NO_OPENCODE\n" : "INSTALLED\n")
+  const state = process.env.FAKE_SSH_STATE
+  const counter = state ? path.join(state, "ssh-install-calls") : ""
+  let calls = 0
+  if (counter && fs.existsSync(counter)) calls = Number(fs.readFileSync(counter, "utf8")) || 0
+  calls += 1
+  if (counter) fs.writeFileSync(counter, String(calls))
+
+  if (process.env.FAKE_SSH_INSTALL_EXIT) {
+    if (process.env.FAKE_SSH_INSTALL_STDOUT) process.stdout.write(process.env.FAKE_SSH_INSTALL_STDOUT)
+    if (process.env.FAKE_SSH_INSTALL_STDERR) process.stderr.write(process.env.FAKE_SSH_INSTALL_STDERR)
+    process.exit(Number(process.env.FAKE_SSH_INSTALL_EXIT))
+  }
+  if (process.env.FAKE_SSH_INSTALL_FAIL_FIRST === "1" && calls === 1) {
+    if (process.env.FAKE_SSH_INSTALL_STDOUT) process.stdout.write(process.env.FAKE_SSH_INSTALL_STDOUT)
+    if (process.env.FAKE_SSH_INSTALL_STDERR) process.stderr.write(process.env.FAKE_SSH_INSTALL_STDERR)
+    else process.stderr.write("\x1b[31mNo matching version found for @lawaty/lacode@" + (process.env.FAKE_VERSION || "") + "\x1b[0m\n")
+    process.exit(1)
+  }
+  process.stdout.write(process.env.FAKE_SSH_NO_OPENCODE === "1" ? "NO_OPENCODE\\n" : "INSTALLED\\n")
   process.exit(0)
 }
 
@@ -81,6 +99,29 @@ if (/^cat\s+/.test(command)) {
 process.exit(0)
 `
 
+// Stand-in for `npm view ... version`. The first call can be made to fail so a
+// test can watch the registry wait retry; later calls report the version.
+const FAKE_NPM = String.raw`#!/usr/bin/env node
+const fs = require("fs")
+const path = require("path")
+
+const args = process.argv.slice(2)
+const log = process.env.FAKE_NPM_LOG
+if (log) fs.appendFileSync(log, JSON.stringify(args) + "\n")
+
+const state = process.env.FAKE_NPM_STATE
+const counter = state ? path.join(state, "npm-calls") : ""
+let calls = 0
+if (counter && fs.existsSync(counter)) calls = Number(fs.readFileSync(counter, "utf8")) || 0
+calls += 1
+if (counter) fs.writeFileSync(counter, String(calls))
+
+if (process.env.FAKE_NPM_FAIL_FIRST === "1" && calls === 1) process.exit(1)
+
+process.stdout.write((process.env.FAKE_NPM_VERSION || "") + "\n")
+process.exit(0)
+`
+
 function setup(t, options = {}) {
   const root = mkdtempSync(join(tmpdir(), "lacode-sync-hosts-"))
   t.after(() => rmSync(root, { recursive: true, force: true }))
@@ -107,6 +148,10 @@ function setup(t, options = {}) {
   writeFileSync(ssh, FAKE_SSH)
   chmodSync(ssh, 0o755)
 
+  const npm = join(bin, "npm")
+  writeFileSync(npm, FAKE_NPM)
+  chmodSync(npm, 0o755)
+
   const env = {
     ...process.env,
     PATH: `${bin}:${process.env.PATH}`,
@@ -117,16 +162,26 @@ function setup(t, options = {}) {
     FAKE_SSH_STATE: state,
     FAKE_SSH_FIXTURE_FILE: fixturePath,
     FAKE_SSH_HELPER: options.helper ?? "HELPER_OK",
+    FAKE_NPM_LOG: join(root, "npm.log"),
+    FAKE_NPM_STATE: state,
+    FAKE_NPM_VERSION: VERSION,
   }
   delete env.npm_package_version
   delete env.LACODE_SYNC
   delete env.LACODE_SYNC_DRY_RUN
+  delete env.LACODE_SYNC_NO_WAIT
+  delete env.LACODE_SYNC_WAIT_SECONDS
   delete env.LACODE_SYNC_STRICT
   delete env.OC_HOSTS
   if (options.noOpencode) env.FAKE_SSH_NO_OPENCODE = "1"
+  if (options.npmFailFirst) env.FAKE_NPM_FAIL_FIRST = "1"
+  if (options.installFailFirst) env.FAKE_SSH_INSTALL_FAIL_FIRST = "1"
+  if (options.installExit !== undefined) env.FAKE_SSH_INSTALL_EXIT = String(options.installExit)
+  if (options.installStdout !== undefined) env.FAKE_SSH_INSTALL_STDOUT = options.installStdout
+  if (options.installStderr !== undefined) env.FAKE_SSH_INSTALL_STDERR = options.installStderr
   if (options.env) Object.assign(env, options.env)
 
-  return { root, state, log: env.FAKE_SSH_LOG, env }
+  return { root, state, log: env.FAKE_SSH_LOG, npmLog: env.FAKE_NPM_LOG, env }
 }
 
 function run(env) {
@@ -189,6 +244,64 @@ test("sync-hosts normalizes the LaCode entries and preserves omniroute options",
   assert.ok(cpIndex >= 0 && writeIndex > cpIndex, "the backup is issued before the write")
 
   assert.doesNotMatch(result.stdout + result.stderr, /sk-test-do-not-log/, "logs do not leak the api key")
+})
+
+test("sync-hosts waits for the published version before touching a host", (t) => {
+  const { log, npmLog, env } = setup(t, { npmFailFirst: true })
+  const result = run({ ...env, OC_HOSTS: "host-a" })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.ok(
+    result.stdout.includes(`waiting for ${EXPECTED} in the registry (up to 600s)`),
+    result.stdout,
+  )
+
+  const npmCalls = calls(npmLog)
+  assert.equal(npmCalls.length, 2, "npm view failed once and then succeeded")
+  assert.deepEqual(npmCalls[1], ["view", EXPECTED, "version"])
+
+  assert.match(result.stdout, /host-a: ok/)
+  assert.match(result.stdout, /summary: 1 ok, 0 warn, 0 skipped, 0 failed/)
+  const sshCalls = calls(log)
+  assert.ok(
+    sshCalls.some((args) => args[args.length - 1].includes(" plugin ")),
+    "the install call ran after the version became available",
+  )
+})
+
+test("sync-hosts skips the registry wait when LACODE_SYNC_NO_WAIT=1", (t) => {
+  const { log, npmLog, env } = setup(t, { npmFailFirst: true })
+  const result = run({ ...env, OC_HOSTS: "host-a", LACODE_SYNC_NO_WAIT: "1" })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.doesNotMatch(result.stdout, /waiting for/)
+  assert.doesNotMatch(result.stdout, /not in the registry after/)
+  assert.equal(existsSync(npmLog), false, "npm was never polled")
+  assert.match(result.stdout, /host-a: ok/)
+  assert.ok(
+    calls(log).some((args) => args[args.length - 1].includes(" plugin ")),
+    "the install call was still attempted",
+  )
+})
+
+test("sync-hosts reports the last install error line when a host install fails", (t) => {
+  const { env } = setup(t, {
+    env: {
+      FAKE_SSH_INSTALL_EXIT: "1",
+      FAKE_SSH_INSTALL_STDERR:
+        "npm warn using --force\n404 Not Found - GET https://registry.npmjs.org/@lawaty%2flacode\n",
+    },
+  })
+  const result = run({ ...env, OC_HOSTS: "host-a" })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.ok(
+    result.stdout.includes(
+      "host-a: failed (install exit 1: 404 Not Found - GET https://registry.npmjs.org/@lawaty%2flacode)",
+    ),
+    result.stdout,
+  )
+  assert.match(result.stdout, /summary: 0 ok, 0 warn, 0 skipped, 1 failed/)
 })
 
 test("sync-hosts dry run prints the planned commands and runs nothing", (t) => {
@@ -267,6 +380,43 @@ test("sync-hosts disables stale lacode shims in plugins/", (t) => {
 
   const otherMove = sshCalls.find((args) => /^mv\s+/.test(args[args.length - 1]) && args[args.length - 1].includes("other-plugin.js"))
   assert.equal(otherMove, undefined, "the other plugin file is not moved")
+})
+
+test("sync-hosts retries after clearing the installer cache when the first install fails", (t) => {
+  const { log, env } = setup(t, {
+    installFailFirst: true,
+    installStderr: "\x1b[31mNo matching version found for @lawaty/lacode@" + VERSION + "\x1b[0m\n",
+  })
+  const result = run({ ...env, OC_HOSTS: "host-a" })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /host-a: retried after clearing the installer cache/)
+  assert.match(result.stdout, /summary: 1 ok, 0 warn, 0 skipped, 0 failed/)
+
+  const sshCalls = calls(log)
+  const cleanupCalls = sshCalls.filter((args) => /rm -rf/.test(args[args.length - 1]))
+  assert.equal(cleanupCalls.length, 1, "the cleanup command was issued exactly once")
+  assert.equal(
+    cleanupCalls[0][cleanupCalls[0].length - 1],
+    `rm -rf "$HOME/.cache/opencode/packages/@lawaty/lacode@${VERSION}" "$HOME"/.bun/install/cache/@lawaty* 2>/dev/null || true`,
+  )
+})
+
+test("sync-hosts reports the real error when the install retry also fails", (t) => {
+  const { env } = setup(t, {
+    installExit: 1,
+    installStderr: "\x1b[0m\n\x1b[31mNo matching version found for @lawaty/lacode@" + VERSION + "\x1b[0m\n",
+  })
+  const result = run({ ...env, OC_HOSTS: "host-a" })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.ok(
+    result.stdout.includes(
+      "host-a: failed (install exit 1: No matching version found for @lawaty/lacode@" + VERSION + ")",
+    ),
+    result.stdout,
+  )
+  assert.match(result.stdout, /summary: 0 ok, 0 warn, 0 skipped, 1 failed/)
 })
 
 test("sync-hosts reports no stale shim when the listing has no lacode file", (t) => {
