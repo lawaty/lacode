@@ -120,6 +120,16 @@ await check("the cartographer session is suppressed", () => {
   assert(!decision.notify, "the internal cartographer must not notify")
 })
 
+await check("a pool probe session is suppressed", () => {
+  const decision = shouldNotify({
+    info: { id: "probe", title: "pool probe (some-provider/some-model)" },
+    outcome: "done",
+    sawMessage: true,
+  })
+  assert(!decision.notify, "a pool probe must not notify")
+  assert(decision.reason === "internal session", `reason should say internal session, got ${decision.reason}`)
+})
+
 await check("a compaction is not a finished task", () => {
   const decision = shouldNotify({
     info: { id: "s1", title: "Long refactor", time: { compacting: 12345 } },

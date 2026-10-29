@@ -161,7 +161,7 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   const key = pool.claimKey("ses_borrow", "context-autoupdate")
   pool.acquire(state, "context", slot, "ses_borrow", key, "ses_borrow")
   let busy = pool.snapshot(state)
-  assert(busy.counts.get(slot.model) === 1, "the borrowed slot must show as loaded")
+  assert(busy.counts.get(slot.index) === 1, "the borrowed slot must show as loaded")
   assert(busy.own.get(key).g === "ses_borrow", "the claim must target the working session for the reaper")
   // Pass 1 keeps the first declared slot until it reaches its weight, so a
   // second borrow stays on it while it is still below budget; only after the
@@ -171,7 +171,7 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   assert(slot2.index === secondExpected, `second borrow should follow the ordered fill, got ${slot2.index}, want ${secondExpected}`)
   pool.release(state, key)
   busy = pool.snapshot(state)
-  assert(busy.counts.get(slot.model) === undefined, "release must clear the borrowed slot")
+  assert(busy.counts.get(slot.index) === undefined, "release must clear the borrowed slot")
 }
 
 // 5b. cross-process: a sibling's live claim is load, so it decides the next slot.

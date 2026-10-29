@@ -42,7 +42,7 @@ let n = 0
 const boot = async (stub, options = {}) =>
   bootLaCode(stub, { id: `omniroute-story-${n++}`, dir: scratch(), selfUpdate: false, ...options })
 
-const poolModels = (cfg) => [1, 2, 3, 4].map((i) => cfg.agent[`explore-${i}`].model)
+const poolModels = (cfg) => [1, 2, 3, 4].map((i) => cfg.agent[`explore-${i}`]?.model)
 
 test("[US-28] a healthy gateway registers provider.omniroute and leaves the pool alone", async () => {
   const gw = gateway(["model-a", "model-b"])

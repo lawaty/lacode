@@ -7,6 +7,50 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.2.0] — voice, a per-session timeline, and a pool without a cap
+
+### Added
+
+- **Voice control for the TUI.** `lacode-voice` runs a local daemon that captures
+  audio, transcribes it through Groq, and forwards prompts to the TUI over a
+  loopback-only control socket. Wake-word detection is optional: the Vosk and
+  Porcupine engines, the recorder and the audio capture path each degrade
+  gracefully when their native dependency, key or device is missing. The daemon,
+  transport and audio code live in `src/voice/`; the TUI is published as the
+  `./tui` export.
+- **A per-session timeline.** `src/plugins/timeline.ts` summarizes a session's
+  transcript into an append-only JSONL file under
+  `~/.local/share/opencode/lacode/timeline/`, and `/reprocess-timeline` rebuilds
+  it from the full transcript through the `timeline_reprocess` tool. Internal
+  summarizer sessions stay out of notifications.
+- **`npm run score`** probes every cost-zero model the configured providers
+  serve, scores context, output, speed and reliability, and suggests a pool
+  order. Results are written to `~/.config/lacode/model-scores.json`.
+
+### Changed
+
+- **BREAKING: Slot routing is one pass, and the four-slot cap is gone.** A
+  slot's `weight` is now its cap, not half of a two-pass budget: the pool fills
+  each slot to its weight in declaration order in one pass, then overflows to the
+  least-loaded slot. Every line is a slot, and a model may repeat — each line
+  adds seats at its position. A preset tuned for the old two-pass behaviour sees
+  roughly half the concurrency it did before; to restore it, double the weights
+  or list a model again.
+- **The pool hot-reloads a bucket-only edit.** Changing only a slot's `b:` bucket
+  now counts as a change and re-validates the table.
+- **A stated `Retry-After` is honoured up to six hours**, instead of being
+  clamped to the fifteen-minute backoff cap.
+
+### Fixed
+
+- **A voice daemon shutdown waits for the transcription in flight**, and manual
+  recording is bounded at two minutes instead of growing without limit.
+- **The voice control socket stays on loopback** unless a non-local bind is
+  explicitly opted into, and the wake engine treats an empty environment value
+  as unset.
+- **The timeline strips terminal control sequences** before rendering model
+  output, and shares its session state across a double-loaded plugin.
+
 ## [1.1.0] — a map contract, feedback, and host credential sync
 
 ### Added
@@ -875,7 +919,9 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/lawaty/lacode/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/lawaty/lacode/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/lawaty/lacode/compare/v0.11.0...v1.0.0
 [0.11.0]: https://github.com/lawaty/lacode/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/lawaty/lacode/compare/v0.9.0...v0.10.0

@@ -4,7 +4,7 @@
 // (fixtures/config.mjs: the fixture provider block plus the package's own agent
 // set), proving:
 //
-//   1. the shipped file parses, and its slots are distinct models with valid weights
+//   1. the shipped file parses, and its slots have valid weights
 //   2. the config hook rewrites every variant agent's model from the file, so the
 //      injected config can disagree and still lose
 //   3. a model missing from a provider's existing whitelist is appended to it,
@@ -15,13 +15,12 @@
 //      instead of a pool that cannot route
 //   5. slot count is data, not code: three slots route 1,2,3 and the fourth agent
 //      name is simply absent
-//   6. weight is a slot's active-session budget for one pass and the basis of its
-//      absolute cap: a slot may hold twice its weight at once (slotCeiling), pass 1
-//      fills each usable slot to its weight in declaration order, pass 2 repeats the
-//      order to twice that weight, a bad weight warns and keeps the slot, and the
-//      pre-weight `tier` spelling still maps to its implied weight
-//   7. the pool is capped at pool.MAX_SLOTS, because the injected agent set declares
-//      one variant per base per slot and a bigger pool would route to nothing
+//   6. weight is a slot's active-session budget: capacity is the sum of the weights,
+//      one pass fills each usable slot to its weight in declaration order, a bad
+//      weight warns and keeps the slot, and the pre-weight `tier` spelling still
+//      maps to its implied weight
+//   7. the pool has no slot cap: a longer file routes every slot, and the watcher
+//      declares the variant an older config did not carry
 
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -82,13 +81,10 @@ const BASES = ["explore", "implement", "context"]
 // 1. the shipped file is well formed
 const shipped = JSON.parse(readFileSync(MODELS, "utf8"))
 assert(Array.isArray(shipped.slots) && shipped.slots.length >= 2, "presets/free-tier.json must list at least two slots")
-const ids = new Set()
 shipped.slots.forEach((slot, i) => {
   assert(typeof slot.model === "string" && slot.model.includes("/"), `slot ${i + 1} needs a provider/model-id`)
   assert(typeof slot.weight === "number" && Number.isFinite(slot.weight), `slot ${i + 1} needs a numeric weight`)
   assert(slot.weight > 0 && slot.weight <= pool.MAX_WEIGHT, `slot ${i + 1} weight must be in (0, ${pool.MAX_WEIGHT}], got ${slot.weight}`)
-  assert(!ids.has(slot.model), `slot ${i + 1} repeats ${slot.model}; slots must be distinct`)
-  ids.add(slot.model)
 })
 // two providers at most half the pool, so one provider-wide limit cannot kill it
 const providers = new Set(shipped.slots.map((s) => pool.providerOf(s.model)))
@@ -169,11 +165,10 @@ assert(missing.warned().some((l) => l.includes("unreadable")), "a missing file s
 const fallbackPick = await missing.spawn("f1")
 assert(fallbackPick === "explore-1", `defaults should still route, got ${fallbackPick}`)
 
-// 6. individual bad entries are dropped with a warning; the good slots still route
-// A bad weight is NOT in that set: it is share and preference, not validity, so it warns
-// and keeps the slot at weight 1 rather than throwing away a model. Two rejection rules
-// are under test, each needing a distinct violation: a repeat of slot 1's model and a
-// model with no provider prefix.
+// 6. individual bad entries are handled without dropping the good slots. A bad weight
+// is NOT a rejection: it is share, not validity, so it warns and keeps the slot at
+// weight 1. A repeated model is valid too -- each line is its own slot. The one
+// rejection under test is a model with no provider prefix.
 const GOOD_1 = `${PROV_A}/fixture-good-1`
 const GOOD_2 = `${PROV_B}/fixture-good-2`
 const GOOD_3 = `${PROV_B}/fixture-good-3`
@@ -190,50 +185,33 @@ const broken = await apply(
   "broken",
 )
 const warns = broken.warned().filter((l) => l.includes("presets/free-tier.json") || l.includes("slot "))
-assert(warns.length === 3, `each bad entry should warn once, got ${warns.length}: ${warns.join(" | ")}`)
+assert(warns.length === 2, `each bad entry should warn once (the repeated model is valid now), got ${warns.length}: ${warns.join(" | ")}`)
 assert(warns.some((l) => l.includes("weight must be a number")), `a bad weight should warn, got ${warns.join(" | ")}`)
-// the model behind the bad weight survives, only its preference is lost
-assert(
-  broken.cfg.agent["explore-2"].model === GOOD_2,
-  `a slot with a bad weight must still route, got ${broken.cfg.agent["explore-2"].model}`,
-)
+assert(warns.some((l) => l.includes("provider/model-id")), `a model with no provider must warn, got ${warns.join(" | ")}`)
+// A repeated model gets its own slot; a bad weight keeps the model at weight 1.
 for (const base of BASES) {
-  assert(broken.cfg.agent[`${base}-1`].model === GOOD_1, `slot 1 must run the first valid entry, got ${broken.cfg.agent[`${base}-1`].model}`)
-  assert(broken.cfg.agent[`${base}-2`].model === GOOD_2, `slot 2 must run the entry with the bad weight, got ${broken.cfg.agent[`${base}-2`].model}`)
-  assert(broken.cfg.agent[`${base}-3`].model === GOOD_3, `slot 3 must run the third valid entry, got ${broken.cfg.agent[`${base}-3`].model}`)
+  assert(broken.cfg.agent[`${base}-1`].model === GOOD_1, `slot 1 must run the first entry, got ${broken.cfg.agent[`${base}-1`].model}`)
+  assert(broken.cfg.agent[`${base}-2`].model === GOOD_1, `a repeated model must get its own slot, got ${broken.cfg.agent[`${base}-2`].model}`)
+  assert(broken.cfg.agent[`${base}-3`].model === GOOD_2, `slot 3 must run the entry with the bad weight, got ${broken.cfg.agent[`${base}-3`].model}`)
+  assert(broken.cfg.agent[`${base}-4`].model === GOOD_3, `slot 4 must run the third valid entry, got ${broken.cfg.agent[`${base}-4`].model}`)
 }
 
-// 7. weight is a per-pass budget and the basis of an absolute cap: pass 1 walks the
-//    usable slots in declaration order and fills each to its weight, then pass 2 walks
-//    them again in the same order and fills each to twice that weight. So the weight-3
-//    slot fills to 3 before the weight-1 slot gets any, both repeat that order on pass
-//    2, and only past the absolute caps does overflow go to the least-loaded slot.
-//    Measured by spawns, because the claim files pool_status reads are exactly those
-//    spawns.
+// 7. weight is a slot's active-session budget and the pool's capacity is the sum of
+//    the weights. Routing is ONE pass in declaration order: the weight-3 slot fills to
+//    3 before the weight-1 slot gets any; past that the pool is at capacity and
+//    overflow goes to the least-loaded slot. Measured by spawns, because the claim
+//    files pool_status reads are exactly those spawns.
 const HEAVY = `${PROV_A}/fixture-weight-heavy`
 const LIGHT = `${PROV_B}/fixture-weight-light`
 const HEAVY_WEIGHT = 3
 const LIGHT_WEIGHT = 1
 const weighted = await apply(file("weighted.json", { slots: [{ model: HEAVY, weight: HEAVY_WEIGHT }, { model: LIGHT, weight: LIGHT_WEIGHT }] }), "weighted")
-// The ordered fill in one literal: pass 1 walks 1,1,1,2 and pass 2 repeats it, so
-// weights 3 and 1 fill in declaration order across both passes.
-const RUN = ["1", "1", "1", "2", "1", "1", "1", "2"]
-// A slot's absolute cap is TWICE its weight (src/lib/pool.ts SLOT_CEILING_FACTOR);
-// that is why the weighted phase is the pass order walked twice rather than once.
-const CEILING_FACTOR = 2
-const HEAVY_CEILING = 6
-const LIGHT_CEILING = 2
-const PASS_SIZE = RUN.length / CEILING_FACTOR
+const RUN = ["1", "1", "1", "2"]
 const WEIGHTED = RUN.length
 assert(
-  RUN.length === PASS_SIZE * CEILING_FACTOR && RUN.join(",") === "1,1,1,2,1,1,1,2",
-  `weights ${HEAVY_WEIGHT}/${LIGHT_WEIGHT} must fill in declaration order across two passes, got ${RUN.join(",")}`,
-)
-assert(
-  pool.SLOT_CEILING_FACTOR === CEILING_FACTOR &&
-    pool.slotCeiling({ weight: HEAVY_WEIGHT }) === HEAVY_CEILING &&
-    pool.slotCeiling({ weight: LIGHT_WEIGHT }) === LIGHT_CEILING,
-  `a slot's absolute cap must be ${CEILING_FACTOR}x its weight (${HEAVY_CEILING} and ${LIGHT_CEILING} here), got factor ${pool.SLOT_CEILING_FACTOR}`,
+  pool.slotCeiling({ weight: HEAVY_WEIGHT }) === HEAVY_WEIGHT &&
+    pool.slotCeiling({ weight: LIGHT_WEIGHT }) === LIGHT_WEIGHT,
+  `a slot's cap must be its weight (${HEAVY_WEIGHT} and ${LIGHT_WEIGHT} here), got ${pool.slotCeiling({ weight: HEAVY_WEIGHT })} and ${pool.slotCeiling({ weight: LIGHT_WEIGHT })}`,
 )
 const tally = { [HEAVY]: 0, [LIGHT]: 0 }
 const tallyPick = async (callID) => {
@@ -241,57 +219,34 @@ const tallyPick = async (callID) => {
   tally[slot === "1" ? HEAVY : LIGHT]++
   return slot
 }
-// PASS 1: the first slot's whole budget of 3 claims comes before the weight-1 slot,
+// ONE PASS: the first slot's whole budget of 3 claims comes before the weight-1 slot,
 // because declaration order, not weight, sets preference.
-for (let i = 0; i < HEAVY_WEIGHT; i++) {
-  const slot = await tallyPick(`w${i}`)
-  assert(slot === "1", `spawn ${i + 1} must go to the first slot and fill its weight-${HEAVY_WEIGHT} budget, got slot ${slot}`)
-}
-// PASS 1 completes and PASS 2 repeats the order: every spawn follows the literal
-// two-pass sequence, and no slot passes its absolute cap while the other still has
-// room under its own.
-for (let i = HEAVY_WEIGHT; i < WEIGHTED; i++) {
+for (let i = 0; i < WEIGHTED; i++) {
   const slot = Number(await tallyPick(`w${i}`))
-  assert(slot === Number(RUN[i]), `spawn ${i + 1} must take position ${i} of the two-pass order (slot ${RUN[i]}), got slot ${slot}`)
-  assert(
-    tally[HEAVY] <= HEAVY_CEILING && tally[LIGHT] <= LIGHT_CEILING,
-    `the weight-3 slot must stop at its absolute cap of ${HEAVY_CEILING} while the weight-1 slot has room at ${LIGHT_CEILING}, got ${tally[HEAVY]}/${HEAVY_CEILING} vs ${tally[LIGHT]}/${LIGHT_CEILING}`,
-  )
+  assert(slot === Number(RUN[i]), `spawn ${i + 1} must take position ${i} of the fill order (slot ${RUN[i]}), got slot ${slot}`)
 }
-// Both passes are exactly what it takes to stand every slot at its absolute cap: one
-// pass leaves each slot at its per-pass budget, which is the whole reason the cap is a
-// multiple of the weight and not the weight itself.
 assert(
-  tally[HEAVY] === HEAVY_CEILING && tally[LIGHT] === LIGHT_CEILING,
-  `${WEIGHTED} spawns (the pass order walked ${CEILING_FACTOR} times) must stand each slot at twice its weight, got ${tally[HEAVY]}/${HEAVY_CEILING} heavy vs ${tally[LIGHT]}/${LIGHT_CEILING} light`,
+  tally[HEAVY] === HEAVY_WEIGHT && tally[LIGHT] === LIGHT_WEIGHT,
+  `${WEIGHTED} spawns must stand each slot at its weight, got ${tally[HEAVY]}/${HEAVY_WEIGHT} heavy vs ${tally[LIGHT]}/${LIGHT_WEIGHT} light`,
 )
-// and pool_status reports that absolute cap as the denominator, marking a slot FULL
-// exactly when it reaches it
+// pool_status reports the weight as the denominator, marking a slot FULL at it
 const weightedStatus = await weighted.status()
-for (const [model, weight, ceiling] of [
-  [HEAVY, HEAVY_WEIGHT, HEAVY_CEILING],
-  [LIGHT, LIGHT_WEIGHT, LIGHT_CEILING],
+for (const [model, weight] of [
+  [HEAVY, HEAVY_WEIGHT],
+  [LIGHT, LIGHT_WEIGHT],
 ]) {
   assert(
-    new RegExp(`slot \\d+ w${weight}\\s+${model}\\s+load=${ceiling}/${ceiling} FULL`).test(weightedStatus),
-    `status should report ${model} at load=${ceiling}/${ceiling} FULL (a weight-${weight} slot's absolute cap is twice its weight), got:\n${weightedStatus}`,
+    new RegExp(`slot \\d+ w${weight}\\s+${model}\\s+load=${weight}/${weight} FULL`).test(weightedStatus),
+    `status should report ${model} at load=${weight}/${weight} FULL (a weight-${weight} slot's cap is its weight), got:\n${weightedStatus}`,
   )
 }
-// OVERFLOW: every slot now stands at its absolute cap, so nothing gates the pick and
-// it goes to the least-loaded one -- the weight-1 slot, four times over, while the
-// weight-3 slot stays exactly where its cap left it.
-const SPILL = PASS_SIZE
+// OVERFLOW: every slot is at its weight, so the pick goes to the least-loaded one.
+const SPILL = 2
 const spill = []
 for (let i = 0; i < SPILL; i++) spill.push(await tallyPick(`x${i}`))
 assert(
-  spill.every((slot) => slot === "2") && tally[HEAVY] === HEAVY_CEILING,
-  `past every absolute cap the overflow must go to the least-loaded slot, not pile on the weight-3 slot, got ${spill.join(",")} after ${tally[HEAVY]}/${HEAVY_CEILING} heavy vs ${tally[LIGHT]}/${LIGHT_CEILING} light`,
-)
-// past every cap the overflow equalises rather than piling on the heavy slot
-const heavyShare = tally[HEAVY] / (WEIGHTED + SPILL)
-assert(
-  heavyShare < 0.8 && heavyShare > 0.3,
-  `the overflow must spread rather than pile on the heavy slot, got ${tally[HEAVY]} heavy vs ${tally[LIGHT]} light`,
+  spill.every((slot) => slot === "2") && tally[HEAVY] === HEAVY_WEIGHT,
+  `past capacity the overflow must go to the least-loaded slot, not pile on the weight-3 slot, got ${spill.join(",")} after ${tally[HEAVY]}/${HEAVY_WEIGHT} heavy vs ${tally[LIGHT]}/${LIGHT_WEIGHT} light`,
 )
 // and the config hook reports the weights it bound, so a typo is visible in the log
 assert(
@@ -313,25 +268,23 @@ assert(
   `primary must bind as weight 2 and overflow as weight 1, got ${legacy.lines.join(" | ")}`,
 )
 
-// 9. the pool is capped: the injected config declares exactly one variant per base per
-//    slot, so a longer file would route spawns at agents that do not exist. Both
-//    halves of that are checked -- the extra entries are dropped with a warning,
-//    and the shipped file is not over the cap.
-const overCap = await apply(
-  file("over-cap.json", { slots: Array.from({ length: pool.MAX_SLOTS + 2 }, (_, i) => ({ model: `${PROV_A}/fixture-cap-${i + 1}`, weight: 1 })) }),
-  "over-cap",
+// 9. the pool has no slot cap: a longer file routes every slot, and the watcher
+//    declares the variant an older injected config did not carry.
+const BIG = 6
+const many = await apply(
+  file("many-slots.json", { slots: Array.from({ length: BIG }, (_, i) => ({ model: `${PROV_A}/fixture-cap-${i + 1}`, weight: 1 })) }),
+  "many-slots",
 )
-const capWarns = overCap.warned().filter((l) => l.includes("capped"))
-assert(capWarns.length === 2, `each ignored entry past the cap should warn, got ${capWarns.length}: ${capWarns.join(" | ")}`)
-const capPicks = []
-for (let i = 0; i < pool.MAX_SLOTS * 2; i++) capPicks.push((await overCap.spawn(`c${i}`)).replace("explore-", ""))
+assert(many.warned().filter((l) => l.includes("capped")).length === 0, "the pool must not warn about a slot cap")
+const manyPicks = []
+for (let i = 0; i < BIG * 2; i++) manyPicks.push((await many.spawn(`c${i}`)).replace("explore-", ""))
 assert(
-  new Set(capPicks).size === pool.MAX_SLOTS && !capPicks.includes(String(pool.MAX_SLOTS + 1)),
-  `only the first ${pool.MAX_SLOTS} slots may route, got ${[...new Set(capPicks)].join(",")}`,
+  new Set(manyPicks).size === BIG && !manyPicks.includes(String(BIG + 1)),
+  `every one of the ${BIG} slots may route, got ${[...new Set(manyPicks)].join(",")}`,
 )
-assert(shipped.slots.length <= pool.MAX_SLOTS, `presets/free-tier.json lists ${shipped.slots.length} slots, over the ${pool.MAX_SLOTS} cap`)
-const shippedVariants = Object.keys(realCfg().agent).filter((n) => /-[5-9]$/.test(n))
-assert(shippedVariants.length === 0, `the injected config must not declare a variant beyond the cap, got ${shippedVariants.join(", ")}`)
+for (let i = 1; i <= BIG; i++) {
+  assert(many.cfg.agent[`explore-${i}`], `variant explore-${i} must exist for slot ${i}`)
+}
 
 // 10. the injected config declares the variants with no model at all: the hook is the
 //    only thing that puts one there, so there is nothing left to fall out of sync

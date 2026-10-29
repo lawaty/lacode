@@ -26,25 +26,21 @@ const MAX_WEIGHT = Math.max(...SHIPPED.map((s) => s.weight))
 const MIN_WEIGHT = Math.min(...SHIPPED.map((s) => s.weight))
 const HEAVY_MODELS = SHIPPED.filter((s) => s.weight === MAX_WEIGHT).map((s) => s.model)
 const LIGHT_MODELS = SHIPPED.filter((s) => s.weight === MIN_WEIGHT).map((s) => s.model)
-// A slot holds at most TWICE its weight (src/lib/pool.ts SLOT_CEILING_FACTOR): the
-// weight is its active-session budget for one pass and the absolute cap is deliberately
-// larger than that budget, so a slot can fill to twice its weight on the second pass
-// before the pool overflows. Written out here as a literal rather than read off the
-// module, because the doubled cap is the rule under test, not a value to follow.
-const CEILING_FACTOR = 2
+// A slot's cap IS its weight: routing is one pass and the pool's capacity is the sum
+// of the weights. Written out here as a literal rather than read off the module,
+// because the cap is the rule under test, not a value to follow.
+const CEILING_FACTOR = 1
 const CEILINGS = SHIPPED.map((s) => s.weight * CEILING_FACTOR)
 // One pass over the slots: each slot fills to its weight in declaration order, so
 // weights [3,2,1,1] walk 1,1,1,2,2,3,4. Derived from the file, so a preset change is
 // not a test edit.
 const RUN = SHIPPED.flatMap((slot, i) => Array(slot.weight).fill(i + 1))
 const PASS_SIZE = RUN.length
-// The summed absolute caps are where pass 2 ends and overflow begins, so the depth
-// needed to see both is derived rather than guessed: a slot cannot reach twice its
-// weight in one pass, so the weighted phase is exactly two passes long.
+// The summed weights are the pool's capacity: fill all slots, then overflow.
 const CAPACITY = PASS_SIZE * CEILING_FACTOR
 // How far the burst has to go for the overflow to have levelled the pool: it can only
-// ever raise the least loaded slot, so the totals converge on the largest absolute cap
-// in the pool and are equal from there on -- and stay within one past it.
+// ever raise the least loaded slot, so the totals converge on the largest weight in
+// the pool and are equal from there on -- and stay within one past it.
 const LEVELED = SLOT_MODELS.length * MAX_WEIGHT * CEILING_FACTOR
 
 const logs = []
@@ -59,8 +55,8 @@ const assert = (cond, msg) => {
   }
 }
 assert(
-  pool.SLOT_CEILING_FACTOR === CEILING_FACTOR,
-  `src/lib/pool.ts must double a slot's weight (SLOT_CEILING_FACTOR ${CEILING_FACTOR}), got ${pool.SLOT_CEILING_FACTOR}`,
+  pool.slotCeiling({ weight: 3 }) === 3 && pool.slotCeiling({ weight: 1 }) === 1,
+  `src/lib/pool.ts must cap a slot at its weight, got ${pool.slotCeiling({ weight: 3 })} for weight 3`,
 )
 
 const make = async (id, dir) => {
@@ -81,13 +77,12 @@ const make = async (id, dir) => {
 const dir1 = mkdtempSync(join(tmpdir(), "agent-pool-solo-"))
 const seq = (calls) => calls.map((c) => c.replace(/^[a-z-]+-/, "")).join(",")
 
-// 1. routing: two-pass ordered fill. Pass 1 walks the usable slots in declaration
-//    order and fills each to its weight; pass 2 repeats the order and fills each to
-//    twice its weight. A slot's absolute cap is TWICE its weight, and only once every
-//    slot is at that cap does overflow go to the least-loaded slot. Live claims decide
-//    the pick, so a released claim immediately reopens its slot and there is no stored
-//    position. Slot numbers, weights and pick order are presets/free-tier.json's
-//    business, so what is pinned here is the property, not a literal sequence.
+// 1. routing: one ordered fill. The slots are walked in declaration order and each
+//    fills to its weight; only once every slot is at its weight does overflow go to
+//    the least-loaded slot. Live claims decide the pick, so a released claim
+//    immediately reopens its slot and there is no stored position. Slot numbers,
+//    weights and pick order are presets/free-tier.json's business, so what is pinned
+//    here is the property, not a literal sequence.
 const a = await make("solo", dir1)
 const calls = []
 // Deep enough to exhaust every ceiling, then overflow, and then overflow far enough
@@ -111,9 +106,8 @@ assert(
   new Set(numbers).size === SLOT_MODELS.length,
   `all ${SLOT_MODELS.length} slots must be used under ${CONCURRENCY} concurrent, got ${seq(calls)}`,
 )
-// inside the summed absolute caps the pick follows the two-pass order and nothing is
-// skipped: a slot's absolute cap is twice its weight, so a slot cannot fill up in one
-// pass, and the weighted phase is the pass order walked twice from a cold start
+// inside the summed weights the pick follows the declaration order and nothing is
+// skipped: each slot fills to exactly its weight
 const countsByModel = (ns) => {
   const m = new Map()
   for (const n of ns) m.set(SLOT_MODELS[n - 1], (m.get(SLOT_MODELS[n - 1]) ?? 0) + 1)
@@ -125,8 +119,8 @@ for (let i = 0; i < CAPACITY; i++) {
     `spawn ${i + 1} must take position ${i % PASS_SIZE} of the pass order (slot ${RUN[i % PASS_SIZE]}), got slot ${numbers[i]} from ${seq(calls)}`,
   )
 }
-// the ceiling binds every slot to twice its weight, and the ONLY way past it is the
-// overflow -- which is not reached until EVERY slot stands at or over its own ceiling
+// the cap binds every slot to its weight, and the ONLY way past it is the overflow --
+// which is not reached until EVERY slot stands at or over its own weight
 for (let i = 1; i <= CONCURRENCY; i++) {
   const tally = countsByModel(numbers.slice(0, i))
   const prefixLoads = SHIPPED.map((slot) => tally.get(slot.model) ?? 0)
@@ -134,7 +128,7 @@ for (let i = 1; i <= CONCURRENCY; i++) {
   const full = prefixLoads.map((l, j) => l >= CEILINGS[j])
   assert(
     !above.some(Boolean) || full.every(Boolean),
-    `a slot may pass its ceiling of ${CEILING_FACTOR}x its weight only once EVERY slot is at one, after spawn ${i}: ${SHIPPED.map((slot, j) => `${slot.model}=${prefixLoads[j]}/${CEILINGS[j]}`).join(" ")}`,
+    `a slot may pass its weight only once EVERY slot is at its weight, after spawn ${i}: ${SHIPPED.map((slot, j) => `${slot.model}=${prefixLoads[j]}/${CEILINGS[j]}`).join(" ")}`,
   )
 }
 // and the leading slot (the heaviest here) holds every position at the top of pass 1
@@ -144,8 +138,7 @@ assert(
   heavyLead.every((n) => HEAVY_MODELS.includes(SLOT_MODELS[n - 1])),
   `the first ${MAX_WEIGHT} spawns must all be the heaviest slot, got ${seq(calls)}`,
 )
-// collecting twice its weight takes both passes, so a slot can only reach its
-// absolute cap on the second pass -- and then it stands at exactly that
+// at the summed capacity every slot stands at exactly its weight
 for (const [j, slot] of SHIPPED.entries()) {
   assert(
     (countsByModel(numbers.slice(0, CAPACITY)).get(slot.model) ?? 0) === CEILINGS[j],
@@ -165,9 +158,8 @@ assert(
   `every spawn must be accounted for, got ${seq(calls)}`,
 )
 
-// The next pick under the two-pass ordered fill, read off live loads: the first slot
-// below its weight (pass 1), else the first below its absolute cap (pass 2), else the
-// least-loaded slot.
+// The next pick under the one-pass ordered fill, read off live loads: the first slot
+// below its weight, else the least-loaded slot.
 const loads = async () => {
   const m = new Map()
   for (const line of (await a.status()).split("\n")) {
@@ -179,9 +171,6 @@ const loads = async () => {
 const expectedNext = (byLoad) => {
   for (let j = 0; j < SLOT_MODELS.length; j++) {
     if (byLoad.get(SLOT_MODELS[j]) < SHIPPED[j].weight) return j + 1
-  }
-  for (let j = 0; j < SLOT_MODELS.length; j++) {
-    if (byLoad.get(SLOT_MODELS[j]) < CEILINGS[j]) return j + 1
   }
   return SLOT_MODELS.reduce(
     (best, model, j) => (byLoad.get(model) < byLoad.get(SLOT_MODELS[best - 1]) ? j + 1 : best),

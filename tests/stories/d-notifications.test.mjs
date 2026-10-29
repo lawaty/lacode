@@ -510,7 +510,7 @@ test("[US-11] a session that never went busy delivers nothing when it idles", as
   assert.deepEqual(sent, [], "an empty session must not announce finished work")
 })
 
-test("[US-11] a subagent session and a cartographer session are both suppressed", async () => {
+test("[US-11] a subagent session, a cartographer session, and a pool probe session are all suppressed", async () => {
   const child = await notifier({ sessions: { c1: { id: "c1", parentID: "root", title: "explore" } } })
   await busy(child.emit, "c1")
   await idle(child.emit, "c1")
@@ -524,6 +524,14 @@ test("[US-11] a subagent session and a cartographer session are both suppressed"
   await idle(cartographer.emit, "m1")
   await settle()
   assert.deepEqual(cartographer.sent, [], "the cartographer's own bookkeeping is not finished work")
+
+  // The pool probe is a root session with no parentID, identified by its title
+  // prefix.
+  const probe = await notifier({ sessions: { p1: { id: "p1", title: "pool probe (some-provider/some-model)" } } })
+  await busy(probe.emit, "p1")
+  await idle(probe.emit, "p1")
+  await settle()
+  assert.deepEqual(probe.sent, [], "the probe is a root session with no parentID, identified by its title prefix")
 })
 
 test("[US-11] a helper that exits non-zero is reported as a failed delivery, not as sent", async () => {

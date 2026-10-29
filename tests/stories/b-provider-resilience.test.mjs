@@ -484,18 +484,16 @@ test("[US-5] equal weights fill pass 1 then pass 2 in declaration order", async 
   await hooks.dispose()
 })
 
-test("[US-5] no slot exceeds its absolute cap except through overflow", async () => {
+test("[US-5] no slot exceeds its weight except through overflow", async () => {
   const slots = [
     { model: "prov/heavy", weight: 3 },
     { model: "prov/mid", weight: 2 },
     { model: "prov/light", weight: 1 },
   ]
   const { hooks, cfg } = await bootPool(slots, "us5-cap-bound")
-  // Exactly the summed absolute caps -- twice each weight. One pass would still
-  // leave room (the absolute cap is deliberately larger than the per-pass
-  // weight), so the pool has to be driven all the way to the doubled cap for
-  // this bound to bite.
-  const ceiling = (s) => s.weight * 2
+  // The pool's capacity is the sum of the weights, so driving it to exactly
+  // that point leaves every slot at its weight and nothing above it.
+  const ceiling = (s) => s.weight
   const capacity = slots.reduce((sum, s) => sum + ceiling(s), 0)
   await burst(hooks, cfg, capacity)
 
@@ -556,7 +554,7 @@ test("[US-6] the status view shows every process's claims and the aggregate load
 
   const status = await hooks.tool.pool_status.execute({}, {})
   const slot = status.output.split("\n").find((l) => l.includes("prov/shared"))
-  assert.match(slot, /load=4\/8/, `per-slot load must aggregate across processes:\n${status.output}`)
+  assert.match(slot, /load=4\/4/, `per-slot load must aggregate across processes:\n${status.output}`)
   // Mine contributed 2 explore, the sibling 1 explore + 1 implement.
   assert.match(slot, /explorex3/, `the per-base breakdown must aggregate both processes: ${slot}`)
   assert.match(slot, /implementx1/, `the per-base breakdown must aggregate both processes: ${slot}`)
@@ -604,7 +602,7 @@ test("[US-6] a claim file older than the dead-file threshold is pruned, not coun
   const status = await hooks.tool.pool_status.execute({}, {})
   assert.doesNotMatch(status.output, /ghost/, `a dead process must not appear:\n${status.output}`)
   assert.ok(!existsSync(stale), "the dead file must be pruned from disk, not merely ignored")
-  assert.match(status.output, /load=1\/8/, `only the live claim counts:\n${status.output}`)
+  assert.match(status.output, /load=1\/4/, `only the live claim counts:\n${status.output}`)
   await hooks.dispose()
 })
 
@@ -649,18 +647,18 @@ test("[US-6] a slot at its absolute cap is not marked as the slot the next spawn
   ]
   const { hooks, cfg } = await bootPool(slots, "us6-next-not-full")
 
-  // Four claims: two on the light slot (its absolute cap is 2 x 1 = 2, so it is
-  // FULL) and two on the heavy one (its absolute cap is 2 x 2 = 4, so it has room).
-  await burst(hooks, cfg, 4)
+  // Two claims: the weight-1 slot is FULL at one claim, and the weight-2 slot has
+  // one more of room.
+  await burst(hooks, cfg, 2)
 
   const status = await hooks.tool.pool_status.execute({}, {})
   const slotLine = (model) => status.output.split("\n").find((l) => /^\s*slot \d/.test(l) && l.includes(model))
   const full = slotLine("prov/full")
   const room = slotLine("prov/room")
 
-  assert.match(full, /load=2\/2 FULL/, `the full slot must be shown as full:\n${status.output}`)
+  assert.match(full, /load=1\/1 FULL/, `the full slot must be shown as full:\n${status.output}`)
   assert.doesNotMatch(full, /<- next/, `a slot at its absolute cap must not be marked as the next one:\n${status.output}`)
-  assert.match(room, /load=2\/4/, `the other slot must still have room:\n${status.output}`)
+  assert.match(room, /load=1\/2/, `the other slot must still have room:\n${status.output}`)
   assert.match(room, /<- next/, `the mark must be on the slot that still has room:\n${status.output}`)
   assert.doesNotMatch(room, /FULL/, `the marked slot must not be the full one:\n${status.output}`)
   await hooks.dispose()
@@ -709,7 +707,7 @@ test("[US-7] a vendor-prefixed id splits on the first slash only, tail preserved
   await hooks.dispose()
 })
 
-test("[US-7] more slots than the pool allows are dropped with a warning naming the cap", async () => {
+test("[US-7] every slot in a long file is kept: there is no slot cap", async () => {
   const slots = [
     { model: "cap/one", weight: 1 },
     { model: "cap/two", weight: 1 },
@@ -720,15 +718,12 @@ test("[US-7] more slots than the pool allows are dropped with a warning naming t
   ]
   const { hooks, cfg, stub } = await bootPool(slots, "us7-cap")
   const warnings = stub.text().filter((line) => line.startsWith("warn"))
-  const capWarning = warnings.find((line) => line.includes("capped at") && /4/.test(line))
-  assert.ok(capWarning, `the surplus must be dropped with a warning naming the cap:\n${warnings.join("\n")}`)
-  assert.match(capWarning, /cap\/five|cap\/six/, "the dropped entry must be named")
-  assert.ok(!cfg.agent["explore-5"], "no fifth variant exists, so routing to it would fail")
-  assert.ok(cfg.agent["explore-4"], "the first four slots must survive")
+  assert.ok(!warnings.some((line) => line.includes("capped")), `no slot may be dropped:\n${warnings.join("\n")}`)
+  for (let i = 1; i <= slots.length; i++) assert.ok(cfg.agent[`explore-${i}`], `variant explore-${i} must exist`)
 
-  // And routing never reaches for the dropped ones.
-  const routed = await burst(hooks, cfg, 4)
-  for (const variant of routed) assert.match(variant, /^explore-[1-4]$/, `got ${variant}`)
+  // And routing reaches every one of them.
+  const routed = await burst(hooks, cfg, slots.length)
+  assert.deepEqual(routed, slots.map((_, i) => `explore-${i + 1}`), `got ${routed}`)
   await hooks.dispose()
 })
 

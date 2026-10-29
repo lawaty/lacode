@@ -45,9 +45,9 @@ opencode/glm-5.3-flash-free               1
 
 `#` starts a comment (whole-line or trailing), blank lines are ignored, and the
 weight is optional (default 1). The rules are exactly the same as the JSON form
-below: up to 4 slots, distinct models, split on the first slash only. The loader
-accepts either shape in the same file, so a leading `{` means JSON and anything
-else means the flat form.
+below: any number of slots, a model may repeat on another line, split on the
+first slash only. The loader accepts either shape in the same file, so a leading
+`{` means JSON and anything else means the flat form.
 
 ## Schema
 
@@ -63,7 +63,7 @@ else means the flat form.
 | Field | Required | Meaning |
 |-------|----------|---------|
 | `model` | yes | `provider/model-id`, split on the **first** slash only |
-| `weight` | no | active-session budget for one pass; its absolute cap is twice that. Absent = 1 |
+| `weight` | no | active-session budget; the pool's capacity is the sum of the weights. Absent = 1 |
 
 `$comment` is a JSON-legal array of strings and is ignored by the loader; the
 bundled preset uses it to explain itself in place.
@@ -74,13 +74,13 @@ The loader checks shape and nothing else:
 
 - `slots` must be a non-empty array
 - each `model` must contain a `/`
-- models must be distinct across slots
+- a model may appear on more than one line; each line is its own slot with its
+  own load counter and weight
 - `weight` must be a number in `(0, 100]`; a bad one **warns and uses 1** rather
   than dropping the slot, because losing a model to a typo in a count costs real
   capacity
-- at most `MAX_SLOTS` (4) slots; extra entries are **dropped with a warning**,
-  because one hidden variant agent per base per slot exists and a fifth slot
-  would route at an agent that does not exist
+- there is no slot cap: one hidden variant agent is declared per base per
+  resolved slot, and the watcher declares a variant if a reload grows the table
 - `tier` is accepted as an alias for `weight` (`primary` → 2,
   `overflow` → 1) and warns
 
@@ -92,20 +92,18 @@ because the pool requires it.
 
 ## Weight, precisely
 
-A weight is a slot's active-session budget for one pass: the number of
-concurrent claims it may hold before the next slot is preferred. Its absolute
-cap is **twice that weight** — a weight-3 slot may hold 6 concurrent sessions.
-Slots are filled in declaration order; preference is order, never weight.
+A weight is a slot's active-session budget: the number of concurrent claims it
+may hold before the next slot is preferred. The pool's capacity is the **sum of
+the weights**, so a weight-3 slot may hold 3 concurrent sessions and listing a
+model on two lines gives it two independent budgets.
 
-Routing runs in two passes:
+Routing is one pass:
 
-1. pass 1 fills each usable slot up to its weight, in declaration order
-2. once every usable slot has reached its weight, pass 2 repeats the order,
-   filling each usable slot up to twice its weight
+1. fill each usable slot up to its weight, in declaration order
 
-A slot is skipped when it is cooling, unavailable, or at its absolute cap.
-When every usable slot is at its absolute cap, overflow goes to the least
-loaded usable slot; the pool never refuses work.
+A slot is skipped when it is cooling or unavailable. When every usable slot is
+at its weight, the pool is at capacity and overflow goes to the least loaded
+usable slot; the pool never refuses work.
 
 Live claims decide the next slot: a released claim immediately reopens its
 slot, and there is no stored position.

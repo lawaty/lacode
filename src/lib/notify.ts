@@ -19,6 +19,14 @@ const INTERNAL_TITLE_PREFIXES = [
   // parentID, so it looks exactly like a root session going idle. Notifying for
   // it would announce the cartographer's own bookkeeping as a finished task.
   "context (auto",
+  // timeline spawns its summarizer through the session API with the same shape,
+  // so it would otherwise announce the summarizer's own bookkeeping as a task.
+  "timeline (auto",
+  // pool probe sessions are created as root sessions with no parentID and the
+  // title `pool probe (<model>)` (`src/lib/probe.ts`), so notification for
+  // their idle/error would announce Lacode's own health-check as finished user
+  // work.
+  "pool probe",
 ]
 
 // The four things worth interrupting someone for. Wording is deliberately about

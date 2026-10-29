@@ -507,7 +507,8 @@ test("[US-23] the pool's resolution, routing and two-direction writer rule are u
     "the structural shape check must survive: a slot must be addressable",
   )
   const duplicated = pool.parseSlots({ slots: [{ model: PAID }, { model: PAID }] }, "test")
-  assert.ok(duplicated.problems.some((p) => /distinct models/.test(p)), "the duplicate-model check must survive")
+  assert.equal(duplicated.slots.length, 2, "a repeated model must get its own slot")
+  assert.equal(duplicated.problems.length, 0, "a repeated model is valid: each line is its own budget")
   assert.equal(pool.parseSlots({ slots: [{ model: PAID }] }, "test").problems.length, 0, "a paid model is not a problem")
 
   // 2. Routing is untouched: a priced model still takes its slot, every spawn.

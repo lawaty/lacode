@@ -29,7 +29,6 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { AGENTS, POOLED_BASES } from "../../src/agents.ts"
 import { COMMANDS } from "../../src/commands.ts"
-import { MAX_SLOTS } from "../../src/lib/pool.ts"
 import { verifyWriterRule } from "../../src/lib/writer-rule.ts"
 import { contextAutoUpdateHooks } from "../../src/plugins/context-autoupdate.ts"
 import { ROOT, PRESET, bootLaCode, cleanupAll, emptyConfig, fakeClock, presetModels, scratch, settle, stubInput } from "./_harness.mjs"
@@ -221,12 +220,14 @@ test("[US-19] the injected cartographer carries no model of its own, so the pool
   // bound the base too, the injected agent would be pinning a model of its own
   // — exactly the regression this test exists to catch.
   const models = presetModels()
-  for (let slot = 1; slot <= MAX_SLOTS; slot++) {
+  for (let slot = 1; slot <= SLOT_COUNT; slot++) {
     const variant = cfg.agent[`context-${slot}`]
     assert.ok(variant, `context-${slot} must exist`)
     assert.ok(models.includes(variant.model), `context-${slot} must be bound to a declared slot, got ${variant.model}`)
   }
 })
+
+const SLOT_COUNT = presetModels().length
 
 test("[US-19] every slot the pool can hand out has a hidden cartographer variant", async () => {
   const stub = stubInput()
@@ -238,16 +239,16 @@ test("[US-19] every slot the pool can hand out has a hidden cartographer variant
   // Cartography must borrow shared capacity rather than add a model of its own:
   // if there were no variant for a slot, the automatic run would have nowhere
   // to land and would either fail or escape the pool's accounting.
-  for (let slot = 1; slot <= MAX_SLOTS; slot++) {
+  for (let slot = 1; slot <= SLOT_COUNT; slot++) {
     const variant = cfg.agent[`context-${slot}`]
     assert.ok(variant, `hidden variant context-${slot} must exist for slot ${slot}`)
     assert.equal(variant.hidden, true, `context-${slot} must be hidden`)
   }
-  assert.equal(cfg.agent[`context-${MAX_SLOTS + 1}`], undefined, "no variant may exist beyond the pool's slot cap")
+  assert.equal(cfg.agent[`context-${SLOT_COUNT + 1}`], undefined, "no variant may exist beyond the resolved slot table")
 
   // A hidden variant is the same agent as its base, so routing through a slot
   // cannot escape the base's instructions or its permissions.
-  for (let slot = 1; slot <= MAX_SLOTS; slot++) {
+  for (let slot = 1; slot <= SLOT_COUNT; slot++) {
     assert.deepEqual(
       cfg.agent[`context-${slot}`].permission,
       cfg.agent["context"].permission,

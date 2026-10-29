@@ -61,7 +61,7 @@ test("[US-9] a live claim keeps its slot past the TTL instead of being handed ou
 
   await spawnChild(t, { callID: "c1", childID: "child-live-1" })
   await spawnChild(t, { callID: "c2", childID: "child-live-2" })
-  assert(/load=2\/4/.test(await t.status()), `both claims should be counted, got:\n${await t.status()}`)
+  assert(/load=2\/2/.test(await t.status()), `both claims should be counted, got:\n${await t.status()}`)
 
   // Well past the TTL, but both children keep producing output: they are alive.
   clock.advance(CLAIM_TTL + 2 * MIN)
@@ -69,7 +69,7 @@ test("[US-9] a live claim keeps its slot past the TTL instead of being handed ou
   await keepAlive(t, "child-live-2")
 
   const status = await t.status()
-  assert(/load=2\/4/.test(status), `a working task past the TTL must stay counted, got:\n${status}`)
+  assert(/load=2\/2/.test(status), `a working task past the TTL must stay counted, got:\n${status}`)
 
   await spawn(t.hooks, t.cfg, { subagent: "explore", callID: "c3", sessionID: "parent" })
   const after = await t.status()

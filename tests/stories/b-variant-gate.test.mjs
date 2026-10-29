@@ -97,7 +97,7 @@ test("[US-5] a hand-named slot variant is coerced to its base and routed by the 
     assert.equal(r.ok, true, `${variant} must be coerced, not thrown: ${r.message ?? ""}`)
     assert.match(
       r.agent,
-      new RegExp(`^${base}-[1-${pool.MAX_SLOTS}]$`),
+      new RegExp(`^${base}-[1-${POOL.slots.length}]$`),
       `${variant} must be routed to a real ${base} slot, got ${r.agent}`,
     )
     assert.ok(t.cfg.agent?.[r.agent], `${r.agent} must exist in the config, so it is a real pool slot`)
@@ -112,7 +112,7 @@ test("[US-5] a hand-named slot variant is coerced to its base and routed by the 
     assert.ok(claim, `${variant}: the routed spawn must take a claim`)
     assert.equal(claim.v, base, `${variant}: the claim must be for the base "${base}", not "${claim.v}"`)
     assert.ok(
-      Number.isInteger(claim.k) && claim.k >= 1 && claim.k <= pool.MAX_SLOTS,
+      Number.isInteger(claim.k) && claim.k >= 1 && claim.k <= POOL.slots.length,
       `${variant}: claim slot ${claim.k} is not a valid pool slot`,
     )
   }

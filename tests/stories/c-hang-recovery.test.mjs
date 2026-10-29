@@ -323,7 +323,7 @@ test("[US-9] a reaped claim's capacity is available to the next routing decision
   await spawnChild(hooks, cfg, { callID: "a", childID: "w1" })
   await spawnChild(hooks, cfg, { callID: "b", childID: "w2" })
   const full = await hooks.tool.pool_status.execute({}, {})
-  assert.match(full.output, /load=2\/4/, `control: the slot is filling:\n${full.output}`)
+  assert.match(full.output, /load=2\/2/, `control: the slot is filling:\n${full.output}`)
 
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
   await spawn(hooks, cfg, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
@@ -332,7 +332,7 @@ test("[US-9] a reaped claim's capacity is available to the next routing decision
   await hooks["tool.execute.after"]({ tool: "task", sessionID: "trigger", callID: "trigger" }, {})
 
   const after = await hooks.tool.pool_status.execute({}, {})
-  assert.match(after.output, /load=0\/4/, `both wedged claims must be gone in the same process:\n${after.output}`)
+  assert.match(after.output, /load=0\/2/, `both wedged claims must be gone in the same process:\n${after.output}`)
   assert.match(after.output, /\[idle[;\]]/, `the slot must carry nothing:\n${after.output}`)
   assert.match(after.output, /0 claim\(s\) in flight/, `the slot must be free again:\n${after.output}`)
 

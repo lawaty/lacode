@@ -19,9 +19,10 @@
 // WHAT IS INJECTED, AND WHAT WAS DROPPED from the author's opencode.jsonc
 // ---------------------------------------------------------------------------
 //
-// INJECTED, 17 keys: the 5 bases below plus one hidden `<base>-1..4` variant per
-// pool slot for each of the 3 pooled bases (build, plan, explore, implement,
-// context).
+// INJECTED: the 5 bases below (build, plan, explore, implement, context), one
+// hidden `<base>-<slot>` variant per resolved pool slot for each of the 3 pooled
+// bases, and the hidden `instructions` agent. The variant count follows the
+// resolved pool table; there is no fixed cap.
 //
 // NOT INJECTED, 1 field: `tools`. No `{ "playwright_*": true }` grant is
 // injected on the explore/implement bases, because a plugin cannot inject tool
@@ -77,7 +78,7 @@
 // the general case, not a special one. The hidden `<base>-<slot>` variants are
 // the exception that matters: the pool needs them, and a user who defined one
 // by hand keeps their definition.
-import { MAX_SLOTS } from "./lib/pool.ts"
+import { FALLBACK_SLOTS } from "./lib/pool.ts"
 import { AGENT_INSTRUCTIONS_WRITER } from "./lib/agent-instructions.ts"
 import { CARTOGRAPHER_PROMPT } from "./lib/cartographer-prompt.ts"
 
@@ -676,16 +677,17 @@ Report briefly what you changed and where. Do not edit any other file.`,
 /**
  * The full set: the bases above plus one hidden `<base>-<slot>` variant per slot.
  *
- * The variants are generated rather than written out twelve times, and the slot
- * count follows `MAX_SLOTS` because that is the cap the pool enforces anyway --
- * one source of truth for "how many slots can exist".
+ * The variants are generated rather than written out by hand, and the slot count
+ * follows the RESOLVED pool table: the pool has no fixed cap, so it gets exactly
+ * one variant per slot it will route to. src/index.ts passes the resolved count;
+ * the default is the built-in table's size, for standalone callers and tests.
  */
-export function buildAgentSet(): Record<string, AgentDef> {
+export function buildAgentSet(slotCount: number = FALLBACK_SLOTS.length): Record<string, AgentDef> {
   const set: Record<string, AgentDef> = { ...AGENTS }
   for (const base of POOLED_BASES) {
     const def = AGENTS[base]
     if (!def) continue
-    for (let slot = 1; slot <= MAX_SLOTS; slot++) {
+    for (let slot = 1; slot <= Math.max(1, slotCount); slot++) {
       const variant: AgentDef = {
         ...def,
         description:

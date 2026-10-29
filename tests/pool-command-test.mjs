@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const { COMMANDS, applyCommands } = await import(join(HERE, "..", "src", "commands.ts"))
-const { USER_MODELS_TXT, MAX_SLOTS, MAX_WEIGHT } = await import(join(HERE, "..", "src", "lib", "pool.ts"))
+const { USER_MODELS_TXT, MAX_WEIGHT } = await import(join(HERE, "..", "src", "lib", "pool.ts"))
 
 let failures = 0
 const assert = (cond, msg) => {
@@ -41,11 +41,12 @@ const assert = (cond, msg) => {
   const template = def.template
 
   assert(template.includes(USER_MODELS_TXT), `template must interpolate USER_MODELS_TXT: ${USER_MODELS_TXT}`)
-  assert(template.includes(String(MAX_SLOTS)), `template must interpolate MAX_SLOTS: ${MAX_SLOTS}`)
   assert(template.includes(String(MAX_WEIGHT)), `template must interpolate MAX_WEIGHT: ${MAX_WEIGHT}`)
-
-  assert(!template.includes("${MAX_SLOTS}"), "template must not contain literal ${MAX_SLOTS}")
   assert(!template.includes("${USER_MODELS_TXT}"), "template must not contain literal ${USER_MODELS_TXT}")
+  assert(template.includes("any number of slots"), "template must state there is no slot cap")
+  assert(!/at most \d+ slots/i.test(template), "template must not state a slot cap")
+  assert(template.includes("appear on more than one line"), "template must allow repeated models")
+  assert(template.includes("sum of the weights"), "template must state total capacity = sum of weights")
 
   assert(template.includes("(0, 100]"), "template must name weight range (0, 100]")
   assert(template.includes("<provider>/<model-id>"), "template must name provider/model-id shape")

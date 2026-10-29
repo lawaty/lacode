@@ -4,11 +4,10 @@
 //   US-6  live pool visibility (the pool_status tool)
 //
 // Slots fill in declaration order. A slot's weight is its active-session budget
-// for one pass, and its absolute cap is twice that budget. Pass 1 walks the
-// usable slots and fills each to its weight, in order; once every usable slot
-// reaches its weight, pass 2 walks them again and fills each to the absolute cap.
-// Preference is order, never weight, so a light slot declared before a heavy one
-// is filled first.
+// and the pool's capacity is the sum of the weights. Routing walks the usable
+// slots and fills each to its weight, in order; once every usable slot is at its
+// weight, overflow goes to the least-loaded slot. Preference is order, never
+// weight, so a light slot declared before a heavy one is filled first.
 //
 // A released claim immediately reopens its slot, because live claims are the only
 // state routing consults and there is no stored position. The serial release test
@@ -78,7 +77,6 @@ const weightedSlots = [
 ]
 
 const FIRST_PASS = ["explore-1", "explore-1", "explore-1", "explore-2", "explore-2", "explore-3", "explore-4"]
-const BOTH_PASSES = [...FIRST_PASS, ...FIRST_PASS]
 
 // ---------------------------------------------------------------------------
 // US-5 — ordered fill
@@ -91,10 +89,12 @@ test("[US-5] seven concurrent spawns fill the first pass in declaration order", 
   await hooks.dispose()
 })
 
-test("[US-5] fourteen concurrent spawns fill both passes in declaration order", async () => {
+test("[US-5] past the summed capacity, overflow goes to the least-loaded slot", async () => {
   const { hooks } = await bootPool(weightedSlots, "slot-fill-both-passes")
   const routed = await burst(hooks, 14)
-  assert.deepEqual(routed, BOTH_PASSES, `both passes must repeat the declaration order, got ${routed}`)
+  assert.deepEqual(routed.slice(0, 7), FIRST_PASS, `capacity fills in declaration order, got ${routed}`)
+  const loads = weightedSlots.map((_, j) => routed.filter((v) => v === `explore-${j + 1}`).length)
+  assert.ok(Math.max(...loads) - Math.min(...loads) <= 1, `overflow must equalise the slots, got ${loads.join("/")}`)
   await hooks.dispose()
 })
 
@@ -123,24 +123,24 @@ test("[US-5] a second pool instance still prefers the earlier slot", async () =>
   await second.hooks.dispose()
 })
 
-test("[US-5] releasing a lower slot in pass 2 reopens it before a higher slot", async () => {
+test("[US-5] releasing a lower slot reopens it before a higher slot", async () => {
   const { hooks } = await bootPool(weightedSlots, "slot-fill-release-pass2")
-  const routed = await burst(hooks, 14)
-  assert.deepEqual(routed, BOTH_PASSES, `the pool must reach both pass targets before the release, got ${routed}`)
+  const routed = await burst(hooks, 7)
+  assert.deepEqual(routed, FIRST_PASS, `the pool must fill to its weights before the release, got ${routed}`)
 
   // The first burst claim sits on slot 1. Releasing it leaves slot 1 one claim
-  // below its absolute cap, so the next pick belongs to it ahead of every later slot.
+  // below its weight, so the next pick belongs to it ahead of every later slot.
   await release(hooks, "burst-0")
   assert.equal(await spawnExplore(hooks, "after-release"), "explore-1", "the released lower slot must reopen first")
   await hooks.dispose()
 })
 
-test("[US-5] all slots at the absolute cap overflow to the least-loaded slot", async () => {
+test("[US-5] past capacity, overflow goes to the least-loaded slot", async () => {
   const { hooks } = await bootPool(weightedSlots, "slot-fill-overflow")
-  const routed = await burst(hooks, 14)
-  assert.deepEqual(routed, BOTH_PASSES, `the pool must fill to the absolute caps first, got ${routed}`)
+  const routed = await burst(hooks, 7)
+  assert.deepEqual(routed, FIRST_PASS, `the pool must fill to capacity first, got ${routed}`)
 
-  // Loads are 6, 4, 2, 2. The least-loaded usable slots are 3 and 4, and the
+  // Loads are 3, 2, 1, 1. The least-loaded usable slots are 3 and 4, and the
   // first of those in declaration order takes the overflow spawn.
   assert.equal(await spawnExplore(hooks, "overflow"), "explore-3", "overflow must go to the least-loaded usable slot")
   await hooks.dispose()
@@ -186,7 +186,7 @@ test("[US-5] a cooling slot is skipped and a recovered earlier slot is preferred
 // US-6 — observing the pool leaves it unchanged
 // ---------------------------------------------------------------------------
 
-test("[US-6] pool_status reports the pass and marks the next slot without changing the pool", async () => {
+test("[US-6] pool_status reports the routing state and marks the next slot without changing the pool", async () => {
   const clock = fakeClock()
   const { hooks } = await bootPool(weightedSlots, "slot-fill-status")
 
@@ -197,32 +197,33 @@ test("[US-6] pool_status reports the pass and marks the next slot without changi
     return Number(/slot (\d)/.exec(marked[0])[1])
   }
 
-  // Pass 1: slot 1 is at its weight, so the next spawn belongs to slot 2.
+  // Fill state: slot 1 is at its weight, so the next spawn belongs to slot 2.
   assert.deepEqual((await burst(hooks, 3)), FIRST_PASS.slice(0, 3), "slot 1 must fill first")
-  const pass1 = await status()
-  assert.equal(await status(), pass1, `reading twice must not change the pool:\n${pass1}`)
-  assert.match(pass1, /pass 1/, `the status must name the current pass:\n${pass1}`)
-  assert.equal(markedSlot(pass1), 2, `pass 1 must mark the next under-weight slot:\n${pass1}`)
+  const filling = await status()
+  assert.equal(await status(), filling, `reading twice must not change the pool:\n${filling}`)
+  assert.match(filling, /state 1/, `the status must name the current state:\n${filling}`)
+  assert.equal(markedSlot(filling), 2, `the fill state must mark the next under-weight slot:\n${filling}`)
   assert.equal(await spawnExplore(hooks, "status-1"), "explore-2", "the marked slot must be the next spawn")
 
-  // Pass 2: every slot is at its weight, and slot 4 is the only one below its cap.
-  await burst(hooks, 9, "pass2")
-  const pass2 = await status()
-  assert.equal(await status(), pass2, `reading twice must not change the pool:\n${pass2}`)
-  assert.match(pass2, /pass 2/, `the status must name the current pass:\n${pass2}`)
-  assert.equal(markedSlot(pass2), 4, `pass 2 must mark the next under-cap slot:\n${pass2}`)
-  assert.equal(await spawnExplore(hooks, "status-2"), "explore-4", "the marked slot must be the next spawn")
+  // At capacity: every slot is at its weight, so overflow marks the least-loaded.
+  await burst(hooks, 3, "fill")
+  const full = await status()
+  assert.equal(await status(), full, `reading twice must not change the pool:\n${full}`)
+  assert.match(full, /overflow/, `the status must name the overflow state:\n${full}`)
+  assert.equal(markedSlot(full), 3, `overflow must mark the least-loaded slot:\n${full}`)
+  assert.equal(await spawnExplore(hooks, "status-2"), "explore-3", "the marked slot must be the next spawn")
 
-  // Overflow: every slot is at its cap, so the mark is the least-loaded one.
+  // Past capacity the mark follows the least-loaded slot, not declaration order.
   const overflow = await status()
   assert.equal(await status(), overflow, `reading twice must not change the pool:\n${overflow}`)
   assert.match(overflow, /overflow/, `the status must name the overflow state:\n${overflow}`)
-  assert.equal(markedSlot(overflow), 3, `overflow must mark the least-loaded slot:\n${overflow}`)
-  assert.equal(await spawnExplore(hooks, "status-3"), "explore-3", "the marked slot must be the next spawn")
+  assert.equal(markedSlot(overflow), 4, `overflow must mark the least-loaded slot:\n${overflow}`)
+  assert.equal(await spawnExplore(hooks, "status-3"), "explore-4", "the marked slot must be the next spawn")
 
   clock.restore()
   await hooks.dispose()
 })
+
 
 // ---------------------------------------------------------------------------
 // US-5 — the selection rule without the disk
@@ -235,8 +236,9 @@ const unitSlots = [
   { index: 4, model: "unit/d", weight: 1 },
 ]
 const unitState = { slots: unitSlots, catalog: new Map() }
+const unitSlotOf = Object.fromEntries(unitSlots.map((s) => [s.model, s.index]))
 const unitSnapshot = (counts = {}, cooling = {}) => ({
-  counts: new Map(Object.entries(counts)),
+  counts: new Map(Object.entries(counts).map(([model, n]) => [unitSlotOf[model] ?? model, n])),
   cooling: new Map(Object.entries(cooling)),
   siblings: [],
   own: new Map(),
@@ -245,8 +247,8 @@ const unitSnapshot = (counts = {}, cooling = {}) => ({
 const atWeight = { "unit/a": 3, "unit/b": 2, "unit/c": 1, "unit/d": 1 }
 const atCap = { "unit/a": 6, "unit/b": 4, "unit/c": 2, "unit/d": 2 }
 
-test("[US-5] pickSlot fills in order through both passes, skips cooling, and overflows to the least-loaded slot", () => {
-  // Pass 1: the lowest-index slot still below its weight.
+test("[US-5] pickSlot fills in declaration order, skips cooling, and overflows to the least-loaded slot", () => {
+  // The lowest-index slot still below its weight.
   assert.equal(pool.pickSlot(unitState, unitSnapshot()).index, 1)
   assert.equal(pool.pickSlot(unitState, unitSnapshot({ "unit/a": 3 })).index, 2)
   assert.equal(
@@ -255,47 +257,40 @@ test("[US-5] pickSlot fills in order through both passes, skips cooling, and ove
     "a lower slot under its weight comes before a higher slot that is already there",
   )
 
-  // Pass 2 opens only once every slot reaches its weight, then fills in order.
-  assert.equal(pool.pickSlot(unitState, unitSnapshot(atWeight)).index, 1)
-  assert.equal(pool.pickSlot(unitState, unitSnapshot({ ...atWeight, "unit/a": 6 })).index, 2)
-
-  // A lower slot under the current target always wins over a higher one.
+  // A lower slot under its weight always wins over a higher one.
   assert.equal(
     pool.pickSlot(unitState, unitSnapshot({ "unit/a": 2, "unit/b": 0 })).index,
     1,
-    "pass 1 must prefer the lower slot before the higher one",
+    "the ordered fill must prefer the lower slot before the higher one",
   )
-  assert.equal(
-    pool.pickSlot(unitState, unitSnapshot({ "unit/a": 3, "unit/b": 2, "unit/c": 1, "unit/d": 1 })).index,
-    1,
-    "pass 2 must prefer the lower slot before the higher one",
-  )
+
+  // Every slot at its weight is capacity; the pick is the least-loaded slot.
+  assert.equal(pool.pickSlot(unitState, unitSnapshot(atWeight)).index, 3)
 
   // A cooling slot is not usable, so the next ordered slot takes the pick.
   const cooling = { "unit/a": { model: "unit/a", until: Infinity, strikes: 1, reason: "test", last: 0 } }
   assert.equal(pool.pickSlot(unitState, unitSnapshot({}, cooling)).index, 2)
 
-  // At the absolute cap every usable slot is skipped, and overflow spreads to
-  // the least-loaded usable slot rather than piling onto the first one.
+  // Past capacity the overflow spreads to the least-loaded usable slot rather
+  // than piling onto the first one.
   const overflow = { "unit/a": 6, "unit/b": 4, "unit/c": 3, "unit/d": 2 }
   assert.equal(pool.pickSlot(unitState, unitSnapshot(overflow)).index, 4)
 })
 
-test("[US-5] poolPass reports pass 1, pass 2, then overflow", () => {
+test("[US-5] poolPass reports fill, then overflow", () => {
   assert.equal(pool.poolPass(unitState, unitSnapshot()), 1)
   assert.equal(
     pool.poolPass(unitState, unitSnapshot({ "unit/a": 0, "unit/b": 4, "unit/c": 2, "unit/d": 2 })),
     1,
-    "one usable slot below its weight keeps routing in pass 1",
+    "one usable slot below its weight keeps routing in the fill state",
   )
-  assert.equal(pool.poolPass(unitState, unitSnapshot(atWeight)), 2)
+  assert.equal(pool.poolPass(unitState, unitSnapshot(atWeight)), "overflow")
   assert.equal(pool.poolPass(unitState, unitSnapshot(atCap)), "overflow")
 })
 
-test("[US-5] every pick leaves all earlier usable slots at or above the current pass target", () => {
+test("[US-5] every pick leaves all earlier usable slots at or above their weight", () => {
   // Deterministic pseudo-random count maps: no fuzzer, no wall clock, and the
-  // same cases on every run. Pass 1 targets weight; pass 2 and overflow target
-  // the absolute cap.
+  // same cases on every run. The fill target is the slot's weight.
   let seed = 123_456_789
   const nextRandom = () => {
     seed = (seed * 1_664_525 + 1_013_904_223) % 4_294_967_296
@@ -308,7 +303,7 @@ test("[US-5] every pick leaves all earlier usable slots at or above the current 
     const snap = unitSnapshot(Object.fromEntries(counts))
     const pass = pool.poolPass(unitState, snap)
     const picked = pool.pickSlot(unitState, snap)
-    const target = (slot) => (pass === 1 ? slot.weight : slot.weight * 2)
+    const target = (slot) => slot.weight
 
     for (const lower of unitSlots.filter((slot) => slot.index < picked.index)) {
       const load = counts.get(lower.model) ?? 0

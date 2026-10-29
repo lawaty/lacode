@@ -85,6 +85,7 @@ import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plu
 import { applyAgents, buildAgentSet } from "./agents.ts"
 import { applyCommands } from "./commands.ts"
 import { PACKAGE_ROOT } from "./lib/package-root.ts"
+import { resolveModels } from "./lib/pool.ts"
 import { readInstalledVersion } from "./lib/selfupdate.ts"
 import { agentPoolHooks } from "./plugins/agent-pool.ts"
 import { contextAutoUpdateHooks } from "./plugins/context-autoupdate.ts"
@@ -95,6 +96,7 @@ import { scrubSlotNames } from "./lib/prompt-guard.ts"
 import { notifyHooks } from "./plugins/notify.ts"
 import { omniRouteHooks } from "./plugins/omniroute.ts"
 import { selfUpdateHooks } from "./plugins/selfupdate.ts"
+import { timelineHooks } from "./plugins/timeline.ts"
 
 export type LacodeOptions = {
   enabled?: boolean
@@ -107,6 +109,7 @@ export type LacodeOptions = {
   selfUpdate?: boolean
   feedbackHint?: boolean
   imagePaste?: ImagePasteOptions
+  timeline?: { enabled?: boolean; intervalMs?: number; maxEntries?: number } | false
   [key: string]: unknown
 }
 
@@ -159,7 +162,10 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
     }
   }
 
-  const agentSet = buildAgentSet()
+  // Resolve the slot table once here so the injected agent set carries exactly the
+  // variants the pool will route to. The pool re-binds against the live table and
+  // creates any variant added by a later reload.
+  const agentSet = buildAgentSet(resolveModels({ models: opts.models, modelsFile: opts.modelsFile }).slots.length)
   const pool = (await settled("agent-pool", () => agentPoolHooks(input, options))) ?? inertHooks
   const autoupdate = (await settled("context-autoupdate", () => contextAutoUpdateHooks(input, options))) ?? inertHooks
   const notifier = (await settled("notify", () => notifyHooks(input, options))) ?? inertHooks
@@ -167,6 +173,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   const feedback = (await settled("feedback", () => feedbackHooks(input, options))) ?? inertHooks
   const omniroute = (await settled("omniroute", () => omniRouteHooks(input, options))) ?? inertHooks
   const imagepaste = (await settled("image-paste", () => imagePasteHooks(input, opts.imagePaste as PluginOptions | undefined))) ?? inertHooks
+  const timeline = (await settled("timeline", () => timelineHooks(input, options))) ?? inertHooks
 
   // Order is the whole design: the pool must see variant agents that already
   // exist, and the agent set must exist before the pool writes models into it.
@@ -198,6 +205,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       pool.event?.(payload).catch(() => {}),
       autoupdate.event?.(payload).catch(() => {}),
       notifier.event?.(payload).catch(() => {}),
+      timeline.event?.(payload).catch(() => {}),
     ])
   }
 
@@ -208,7 +216,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
     // only thing that routes task calls, so there is nothing to merge them with.
     "tool.execute.before": pool["tool.execute.before"],
     "tool.execute.after": pool["tool.execute.after"],
-    tool: pool.tool,
+    tool: { ...(pool.tool ?? {}), ...(timeline.tool ?? {}) },
     "command.execute.before": imagepaste["command.execute.before"],
     dispose: async () => {
       await pool.dispose?.()
@@ -218,6 +226,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       await feedback.dispose?.()
       await omniroute.dispose?.()
       await imagepaste.dispose?.()
+      await timeline.dispose?.()
     },
     "experimental.chat.system.transform": async (_input, output) => {
       if (!Array.isArray(output?.system)) return

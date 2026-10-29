@@ -478,6 +478,64 @@ const dirB = scratch()
   assert(pool.limitReason("context limit reached") === undefined, `got ${pool.limitReason("context limit reached")}`)
 }
 
+// 19. auth failures observed via event hooks bench the model with AUTH_FAILURE_REASON
+//     and the long AUTH_FAILURE_COOLDOWN_MS window (real runtime path).
+{
+  const dir = scratch()
+  const p = await mk("p19", dir)
+  const baseline = await p.spawn("p19a")
+  const slot = SLOTS[Number(/-(\d+)$/.exec(baseline)[1]) - 1]
+  // Bind a child session so the event hooks can resolve the claimed model if needed.
+  await p.hooks.event({ event: { type: "session.created", properties: { info: { id: "child-p19", parentID: "s1" } } } })
+  await p.hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          role: "assistant",
+          providerID: slot.provider,
+          modelID: slot.modelID,
+          sessionID: "child-p19",
+          error: { name: "ProviderError", data: { statusCode: 401, message: "Invalid API Token" } },
+        },
+      },
+    },
+  })
+  const state = pool.state({ id: "p19", dir, modelsFile: PRESET })
+  const limits = pool.readLimits(state)
+  const entry = limits.get(slot.model)
+  assert(entry !== undefined, "auth failure must create a limit entry")
+  assert(entry.reason === pool.AUTH_FAILURE_REASON, `auth failure must use AUTH_FAILURE_REASON, got ${entry.reason}`)
+  assert(
+    entry.until > Date.now() + 5 * 60 * 60 * 1000,
+    `auth failure must bench for the long window (~6h), got until=${entry.until}, now=${Date.now()}`,
+  )
+  // Also assert via session.error for a second model
+  const dir2 = scratch()
+  const p2 = await mk("p19b", dir2)
+  const baseline2 = await p2.spawn("p19b1")
+  const slot2 = SLOTS[Number(/-(\d+)$/.exec(baseline2)[1]) - 1]
+  await p2.hooks.event({ event: { type: "session.created", properties: { info: { id: "child-p19b", parentID: "s1" } } } })
+  await p2.hooks.event({
+    event: {
+      type: "session.error",
+      properties: {
+        sessionID: "child-p19b",
+        error: { data: { statusCode: 403, message: "Forbidden" } },
+      },
+    },
+  })
+  const state2 = pool.state({ id: "p19b", dir: dir2, modelsFile: PRESET })
+  const limits2 = pool.readLimits(state2)
+  const entry2 = limits2.get(slot2.model)
+  assert(entry2 !== undefined, "auth failure via session.error must create a limit entry")
+  assert(entry2.reason === pool.AUTH_FAILURE_REASON, `auth failure via session.error must use AUTH_FAILURE_REASON, got ${entry2.reason}`)
+  assert(
+    entry2.until > Date.now() + 5 * 60 * 60 * 1000,
+    `auth failure via session.error must bench for the long window (~6h), got until=${entry2.until}, now=${Date.now()}`,
+  )
+}
+
 globalThis.fetch = realFetch
 for (const dir of made) rmSync(dir, { recursive: true, force: true })
 if (failures === 0) console.log("\nALL LIMIT CHECKS PASSED")

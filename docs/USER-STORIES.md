@@ -15,7 +15,7 @@ line. Criteria that cannot be observed without a running server are not in this
 document; everything here is testable offline with a stub client and a
 `mkdtempSync` state directory.
 
-**Terminology.** A *slot* is one entry in `presets/free-tier.json`, carrying a model and a `weight`. A slot's `weight` is its active-session budget for one pass: the number of concurrent claims it may hold before the next slot is preferred. A *pass* is one declaration-order sweep of the slot list; the pool runs at most two passes, and a slot's absolute cap is twice its weight. Preference is by declaration order, never by weight. A *base* is a pooled agent type (`explore`), and its slot holders are `<base>-<slot>`, hidden in `opencode.jsonc`. A *claim* is a running spawn recorded in `claims.<pid>.json`. A *context map* is the five-file `.opencode/context/` codemap described in Epic G.
+**Terminology.** A *slot* is one entry in `presets/free-tier.json`, carrying a model and a `weight`. A slot's `weight` is its active-session budget for one pass: the number of concurrent claims it may hold before the next slot is preferred. A *pass* is one declaration-order sweep of the slot list; the pool runs one pass, and a slot's cap is its weight. There is no slot cap, and a model may appear on more than one line — each line is its own slot with its own weight. Preference is by declaration order, never by weight. A *base* is a pooled agent type (`explore`), and its slot holders are `<base>-<slot>`, hidden in `opencode.jsonc`. A *claim* is a running spawn recorded in `claims.<pid>.json`. A *context map* is the five-file `.opencode/context/` codemap described in Epic G.
 
 ---
 
@@ -92,18 +92,18 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given every model is cooling, When a spawn is routed, Then the least-loaded slot is chosen anyway (degrade, never block).
 - [ ] Given a limit error names a reset time, When the cooldown is recorded, Then the stated reset is used instead of a guessed backoff.
 
-### US-5: Slots fill in declaration order, in up to two passes
+### US-5: Slots fill in declaration order in one pass, with repeats
 **As a** user, **I want** work to prefer the first slot and spill to later slots only when the earlier ones are full, **so that** a healthy preferred model is used before fallbacks and no slot is used while an earlier usable slot has room.
 
 **Story ID(s) for tests:** US-5
 **Acceptance criteria:**
-- [ ] Given live claims, When the pool has room in the first pass, Then the lowest-index usable slot whose load is below its weight is chosen, and a slot declared later is not used until every earlier usable slot has reached its weight.
-- [ ] Given every usable slot has reached its weight, When another spawn is routed, Then the second pass begins at the lowest-index slot and fills each usable slot up to twice its weight.
-- [ ] Given a slot is cooling or unavailable, When its position in the pass comes up, Then it is skipped and the pass continues to the next slot.
+- [ ] Given live claims, When the pool has room, Then the lowest-index usable slot whose load is below its weight is chosen, and a slot declared later is not used until every earlier usable slot has reached its weight.
+- [ ] Given a model appears on more than one line, When the pool loads, Then each line is its own slot with its own weight, and the later line adds seats at its own position.
+- [ ] Given a slot is cooling or unavailable, When its position comes up, Then it is skipped and the pass continues to the next slot.
 - [ ] Given a claim is released, When the next spawn is routed, Then the slot that freed capacity is preferred again in declaration order; no stored position keeps it waiting.
-- [ ] Given every usable slot is at its absolute cap, When another spawn is routed, Then it goes to the least-loaded usable slot as overflow, and the pool never refuses work.
-- [ ] Given all slots carry equal weight, When spawns are routed, Then the same ordered two-pass fill applies.
-- [ ] Given per-slot load is read, When it is asserted, Then a slot's load never exceeds twice its weight except through overflow.
+- [ ] Given every usable slot is at its weight, When another spawn is routed, Then it goes to the least-loaded usable slot as overflow, and the pool never refuses work.
+- [ ] Given all slots carry equal weight, When spawns are routed, Then the same ordered one-pass fill applies.
+- [ ] Given per-slot load is read, When it is asserted, Then a slot's load never exceeds its weight except through overflow.
 
 ### US-6: Live pool visibility
 **As a** user, **I want** to see per-slot load and which model is cooling and why, **so that** I understand where my subagents are going.
@@ -113,8 +113,8 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given claims are held by several processes, When the status view is requested, Then it shows every process's claims and the aggregate load per slot.
 - [ ] Given a model is cooling with a stated reason, When the status view is requested, Then the model is listed as cooling together with that reason.
 - [ ] Given a claim file is older than the dead-file threshold, When the status view is computed, Then the stale claim is pruned rather than counted.
-- [ ] Given a slot is at its absolute cap, When the status view is requested, Then it is not marked as the slot the next spawn would take while any usable slot is below its current pass target; when every usable slot is at its absolute cap, the least-loaded slot is marked next.
-- [ ] Given the pool is filling, When the status view is requested, Then it shows whether the next spawn belongs to the first pass, the second pass, or overflow.
+- [ ] Given a slot is at its weight, When the status view is requested, Then it is not marked as the slot the next spawn would take while any usable slot is below its weight; when every usable slot is at its weight, the least-loaded slot is marked next.
+- [ ] Given the pool is filling, When the status view is requested, Then it shows whether the next spawn is a normal pick or overflow.
 
 ### US-7: Non-free models still work
 **As a** user who wants a paid model in the pool, **I want** to supply any model list, **so that** the pool is not restricted to free tiers.
@@ -123,7 +123,7 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 **Acceptance criteria:**
 - [ ] Given a slot names a paid model, When the pool loads, Then the slot is accepted and routed to without a free-tier filter rejecting it.
 - [ ] Given a model id contains a vendor prefix with slashes (e.g. `openrouter/nvidia/model:free`), When it is split into provider and model id, Then the split is on the first slash only and the id tail is preserved.
-- [ ] Given more slots are declared than the pool allows, When the pool loads, Then the surplus entries are dropped with a warning naming the cap.
+- [ ] Given a pool file declares more slots than the built-in warning threshold, When the pool loads, Then every entry is kept and a warning names the count; there is no slot cap.
 - [ ] Given a provider configured with **no** `whitelist` key, When the config hook binds a slot on that provider, Then no `whitelist` is written for it, because an absent whitelist already allows every model the provider offers.
 - [ ] Given a provider the pool never names a slot on, When the config hook runs, Then that provider entry is left exactly as it was, with no `whitelist` key added.
 - [ ] Given a provider that already carries a `whitelist`, When the config hook binds a slot model on it, Then the model id is appended and every entry the user wrote is preserved in order.

@@ -45,13 +45,17 @@ export const ENTRY_POINTS = [
   { subpath: "./pool", in: "src/lib/pool.ts", out: "dist/pool.js" },
   { subpath: "./agents", in: "src/agents.ts", out: "dist/agents.js" },
   { subpath: "./commands", in: "src/commands.ts", out: "dist/commands.js" },
+  { subpath: "./tui", in: "src/tui/index.ts", out: "dist/tui.js" },
   { subpath: "./tunnel", in: "src/tunnel/index.ts", out: "dist/tunnel.js" },
   { subpath: "bin", in: "bin/lacode", out: "dist/lacode.js", executable: true },
+  { subpath: "bin/lacode-voice", in: "bin/lacode-voice", out: "dist/lacode-voice.js", executable: true },
 ]
 
 /** Never inlined: the peer SDK the host provides, and everything node ships. */
 export const EXTERNAL = [
   "@opencode-ai/plugin",
+  "@picovoice/porcupine-node",
+  "vosk",
   ...builtinModules,
   ...builtinModules.map((name) => `node:${name}`),
 ]

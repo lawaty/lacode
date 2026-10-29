@@ -23,12 +23,22 @@ allowlist anywhere in the package, and no cost check of any kind: only the
 structure is validated. The bundled preset is built from free models because
 that is a sensible default, not because the pool requires it.
 
+A slot's `weight` (default 1) is both its concurrency budget and its cap. The
+pool fills slots in declaration order in one pass; there is no slot cap, and a
+model may appear on more than one line — each line is its own slot with its own
+weight. A `tier` key is the deprecated spelling of `weight`.
+
+A slot may also declare a shared quota bucket with `b:<name>` on the line (or a
+`bucket` field in JSON). A limit on any member benches the whole bucket, because
+the sibling would spend the same exhausted window; without one, the model is its
+own bucket. `pool_status` shows each shared bucket's effective capacity.
+
 
 ## Which models run which agent
 
 Only the **pool** writes a model onto a pooled agent, from whichever source wins
 above. The pooled bases (`explore`, `implement`, `context`)
-and their hidden `-1`..`-4` variants therefore carry no model of their own: a
+and their hidden `<base>-<slot>` variants therefore carry no model of their own: a
 model written next to an agent would be a second source of truth that silently
 wins whenever routing falls through. Spawn a base and let the pool route it.
 
@@ -39,7 +49,7 @@ wins whenever routing falls through. Spawn a base and let the pool route it.
 work around by configuring it.** If you keep a global `"tools"` block in your
 config — for example `"tools": { "playwright_*": false }` — then the pooled
 exploration and implementation bases (`explore` and `implement`, plus their
-hidden `-1`..`-4` pool variants) lose browser access, and **nothing tells them why**: the tool call is simply
+hidden `<base>-<slot>` pool variants, one per resolved slot) lose browser access, and **nothing tells them why**: the tool call is simply
 refused mid-task. `context` gets no grant either, which is correct — it
 writes the context map and has no business in a browser.
 
@@ -89,11 +99,11 @@ mention/direct-session case cannot be detected before it runs.
 
 ## What gets injected
 
-**18 agent keys**: the 5 bases `build`, `plan`, `explore`, `implement`,
-`context`, plus one hidden
-`<base>-1`..`-4` pool variant for each of the 3 pooled bases, plus the hidden
-`instructions` agent — the one writer of the project's root `AGENTS.md`,
-reachable only from the `/agent-instructions` command.
+**One key per base, plus a variant per slot**: the 5 bases `build`, `plan`,
+`explore`, `implement`, `context`, one hidden `<base>-<slot>` pool variant per
+resolved slot for each of the 3 pooled bases, and the hidden `instructions`
+agent — the one writer of the project's root `AGENTS.md`, reachable only from
+the `/agent-instructions` command.
 
 `build` and `plan` exist in opencode as built-ins, so on a stock config those
 two keys are already taken and merge-without-clobber keeps the built-in — the

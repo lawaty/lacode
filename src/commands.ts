@@ -19,7 +19,7 @@
 // names nobody has taken.
 
 import { AGENT_INSTRUCTIONS_COMMAND, AGENT_INSTRUCTIONS_WRITER } from "./lib/agent-instructions.ts"
-import { USER_MODELS_TXT, MAX_SLOTS, MAX_WEIGHT } from "./lib/pool.ts"
+import { USER_MODELS_TXT, MAX_WEIGHT } from "./lib/pool.ts"
 
 export type CommandDef = {
   template: string
@@ -143,7 +143,7 @@ Follow the rules for the file in your system prompt, then report what you change
 Print one PASS/FAIL line per check below, with the exact fix for any FAIL.
 
 1. Pool status — call the \`pool_status\` tool. Report the slot list, each
-   slot's load against its ceiling (twice the slot's weight), and which models
+   slot's load against its budget (its weight), and which models
    are cooling.
 
 2. OmniRoute configured — inspect the \`@lawaty/lacode\` plugin options in the
@@ -182,10 +182,10 @@ The pool is ONE global slot table shared by every pooled base (explore, implemen
 
 2. Resolve the instruction above into a target slot table. These are the rules the loader enforces — never write a file that breaks one:
    - one slot per line: \`<provider>/<model-id>  [weight]\`
-   - at most ${MAX_SLOTS} slots, and a model may appear only once
-   - weight is optional (default 1) and must be a number in (0, ${MAX_WEIGHT}]. It is the slot's active-session budget for one pass — how many turns it takes per cycle — and its concurrency ceiling is twice that. NOT a priority; pick order follows line order.
+   - any number of slots; a model may appear on more than one line, and each line is its own slot with its own budget
+   - weight is optional (default 1) and must be a number in (0, ${MAX_WEIGHT}]. It is the slot's active-session budget — how many concurrent sessions it may hold. The pool's total capacity is the sum of the weights. NOT a priority; pick order follows line order.
    - \`#\` starts a comment (whole-line or trailing); blank lines are ignored.
-   If the instruction names a model ambiguously, or would need more than ${MAX_SLOTS} slots, stop and ask rather than guessing.
+   If the instruction names a model ambiguously, stop and ask rather than guessing.
 
 3. Write the WHOLE file, not a patch. This file is an override, not an edit target: any slot you drop disappears, and slot numbers are line positions, so a partial write silently renumbers slots. Keep the existing comment header. If the write fails on a missing directory, create \`~/.config/lacode\` first and retry.
 
@@ -211,6 +211,12 @@ $ARGUMENTS
 - Otherwise call \`pool_recheck\` with no arguments; it probes every model that is currently cooling.
 
 Report the tool's output as it came back, then add one short line naming what changed: re-admitted, still limited, or benched because the provider does not serve the model. If a model was benched as \`model-missing\`, say so and name the replacement in \`~/.config/lacode/pool.txt\` — but change nothing yourself.`,
+  },
+
+  "reprocess-timeline": {
+    description: "Rebuild this session's timeline from its full transcript",
+    agent: "implement",
+    template: "Call the `timeline_reprocess` tool exactly once with no arguments. Then reply with only its output.",
   },
 
   "image-in-cb": {

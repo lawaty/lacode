@@ -1,5 +1,8 @@
 import {
+  AUTH_FAILURE_COOLDOWN_MS,
+  AUTH_FAILURE_REASON,
   clearCooldowns,
+  isAuthFailureText,
   isLimitText,
   isModelMissingText,
   limitReason,
@@ -78,6 +81,8 @@ const PROBE_PROMPT = "ok"
  */
 export const PROBE_TIMEOUT_MS = 45_000
 
+export const REASON_UNRESPONSIVE = "no answer"
+
 /** What one probe settled. */
 export type ProbeOutcome = {
   model: string
@@ -89,6 +94,8 @@ export type ProbeOutcome = {
   hadSeconds: number
   /** What is left after the probe. Zero means it answered and was re-admitted. */
   leftSeconds: number
+  kind: "answered" | "benched" | "cooling"
+  strikes?: number
 }
 
 export type ProbeReport = {
@@ -148,6 +155,7 @@ const failureText = (error: unknown): string => {
 const shortReason = (text: string): string => {
   if (!text) return "failed"
   if (isModelMissingText(text)) return MODEL_MISSING_REASON
+  if (isAuthFailureText(text)) return AUTH_FAILURE_REASON
   return limitReason(text) ?? (isLimitText(text) ? "limit" : "failed")
 }
 
@@ -155,19 +163,21 @@ const shortReason = (text: string): string => {
 const probeOne = async (client: ProbeClient, opts: ProbeOptions, model: string, leftSeconds: number): Promise<ProbeOutcome> => {
   const { state: s, directory } = opts
   const { provider, id: modelID } = splitModel(model)
-  const settle = (ok: boolean, reason: string, left: number): ProbeOutcome => ({
+  const settle = (ok: boolean, reason: string, left: number, kind: "answered" | "benched" | "cooling", strikes?: number): ProbeOutcome => ({
     model,
     ok,
     reason,
     hadSeconds: leftSeconds,
     leftSeconds: left,
+    kind,
+    strikes,
   })
 
   const created = await client.session
     .create({ body: { title: `pool probe (${model})` }, query: { directory } })
     .then((r) => r?.data?.id)
     .catch(() => undefined)
-  if (!created) return settle(false, "no probe session", leftSeconds)
+  if (!created) return settle(false, "no probe session", leftSeconds, "cooling")
 
   // Registered before the prompt, not after: the failure this is watching for
   // arrives as an event, and an event for a session that is not yet marked would be
@@ -222,28 +232,51 @@ const probeOne = async (client: ProbeClient, opts: ProbeOptions, model: string, 
     if (!timedOut && failure === undefined && result?.data?.info !== undefined) {
       // It answered. This is the fact the whole module exists to obtain.
       clearCooldowns(s, [model])
-      return settle(true, "answered", 0)
+      return settle(true, "answered", 0, "answered")
     }
 
     const text = failureText(failure)
+    let kind: "benched" | "cooling" = "cooling"
+    let strikes: number | undefined
     if (isModelMissingText(text)) {
       // The provider does not serve this model id. Unlike a quota this does not
       // lift on its own, so bench it for the quota cap instead of leaving a dead
       // slot in the pool; a later probe re-admits it if it comes back.
-      recordStrike(s, model, MODEL_MISSING_REASON, MODEL_MISSING_COOLDOWN_MS)
+      const recorded = recordStrike(s, model, MODEL_MISSING_REASON, MODEL_MISSING_COOLDOWN_MS)
+      strikes = recorded?.strikes
+      kind = "benched"
+    } else if (isAuthFailureText(text)) {
+      // A bad credential does not lift on its own; bench it for the cap like a
+      // withdrawn model id, and let a later probe re-admit it once the key is fixed.
+      const recorded = recordStrike(s, model, AUTH_FAILURE_REASON, AUTH_FAILURE_COOLDOWN_MS)
+      strikes = recorded?.strikes
+      kind = "benched"
+    } else if (timedOut || text === "") {
+      // No answer at all: there is no stated window to read and nothing that
+      // expires on its own, so bench it with the generic backoff (60s, doubling,
+      // 15min cap). Without this write an unresponsive model is never in the
+      // cooling map, and the router re-selects it on every spawn forever.
+      const recorded = recordStrike(s, model, REASON_UNRESPONSIVE, 0)
+      strikes = recorded?.strikes
+      kind = "benched"
     } else {
       // A window the provider STATED is the provider correcting a guess, so it is
       // worth recording. Anything else leaves the existing window exactly as it was:
       // a probe must never lengthen a cooldown, or the model it is checking could
       // never pass the check.
       const stated = statedCooldown(text)
-      if (stated !== undefined) recordStrike(s, model, shortReason(text), stated)
+      if (stated !== undefined) {
+        const recorded = recordStrike(s, model, shortReason(text), stated)
+        strikes = recorded?.strikes
+      }
     }
     const still = readLimits(s).get(model)
     return settle(
       false,
       timedOut ? `no answer in ${Math.round(timeoutMs / 1000)}s` : shortReason(text),
       still && still.until > clock() ? Math.ceil((still.until - clock()) / 1000) : 0,
+      kind,
+      strikes,
     )
   } finally {
     if (timer) clearTimeout(timer)

@@ -7,19 +7,18 @@ import { PACKAGE_ROOT } from "./package-root.ts"
 //
 // One set of slots is shared by ALL pooled agent types (explore,
 // implement, context). A slot is a model, not an agent: load is
-// counted per MODEL across every agent type, so total pressure on each model is
+// counted per SLOT across every agent type, so total pressure on each slot is
 // balanced no matter which kind of work is running. Slot N of any base is the
-// same model, so `explore-2` and `context-2` are the same model and
-// share one load counter.
+// same slot, so `explore-2` and `context-2` share one load counter. Two slots may
+// name the same model; each keeps its own counter, so listing a model twice gives
+// it two independent budgets.
 //
 // Every slot carries a `weight` (the preset), and that is the only knob. A slot's
-// weight is its active-session budget for one pass, and its absolute cap is twice
-// that budget (slotCeiling: SLOT_CEILING_FACTOR x weight). Routing fills in
-// declaration order: pass 1 walks the usable slots and fills each to its weight,
-// then pass 2 walks them again and fills each to its absolute cap. When every
-// usable slot is at its cap, the overflow goes to the least-loaded usable slot --
-// the pool never blocks, and a burst past the summed caps degrades to even spreading
-// rather than piling on slot 1.
+// weight is its active-session budget: routing walks the usable slots in
+// declaration order and fills each to its weight. There is no second pass and no
+// 2x ceiling. When every usable slot is at its weight the pool is at capacity
+// (the sum of the weights); a burst past that degrades to even spreading over the
+// least-loaded usable slot rather than blocking the caller.
 //
 // This module holds the state and the decision; src/plugins/agent-pool.ts owns
 // the hooks (task routing, limit detection, hang reaping) and
@@ -37,7 +36,7 @@ import { PACKAGE_ROOT } from "./package-root.ts"
 // string is accepted, paid or not. The bundled preset happens to be built from
 // free models because that is a good default, not because the pool requires it.
 // Validation below is STRUCTURAL ONLY -- shape of the models object, weights in
-// range, slots distinct and under the cap.
+// range, repeats allowed, no slot cap.
 
 export const CLAIM_TTL_MS = 10 * 60 * 1000
 export const DEAD_FILE_MS = 2 * CLAIM_TTL_MS
@@ -62,27 +61,23 @@ export const UNAVAILABLE_COOLDOWN_MS = 60 * 1000
  * long as the first one.
  */
 export const UNAVAILABLE_REASON = "endpoint-unavailable"
-// A weight is a slot's active-session budget for one pass, and its absolute cap is
-// a small multiple of that (SLOT_CEILING_FACTOR), so this bounds both the cap and
-// the total pool capacity (4 slots at MAX_WEIGHT, each capped at SLOT_CEILING_FACTOR
-// times that). Past it the number stops describing concurrency and becomes a way to
+// A weight is a slot's active-session budget. With no second pass the pool's
+// whole capacity is the sum of the slot weights, so this only bounds one line's
+// share. Past it the number stops describing concurrency and becomes a way to
 // silence load balancing entirely, which is a config error rather than a value to
 // honour.
 export const MAX_WEIGHT = 100
-// The number of passes routing makes through the slot list, and therefore the
-// multiple of weight that forms each slot's absolute cap. Pass 1 fills every usable
-// slot to its weight; pass 2 fills it to SLOT_CEILING_FACTOR x weight. A burst that
-// outruns pass 2 lands on the least-loaded usable slot instead of falling through.
-export const SLOT_CEILING_FACTOR = 2
-/** How many active sessions a slot may hold at once: SLOT_CEILING_FACTOR times its per-pass budget. */
-export const slotCeiling = (slot: Slot) => slot.weight * SLOT_CEILING_FACTOR
-// opencode.jsonc -- and, for an installed package, the agent set injected by
-// src/index.ts -- declares exactly one hidden variant per base per slot, and a
-// pool larger than that would route to agents that do not exist, so the slot
-// count is capped rather than trusted: slot 5 and beyond are dropped with a
-// warning. Four is also all the pool needs -- with two providers at two slots
-// each, a provider-wide limit already takes out half of it.
-export const MAX_SLOTS = 4
+/** How many active sessions a slot may hold at once: its weight. To give a
+ * model more capacity, list it again on another line with its own weight. */
+export const slotCeiling = (slot: Slot) => slot.weight
+
+/** The quota group a slot belongs to. Default: the model is its own bucket. */
+export const slotBucket = (slot: Slot) => slot.bucket ?? slot.model
+// The pool has no fixed slot count: src/agents.ts generates exactly one hidden
+// variant per base per resolved slot, and the watcher creates a variant when the
+// table grows. This is a loud sanity threshold, not a cap -- a malformed file
+// that expands to hundreds of slots is reported but still honoured.
+export const SLOTS_WARN_AT = 64
 const COOLDOWN_BASE_MS = 60 * 1000
 const COOLDOWN_MAX_MS = 15 * 60 * 1000
 // A provider quota/limit is not a transient blip: it reopens on the provider's
@@ -132,6 +127,8 @@ export const isQuotaReason = (reason: string) => /quota|limit|rate|too-many|over
  */
 export const MODEL_MISSING_REASON = "model-missing"
 export const MODEL_MISSING_COOLDOWN_MS = QUOTA_COOLDOWN_MAX_MS
+export const AUTH_FAILURE_REASON = "auth-failed"
+export const AUTH_FAILURE_COOLDOWN_MS = QUOTA_COOLDOWN_MAX_MS
 // The wording opencode uses when a provider does not know a model id:
 // "Model not found: provider/model. Did you mean: ...". Deliberately textual --
 // a bare 404 can be a gateway route, and benching a healthy model for it would
@@ -139,7 +136,12 @@ export const MODEL_MISSING_COOLDOWN_MS = QUOTA_COOLDOWN_MAX_MS
 const MODEL_MISSING_PATTERN = /model\s+(?:not\s+found|does\s+not\s+exist|is\s+not\s+available)|(?:unknown|no\s+such)\s+model/i
 export const isModelMissingText = (text: string) => MODEL_MISSING_PATTERN.test(text)
 
-export type Slot = { index: number; model: string; weight: number }
+const AUTH_FAILURE_PATTERN =
+  /\b401\b|\b403\b|unauthori[sz]ed|not\s+authori[sz]ed|invalid[\s_-]+(?:api[\s_-]?(?:key|token)|token|credential|bearer)|api[\s_-]?key\s+(?:is\s+)?(?:invalid|missing|expired|not\s+valid)|authentication\s+(?:failed|error|required)|incorrect[\s_-]+api[\s_-]?key/i
+
+export const isAuthFailureText = (text: string) => AUTH_FAILURE_PATTERN.test(text)
+
+export type Slot = { index: number; model: string; weight: number; bucket?: string }
 
 export type Claim = {
   v: string
@@ -162,7 +164,7 @@ export type Claim = {
 export type Strike = { model: string; until: number; strikes: number; reason: string; last: number }
 export type Sibling = { id: string; claims: Claim[] }
 export type Snapshot = {
-  counts: Map<string, number>
+  counts: Map<number, number>
   cooling: Map<string, Strike>
   siblings: Sibling[]
   own: Map<string, Claim>
@@ -222,10 +224,9 @@ export type ModelsSource = { slots: Slot[]; problems: string[]; origin: string }
 // validated on its own: one bad slot is dropped with a warning, the rest still
 // route, unless nothing survives and the built-in defaults take over.
 //
-// Weight is the slot's per-pass active-session budget, and its absolute cap is twice
-// that, so a bad one warns and falls back to 1 rather than dropping the slot -- losing
-// a model because of a typo in a count would cost real capacity. A slot with no weight
-// at all is weight 1, i.e. a budget of one session in each of the two passes.
+// Weight is the slot's active-session budget, so a bad one warns and falls back to 1
+// rather than dropping the slot -- losing a model because of a typo in a count would
+// cost real capacity. A slot with no weight at all is weight 1.
 export function parseSlots(parsed: unknown, origin: string): SlotFile {
   const problems: string[] = []
   const entries = (parsed as { slots?: unknown })?.slots
@@ -236,17 +237,21 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
   entries.forEach((entry, i) => {
     const model = typeof (entry as { model?: unknown })?.model === "string" ? ((entry as { model: string }).model).trim() : ""
     const at = `slot ${i + 1}`
-    if (slots.length >= MAX_SLOTS) {
-      problems.push(`${at} (${model || "?"}): the pool is capped at ${MAX_SLOTS} slots (one variant agent per base per slot is declared); entry ignored`)
-      return
-    }
     // The only per-model rule there is: a slot must be addressable. Whether it
-    // costs money is never inspected (US-7).
+    // costs money is never inspected (US-7), and a model may appear on more than
+    // one line: each line is its own slot with its own weight.
     if (!model.includes("/")) return problems.push(`${at}: model must be written provider/model-id, got "${model}"`)
     const weight = readWeight(entry, at, model, problems)
-    if (slots.some((s) => s.model === model)) return problems.push(`${at}: ${model} is already used by another slot; slots must be distinct models`)
-    slots.push({ index: slots.length + 1, model, weight })
+    const rawBucket = (entry as { bucket?: unknown })?.bucket
+    const bucket = typeof rawBucket === "string" ? rawBucket.trim() : undefined
+    if (rawBucket !== undefined && !bucket) {
+      problems.push(`${at} (${model}): bucket must be a non-empty name; using the model id`)
+    }
+    slots.push({ index: slots.length + 1, model, weight, ...(bucket ? { bucket } : {}) })
   })
+  if (slots.length > SLOTS_WARN_AT) {
+    problems.push(`${origin}: ${slots.length} slots is unusually large, but every entry is kept (the pool has no slot cap)`)
+  }
   if (slots.length === 0) {
     problems.push(`${origin} yielded no usable slot; using built-in defaults`)
     return { slots: FALLBACK_SLOTS, problems }
@@ -255,19 +260,31 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
 }
 
 /**
- * Parse the flat, hand-edited pool file: one `<provider>/<model-id> [weight]` per
- * line. `#` starts a comment (whole-line or trailing); blank lines are ignored; a
- * missing weight is 1. Entries go through the SAME `parseSlots` validation as every
- * other source, so the rules (<= MAX_SLOTS, distinct, first-slash split, weight in
- * range) are identical everywhere.
+ * Parse the flat, hand-edited pool file: one
+ * `<provider>/<model-id> [weight] [b:<bucket>]` per line. `#` starts a comment
+ * (whole-line or trailing); blank lines are ignored; a missing weight is 1. A
+ * `b:<bucket>` token declares a shared quota group: a limit on any line in the
+ * bucket benches every line in it. Without one, the model id is its own bucket.
+ * Entries go through the SAME `parseSlots` validation as every other source, so
+ * the rules (first-slash split, weight in range, repeats allowed, no slot cap)
+ * are identical everywhere.
  */
 export function parseTextSlots(text: string, origin: string): SlotFile {
-  const entries: Array<{ model: string; weight?: string }> = []
+  const entries: Array<{ model: string; weight?: string; bucket?: string }> = []
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.split("#")[0].trim()
     if (!line) continue
-    const [model, weight] = line.split(/\s+/)
-    entries.push(weight === undefined ? { model } : { model, weight })
+    const [model, ...rest] = line.split(/\s+/)
+    let weight: string | undefined
+    let bucket: string | undefined
+    for (const token of rest) {
+      if (token.startsWith("b:")) {
+        if (bucket === undefined) bucket = token.slice(2)
+      } else if (weight === undefined) {
+        weight = token
+      }
+    }
+    entries.push({ model, ...(weight === undefined ? {} : { weight }), ...(bucket === undefined ? {} : { bucket }) })
   }
   return parseSlots({ slots: entries }, origin)
 }
@@ -396,9 +413,8 @@ export function ensureUserConfigDir(): boolean {
   }
 }
 
-// `weight` is the slot's active-session budget for one pass, with a ceiling of
-// twice that; absent means 1. `tier` is the pre-weight spelling, accepted as a
-// deprecated alias
+// `weight` is the slot's active-session budget; absent means 1. `tier` is the
+// pre-weight spelling, accepted as a deprecated alias
 // (primary -> 2, overflow -> 1) so a host that has not been re-deployed keeps two
 // slots' worth of headroom instead of silently collapsing to a budget of one each.
 function readWeight(entry: unknown, at: string, model: string, problems: string[]): number {
@@ -517,9 +533,17 @@ export const retryAfterMs = (headers?: Record<string, string>): number | undefin
   for (const [key, value] of Object.entries(headers)) {
     if (key.toLowerCase() !== "retry-after") continue
     const seconds = Number(value)
-    if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds * 1000, COOLDOWN_MAX_MS)
+    if (Number.isFinite(seconds) && seconds > 0) {
+      const ms = seconds * 1000
+      if (ms > STATED_COOLDOWN_MAX_MS) return undefined
+      return ms
+    }
     const when = Date.parse(value)
-    if (Number.isFinite(when)) return Math.min(Math.max(when - Date.now(), 1000), COOLDOWN_MAX_MS)
+    if (Number.isFinite(when)) {
+      const delay = when - Date.now()
+      if (delay > STATED_COOLDOWN_MAX_MS) return undefined
+      return Math.max(delay, 1000)
+    }
   }
   return undefined
 }
@@ -650,7 +674,7 @@ export function ensureSlots(s: State, onWarn: (m: string) => void) {
  * changes where the table came from, and the status line must say so.
  */
 const slotSignature = (origin: string, slots: Slot[]) =>
-  `${origin}\u0000${slots.map((slot) => `${slot.index}:${slot.model}:${slot.weight}`).join("|")}`
+  `${origin}\u0000${slots.map((slot) => `${slot.index}:${slot.model}:${slot.weight}:${slot.bucket ?? ""}`).join("|")}`
 
 export type SlotReload = { changed: boolean; slots: Slot[]; origin: string }
 
@@ -659,7 +683,7 @@ export type SlotReload = { changed: boolean; slots: Slot[]; origin: string }
  *
  * ensureSlots() is a read-once cache, so the watcher must come through here.
  * Assigning a new `s.slots` array is safe: every consumer reads it at call time,
- * `snapshot()` counts load by CLAIM.MODEL, and `release()` deletes claims by key.
+ * `snapshot()` counts load by CLAIM.SLOT (claim.k), and `release()` deletes claims by key.
  * What the caller MUST do on a change is re-bind the variant agents -- their model
  * is written by the config hook, not read from `s.slots` at spawn time.
  *
@@ -913,7 +937,7 @@ export function readSiblings(s: State): Sibling[] {
     try {
       const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, Claim>
       const claims = Object.values(parsed).filter(
-        (c) => c && typeof c.v === "string" && typeof c.m === "string" && now - (c.hb ?? c.t) <= CLAIM_TTL_MS,
+        (c) => c && typeof c.v === "string" && typeof c.m === "string" && typeof c.k === "number" && Number.isFinite(c.k) && now - (c.hb ?? c.t) <= CLAIM_TTL_MS,
       )
       siblings.push({ id: match[1], claims })
     } catch {
@@ -991,23 +1015,44 @@ export function recordStrike(s: State, model: string, reason: string, stated?: n
   // left alone so the next real failure on this model starts at strike 1.
   if (reason === UNAVAILABLE_REASON) return coolUnavailable(s, model)
   const now = Date.now()
-  // Read the prior count from the whole memory map, not from `cooling`: a lapsed
-  // cooldown is not cooling but its strike streak still counts (readLimits).
-  const prior = s.strikes.get(model)
+  // A bucket is a shared quota: a limit on one line is evidence about every
+  // line in it, so the whole group is benched with the same window. Without a
+  // bucket the target list is just this model, which is the old behaviour.
+  const slotsForModel = s.slots.filter((candidate) => candidate.model === model)
+  const buckets = [...new Set(slotsForModel.map((slot) => slotBucket(slot)))]
+  const targets = buckets.length === 0
+    ? [model]
+    : [...new Set(
+        s.slots
+          .filter((candidate) => buckets.includes(slotBucket(candidate)))
+          .map((candidate) => candidate.model),
+      )]
+  if (targets.length === 0) targets.push(model)
+  // The strike streak belongs to the quota group, so take the worst prior.
+  const prior = targets
+    .map((target) => s.strikes.get(target))
+    .filter((candidate): candidate is Strike => Boolean(candidate))
+    .reduce<Strike | undefined>((worst, candidate) => (!worst || candidate.strikes > worst.strikes ? candidate : worst), undefined)
   const strikes = prior && now - prior.last < STRIKE_DECAY_MS ? prior.strikes + 1 : 1
   const quota = isQuotaReason(reason)
   const base = quota ? QUOTA_COOLDOWN_BASE_MS : COOLDOWN_BASE_MS
   const cap = quota ? QUOTA_COOLDOWN_MAX_MS : COOLDOWN_MAX_MS
   const backoff = Math.min(cap, base * 2 ** (strikes - 1))
-  const strike: Strike = { model, until: now + (stated ?? backoff), strikes, reason, last: now }
-  s.cooling.set(model, strike)
-  s.strikes.set(model, strike)
-  const path = join(s.dir, limitFile(model))
-  try {
-    writeFileSync(`${path}.tmp`, JSON.stringify(strike))
-    renameSync(`${path}.tmp`, path)
-  } catch {
-    /* cooldown stays local to this process */
+  const statedOk = typeof stated === "number" && Number.isFinite(stated) && stated > 0 && stated <= STATED_COOLDOWN_MAX_MS
+  const until = now + (statedOk ? stated : backoff)
+  let strike: Strike | undefined
+  for (const target of targets) {
+    const record: Strike = { model: target, until, strikes, reason, last: now }
+    s.cooling.set(target, record)
+    s.strikes.set(target, record)
+    const path = join(s.dir, limitFile(target))
+    try {
+      writeFileSync(`${path}.tmp`, JSON.stringify(record))
+      renameSync(`${path}.tmp`, path)
+    } catch {
+      /* cooldown stays local to this process */
+    }
+    if (target === model) strike = record
   }
   return strike
 }
@@ -1164,58 +1209,53 @@ export function snapshot(s: State): Snapshot {
   pruneSessions(s)
   const siblings = readSiblings(s)
   const cooling = readLimits(s)
-  const counts = new Map<string, number>()
-  const bump = (m: string) => counts.set(m, (counts.get(m) ?? 0) + 1)
-  for (const claim of s.own.values()) bump(claim.m)
-  for (const sibling of siblings) for (const claim of sibling.claims) bump(claim.m)
+  const counts = new Map<number, number>()
+  const bump = (k: number) => counts.set(k, (counts.get(k) ?? 0) + 1)
+  for (const claim of s.own.values()) bump(claim.k)
+  for (const sibling of siblings) for (const claim of sibling.claims) bump(claim.k)
   return { counts, cooling, siblings, own: s.own, dirReady: s.dirReady }
 }
 
-const loadOf = (counts: Map<string, number>, model: string) => counts.get(model) ?? 0
+const loadOf = (counts: Map<number, number>, slot: number) => counts.get(slot) ?? 0
 
-// True while the slot still has room under its absolute cap (slotCeiling, i.e. twice
-// its per-pass budget). A cooling slot is never picked regardless of this.
-export const underCeiling = (slot: Slot, counts: Map<string, number>) => loadOf(counts, slot.model) < slotCeiling(slot)
+// True while the slot still has room under its cap (slotCeiling, i.e. its weight).
+// A cooling slot is never picked regardless of this.
+export const underCeiling = (slot: Slot, counts: Map<number, number>) => loadOf(counts, slot.index) < slotCeiling(slot)
 
 /**
  * The next slot the pool would hand a spawn.
  *
- * Two ordered passes over the usable slots, in declaration order. Pass 1 gives each
- * usable slot its weight -- its active-session budget for one pass -- and returns the
- * first slot still below that budget. Pass 2 runs once every usable slot has reached
- * its weight, and returns the first slot still below its absolute cap (slotCeiling,
- * twice the weight). Preference is declaration order throughout.
+ * ONE ordered pass over the usable slots, in declaration order: the first slot
+ * still below its weight (its active-session budget) wins. There is no second
+ * pass and no 2x ceiling, so the pool's capacity is the sum of the slot weights.
+ * To give a model more of it, list that model on another line with its own weight.
  *
- * When every usable slot is at its absolute cap, the overflow goes to the least-loaded
- * usable slot; if every slot is cooling, the least-loaded slot of all. The pool never
- * refuses work.
+ * When every usable slot is at its weight, the overflow goes to the least-loaded
+ * usable slot; if every slot is cooling, the least-loaded slot of all. The pool
+ * never refuses work.
  */
-export type PoolPass = 1 | 2 | "overflow"
+export type PoolPass = 1 | "overflow"
 
 export function pickSlot(s: State, snap: Snapshot): Slot {
   const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
   const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
   const pool = usable.length > 0 ? usable : slots
   for (const slot of usable) {
-    if (loadOf(snap.counts, slot.model) < slot.weight) return slot
+    if (loadOf(snap.counts, slot.index) < slot.weight) return slot
   }
-  for (const slot of usable) {
-    if (loadOf(snap.counts, slot.model) < slotCeiling(slot)) return slot
-  }
-  // Every usable slot is at its absolute cap, so nothing gates the pick: spread the
-  // overflow over the least-loaded usable slot rather than refusing the work. The
-  // condition is not "every slot is at its cap" -- a slot that is cooling frees the
+  // Every usable slot is at its weight, so the pool is at its summed capacity:
+  // spread the burst over the least-loaded usable slot rather than refusing the
+  // work. The condition is not "every slot is full" -- a cooling slot frees the
   // others.
-  return pool.reduce((best, slot) => (loadOf(snap.counts, slot.model) < loadOf(snap.counts, best.model) ? slot : best), pool[0])
+  return pool.reduce((best, slot) => (loadOf(snap.counts, slot.index) < loadOf(snap.counts, best.index) ? slot : best), pool[0])
 }
 
-/** Which fill pass routing is in: 1 until every usable slot reaches its weight, 2
- * until every usable slot reaches its absolute cap, then overflow. */
+/** Which fill state routing is in: 1 while any usable slot is below its weight,
+ * otherwise overflow (the pool is at its summed capacity). */
 export function poolPass(s: State, snap: Snapshot): PoolPass {
   const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
   const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
-  if (usable.some((slot) => loadOf(snap.counts, slot.model) < slot.weight)) return 1
-  if (usable.some((slot) => loadOf(snap.counts, slot.model) < slotCeiling(slot))) return 2
+  if (usable.some((slot) => loadOf(snap.counts, slot.index) < slot.weight)) return 1
   return "overflow"
 }
 

@@ -95,6 +95,41 @@ const ABORT_TIMEOUT_MS = 10_000
  */
 const formatWindow = (seconds: number): string => (seconds < 60 ? `${seconds}s` : `${Math.ceil(seconds / 60)}m`)
 
+/**
+ * Brief by design: this lands in a toast and in a tool answer, not in a report.
+ * Every line is derived from the outcome itself, so a success is never reported as
+ * a shortage and a newly benched model says what it was benched for.
+ */
+export const reportText = (report: probe.ProbeReport): string => {
+  if (report.outcomes.length === 0) return "no models are cooling down, so there was nothing to probe."
+  const answered = report.outcomes.filter((outcome) => outcome.ok).length
+  const benched = report.outcomes.filter((outcome) => outcome.kind === "benched").length
+  const cooling = report.outcomes.length - answered - benched
+  return [
+    ...report.outcomes.map((outcome) => {
+      if (outcome.ok) return `${outcome.model}: answered, cooldown cleared`
+      if (outcome.kind === "benched") {
+        const window = outcome.leftSeconds > 0 ? ` for ${Math.round(outcome.leftSeconds)}s` : ""
+        const strike = outcome.strikes !== undefined ? ` (strike ${outcome.strikes})` : ""
+        return `${outcome.model}: ${outcome.reason} — benched${window}${strike}`
+      }
+      return `${outcome.model}: still limited (${outcome.reason}) — cooldown kept${
+        outcome.leftSeconds > 0 ? `, ${formatWindow(outcome.leftSeconds)} left` : ""
+      }`
+    }),
+    `summary: ${answered} answered, ${benched} benched, ${cooling} still cooling`,
+  ].join("\n")
+}
+
+type AbortReport = {
+  slot: number
+  model: string
+  elapsedMs: number
+  kind: "no-answer" | "rate-limit" | "empty response" | "permission" | "provider error"
+  released: boolean
+  message: string
+}
+
 type LogFn = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => Promise<void>
 
 export type AgentPoolOptions = {
@@ -178,6 +213,43 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       return { ok: true, why: "" }
     } catch (error) {
       return { ok: false, why: String(error) }
+    }
+  }
+
+  // A task child this plugin aborts ends in opencode as a bare "Task cancelled".
+  // The cause is recorded here under the claim key so the task result can carry it,
+  // and toasted at the same moment. Only aborts this plugin initiates are recorded,
+  // so a stop the user pressed stays silent.
+  const abortReports = new Map<string, AbortReport>()
+  const abortKind = (reason: string): AbortReport["kind"] =>
+    pool.isQuotaReason(reason) || pool.isLimitText(reason) ? "rate-limit" : "provider error"
+  const abortLabel = (kind: AbortReport["kind"], elapsedMs: number): string => {
+    const seconds = Math.max(1, Math.round(elapsedMs / 1000))
+    if (kind === "no-answer") return `no answer in ${seconds}s`
+    if (kind === "rate-limit") return `rate limited after ${seconds}s`
+    if (kind === "empty response") return `empty response after ${seconds}s`
+    if (kind === "permission") return `permission denied after ${seconds}s`
+    return `provider error after ${seconds}s`
+  }
+  const noteAbort = async (key: string, report: AbortReport) => {
+    abortReports.set(key, report)
+    if (abortReports.size > 32) {
+      const oldest = abortReports.keys().next().value
+      if (oldest !== undefined) abortReports.delete(oldest)
+    }
+    await log("warn", report.message, {
+      slot: report.slot,
+      model: report.model,
+      elapsedMs: report.elapsedMs,
+      failure: report.kind,
+      released: report.released,
+    })
+    try {
+      await client.tui?.showToast?.({
+        body: { title: "pool spawn", message: report.message, variant: "warning", duration: 8000 },
+      })
+    } catch {
+      /* no TUI attached; the log line above is the record */
     }
   }
 
@@ -285,6 +357,16 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       const kill = await abortSession(sessionID)
       if (kill.ok) {
         pool.release(s, key)
+        const elapsedMs = Date.now() - claim.t
+        const kind = abortKind(reason)
+        await noteAbort(key, {
+          slot: claim.k,
+          model: claim.m,
+          elapsedMs,
+          kind,
+          released: true,
+          message: `slot ${claim.k} ${claim.m} — ${abortLabel(kind, elapsedMs)}; claim released`,
+        })
         await log(
           "warn",
           `limit (${reason}) on ${model}; aborted in-flight ${claim.v} session ${sessionID} to fail over now`,
@@ -380,6 +462,17 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
                 : `hung ${claim.v} on ${claim.m} after ${age}s with ${since}; aborted session ${claim.g}`,
               { base: claim.v, model: claim.m, slot: claim.k, session: claim.g, aborted: true },
             )
+            const elapsedMs = Date.now() - claim.t
+            await noteAbort(key, {
+              slot: claim.k,
+              model: claim.m,
+              elapsedMs,
+              kind: "no-answer",
+              released: true,
+              message: `slot ${claim.k} ${claim.m} — ${
+                reason === "overran" ? `overran after ${Math.max(1, Math.round(elapsedMs / 1000))}s` : abortLabel("no-answer", elapsedMs)
+              }; claim released`,
+            })
             await coolForHang(claim, log)
             continue
           }
@@ -461,33 +554,12 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     if (report.outcomes.length === 0) return "nothing cooling to probe"
     const parts = [`probed ${report.outcomes.length} model(s)`, `re-admitted ${report.cleared.length}`]
     if (report.missing.length > 0) parts.push(`benched ${report.missing.length} missing`)
+    const authBenched = report.outcomes.filter((outcome) => outcome.reason === pool.AUTH_FAILURE_REASON).length
+    if (authBenched > 0) parts.push(`benched ${authBenched} auth-failed`)
     return parts.join(", ")
   }
 
-  /** Brief by design: this lands in a toast and in a tool answer, not in a report. */
-  const reportText = (report: probe.ProbeReport): string => {
-    if (report.outcomes.length === 0) return "no models are cooling down, so there was nothing to probe."
-    return [
-      ...report.outcomes.map((outcome) =>
-        outcome.ok
-            ? `${outcome.model}: answered — cooldown cleared (it had ${formatWindow(outcome.hadSeconds)} left), back in the pool`
-          : outcome.reason === pool.MODEL_MISSING_REASON
-            ? `${outcome.model}: not served by the provider (${outcome.reason}) — benched${
-                outcome.leftSeconds > 0 ? `, ${formatWindow(outcome.leftSeconds)} left` : ""
-              }`
-            : `${outcome.model}: still limited (${outcome.reason}) — cooldown kept${
-                outcome.leftSeconds > 0 ? `, ${formatWindow(outcome.leftSeconds)} left` : ""
-              }`,
-      ),
-      report.cleared.length > 0
-        ? `re-admitted: ${report.cleared.join(", ")}. They route again on the next pooled spawn — nothing needs restarting or reloading.`
-        : report.missing.length > 0
-          ? `benched: ${report.missing.join(", ")}. The provider does not serve them; replace them in the pool.`
-          : report.outcomes.every((outcome) => outcome.ok)
-            ? "every model that was asked answered; nothing needed re-admitting."
-            : "nothing was re-admitted; the pool is short exactly as much as it was.",
-    ].join("\n")
-  }
+
 
   /**
    * Surface a change the user would otherwise never learn about.
@@ -565,10 +637,28 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       // stale leftover and is reported, not obeyed.
       for (const base of pool.BASES) {
         const name = pool.agentFor(base, slot.index)
-        const def = agents?.[name]
+        let def = agents?.[name]
         if (!def) {
-          await warnOnce(`variant ${name} is missing from the config; spawns of ${base} that route to slot ${slot.index} would fail`)
-          continue
+          // A pool that grows at runtime has a slot with no injected variant yet.
+          // Declare it here from the base definition rather than warning: the
+          // slot count is open, so a reload may legitimately add slot N > the
+          // count present when the plugin started.
+          const baseDef = agents?.[base]
+          if (!agents || !baseDef) {
+            await warnOnce(`variant ${name} is missing from the config; spawns of ${base} that route to slot ${slot.index} would fail`)
+            continue
+          }
+          const created: { model?: string; [k: string]: unknown } = {
+            ...baseDef,
+            description:
+              `Hidden pool slot ${slot.index} for ${base}. Its model is set by the pool at config time. Spawn '${base}' and let the pool route.`,
+            hidden: true,
+            mode: "primary",
+          }
+          delete created.model
+          agents[name] = created
+          def = created
+          await log("info", `declared variant ${name} for slot ${slot.index} (table grew after startup)`)
         }
         if (def.model && def.model !== slot.model) {
           await warnOnce(`${name} still hard-codes ${def.model}; the resolved pool preset wins (${slot.model}). Delete the line to keep one source of truth.`)
@@ -693,7 +783,8 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           // is what lets a provider with its own vocabulary count, and it is the
           // only signal there is when the provider is not named.
           const message = typeof status?.message === "string" ? status.message : ""
-          const limited = reason === "free_tier_limit" || pool.isLimitText(reason) || pool.isLimitText(message)
+          const auth = pool.isAuthFailureText(reason) || pool.isAuthFailureText(message)
+          const limited = reason === "free_tier_limit" || pool.isLimitText(reason) || pool.isLimitText(message) || auth
           if (status?.type === "retry" && limited) {
             // A probe's own 429 is evidence about one request, not about every slot
             // on the provider, and letting it bench the whole provider would turn a
@@ -718,16 +809,18 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             // provider is out of allowance, not down -- but a reason that says
             // nothing about quota does not get to relabel an outage as something
             // else, because then the outage would land in the strike memory.
-            const named = outage ? pool.UNAVAILABLE_REASON : reason || pool.limitReason(message) || "rate-limited"
+            const named = auth ? pool.AUTH_FAILURE_REASON : (outage ? pool.UNAVAILABLE_REASON : reason || pool.limitReason(message) || "rate-limited")
             if (provider) {
               // An outage gets the flat window as well: a provider that is briefly
               // down must not be benched for the quota window because it said so
               // in the wrong words.
-              const until = outage
-                ? Date.now() + pool.UNAVAILABLE_COOLDOWN_MS
-                : typeof status.next === "number" && status.next > Date.now()
-                  ? status.next
-                  : Date.now() + HANG_FALLBACK_MS
+              const until = auth
+                ? Date.now() + pool.AUTH_FAILURE_COOLDOWN_MS
+                : outage
+                  ? Date.now() + pool.UNAVAILABLE_COOLDOWN_MS
+                  : typeof status.next === "number" && status.next > Date.now()
+                    ? status.next
+                    : Date.now() + HANG_FALLBACK_MS
               const cooled = pool.coolProvider(s, provider, until, named)
               if (cooled.length > 0) {
                 await log("warn", `limit on provider ${provider} (${named}); cooling ${cooled.length} slot(s) until ${new Date(until).toISOString().slice(11, 19)}Z`, {
@@ -741,7 +834,16 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
               // is the one model this refusal is evidence about, and cooling it is
               // what sends the retry to a slot that answers. A reset the provider
               // stated in the message wins over the computed backoff.
-              if (outage) {
+              if (auth) {
+                const strike = pool.recordStrike(s, own.claim.m, pool.AUTH_FAILURE_REASON, pool.AUTH_FAILURE_COOLDOWN_MS)
+                if (strike) {
+                  await log("warn", `limit on ${own.claim.m} (${pool.AUTH_FAILURE_REASON}); cooling it for ${Math.round((strike.until - Date.now()) / 1000)}s`, {
+                    model: own.claim.m,
+                    slot: own.claim.k,
+                    session: sessionID,
+                  })
+                }
+              } else if (outage) {
                 // The session is still aborted below: a retry status means opencode
                 // is LOOPING on a refused model, and only the abort ends the wait.
                 // What an outage changes is the WINDOW, not the wait.
@@ -784,14 +886,25 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             return
           }
           const status = typeof error?.data?.statusCode === "number" ? error.data.statusCode : undefined
+          const auth = pool.isAuthFailureText(haystack) || status === 401 || status === 403
           const limited = pool.isLimitText(haystack) || status === 429
           const outage = pool.isUnavailableText(haystack)
-          if (!limited && !outage) return
+          if (!limited && !outage && !auth) return
           const own = claimFor(sessionID)
-          const named = outage ? pool.UNAVAILABLE_REASON : pool.limitReason(haystack) ?? "rate-limited"
+          const named = auth ? pool.AUTH_FAILURE_REASON : (outage ? pool.UNAVAILABLE_REASON : pool.limitReason(haystack) ?? "rate-limited")
           let stated: number | undefined
           if (own) {
-            if (outage) {
+            if (auth) {
+              stated = pool.AUTH_FAILURE_COOLDOWN_MS
+              const strike = pool.recordStrike(s, own.claim.m, pool.AUTH_FAILURE_REASON, stated)
+              if (strike) {
+                await log("warn", `limit on ${own.claim.m} (${pool.AUTH_FAILURE_REASON}); cooling it for ${Math.round((strike.until - Date.now()) / 1000)}s from a terminal session.error`, {
+                  model: own.claim.m,
+                  slot: own.claim.k,
+                  session: sessionID,
+                })
+              }
+            } else if (outage) {
               const transient = pool.coolUnavailable(s, own.claim.m)
               if (transient) {
                 await log("warn", `cooling ${own.claim.m} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason}) after a terminal error`)
@@ -838,13 +951,14 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         const status = typeof (info.error as { data?: { statusCode?: number } }).data?.statusCode === "number"
           ? (info.error as { data: { statusCode: number } }).data.statusCode
           : undefined
+        const auth = pool.isAuthFailureText(haystack) || status === 401 || status === 403
         const limited = pool.isLimitText(haystack) || status === 429
         // A gateway 5xx, a queue budget, or a stalled request aborted on timeout
         // is a transient fault: the gateway is saying it cannot serve the request
         // right now, not that the key is out of quota.
         const gateway5xx = status !== undefined && status >= 500 && status <= 599
         const transientGateway = gateway5xx || pool.isTransientGatewayText(haystack)
-        if (!limited && !transientGateway) return
+        if (!limited && !transientGateway && !auth) return
         const model = `${info.providerID ?? "?"}/${info.modelID ?? "?"}`
         // A probe is a QUESTION about a model, not work on it. Counting its failure
         // would re-cool the model a little further on every check, until the window
@@ -862,7 +976,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         // A gateway 5xx, a queue budget, or a timeout is the same kind of fault
         // and takes the same flat path; a real limit still escalates below.
         const ownMsg = claimFor(info.sessionID)
-        if (pool.isUnavailableText(haystack) || (!limited && transientGateway)) {
+        if (pool.isUnavailableText(haystack) || (!limited && !auth && transientGateway)) {
           const transient = pool.coolUnavailable(s, model)
           if (transient) await log("warn", `cooling ${model} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason})`)
           // The caller already cooled the model, so only the abort/release side
@@ -870,8 +984,8 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           await failOver(info.sessionID, model, transient?.reason ?? pool.UNAVAILABLE_REASON, { cool: false })
           return
         }
-        const stated = pool.statedCooldown(haystack) ?? pool.retryAfterMs((info.error as { data?: { responseHeaders?: Record<string, string> } }).data?.responseHeaders)
-        const reason = pool.limitReason(haystack)
+        const stated = auth ? pool.AUTH_FAILURE_COOLDOWN_MS : (pool.statedCooldown(haystack) ?? pool.retryAfterMs((info.error as { data?: { responseHeaders?: Record<string, string> } }).data?.responseHeaders))
+        const reason = auth ? pool.AUTH_FAILURE_REASON : pool.limitReason(haystack)
         const strike = pool.recordStrike(s, model, reason ?? "rate-limited", stated)
         if (strike) await log("warn", `cooling ${model} for ${Math.round((strike.until - Date.now()) / 1000)}s (${reason ?? "rate-limited"}, strike ${strike.strikes})`)
         // The model is benched; the task already in flight on it is not. Abort it
@@ -941,7 +1055,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             weight: slot.weight,
             model: slot.model,
             ceiling: pool.slotCeiling(slot),
-            load: (snap.counts.get(slot.model) ?? 0) + 1,
+            load: (snap.counts.get(slot.index) ?? 0) + 1,
           })
           output.args.subagent_type = variant
           // Invariant: a claim is held only for a rout that completes.
@@ -969,9 +1083,21 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       }
     },
 
-    "tool.execute.after": async (input) => {
+    "tool.execute.after": async (input, output) => {
       if (input.tool !== "task") return
-      pool.release(s, pool.claimKey(input.sessionID, input.callID))
+      const key = pool.claimKey(input.sessionID, input.callID)
+      pool.release(s, key)
+      const report = abortReports.get(key)
+      if (!report) return
+      abortReports.delete(key)
+      const detail = [
+        `pool spawn: ${report.message}`,
+        `slot ${report.slot}; model ${report.model}; elapsed ${report.elapsedMs}ms; failure ${report.kind}; claim ${report.released ? "released" : "held"}`,
+      ].join("\n")
+      const text = typeof output.output === "string" ? output.output : ""
+      // Replace opencode's dead end rather than appending to it, so a plain
+      // "Task cancelled" is not reachable for an abort this plugin caused.
+      output.output = /task\s+cancel+ed/i.test(text) ? detail : text ? `${text}\n\n${detail}` : detail
     },
 
     tool: {
@@ -1001,21 +1127,23 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           const snap = pool.snapshot(s)
           const pass = pool.poolPass(s, snap)
           const now = Date.now()
-          const byModel = new Map<string, { total: number; bases: Map<string, number> }>()
-          const add = (model: string, base: string) => {
-            const entry = byModel.get(model) ?? { total: 0, bases: new Map() }
+          // Load is per SLOT, not per model: the same model may occupy two lines
+          // with independent budgets, and grouping by model would merge them.
+          const bySlot = new Map<number, { total: number; bases: Map<string, number> }>()
+          const add = (k: number, base: string) => {
+            const entry = bySlot.get(k) ?? { total: 0, bases: new Map() }
             entry.total++
             entry.bases.set(base, (entry.bases.get(base) ?? 0) + 1)
-            byModel.set(model, entry)
+            bySlot.set(k, entry)
           }
-          for (const claim of snap.own.values()) add(claim.m, claim.v)
-          for (const sibling of snap.siblings) for (const claim of sibling.claims) add(claim.m, claim.v)
+          for (const claim of snap.own.values()) add(claim.k, claim.v)
+          for (const sibling of snap.siblings) for (const claim of sibling.claims) add(claim.k, claim.v)
 
           // Which slot the next pooled spawn would actually take, so a surprising routing
           // decision can be read off the status instead of guessed at from load alone.
           const next = pool.pickSlot(s, snap)
           const line = (slot: pool.Slot) => {
-            const entry = byModel.get(slot.model)
+            const entry = bySlot.get(slot.index)
             const users = entry && entry.bases.size > 0 ? [...entry.bases].map(([b, n]) => `${b}x${n}`).join(" ") : "idle"
             const strike = snap.cooling.get(slot.model)
             const status = s.catalog.get(slot.model)
@@ -1024,9 +1152,8 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
               status && status !== "active" && status !== "unknown" ? `catalog:${status}` : "",
             ].filter(Boolean)
             const marker = slot.index === next.index ? " <- next" : ""
-            // claims/ceiling: the ceiling is reached at the denominator (twice the
-            // slot's weight), and a slot at its ceiling is only used again once no
-            // other slot is both available and under its ceiling.
+            // load/ceiling: the ceiling is the slot's weight. A FULL slot is only
+            // used again once no other slot is both available and under its weight.
             const load = entry?.total ?? 0
             const atCeiling = !pool.underCeiling(slot, snap.counts)
             return `  slot ${slot.index} w${slot.weight}  ${slot.model}  load=${load}/${pool.slotCeiling(slot)}${atCeiling ? " FULL" : ""}${marker}  [${users}${notes.length ? "; " + notes.join("; ") : ""}]`
@@ -1034,6 +1161,18 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
 
           const total = [...snap.counts.values()].reduce((sum, n) => sum + n, 0)
           const coolingNow = [...snap.cooling.entries()].filter(([, st]) => st.until > now)
+          // Effective capacity per shared quota group. A bucket with one slot is
+          // just that model and is not repeated here.
+          const buckets = new Map<string, { seats: number; slots: number; cooling: boolean }>()
+          for (const slot of slots) {
+            const name = pool.slotBucket(slot)
+            const entry = buckets.get(name) ?? { seats: 0, slots: 0, cooling: false }
+            entry.seats += slot.weight
+            entry.slots++
+            if (snap.cooling.has(slot.model)) entry.cooling = true
+            buckets.set(name, entry)
+          }
+          const sharedBuckets = [...buckets].filter(([, entry]) => entry.slots > 1)
           // Judged by the reaper's own rule, not a restatement of it: the status
           // and the sweep must describe the same rule, or a claim the status
           // calls healthy is one the reaper is about to condemn.
@@ -1044,7 +1183,10 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           return {
             title: `agent-pool: ${total} task(s) in flight, ${coolingNow.length} model(s) cooling`,
             output: [
-              `shared pool over ${slots.length} model(s) from ${s.origin}; pass ${pass}; bases: ${pool.BASES.join(", ")}\ntwo ordered passes in slot order: pass 1 fills each slot to its weight, pass 2 to its ceiling, then overflow goes to the least-loaded slot (FULL = at ceiling, used only when no other slot is available and under its ceiling)`,
+              `shared pool over ${slots.length} slot(s) from ${s.origin}; state ${pass}; bases: ${pool.BASES.join(", ")}\none ordered pass in slot order: each slot fills to its weight, then overflow goes to the least-loaded slot. Capacity is the sum of the weights; repeat a model on another line to give it more (FULL = at weight).`,
+              ...(sharedBuckets.length
+                ? [`buckets: ${sharedBuckets.map(([name, entry]) => `${name} ${entry.seats} seat(s)${entry.cooling ? " COOLING" : ""}`).join("; ")}`]
+                : []),
               ...slots.map(line),
               "",
               "by process:",

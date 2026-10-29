@@ -1,0 +1,362 @@
+#!/usr/bin/env node
+// lacode-voice — CLI for the LaCode voice daemon.
+
+import { fileURLToPath } from "node:url"
+import { spawn } from "node:child_process"
+import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs"
+import { createRequire } from "node:module"
+import { homedir } from "node:os"
+import { dirname, join } from "node:path"
+import * as net from "node:net"
+import { Readable, Transform } from "node:stream"
+import { pipeline } from "node:stream/promises"
+import { createVoiceDaemon } from "../src/voice/daemon.ts"
+import { resolveVoiceConfig, VOICE_DATA_DIR } from "../src/voice/config.ts"
+import { createVoiceClient } from "../src/voice/transport.ts"
+import { VOICE_PROTOCOL_VERSION } from "../src/voice/protocol.ts"
+import { planCapture } from "../src/voice/capture.ts"
+
+const require = createRequire(import.meta.url)
+
+if (!process.features?.typescript) {
+  if (process.env.LACODE_STRIP_TYPECHECKED === "1") {
+    console.error("lacode-voice: this node cannot load TypeScript sources; node >= 22.18 is required.")
+    process.exit(1)
+  }
+  const { spawnSync } = await import("node:child_process")
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", "--no-warnings", fileURLToPath(import.meta.url), ...process.argv.slice(2)],
+    { stdio: "inherit", env: { ...process.env, LACODE_STRIP_TYPECHECKED: "1" } },
+  )
+  process.exit(result.status ?? 1)
+}
+
+const USAGE = `lacode-voice — CLI for the LaCode voice daemon
+
+  lacode-voice [start]
+      Resolve config, start the voice daemon, and keep running.
+
+  lacode-voice doctor
+      Print a diagnostic checklist. Does not start audio capture.
+
+  lacode-voice model [--force] | fetch-model [--force]
+      Download the Vosk wake-word model into the voice data directory.
+      --force re-downloads and re-extracts an existing model.
+
+  lacode-voice status
+      Query a running daemon (ping + hello) and print its state.
+
+  lacode-voice --help | -h
+      Print this help.`
+
+function expandHome(value, home) {
+  const v = value.trim()
+  if (v === "~") return home
+  if (v.startsWith("~/")) return join(home, v.slice(2))
+  return v
+}
+
+function isBuiltinWakeWord(value) {
+  const builtins = [
+    "alexa", "americano", "blueberry", "bumblebee", "computer", "grapefruit",
+    "grasshopper", "hey google", "hey siri", "jarvis", "ok google", "picovoice",
+    "porcupine", "terminator",
+  ]
+  return builtins.includes(value.trim().toLowerCase())
+}
+
+function porcupineInfo() {
+  try {
+    const resolved = require.resolve("@picovoice/porcupine-node")
+    let dir = dirname(resolved)
+    for (let i = 0; i < 8; i++) {
+      try {
+        const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"))
+        if (pkg && pkg.name === "@picovoice/porcupine-node" && typeof pkg.version === "string") {
+          return { installed: true, version: pkg.version }
+        }
+      } catch {}
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+    try {
+      const pkg = require("@picovoice/porcupine-node/package.json")
+      if (pkg && typeof pkg.version === "string") return { installed: true, version: pkg.version }
+    } catch {}
+    return { installed: true, version: "unknown" }
+  } catch {
+    return { installed: false, version: "not installed" }
+  }
+}
+
+function voskInfo() {
+  try {
+    const resolved = require.resolve("vosk")
+    let dir = dirname(resolved)
+    for (let i = 0; i < 8; i++) {
+      try {
+        const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"))
+        if (pkg && pkg.name === "vosk" && typeof pkg.version === "string") {
+          return { installed: true, version: pkg.version }
+        }
+      } catch {}
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+    return { installed: true, version: "unknown" }
+  } catch {
+    return { installed: false, version: "not installed" }
+  }
+}
+
+function runUnzip(zip, dest) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("unzip", ["-q", "-o", zip, "-d", dest], { stdio: "inherit" })
+    child.once("error", reject)
+    child.once("close", (code) => resolve(code))
+  })
+}
+
+function canBind(port, host) {
+  return new Promise((resolve) => {
+    let server
+    try {
+      server = net.createServer()
+    } catch {
+      resolve(false)
+      return
+    }
+    let done = false
+    const finish = (value) => {
+      if (done) return
+      done = true
+      try { server.close() } catch {}
+      resolve(value)
+    }
+    server.once("error", () => finish(false))
+    try {
+      server.listen(port, host, () => finish(true))
+    } catch {
+      finish(false)
+    }
+    setTimeout(() => finish(false), 1000).unref?.()
+  })
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+const rawArgv = process.argv.slice(2)
+let command
+if (rawArgv.length > 0 && rawArgv[0].startsWith("-")) {
+  if (rawArgv[0] === "--help" || rawArgv[0] === "-h") {
+    command = rawArgv.shift()
+  } else {
+    const idx = rawArgv.findIndex((a) => !a.startsWith("-"))
+    if (idx >= 0) {
+      command = rawArgv.splice(idx, 1)[0]
+    } else {
+      command = rawArgv.shift()
+    }
+  }
+} else {
+  command = rawArgv.shift()
+}
+if (command === undefined) command = "start"
+
+switch (command) {
+  case "start": {
+    const config = resolveVoiceConfig()
+    const daemon = createVoiceDaemon({ config })
+    let shuttingDown = false
+    const shutdown = async () => {
+      if (shuttingDown) return
+      shuttingDown = true
+      try { await daemon.stop() } catch {}
+      process.exit(0)
+    }
+    process.on("SIGINT", () => { void shutdown() })
+    process.on("SIGTERM", () => { void shutdown() })
+    const result = await daemon.start()
+    const wake = result.wake ? "on" : "off"
+    console.log(`voice daemon listening on ${config.host}:${result.port} (wake: ${wake})`)
+    if (result.wakeError) {
+      console.log(`warning: wake word unavailable: ${result.wakeError}`)
+    }
+    break
+  }
+
+  case "doctor": {
+    const config = resolveVoiceConfig()
+    const home = homedir()
+    if (config.groqKey) {
+      console.log(`ok groq key: ${config.groqSource ?? "unknown"}`)
+    } else {
+      console.log("fail groq key: missing")
+    }
+    console.log(`wake engine: ${config.wakeEngine}`)
+    let engineUsable = false
+    if (config.wakeEngine === "vosk") {
+      const modelPath = config.voskModelPath
+      const modelDisplay = modelPath && modelPath.trim() !== "" ? modelPath : "(none)"
+      let modelExists = false
+      if (modelPath && modelPath.trim() !== "") {
+        try { modelExists = existsSync(modelPath) } catch { modelExists = false }
+      }
+      if (modelExists) {
+        console.log(`ok vosk model: ${modelDisplay} (exists)`)
+      } else {
+        console.log(`fail vosk model: ${modelDisplay} (not found)`)
+        console.log('hint: run "lacode-voice model" to download it')
+      }
+      const vk = voskInfo()
+      if (vk.installed) {
+        console.log(`ok vosk module: ${vk.version}`)
+      } else {
+        console.log("fail vosk module: not installed")
+      }
+      engineUsable = modelExists && vk.installed
+    } else {
+      if (config.picovoiceKey) {
+        console.log("ok picovoice key: present")
+      } else {
+        console.log("warn picovoice key: missing")
+      }
+      const ww = config.wakeWordPath
+      const wwDisplay = ww ? ww : "(none)"
+      let wwExists = false
+      let wwAvailable = false
+      if (ww) {
+        if (isBuiltinWakeWord(ww)) {
+          wwExists = true
+          wwAvailable = true
+        } else {
+          const expanded = expandHome(ww, home)
+          try { wwExists = existsSync(expanded) } catch { wwExists = false }
+          wwAvailable = wwExists
+        }
+      }
+      const wwStatus = wwExists ? "exists" : "not found"
+      const pp = porcupineInfo()
+      const wakeAvailable = Boolean(config.picovoiceKey) && wwAvailable && pp.installed
+      const wwPrefix = wakeAvailable ? "ok" : "fail"
+      console.log(`${wwPrefix} wake word: ${wwDisplay} (${wwStatus})`)
+      if (pp.installed) {
+        console.log(`ok porcupine module: ${pp.version}`)
+      } else {
+        console.log("warn porcupine module: not installed")
+      }
+      engineUsable = wakeAvailable
+    }
+    const plan = planCapture()
+    if (plan) {
+      console.log(`ok capture: ${plan.bin} ${plan.args.join(" ")}`)
+    } else {
+      console.log("warn capture: no recorder found (install ffmpeg)")
+    }
+    const bindable = await canBind(config.port, config.host)
+    const portPrefix = bindable ? "ok" : "fail"
+    const portStatus = bindable ? "available" : "in use"
+    console.log(`${portPrefix} port: ${config.port} ${portStatus}`)
+    const groqMissing = !config.groqKey
+    const exitCode = groqMissing || !engineUsable ? 1 : 0
+    process.exit(exitCode)
+    break
+  }
+
+  case "model":
+  case "fetch-model": {
+    const config = resolveVoiceConfig()
+    const modelPath = config.voskModelPath
+    const force = rawArgv.includes("--force")
+    try {
+      if (!force && modelPath && modelPath.trim() !== "" && existsSync(modelPath)) {
+        console.log(`vosk model already present: ${modelPath}`)
+        process.exit(0)
+      }
+      const dataDir = VOICE_DATA_DIR()
+      const zip = join(dataDir, "vosk-model.zip")
+      mkdirSync(dataDir, { recursive: true })
+      const url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+      console.log("downloading vosk model (41 MB)...")
+      const response = await fetch(url)
+      if (!response.ok || !response.body) {
+        throw new Error(`download failed: HTTP ${response.status} ${response.statusText}`)
+      }
+      let bytes = 0
+      const counter = new Transform({
+        transform(chunk, _encoding, callback) {
+          bytes += chunk.length
+          callback(null, chunk)
+        },
+      })
+      await pipeline(Readable.fromWeb(response.body), counter, createWriteStream(zip))
+      console.log(`downloaded ${(bytes / (1024 * 1024)).toFixed(1)} MB`)
+      const code = await runUnzip(zip, dataDir)
+      if (code !== 0) throw new Error(`unzip failed with exit code ${code}`)
+      if (!existsSync(modelPath)) {
+        throw new Error(`vosk model not found after extraction: ${modelPath}`)
+      }
+      console.log(`vosk model ready: ${modelPath}`)
+      rmSync(zip, { force: true })
+      process.exit(0)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      console.error(`lacode-voice: ${message}`)
+      process.exit(1)
+    }
+    break
+  }
+
+  case "status": {
+    const config = resolveVoiceConfig()
+    let got = null
+    const client = createVoiceClient({
+      host: config.host,
+      port: config.port,
+      reconnectMs: 5000,
+      onMessage: (m) => {
+        if (!got && (m.t === "pong" || m.t === "welcome" || m.t === "state")) got = m
+      },
+    })
+    client.start()
+    const deadline = Date.now() + 1500
+    while (!client.connected && Date.now() < deadline) await delay(10)
+    if (client.connected) {
+      client.send({ t: "ping" })
+      client.send({ t: "hello", v: VOICE_PROTOCOL_VERSION, client: "lacode-voice" })
+    }
+    while (!got && Date.now() < deadline) await delay(10)
+    try { client.stop() } catch {}
+    if (!got) {
+      console.log("daemon not running")
+      process.exit(1)
+    }
+    if (got.t === "state") {
+      console.log(`armed: ${got.armed} phase: ${got.phase}`)
+    } else if (got.t === "welcome") {
+      console.log(`armed: ${got.armed} wake: ${got.wake ? "on" : "off"}`)
+    } else {
+      console.log("daemon running")
+    }
+    process.exit(0)
+    break
+  }
+
+  case "--help":
+  case "-h":
+  case "help":
+    console.log(USAGE)
+    process.exit(0)
+    break
+
+  default:
+    console.error(`lacode-voice: unknown command ${JSON.stringify(command)}`)
+    console.error(USAGE)
+    process.exit(1)
+    break
+}

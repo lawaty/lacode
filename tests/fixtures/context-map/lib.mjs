@@ -9,7 +9,7 @@
 // fixture in the repository is never edited, and the consumer's live map is
 // never involved. `now` is a parameter so lifecycle boundaries are deterministic.
 
-import { cpSync, readFileSync, rmSync } from "node:fs"
+import { cpSync, readdirSync, readFileSync, rmSync, statSync, utimesSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { auditMap, maintainMap, parseMapEntries } from "../../../src/lib/map-schema.ts"
@@ -99,17 +99,37 @@ export const checkFixture = (name, { now = Date.now() } = {}) => {
   rmSync(root, { recursive: true, force: true })
   cpSync(source, root, { recursive: true })
 
+  const fixed = new Date(now)
+  for (const entry of readdirSync(root, { recursive: true })) {
+    const full = join(root, entry)
+    try {
+      if (statSync(full).isFile()) utimesSync(full, fixed, fixed)
+    } catch {}
+  }
+
   const mapDir = join(root, ".opencode", "context")
   rmSync(mapDir, { recursive: true, force: true })
   cpSync(join(root, "map", "before"), mapDir, { recursive: true })
 
-  const before = auditMap(root, mapDir, now)
-  const lifecycle = maintainMap(root, mapDir, now)
-  const afterLifecycle = auditMap(root, mapDir, now)
-
   const targetDir = join(root, ".opencode", "context-after")
   rmSync(targetDir, { recursive: true, force: true })
   cpSync(join(root, "map", "after"), targetDir, { recursive: true })
+
+  const fixedTime = new Date("2026-10-26T00:00:00Z")
+  for (const dir of [root, mapDir, targetDir]) {
+    try {
+      for (const entry of readdirSync(dir, { recursive: true })) {
+        const full = join(dir, entry)
+        try {
+          if (statSync(full).isFile()) utimesSync(full, fixedTime, fixedTime)
+        } catch {}
+      }
+    } catch {}
+  }
+
+  const before = auditMap(root, mapDir, now)
+  const lifecycle = maintainMap(root, mapDir, now)
+  const afterLifecycle = auditMap(root, mapDir, now)
   const after = auditMap(root, targetDir, now)
 
   const files = {}
