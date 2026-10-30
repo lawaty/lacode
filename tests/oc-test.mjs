@@ -1668,6 +1668,17 @@ install_tunnel_preflight
 })
 
 // ---------------------------------------------------------------------------
+// Cloudflare account-id sync
+// ---------------------------------------------------------------------------
+
+check("oc-sync has sync_cloudflare and cloudflare_account_id reads env", () => {
+  const src = read("oc-sync")
+  assert(/sync_cloudflare\(\)/.test(src), "sync_cloudflare must be defined")
+  assert(/cloudflare_account_id\(\)/.test(src), "cloudflare_account_id must be defined")
+  assert(/sync_auth "\$HOST"\n\s*sync_cloudflare "\$HOST"/.test(src),
+    "sync_cloudflare must be called in the main loop after sync_auth")
+  assert(/CLOUDFLARE_ACCOUNT_ID/.test(src), "cloudflare_account_id must read CLOUDFLARE_ACCOUNT_ID")
+})
 
 console.log(`${passed} checks passed${skipped ? `, ${skipped} skipped` : ""}`)
 if (failures.length > 0) {

@@ -7,6 +7,45 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.3.0-beta.0] — provider readiness, timeline roots, and a reason on cancelled tasks
+
+### Added
+
+- **The pool gates slots on provider readiness.** Before routing, LaCode asks
+  opencode which providers are connected and which carry credentials, then
+  excludes slots whose provider is unconfigured or unauthenticated. Readiness
+  fails open until the first successful probe, so an offline start still routes;
+  `pool_status` names the provider to log in to.
+- **`/reprocess-timeline` rebuilds the root session.** A reprocess started from a
+  subagent walks the `parentID` chain (with cycle protection) and summarizes the
+  root session, instead of only the child it was invoked from.
+- **Host sync merges a Cloudflare Workers AI provider.** `bin/oc-sync` reads
+  `CLOUDFLARE_ACCOUNT_ID` (or derives it from the local provider URL) and merges
+  the provider into each host's `opencode.jsonc` after the auth sync; existing
+  providers are preserved and the write is backed up.
+- **`OC_AUTH_PROVIDERS` can come from the env file.** The post-publish host sync
+  falls back to `~/.config/lacode/env` when the variable is unset.
+
+### Changed
+
+- **A pool-cancelled subtask now carries its cause.** The bare `Task cancelled`
+  card is rewritten in place to `Task Cancelled by LaCode: <cause>` — slot,
+  model, elapsed time, failure kind and claim state. The old warning toast is
+  gone; the reason lives on the task itself. The rewrite is best-effort: if
+  opencode rejects the part update, a warning is logged and the original text
+  stays.
+- **A model that disappears is benched, not retried forever.** A terminal
+  model-not-found error cools the model for the cap and releases the claim.
+
+### Fixed
+
+- **Startup no longer waits on the provider endpoint.** The config hook used to
+  await `client.provider.list` while opencode was still bootstrapping the same
+  instance, which deadlocked startup. The first spawn now refreshes readiness
+  before routing, and `pool_status`/`pool_recheck` still force a refresh.
+- **A terminal session error, or an abort that does not confirm, releases the
+  claim** instead of holding it until the reaper.
+
 ## [1.2.0] — voice, a per-session timeline, and a pool without a cap
 
 ### Added
@@ -920,6 +959,7 @@ experimental; `latest` remains 0.4.2.
 - First published release: pooled subagents over a shared set of models.
 
 [Unreleased]: https://github.com/lawaty/lacode/compare/v1.2.0...HEAD
+[1.3.0-beta.0]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.0
 [1.2.0]: https://github.com/lawaty/lacode/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/lawaty/lacode/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/lawaty/lacode/compare/v0.11.0...v1.0.0

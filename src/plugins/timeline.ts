@@ -360,20 +360,36 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
     }
   }
 
+  async function resolveRootSession(id: string): Promise<string> {
+    let current = id
+    const seen = new Set<string>()
+    while (true) {
+      if (seen.has(current)) return current
+      seen.add(current)
+      const info = await client.session
+        .get({ path: { id: current }, query: { directory } })
+        .then((result) => result?.data)
+        .catch(() => undefined)
+      if (!info?.parentID) return current
+      current = info.parentID
+    }
+  }
+
   async function reprocess(id: string, abort?: AbortSignal): Promise<string> {
-    if (reprocessing.has(id)) return "A timeline reprocess is already running for this session."
-    if (sessions.get(id)?.running) return "The timeline is currently summarizing this session; try again in a moment."
-    reprocessing.add(id)
-    const targetFile = timelineFile(id)
+    const rootId = await resolveRootSession(id)
+    if (reprocessing.has(rootId)) return "A timeline reprocess is already running for this session."
+    if (sessions.get(rootId)?.running) return "The timeline is currently summarizing this session; try again in a moment."
+    reprocessing.add(rootId)
+    const targetFile = timelineFile(rootId)
     const temp = targetFile + ".reprocess." + process.pid + "." + Date.now() + ".tmp"
     let cursor: TimelineCursor | undefined
     let entries = 0
     let calls = 0
     try {
-      const infoRes = await client.session.get({ path: { id }, query: { directory } })
+      const infoRes = await client.session.get({ path: { id: rootId }, query: { directory } })
       const info = infoRes?.data
       if (!info) return "Session not found."
-      const msgRes = await client.session.messages({ path: { id }, query: { directory } })
+      const msgRes = await client.session.messages({ path: { id: rootId }, query: { directory } })
       const messages = (msgRes?.data ?? []) as TimelineMessage[]
       writeFileSync(temp, "")
       for (let i = 0; i < MAX_REPROCESS_SLICES; i++) {
@@ -384,7 +400,7 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
         const excerpt = buildExcerpt(messages, cursor)
         if (!excerpt.text) break
         const prior = readEntriesAt(temp, 4)
-        const result = await summarize(id, info.title ?? "untitled", excerpt.text, prior, abort)
+        const result = await summarize(rootId, info.title ?? "untitled", excerpt.text, prior, abort)
         calls++
         if (!result.ok) {
           try { rmSync(temp, { force: true }) } catch {}
@@ -404,7 +420,7 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
         return "No entries generated; previous timeline kept."
       }
       renameSync(temp, targetFile)
-      const state = sessions.get(id)
+      const state = sessions.get(rootId)
       if (state) {
         state.cursor = cursor
         state.failures = 0
@@ -415,12 +431,12 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
       try { rmSync(temp, { force: true }) } catch {}
       return `Reprocess failed: ${String(error)}. Previous timeline kept.`
     } finally {
-      reprocessing.delete(id)
+      reprocessing.delete(rootId)
     }
   }
 
   const timelineReprocess = tool({
-    description: "Rebuild the current session's entire timeline from its transcript, replacing the existing entries. Used by /reprocess-timeline.",
+    description: "Rebuild the root session's entire timeline from its transcript, replacing the existing entries. Used by /reprocess-timeline.",
     args: {},
     execute: async (_args, ctx) => {
       const output = await reprocess(ctx.sessionID, ctx.abort)

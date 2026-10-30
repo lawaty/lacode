@@ -2,7 +2,7 @@
 
 > Ultimate opencode setup for Go users
 
-> LaCode 1.0.0 ships on the npm **`latest`** dist-tag. Prereleases use
+> LaCode 1.2.0 ships on the npm **`latest`** dist-tag. Prereleases use
 > `beta`: install `@lawaty/lacode@beta`, or pin an exact version.
 
 LaCode is an opencode plugin. It routes delegated work onto a weighted pool of
@@ -170,7 +170,7 @@ The running session keeps its loaded code; the new version takes effect on the
 next start, and the log says so. Run `lacode update` to do it on demand, or
 `lacode update --check` to just report.
 
-1.0.0 is published to the `latest` dist-tag; prereleases use `beta`. This check
+1.2.0 is published to the `latest` dist-tag; prereleases use `beta`. This check
 follows `latest`. A beta install is therefore reported as current even when a
 newer beta exists,
 and `lacode update` will not move it: pin the version you want in the `plugin`
@@ -186,7 +186,7 @@ lacode version
 ```
 
 ```
-version    1.0.0
+version    1.2.0
 root       /home/you/lacode
 source     checkout
 commit     <hash> (dirty)

@@ -169,6 +169,66 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     await log("warn", message)
   }
 
+  const refreshProviders = async (force = false) => {
+    if (!force && Date.now() - s.connectedAt < pool.PROVIDER_LIST_TTL_MS) return
+    s.connectedAt = Date.now()
+    try {
+      const providerApi = (client as unknown as { provider?: { list?: (options?: { query?: { directory?: string } }) => Promise<{ data?: { connected?: unknown; all?: unknown } }> } }).provider
+      if (!providerApi || typeof providerApi.list !== "function") return
+      const result = await providerApi.list({ query: { directory } })
+      const data = result?.data as { connected?: unknown; all?: unknown } | undefined
+      const connected = data?.connected
+      const all = data?.all
+      if (Array.isArray(connected) && Array.isArray(all)) {
+        s.connected = new Set(connected.filter((id): id is string => typeof id === "string"))
+        const credentialed = new Set<string>()
+        for (const entry of all) {
+          if (!entry || typeof entry !== "object") continue
+          const rec = entry as Record<string, unknown>
+          const id = typeof rec.id === "string" ? rec.id : undefined
+          if (!id) continue
+          if (typeof rec.key === "string" && rec.key.trim() !== "") {
+            credentialed.add(id)
+            continue
+          }
+          const options = rec.options
+          if (options && typeof options === "object") {
+            const opts = options as Record<string, unknown>
+            if (typeof opts.apiKey === "string" && opts.apiKey.trim() !== "") {
+              credentialed.add(id)
+              continue
+            }
+            const baseURL = typeof opts.baseURL === "string" ? opts.baseURL.trim() : ""
+            if (baseURL !== "") {
+              const envArr = Array.isArray(rec.env) ? rec.env : []
+              const hasCredEnv = envArr.some((e) => typeof e === "string" && /key|token|secret|password|credential|auth/i.test(e))
+              if (!hasCredEnv) {
+                credentialed.add(id)
+                continue
+              }
+            }
+          }
+          const envArr = Array.isArray(rec.env) ? rec.env : []
+          for (const e of envArr) {
+            if (typeof e === "string" && /key|token|secret|password|credential|auth/i.test(e)) {
+              if (typeof (process.env as Record<string, string | undefined>)[e] === "string" && (process.env as Record<string, string | undefined>)[e]!.trim() !== "") {
+                credentialed.add(id)
+                break
+              }
+            }
+          }
+        }
+        s.credentialed = credentialed
+        s.connectedReady = true
+      } else if (Array.isArray(connected)) {
+        s.connected = new Set(connected.filter((id): id is string => typeof id === "string"))
+        // Do not set connectedReady true if all missing; keep previous credentialed
+      }
+    } catch {
+      // Keep the last successful set. Until the first success, providerReady fails open.
+    }
+  }
+
   pool.init(s, (m) => void warnOnce(m))
 
   // Sweep the shared state directory on its own clock, independent of traffic.
@@ -217,8 +277,8 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
   }
 
   // A task child this plugin aborts ends in opencode as a bare "Task cancelled".
-  // The cause is recorded here under the claim key so the task result can carry it,
-  // and toasted at the same moment. Only aborts this plugin initiates are recorded,
+  // The cause is recorded here under the claim key so the event hook can rewrite
+  // the cancelled task part. Only aborts this plugin initiates are recorded,
   // so a stop the user pressed stays silent.
   const abortReports = new Map<string, AbortReport>()
   const abortKind = (reason: string): AbortReport["kind"] =>
@@ -231,6 +291,66 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     if (kind === "permission") return `permission denied after ${seconds}s`
     return `provider error after ${seconds}s`
   }
+  type CancelledTaskPart = {
+    id: string
+    sessionID: string
+    messageID: string
+    callID: string
+    type: "tool"
+    tool: string
+    state: {
+      status: "error"
+      error: string
+      input: Record<string, unknown>
+      metadata?: Record<string, unknown>
+      time: { start: number; end: number }
+    }
+    metadata?: Record<string, unknown>
+  }
+
+  // Cancelled spawns never reach tool.execute.after: opencode's task tool throws
+  // before the hook runs, so the inline card keeps the bare thrown message. The
+  // only lever is to rewrite the persisted tool part once opencode emits it.
+  const pendingCancelledParts = new Map<string, CancelledTaskPart>()
+  const patchedCancelledParts = new Set<string>()
+  const cancelledPrefix = "Task Cancelled by LaCode:"
+
+  const patchCancelledPart = async (part: CancelledTaskPart, key: string, report: AbortReport) => {
+    if (patchedCancelledParts.has(key)) return
+    patchedCancelledParts.add(key)
+    if (patchedCancelledParts.size > 64) {
+      const oldest = patchedCancelledParts.values().next().value
+      if (oldest !== undefined) patchedCancelledParts.delete(oldest)
+    }
+    const error = `${cancelledPrefix} ${report.message}`
+    try {
+      const url = new URL(
+        `/session/${encodeURIComponent(part.sessionID)}/message/${encodeURIComponent(part.messageID)}/part/${encodeURIComponent(part.id)}`,
+        serverUrl,
+      )
+      if (directory) url.searchParams.set("directory", directory)
+      const headers: Record<string, string> = { "Content-Type": "application/json" }
+      const password = process.env.OPENCODE_SERVER_PASSWORD
+      if (password) {
+        const username = process.env.OPENCODE_SERVER_USERNAME ?? "opencode"
+        headers.Authorization = `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`
+      }
+      const response = await fetch(url, {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ ...part, state: { ...part.state, error } }),
+        signal: AbortSignal.timeout(5000),
+      })
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`.trim())
+      abortReports.delete(key)
+    } catch (cause) {
+      await log("warn", `could not rewrite cancelled task ${part.callID}: ${cause instanceof Error ? cause.message : String(cause)}`, {
+        session: part.sessionID,
+        callID: part.callID,
+      })
+    }
+  }
+
   const noteAbort = async (key: string, report: AbortReport) => {
     abortReports.set(key, report)
     if (abortReports.size > 32) {
@@ -244,12 +364,10 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       failure: report.kind,
       released: report.released,
     })
-    try {
-      await client.tui?.showToast?.({
-        body: { title: "pool spawn", message: report.message, variant: "warning", duration: 8000 },
-      })
-    } catch {
-      /* no TUI attached; the log line above is the record */
+    const pending = pendingCancelledParts.get(key)
+    if (pending) {
+      pendingCancelledParts.delete(key)
+      await patchCancelledPart(pending, key, report)
     }
   }
 
@@ -625,7 +743,13 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
   const bind = async (cfg: Parameters<NonNullable<Hooks["config"]>>[0]) => {
     const slots = pool.ensureSlots(s, (m) => void warnOnce(m))
     const agents = cfg.agent as Record<string, { model?: string; [k: string]: unknown }> | undefined
-    const providers = cfg.provider as Record<string, { whitelist?: string[] }> | undefined
+    const providers = cfg.provider as Record<string, { whitelist?: string[]; options?: { apiKey?: unknown } }> | undefined
+    const configCreds = new Set<string>()
+    for (const [id, entry] of Object.entries(providers ?? {})) {
+      const options = (entry as { options?: { apiKey?: unknown } }).options
+      if (typeof options?.apiKey === "string" && options.apiKey.trim() !== "") configCreds.add(id)
+    }
+    s.configCreds = configCreds
     const known = new Set<string>()
     for (const [name, def] of Object.entries(cfg.agent ?? {})) if (def?.model) s.models.set(name, def.model)
 
@@ -681,6 +805,11 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       const provider = slot.model.slice(0, slash)
       const id = slot.model.slice(slash + 1)
       const entry = providers?.[provider]
+      if (!pool.providerReady(s, slot.model)) {
+        await warnOnce(
+          `provider ${provider} is not connected in opencode; slot ${slot.index} (${slot.model}) is excluded from routing until it is authenticated (run \`opencode auth login ${provider}\` or remove the line)`,
+        )
+      }
       if (!entry) {
         await warnOnce(`provider ${provider} is not configured in opencode.jsonc; slot ${slot.index} (${slot.model}) cannot resolve`)
         continue
@@ -885,12 +1014,58 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             await log("debug", `probe session ${sessionID} ended with an error; not cooling anything`)
             return
           }
+          const own = claimFor(sessionID)
+          const missing = pool.isModelMissingText(haystack)
           const status = typeof error?.data?.statusCode === "number" ? error.data.statusCode : undefined
           const auth = pool.isAuthFailureText(haystack) || status === 401 || status === 403
           const limited = pool.isLimitText(haystack) || status === 429
           const outage = pool.isUnavailableText(haystack)
-          if (!limited && !outage && !auth) return
-          const own = claimFor(sessionID)
+          if (missing) {
+            // A model id the provider does not serve is terminal and will not fix itself.
+            // Bench it for the cap like the probe does, and release the claim at once:
+            // tool.execute.after never runs when the spawn dies before the tool completes,
+            // so waiting for the reaper would leave a dead slot looking FULL.
+            const unbound = !own && sessionID
+              ? [...s.own.entries()].find(([, claim]) => !claim.g && claim.s === sessionID && haystack.includes(claim.m))
+              : undefined
+            const target = own ?? (unbound ? { key: unbound[0], claim: unbound[1] } : undefined)
+            const model = target?.claim.m
+            if (model) {
+              const strike = pool.recordStrike(s, model, pool.MODEL_MISSING_REASON, pool.MODEL_MISSING_COOLDOWN_MS)
+              if (strike) {
+                await log("warn", `bench ${model} (${pool.MODEL_MISSING_REASON}, strike ${strike.strikes}) after a terminal model-not-found error`, {
+                  model,
+                  slot: target?.claim.k,
+                  session: sessionID,
+                })
+              }
+            }
+            if (target) {
+              pool.release(s, target.key)
+              await log("warn", `released ${target.claim.v} claim on ${target.claim.m} after a terminal model-not-found error`, {
+                base: target.claim.v,
+                model: target.claim.m,
+                slot: target.claim.k,
+                session: sessionID,
+              })
+            }
+            return
+          }
+          if (!limited && !outage && !auth) {
+            // session.error is terminal (see the comment above the branch), so any claim
+            // bound to this session is finished even when the error is not a pool signal.
+            // Release it here rather than leaving the slot FULL until the reaper.
+            if (own) {
+              pool.release(s, own.key)
+              await log("warn", `released ${own.claim.v} claim on ${own.claim.m} after a terminal session error`, {
+                base: own.claim.v,
+                model: own.claim.m,
+                slot: own.claim.k,
+                session: sessionID,
+              })
+            }
+            return
+          }
           const named = auth ? pool.AUTH_FAILURE_REASON : (outage ? pool.UNAVAILABLE_REASON : pool.limitReason(haystack) ?? "rate-limited")
           let stated: number | undefined
           if (own) {
@@ -922,6 +1097,15 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             }
           }
           await failOver(sessionID, own?.claim.m ?? "?", named, { stated, cool: !own })
+          if (own && s.own.has(own.key)) {
+            pool.release(s, own.key)
+            await log("warn", `released ${own.claim.v} claim on ${own.claim.m} after a terminal session error (abort did not confirm)`, {
+              base: own.claim.v,
+              model: own.claim.m,
+              slot: own.claim.k,
+              session: sessionID,
+            })
+          }
           return
         }
 
@@ -941,6 +1125,40 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           if (sessionID) pool.noteActivity(s, sessionID)
         }
 
+        // A cancelled spawn leaves a bare "Task cancelled" on the parent's task
+        // part. Rewrite it with the cause the abort recorded, so the expanded
+        // card explains why instead of dead-ending. The part can be emitted
+        // before the abort report is stored; park it until noteAbort flushes it.
+        if (event.type === "message.part.updated") {
+          const part = props.part as
+            | (Partial<CancelledTaskPart> & { state?: Partial<CancelledTaskPart["state"]> })
+            | undefined
+          if (
+            part?.type === "tool" &&
+            part.tool === "task" &&
+            part.state?.status === "error" &&
+            part.state.error === "Task cancelled" &&
+            part.id &&
+            part.sessionID &&
+            part.messageID &&
+            part.callID
+          ) {
+            const key = pool.claimKey(part.sessionID, part.callID)
+            const full = part as CancelledTaskPart
+            const report = abortReports.get(key)
+            if (report) {
+              await patchCancelledPart(full, key, report)
+            } else {
+              pendingCancelledParts.set(key, full)
+              if (pendingCancelledParts.size > 32) {
+                const oldest = pendingCancelledParts.keys().next().value
+                if (oldest !== undefined) pendingCancelledParts.delete(oldest)
+              }
+            }
+          }
+          return
+        }
+
         if (event.type !== "message.updated") return
         const info = props.info as { role?: string; error?: unknown; providerID?: string; modelID?: string; sessionID?: string } | undefined
         if (!info || info.role !== "assistant" || !info.error) return
@@ -958,7 +1176,8 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         // right now, not that the key is out of quota.
         const gateway5xx = status !== undefined && status >= 500 && status <= 599
         const transientGateway = gateway5xx || pool.isTransientGatewayText(haystack)
-        if (!limited && !transientGateway && !auth) return
+        const missing = pool.isModelMissingText(haystack)
+        if (!limited && !transientGateway && !auth && !missing) return
         const model = `${info.providerID ?? "?"}/${info.modelID ?? "?"}`
         // A probe is a QUESTION about a model, not work on it. Counting its failure
         // would re-cool the model a little further on every check, until the window
@@ -976,6 +1195,30 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         // A gateway 5xx, a queue budget, or a timeout is the same kind of fault
         // and takes the same flat path; a real limit still escalates below.
         const ownMsg = claimFor(info.sessionID)
+        if (missing) {
+          const ownMsgMissing = ownMsg
+          const missingModel = ownMsgMissing?.claim.m ?? model
+          if (missingModel !== "?/?") {
+            const strike = pool.recordStrike(s, missingModel, pool.MODEL_MISSING_REASON, pool.MODEL_MISSING_COOLDOWN_MS)
+            if (strike) {
+              await log("warn", `bench ${missingModel} (${pool.MODEL_MISSING_REASON}, strike ${strike.strikes}) after a model-not-found error`, {
+                model: missingModel,
+                slot: ownMsgMissing?.claim.k,
+                session: info.sessionID,
+              })
+            }
+          }
+          if (ownMsgMissing) {
+            pool.release(s, ownMsgMissing.key)
+            await log("warn", `released ${ownMsgMissing.claim.v} claim on ${ownMsgMissing.claim.m} after a model-not-found error`, {
+              base: ownMsgMissing.claim.v,
+              model: ownMsgMissing.claim.m,
+              slot: ownMsgMissing.claim.k,
+              session: info.sessionID,
+            })
+          }
+          return
+        }
         if (pool.isUnavailableText(haystack) || (!limited && !auth && transientGateway)) {
           const transient = pool.coolUnavailable(s, model)
           if (transient) await log("warn", `cooling ${model} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason})`)
@@ -1031,6 +1274,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
 
       try {
         await reapStuck()
+        await refreshProviders()
         pool.refreshCatalog(s, serverUrl)
         const snap = pool.snapshot(s)
 
@@ -1091,12 +1335,14 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       if (!report) return
       abortReports.delete(key)
       const detail = [
-        `pool spawn: ${report.message}`,
+        `Task Cancelled by LaCode: ${report.message}`,
         `slot ${report.slot}; model ${report.model}; elapsed ${report.elapsedMs}ms; failure ${report.kind}; claim ${report.released ? "released" : "held"}`,
       ].join("\n")
       const text = typeof output.output === "string" ? output.output : ""
       // Replace opencode's dead end rather than appending to it, so a plain
-      // "Task cancelled" is not reachable for an abort this plugin caused.
+      // "Task cancelled" is not reachable for an abort this plugin caused. This
+      // only covers a spawn that completed before the abort landed; cancelled
+      // spawns are handled by the event hook.
       output.output = /task\s+cancel+ed/i.test(text) ? detail : text ? `${text}\n\n${detail}` : detail
     },
 
@@ -1111,6 +1357,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             .describe("Model ids to validate, as provider/model-id. Omit to probe only the models that are cooling."),
         },
         async execute(args) {
+          await refreshProviders(true)
           const models = args?.models
           const report = models && models.length > 0 ? await runValidation(models) : await runProbe()
           return { title: `agent-pool: ${reportTitle(report)}`, output: reportText(report) }
@@ -1122,6 +1369,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           "Show live pool load across every opencode process, per free model and per agent type, each slot's load against its ceiling, the slot marked <- next that the next spawn would take, and which models are cooling after a rate limit or a stuck task; COOLING/UNAVAILABLE = not routable. Check it before launching many parallel subagents.",
         args: {},
         async execute() {
+          await refreshProviders(true)
           pool.refreshCatalog(s, serverUrl)
           const slots = pool.ensureSlots(s, (m) => void warnOnce(m))
           const snap = pool.snapshot(s)
@@ -1149,6 +1397,9 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             const status = s.catalog.get(slot.model)
             const notes = [
               strike ? `UNAVAILABLE (COOLING ${Math.ceil((strike.until - now) / 1000)}s, ${strike.reason}, strike ${strike.strikes})` : "",
+              !pool.providerReady(s, slot.model)
+                ? `UNAVAILABLE (provider-unconfigured: ${pool.providerOf(slot.model)}; run \`opencode auth login ${pool.providerOf(slot.model)}\`)`
+                : "",
               status && status !== "active" && status !== "unknown" ? `catalog:${status}` : "",
             ].filter(Boolean)
             const marker = slot.index === next.index ? " <- next" : ""

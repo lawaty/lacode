@@ -969,6 +969,241 @@ sync_auth() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Cloudflare account id: local helper. Never printed to the console; callers
+# capture its stdout.
+# ---------------------------------------------------------------------------
+cloudflare_account_id() {
+  if [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+    printf '%s' "$CLOUDFLARE_ACCOUNT_ID"
+    return 0
+  fi
+  python3 - "$CONFIG_DIR/opencode.jsonc" <<'PY'
+import re, sys
+path = sys.argv[1]
+try:
+    with open(path) as fh:
+        text = fh.read()
+except Exception:
+    sys.exit(0)
+m = re.search(r'accounts/([A-Za-z0-9_-]{8,64})/ai/v1', text)
+if m:
+    print(m.group(1), end='')
+PY
+}
+
+# ---------------------------------------------------------------------------
+# Cloudflare: merge the account id into the remote opencode.jsonc.
+# ---------------------------------------------------------------------------
+remote_cf_merge() {
+  local host="$1" payload="$2"
+  [[ "$payload" != *$'\n'* ]] || { echo "oc-cf|err:payload must be single-line"; return 1; }
+  {
+    printf 'set -u\n'
+    printf 'DRY=%q\n' "$DRY_RUN"
+    printf 'emit() { echo "oc-cf|$1"; }\n'
+    printf "PAYLOAD=\$(cat <<'PAYLOAD_EOF'\n"
+    printf '%s\n' "$payload"
+    printf 'PAYLOAD_EOF\n)\n'
+    cat <<'REMOTE_TAIL'
+[ -n "$PAYLOAD" ] || { emit "warn:empty payload, nothing to do"; exit 0; }
+DRY="$DRY" python3 -c '
+import json, os, re, shutil, sys, time
+
+def strip_jsonc(text):
+    out = []
+    i = 0
+    n = len(text)
+    in_str = False
+    escape = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == "\"":
+                in_str = False
+            i += 1
+            continue
+        if c == "\"":
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i+1] == "/":
+            j = text.find("\n", i)
+            if j == -1:
+                break
+            i = j
+            continue
+        if c == "/" and i + 1 < n and text[i+1] == "*":
+            j = text.find("*/", i + 2)
+            if j == -1:
+                break
+            i = j + 2
+            continue
+        out.append(c)
+        i += 1
+    s = "".join(out)
+    s = re.sub(r",(\s*[}\]])", r"\1", s)
+    return s
+
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw)
+except Exception as e:
+    print("REJECT:bad payload (%s)" % e); raise SystemExit(0)
+if not isinstance(data, dict):
+    print("REJECT:payload is not an object"); raise SystemExit(0)
+account_id = data.get("accountId")
+if not isinstance(account_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{8,64}", account_id) is None:
+    print("REJECT:invalid account id"); raise SystemExit(0)
+
+config_path = os.path.expanduser("~/.config/opencode/opencode.jsonc")
+try:
+    with open(config_path) as fh:
+        original = fh.read()
+except FileNotFoundError:
+    print("REJECT:config missing"); raise SystemExit(0)
+except Exception as e:
+    print("REJECT:config unreadable (%s)" % e); raise SystemExit(0)
+
+try:
+    parsed = json.loads(strip_jsonc(original))
+except Exception as e:
+    print("REJECT:config unparseable (%s)" % e); raise SystemExit(0)
+if not isinstance(parsed, dict):
+    print("REJECT:config is not an object"); raise SystemExit(0)
+
+providers = parsed.get("provider")
+cf = None
+if isinstance(providers, dict):
+    cf = providers.get("cloudflare-workers-ai")
+base_url = None
+if isinstance(cf, dict):
+    opts = cf.get("options")
+    if isinstance(opts, dict):
+        base_url = opts.get("baseURL")
+
+if isinstance(base_url, str) and ("/accounts/%s/ai/v1" % account_id) in base_url:
+    print("IDENTICAL"); raise SystemExit(0)
+if cf is not None:
+    print("KEPT"); raise SystemExit(0)
+
+m = re.search(r"\"provider\"\s*:\s*\{", original)
+if not m:
+    print("REJECT:no provider section"); raise SystemExit(0)
+entry = "\n    \"cloudflare-workers-ai\": {\n      \"options\": {\n        \"baseURL\": \"https://api.cloudflare.com/client/v4/accounts/%s/ai/v1\"\n      }\n    }," % account_id
+new_text = original[:m.end()] + entry + original[m.end():]
+
+try:
+    json.loads(strip_jsonc(new_text))
+except Exception as e:
+    print("REJECT:validation failed (%s)" % e); raise SystemExit(0)
+
+dry = os.environ.get("DRY") == "1"
+if dry:
+    print("WOULD-ADD"); raise SystemExit(0)
+
+try:
+    if os.path.exists(config_path):
+        shutil.copy2(config_path, config_path + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+except Exception:
+    pass
+tmp = config_path + ".tmp"
+try:
+    mode = 0o644
+    if os.path.exists(config_path):
+        mode = os.stat(config_path).st_mode & 0o777
+    with open(tmp, "w") as fh:
+        fh.write(new_text)
+    os.chmod(tmp, mode if mode else 0o644)
+    os.replace(tmp, config_path)
+except Exception as e:
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    print("REJECT:write failed (%s)" % e); raise SystemExit(0)
+print("ADDED")
+' <<< "$PAYLOAD"
+rc=$?
+[ $rc -eq 0 ] || emit "err:merge helper failed"
+REMOTE_TAIL
+  } | timeout "$SSH_TIMEOUT" "${SSH_STDIN[@]}" "$host" bash -s
+}
+
+# alias for callers that use the longer name
+remote_cloudflare_merge() { remote_cf_merge "$@"; }
+
+sync_cloudflare() {
+  local host="$1"
+  local account_id
+  account_id="$(cloudflare_account_id)" || true
+  if [[ -z "$account_id" ]]; then
+    warn "cloudflare: no account id available; skipping"
+    return 0
+  fi
+  if [[ ! "$account_id" =~ ^[A-Za-z0-9_-]{8,64}$ ]]; then
+    bad "cloudflare: invalid account id on $host"
+    FAILED+=("$host")
+    return 1
+  fi
+  local payload="{\"accountId\":\"${account_id}\"}"
+  local out
+  out="$(remote_cf_merge "$host" "$payload")" || { bad "cloudflare: merge failed on $host"; FAILED+=("$host"); return 1; }
+  local line reported=0
+  local added=0 identical=0 kept=0 would_add=0 reject=""
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      oc-cf\|*)
+        local msg="${line#oc-cf|}"
+        case "$msg" in
+          ok:*)   ok "cloudflare: ${msg#ok:}"; reported=1 ;;
+          warn:*) warn "cloudflare: ${msg#warn:}"; reported=1 ;;
+          err:*)  bad "cloudflare: ${msg#err:}"; FAILED+=("$host"); reported=1 ;;
+        esac
+        ;;
+      ADDED) added=1 ;;
+      IDENTICAL) identical=1 ;;
+      KEPT) kept=1 ;;
+      WOULD-ADD) would_add=1 ;;
+      REJECT:*) reject="${reject} ${line#REJECT:}" ;;
+    esac
+  done <<< "$out"
+  if [[ -n "$reject" ]]; then
+    bad "cloudflare: rejected on $host (${reject# })"
+    FAILED+=("$host")
+    return 1
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    if [[ $would_add -eq 1 ]]; then
+      ok "cloudflare: would add cloudflare-workers-ai"
+    elif [[ $identical -eq 1 ]]; then
+      ok "cloudflare: already configured"
+    elif [[ $kept -eq 1 ]]; then
+      ok "cloudflare: kept existing provider"
+    fi
+  else
+    if [[ $added -eq 1 ]]; then
+      ok "cloudflare: added cloudflare-workers-ai"
+    elif [[ $identical -eq 1 ]]; then
+      ok "cloudflare: already configured"
+    elif [[ $kept -eq 1 ]]; then
+      ok "cloudflare: kept existing provider"
+    fi
+  fi
+  if [[ $reported -eq 0 && $added -eq 0 && $identical -eq 0 && $kept -eq 0 && $would_add -eq 0 ]]; then
+    bad "cloudflare: merge produced no confirmation on $host - treat as not applied"
+    FAILED+=("$host")
+    return 1
+  fi
+}
+
 # Before any unit is written: a port collision is only detectable with every
 # host's port in hand, and by then one unit may already be running.
 assert_ports_unique
@@ -1128,6 +1363,7 @@ for HOST in "${HOSTS[@]}"; do
 
   if [[ $WITH_AUTH -eq 1 ]]; then
     sync_auth "$HOST"
+    sync_cloudflare "$HOST"
   fi
 
   ok "done"

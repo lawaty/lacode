@@ -535,3 +535,20 @@ test("sync-hosts honours the LACODE_SYNC kill switch without touching a host", (
   assert.match(result.stdout, /lacode sync: disabled/)
   assert.equal(calls(log).length, 0)
 })
+
+
+test("sync-hosts reads OC_AUTH_PROVIDERS from the env file", (t) => {
+  const { log, env, root } = setup(t, { auth: { opencode: { key: "sk-test-do-not-log" } } })
+  const envFile = join(root, "sync.env")
+  writeFileSync(envFile, "OC_HOSTS=host-a\nOC_AUTH_PROVIDERS=foo bar\n")
+
+  const runEnv = { ...env, OC_SYNC_ENV_FILE: envFile, LACODE_SYNC_NO_WAIT: "1" }
+  delete runEnv.OC_HOSTS
+  delete runEnv.OC_AUTH_PROVIDERS
+
+  const result = run(runEnv)
+  assert.equal(result.status, 0, result.stderr)
+
+  const envelope = JSON.parse(readFileSync(env.FAKE_SSH_AUTH_LOG, "utf8"))
+  assert.deepEqual(envelope.replace, ["foo", "bar"])
+})

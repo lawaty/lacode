@@ -39,9 +39,11 @@ import { PACKAGE_ROOT } from "./package-root.ts"
 // range, repeats allowed, no slot cap.
 
 export const CLAIM_TTL_MS = 10 * 60 * 1000
+export const UNBOUND_CLAIM_MS = 2 * 60 * 1000
 export const DEAD_FILE_MS = 2 * CLAIM_TTL_MS
 export const ORPHAN_TMP_MS = 60 * 1000
 export const CATALOG_TTL_MS = 10 * 60 * 1000
+export const PROVIDER_LIST_TTL_MS = 60 * 1000
 export const STUCK_MIN_AGE_MS = 5 * 60 * 1000
 export const STUCK_IDLE_MS = 3 * 60 * 1000
 /** Absolute ceiling on a claim's life. The silence check below can be reset by
@@ -601,6 +603,16 @@ type State = {
   lastSweep: number
   /** When the shared state directory was last swept of stale files. */
   lastDirSweep: number
+  /** provider ids opencode reported as connected */
+  connected: Set<string>
+  /** when the list was last fetched (0 = never) */
+  connectedAt: number
+  /** true after the first successful fetch, even if the set is empty */
+  connectedReady: boolean
+  /** providers with positive credential evidence from provider.list() (key, apiKey, env, local baseURL) */
+  credentialed: Set<string>
+  /** providers whose resolved opencode config has a non-empty apiKey (config hook resolves {env:...}) */
+  configCreds: Set<string>
   id: string
   dir: string
   modelsFile?: string
@@ -643,6 +655,11 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
       reaping: false,
       lastSweep: 0,
       lastDirSweep: 0,
+      connected: new Set(),
+      connectedAt: 0,
+      connectedReady: false,
+      credentialed: new Set(),
+      configCreds: new Set(),
       id,
       dir,
       modelsFile,
@@ -827,9 +844,18 @@ export function sweepStateDir(s: State): string[] {
   return removed
 }
 
+const claimExpired = (claim: Claim, now: number) =>
+  now - (claim.hb ?? claim.t) > CLAIM_TTL_MS || (!claim.g && now - claim.t > UNBOUND_CLAIM_MS)
+
 export function pruneOwn(s: State) {
   const now = Date.now()
-  for (const [key, claim] of s.own) if (now - (claim.hb ?? claim.t) > CLAIM_TTL_MS) s.own.delete(key)
+  let removed = false
+  for (const [key, claim] of s.own)
+    if (claimExpired(claim, now)) {
+      s.own.delete(key)
+      removed = true
+    }
+  if (removed) publish(s)
 }
 
 // Bound the two per-session maps that would otherwise grow for the life of the
@@ -880,7 +906,7 @@ export function publish(s: State) {
   if (!s.dirReady) return
   const now = Date.now()
   const payload: Record<string, Claim> = {}
-  for (const [key, claim] of s.own) if (now - (claim.hb ?? claim.t) <= CLAIM_TTL_MS) payload[key] = claim
+  for (const [key, claim] of s.own) if (!claimExpired(claim, now)) payload[key] = claim
   try {
     writeFileSync(join(s.dir, `${selfFile(s.id)}.tmp`), JSON.stringify(payload))
     renameSync(join(s.dir, `${selfFile(s.id)}.tmp`), join(s.dir, selfFile(s.id)))
@@ -937,7 +963,7 @@ export function readSiblings(s: State): Sibling[] {
     try {
       const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, Claim>
       const claims = Object.values(parsed).filter(
-        (c) => c && typeof c.v === "string" && typeof c.m === "string" && typeof c.k === "number" && Number.isFinite(c.k) && now - (c.hb ?? c.t) <= CLAIM_TTL_MS,
+        (c) => c && typeof c.v === "string" && typeof c.m === "string" && typeof c.k === "number" && Number.isFinite(c.k) && !claimExpired(c as Claim, now),
       )
       siblings.push({ id: match[1], claims })
     } catch {
@@ -1161,6 +1187,13 @@ export const unmarkProbe = (s: State, sessionID: string) => s.probes.delete(sess
 /** True for a session this process opened to probe a cooled model. */
 export const isProbe = (s: State, sessionID: string) => s.probes.has(sessionID)
 
+export function providerReady(s: State, model: string) {
+  if (!s.connectedReady) return true
+  const provider = providerOf(model)
+  if (!s.connected.has(provider)) return false
+  return s.credentialed.has(provider) || s.configCreds.has(provider) || provider === "opencode"
+}
+
 export function refreshCatalog(s: State, serverUrl?: URL) {
   if (!serverUrl || Date.now() - s.catalogAt < CATALOG_TTL_MS) return
   s.catalogAt = Date.now()
@@ -1199,6 +1232,7 @@ export function refreshCatalog(s: State, serverUrl?: URL) {
  * have. That is the trade: prefer a wasted spawn over a stranded one.
  */
 export function isAvailable(s: State, model: string, cooling: Map<string, Strike>) {
+  if (!providerReady(s, model)) return false
   if (cooling.has(model)) return false
   const status = s.catalog.get(model)
   return status === undefined || status === "active" || status === "unknown"
@@ -1238,8 +1272,9 @@ export type PoolPass = 1 | "overflow"
 
 export function pickSlot(s: State, snap: Snapshot): Slot {
   const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
-  const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
-  const pool = usable.length > 0 ? usable : slots
+  const configured = slots.filter((slot) => providerReady(s, slot.model))
+  const usable = configured.filter((slot) => isAvailable(s, slot.model, snap.cooling))
+  const pool = usable.length > 0 ? usable : configured.length > 0 ? configured : slots
   for (const slot of usable) {
     if (loadOf(snap.counts, slot.index) < slot.weight) return slot
   }

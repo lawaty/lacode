@@ -238,6 +238,26 @@ function readEnvHosts(file) {
   return value
 }
 
+/** Read a single NAME=value line from an env file. Last line wins. */
+function readEnvValue(file, name) {
+  if (!existsSync(file)) return null
+  let value = null
+  let seen = false
+  try {
+    for (const line of readFileSync(file, "utf8").split(/\r?\n/)) {
+      const match = new RegExp("^\\s*(?:export\\s+)?" + name + "\\s*=\\s*(.*)$").exec(line)
+      if (match) {
+        value = parseShellValue(match[1])
+        seen = true
+      }
+    }
+  } catch {
+    return null
+  }
+  if (!seen) return null
+  return value
+}
+
 function parseShellValue(rest) {
   const raw = rest.trim()
   if (raw.startsWith('"')) {
@@ -255,6 +275,10 @@ function parseShellValue(rest) {
   }
   if (raw.startsWith("'")) {
     const end = raw.indexOf("'", 1)
+    return end === -1 ? raw.slice(1) : raw.slice(1, end)
+  }
+  if (raw.startsWith("`")) {
+    const end = raw.indexOf("`", 1)
     return end === -1 ? raw.slice(1) : raw.slice(1, end)
   }
   return raw.replace(/#.*$/, "").trim()
@@ -700,7 +724,7 @@ function printDryRun(hosts, version) {
 }
 
 export { cleanupRemote }
-export { loadLocalAuth, syncAuth, syncHost, hostList, splitHosts }
+export { loadLocalAuth, syncAuth, syncHost, hostList, splitHosts, readEnvHosts, readEnvValue }
 
 export function main(env = process.env) {
   const disabled = env.LACODE_SYNC
@@ -723,7 +747,9 @@ export function main(env = process.env) {
     return 0
   }
 
-  const replace = (env.OC_AUTH_PROVIDERS || "opencode-go opencode").split(/\s+/).filter(Boolean)
+  const envFile = env.OC_SYNC_ENV_FILE || envFileDefault()
+  const authProviders = env.OC_AUTH_PROVIDERS ?? readEnvValue(envFile, "OC_AUTH_PROVIDERS") ?? "opencode-go opencode"
+  const replace = authProviders.split(/\s+/).filter(Boolean)
 
   const seconds = waitSeconds(env)
 
