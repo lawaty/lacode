@@ -7,6 +7,13 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.3.0-beta.3] — the 1.3.0-beta.2 notes
+
+### Changed
+
+- **Republished so the published tarball carries the 1.3.0-beta.2 changelog
+  entry.** No runtime change: the code is identical to 1.3.0-beta.2.
+
 ## [1.3.0-beta.2] — a reason that survives, and a timeline that ships
 
 ### Added
