@@ -5,7 +5,11 @@ import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
 
+let registered = false
+
 const tui: TuiPlugin = async (api) => {
+  if (registered) return
+  registered = true
   // built-in sidebar panels are context 100, MCP 200, LSP 300, todo 400, files 500, so 150 places the timeline right after context and above MCP
   api.slots.register({
     order: 150,

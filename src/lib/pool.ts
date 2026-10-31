@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { PACKAGE_ROOT } from "./package-root.ts"
@@ -1457,4 +1457,72 @@ export function coolProvider(s: State, provider: string, until: number, reason: 
     if (strike) affected.push(strike)
   }
   return affected
+}
+
+export type FailureRecord = {
+  ts: number
+  source: "pool" | "observed"
+  base?: string
+  slot?: number
+  model: string
+  session?: string
+  reason: string
+  elapsedMs?: number
+  released?: boolean
+  detail?: string
+}
+
+export function recordFailure(s: State, f: FailureRecord): void {
+  try {
+    const path = join(s.dir, "failures.jsonl")
+    const trimSize = 64 * 1024
+    const keepLines = 200
+    if (existsSync(path)) {
+      const st = statSync(path)
+      if (typeof st.size === "number" && st.size > trimSize) {
+        try {
+          const content = readFileSync(path, "utf8")
+          const parts = content.split("\n")
+          const lines = parts.filter((line) => line.length > 0)
+          if (lines.length > keepLines) {
+            const kept = lines.slice(lines.length - keepLines)
+            writeFileSync(`${path}.tmp`, kept.join("\n") + "\n")
+            renameSync(`${path}.tmp`, path)
+          } else if (lines.length === 0 && parts.length >= 1) {
+            // if file only had newlines, try to trim
+          }
+        } catch {
+          // if trim fails, continue to append as best effort
+        }
+      }
+    }
+    appendFileSync(path, JSON.stringify(f) + "\n")
+  } catch (error) {
+    console.error("[agent-pool] failed to record failure:", String(error))
+  }
+}
+
+export function readFailures(s: State, limit: number): FailureRecord[] {
+  const path = join(s.dir, "failures.jsonl")
+  try {
+    if (!existsSync(path)) return []
+    const content = readFileSync(path, "utf8")
+    const parts = content.split("\n")
+    const records: FailureRecord[] = []
+    for (let i = 0; i < parts.length; i++) {
+      const line = parts[i]
+      if (line.length === 0) continue
+      try {
+        const parsed = JSON.parse(line) as FailureRecord
+        records.push(parsed)
+      } catch {
+        // skip unparseable lines
+      }
+    }
+    if (limit <= 0) return []
+    if (records.length <= limit) return records
+    return records.slice(records.length - limit)
+  } catch {
+    return []
+  }
 }

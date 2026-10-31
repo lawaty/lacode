@@ -54,6 +54,8 @@ export const ENTRY_POINTS = [
 /** Never inlined: the peer SDK the host provides, and everything node ships. */
 export const EXTERNAL = [
   "@opencode-ai/plugin",
+  "solid-js",
+  "@opentui/solid",
   "@picovoice/porcupine-node",
   "vosk",
   ...builtinModules,
@@ -114,6 +116,7 @@ export const build = async ({ log = false } = {}) => {
       format: "esm",
       platform: "node",
       target: "node22",
+      jsx: "automatic",
       external: EXTERNAL,
       // esbuild hoists a leading `#!` to the top of the output on its own, so
       // dist/lacode.js keeps its shebang and stays directly executable.

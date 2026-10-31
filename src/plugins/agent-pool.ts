@@ -281,6 +281,8 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
   // the cancelled task part. Only aborts this plugin initiates are recorded,
   // so a stop the user pressed stays silent.
   const abortReports = new Map<string, AbortReport>()
+  const spawns = new Map<string, { base: string; slot: number; model: string; t: number }>()
+  const observedErrors = new Map<string, { reason: string; detail: string }>()
   const abortKind = (reason: string): AbortReport["kind"] =>
     pool.isQuotaReason(reason) || pool.isLimitText(reason) ? "rate-limit" : "provider error"
   const abortLabel = (kind: AbortReport["kind"], elapsedMs: number): string => {
@@ -323,13 +325,31 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       if (oldest !== undefined) patchedCancelledParts.delete(oldest)
     }
     const error = `${cancelledPrefix} ${report.message}`
+    const updated = { ...part, state: { ...part.state, error } }
     try {
+      // Prefer SDK path: the env-var OPENCODE_SERVER_PASSWORD only exists in the
+      // server process, not in the plugin's process, so raw fetch goes unauthenticated.
+      const updater = (client as { part?: { update?: (args: Record<string, unknown>) => Promise<{ response?: { ok?: boolean; status?: number } } | undefined> } }).part?.update
+      if (typeof updater === "function") {
+        const result = await updater({
+          sessionID: part.sessionID,
+          messageID: part.messageID,
+          partID: part.id,
+          directory,
+          part: updated,
+          signal: AbortSignal.timeout(5000),
+        })
+        if (!result?.response?.ok) throw new Error(`server answered HTTP ${result?.response?.status ?? "?"}`)
+        abortReports.delete(key)
+        return
+      }
       const url = new URL(
         `/session/${encodeURIComponent(part.sessionID)}/message/${encodeURIComponent(part.messageID)}/part/${encodeURIComponent(part.id)}`,
         serverUrl,
       )
       if (directory) url.searchParams.set("directory", directory)
       const headers: Record<string, string> = { "Content-Type": "application/json" }
+      if (directory) headers["x-opencode-directory"] = directory
       const password = process.env.OPENCODE_SERVER_PASSWORD
       if (password) {
         const username = process.env.OPENCODE_SERVER_USERNAME ?? "opencode"
@@ -1056,6 +1076,26 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             // bound to this session is finished even when the error is not a pool signal.
             // Release it here rather than leaving the slot FULL until the reaper.
             if (own) {
+              const detail = haystack.slice(0, 400)
+              pool.recordFailure(s, {
+                ts: Date.now(),
+                source: "observed",
+                base: own.claim.v,
+                slot: own.claim.k,
+                model: own.claim.m,
+                session: sessionID,
+                reason: "provider error",
+                elapsedMs: Date.now() - own.claim.t,
+                released: true,
+                detail,
+              })
+              if (!observedErrors.has(own.key)) {
+                observedErrors.set(own.key, { reason: "provider error", detail })
+                if (observedErrors.size > 32) {
+                  const oldest = observedErrors.keys().next().value
+                  if (oldest !== undefined) observedErrors.delete(oldest)
+                }
+              }
               pool.release(s, own.key)
               await log("warn", `released ${own.claim.v} claim on ${own.claim.m} after a terminal session error`, {
                 base: own.claim.v,
@@ -1148,6 +1188,21 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             const report = abortReports.get(key)
             if (report) {
               await patchCancelledPart(full, key, report)
+            } else if (observedErrors.has(key)) {
+              const spawn = spawns.get(key)
+              const seen = observedErrors.get(key)!
+              const elapsedMs = spawn ? Date.now() - spawn.t : 0
+              const failureReport: AbortReport = {
+                slot: spawn?.slot ?? 0,
+                model: spawn?.model ?? "?",
+                elapsedMs,
+                kind: seen.reason as AbortReport["kind"],
+                released: true,
+                message: `${spawn?.model ?? "?"} — ${seen.reason}${seen.detail ? `: ${seen.detail.slice(0, 200)}` : ""}`,
+              }
+              await patchCancelledPart(full, key, failureReport)
+              observedErrors.delete(key)
+              spawns.delete(key)
             } else {
               pendingCancelledParts.set(key, full)
               if (pendingCancelledParts.size > 32) {
@@ -1177,7 +1232,31 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         const gateway5xx = status !== undefined && status >= 500 && status <= 599
         const transientGateway = gateway5xx || pool.isTransientGatewayText(haystack)
         const missing = pool.isModelMissingText(haystack)
-        if (!limited && !transientGateway && !auth && !missing) return
+        if (!limited && !transientGateway && !auth && !missing) {
+          const ownMsgUnclassified = claimFor(info.sessionID)
+          if (ownMsgUnclassified) {
+            pool.recordFailure(s, {
+              ts: Date.now(),
+              source: "observed",
+              base: ownMsgUnclassified.claim.v,
+              slot: ownMsgUnclassified.claim.k,
+              model: ownMsgUnclassified.claim.m,
+              session: info.sessionID,
+              reason: "provider error",
+              elapsedMs: Date.now() - ownMsgUnclassified.claim.t,
+              released: false,
+              detail: haystack.slice(0, 400),
+            })
+            if (!observedErrors.has(ownMsgUnclassified.key)) {
+              observedErrors.set(ownMsgUnclassified.key, { reason: "provider error", detail: haystack.slice(0, 400) })
+              if (observedErrors.size > 32) {
+                const oldest = observedErrors.keys().next().value
+                if (oldest !== undefined) observedErrors.delete(oldest)
+              }
+            }
+          }
+          return
+        }
         const model = `${info.providerID ?? "?"}/${info.modelID ?? "?"}`
         // A probe is a QUESTION about a model, not work on it. Counting its failure
         // would re-cool the model a little further on every check, until the window
@@ -1303,7 +1382,9 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           })
           output.args.subagent_type = variant
           // Invariant: a claim is held only for a rout that completes.
-          pool.acquire(s, requested, slot, input.sessionID, pool.claimKey(input.sessionID, input.callID))
+          const routeKey = pool.claimKey(input.sessionID, input.callID)
+          pool.acquire(s, requested, slot, input.sessionID, routeKey)
+          spawns.set(routeKey, { base: requested, slot: slot.index, model: slot.model, t: Date.now() })
           return
         }
 
@@ -1330,15 +1411,30 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     "tool.execute.after": async (input, output) => {
       if (input.tool !== "task") return
       const key = pool.claimKey(input.sessionID, input.callID)
+      const spawn = spawns.get(key)
       pool.release(s, key)
+      const text = typeof output.output === "string" ? output.output : ""
+      const failed = abortReports.has(key) || /task\s+cancel+ed/i.test(text)
+      spawns.delete(key)
       const report = abortReports.get(key)
       if (!report) return
       abortReports.delete(key)
+      pool.recordFailure(s, {
+        ts: Date.now(),
+        source: "pool",
+        base: undefined,
+        slot: report.slot,
+        model: report.model,
+        session: input.sessionID,
+        reason: report.kind,
+        elapsedMs: report.elapsedMs,
+        released: report.released,
+        detail: report.message,
+      })
       const detail = [
         `Task Cancelled by LaCode: ${report.message}`,
         `slot ${report.slot}; model ${report.model}; elapsed ${report.elapsedMs}ms; failure ${report.kind}; claim ${report.released ? "released" : "held"}`,
       ].join("\n")
-      const text = typeof output.output === "string" ? output.output : ""
       // Replace opencode's dead end rather than appending to it, so a plain
       // "Task cancelled" is not reachable for an abort this plugin caused. This
       // only covers a spawn that completed before the abort landed; cancelled
@@ -1466,6 +1562,37 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
               coolingNow.length === 0
                 ? "no models cooling down."
                 : `unavailable/cooling: ${coolingNow.map(([m, st]) => `${m} for ${Math.ceil((st.until - now) / 1000)}s`).join(", ")}`,
+              (() => {
+                const recent = pool.readFailures(s, 5)
+                if (recent.length === 0) {
+                  return "recent failures: none recorded"
+                }
+                const all = pool.readFailures(s, 1000)
+                const total = all.length
+                const fmtAge = (ts: number) => {
+                  const diff = Math.max(0, Date.now() - ts)
+                  const sAge = Math.floor(diff / 1000)
+                  if (sAge < 60) return `${sAge}s`
+                  const mAge = Math.floor(sAge / 60)
+                  if (mAge < 60) return `${mAge}m`
+                  const hAge = Math.floor(mAge / 60)
+                  if (hAge < 24) return `${hAge}h`
+                  const dAge = Math.floor(hAge / 24)
+                  return `${dAge}d`
+                }
+                const lines = [`recent failures: ${total} recorded in ${s.dir}/failures.jsonl`]
+                const ordered = [...recent].reverse()
+                for (const rec of ordered) {
+                  const age = fmtAge(rec.ts)
+                  const slot = rec.slot === undefined || rec.slot === null ? "-" : rec.slot
+                  const model = rec.model
+                  const reason = rec.reason
+                  const source = rec.source
+                  const suffix = source === "observed" ? " (unclassified)" : ""
+                  lines.push(`  ${age} ago  slot ${slot} ${model}  ${reason}  [${source}]${suffix}`)
+                }
+                return lines.join("\n")
+              })(),
             ].join("\n"),
           }
         },

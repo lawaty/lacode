@@ -152,3 +152,64 @@ test("rewrites a cancelled task part when it arrives before the abort report", a
     await cleanup()
   }
 })
+
+test("uses SDK part.update when available (primary path) and avoids fetch PATCH", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cancelled-part-sdk-"))
+  const calls = []
+  const toasts = []
+  const logs = []
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, init = {}) => {
+    const method = init.method ?? "GET"
+    calls.push({ url: String(url), method, body: typeof init.body === "string" ? init.body : undefined })
+    if (method === "PATCH") {
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+    }
+    return new Response(JSON.stringify({ data: [] }), { status: 200, headers: { "content-type": "application/json" } })
+  }
+  const updateCalls = []
+  const client = {
+    app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) },
+    session: {
+      abort: async () => ({ data: true, response: { ok: true, status: 200 }, error: undefined, request: undefined }),
+    },
+    tui: { showToast: async (toast) => toasts.push(toast) },
+    part: {
+      update: async (args) => {
+        updateCalls.push(args)
+        return { response: { ok: true, status: 200 } }
+      },
+    },
+  }
+  const hooks = await AgentPool(
+    { client, serverUrl: new URL("http://127.0.0.1:59999") },
+    { id: "cancelled-part", dir, modelsFile: PRESET },
+  )
+  await hooks.config(shippedConfig())
+  try {
+    const slot = await spawn(hooks)
+    await bindChild(hooks)
+    await triggerFailover(hooks, slot)
+    await emitCancelledPart(hooks)
+    assert.equal(updateCalls.length, 1, `expected client.part.update called once`)
+    const args = updateCalls[0]
+    assert.equal(args.sessionID, "parent")
+    assert.equal(args.messageID, "msg-1")
+    assert.equal(args.partID, "part-1")
+    assert.ok(args.part)
+    assert.equal(args.part.callID, "call-1")
+    assert.equal(args.part.tool, "task")
+    assert.ok(args.part.state.error.startsWith("Task Cancelled by LaCode: "))
+    const patches = calls.filter((call) => call.method === "PATCH")
+    assert.equal(patches.length, 0, `no fetch PATCH should be issued, got ${patches.length}`)
+    assert.equal(toasts.length, 0)
+  } finally {
+    globalThis.fetch = realFetch
+    try {
+      await hooks.dispose()
+    } catch {
+      /* best-effort teardown */
+    }
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

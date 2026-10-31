@@ -15,6 +15,7 @@ import { decodeWavPcm, hasSpeech, isSilenceHallucination } from "../voice/audio.
 import type { ParsedQuestion } from "../voice/parse.ts"
 import { createVoiceClient } from "../voice/transport.ts"
 import { VOICE_PROTOCOL_VERSION } from "../voice/protocol.ts"
+import timelineMod from "./timeline.tsx"
 
 export type VoiceOptions = {
   enabled?: boolean
@@ -640,6 +641,18 @@ const tui: TuiPlugin = async (api, options) => {
   }
 
   api.keymap.registerLayer({ mode: "base", commands, bindings } as any)
+
+  const timelineOpts = (options ?? {}) as { timeline?: boolean | { enabled?: boolean } }
+  const timelineOff =
+    timelineOpts.timeline === false ||
+    (typeof timelineOpts.timeline === "object" && timelineOpts.timeline !== null && timelineOpts.timeline.enabled === false)
+  if (!timelineOff) {
+    try {
+      await timelineMod.tui(api, options)
+    } catch {
+      // A broken sidebar must never cost dictation.
+    }
+  }
 }
 
 const mod: TuiPluginModule = {

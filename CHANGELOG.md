@@ -7,6 +7,43 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.3.0-beta.2] — a reason that survives, and a timeline that ships
+
+### Added
+
+- **A durable failure journal.** Every failed or cancelled spawn appends one JSON
+  line to `failures.jsonl` in the pool state directory: timestamp, source, base,
+  slot, model, reason, elapsed time and the error text. `pool_status` prints the
+  last five under `recent failures:`, so a slot that dies without a cooldown is
+  no longer invisible afterwards.
+
+### Changed
+
+- **A spawn the pool did not abort now records why it died.** An unclassified
+  `session.error`, or an assistant message error matching no known class, used to
+  release the claim and say nothing. It now records the slot, model and error
+  text, and the cancelled task card is rewritten with that reason. A stop the
+  user presses still produces no record and no rewrite, because it raises no
+  session error.
+
+### Fixed
+
+- **The cancelled-task rewrite was unauthenticated.** It hand-rolled a `fetch`
+  PATCH and read `OPENCODE_SERVER_PASSWORD` from the plugin's own environment —
+  but that variable exists only in the server process, so the request always went
+  out unauthenticated and a password-protected server answered `401`. The reason
+  was then dropped and the caller saw a bare `Task cancelled`. The rewrite now
+  goes through the injected client's part update, which is already authenticated;
+  the raw request remains only as a fallback for a runtime without it.
+- **The timeline sidebar was never bundled.** `src/tui/timeline.tsx` was added in
+  1.2.0 but never imported by the TUI entry point, so `dist/tui.js` contained no
+  reference to it and no published version shipped the panel: it worked only on a
+  machine whose `tui.json` pointed at the raw source file. The TUI entry now
+  composes it, `solid-js` and `@opentui/solid` are treated as host-provided peers
+  instead of being bundled, and the automatic JSX transform is enabled so the
+  `@opentui/solid` pragma is honoured rather than silently compiling to
+  `React.createElement`.
+
 ## [1.3.0-beta.0] — provider readiness, timeline roots, and a reason on cancelled tasks
 
 ### Added

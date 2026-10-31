@@ -1,6 +1,6 @@
 {
   "name": "@lawaty/lacode",
-  "version": "1.3.0-beta.0",
+  "version": "1.3.0-beta.2",
   "description": "Ultimate opencode setup for Go users — cost-controlled pooled subagents, hang recovery, and notifications for opencode.",
   "license": "MIT",
   "type": "module",
@@ -64,7 +64,17 @@
     "esbuild": "^0.28.2"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "1.18.34"
+    "@opencode-ai/plugin": "1.18.34",
+    "solid-js": "*",
+    "@opentui/solid": "*"
+  },
+  "peerDependenciesMeta": {
+    "solid-js": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    }
   },
   "optionalDependencies": {
     "@picovoice/porcupine-node": "^4.0.2",
