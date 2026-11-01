@@ -911,6 +911,14 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     event: async ({ event }) => {
       try {
         const props = (event as { type?: string; properties?: Record<string, unknown> }).properties ?? {}
+        // Proof of life: any event that says opencode is still working on the
+        // session. Message traffic is the narrowest signal; session status,
+        // lifecycle and task bookkeeping are the rest, and a wedged task emits
+        // none of them. This only refreshes the silence clock -- MAX_CLAIM_AGE_MS
+        // still bounds a task that never goes quiet.
+        const noteLive = (sessionID: unknown) => {
+          if (typeof sessionID === "string" && sessionID) pool.noteActivity(s, sessionID)
+        }
 
         // opencode reports free-tier exhaustion itself, per session: a retry
         // status carrying action.reason "free_tier_limit", the provider, and a
@@ -922,6 +930,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           const status = props.status as
             | { type?: string; message?: string; next?: number; action?: { reason?: string; provider?: string } }
             | undefined
+          if (status?.type === "busy" || status?.type === "retry") noteLive(sessionID)
           const action = status?.action
           const provider = typeof action?.provider === "string" ? action.provider : undefined
           const reason = action?.reason ?? ""
@@ -1153,7 +1162,10 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         // claim that triggered it, oldest unbound claim first.
         if (event.type === "session.created") {
           const info = props.info as { id?: string; parentID?: string } | undefined
-          if (info?.id && info.parentID) pool.bindChild(s, info.parentID, info.id)
+          if (info?.id && info.parentID) {
+            pool.bindChild(s, info.parentID, info.id)
+            noteLive(info.id)
+          }
           return
         }
 
@@ -1211,6 +1223,24 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
               }
             }
           }
+          return
+        }
+
+        // Session lifecycle and task bookkeeping are also evidence opencode is
+        // still working: a title/token update, a todo rewrite, or a compaction
+        // cannot happen in a wedged session.
+        if (event.type === "session.updated") {
+          noteLive((props.info as { id?: string } | undefined)?.id)
+          return
+        }
+        if (event.type === "todo.updated" || event.type === "session.compacted") {
+          noteLive(props.sessionID)
+          return
+        }
+        // Not in the pinned SDK's event union, but the runtime emits them (see
+        // src/plugins/notify.ts): a session blocked on a prompt is alive, not hung.
+        if (event.type === "permission.asked" || event.type === "question.asked") {
+          noteLive(props.sessionID)
           return
         }
 

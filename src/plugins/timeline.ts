@@ -93,6 +93,7 @@ type TimelineState = {
   root?: boolean
   cursor?: TimelineCursor
   failures: number
+  title?: string
 }
 
 type SummarizerResult = {
@@ -176,6 +177,23 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
     state.pending = true
     if (state.timer || state.running) return
     schedule(id, state)
+  }
+
+  // Build now instead of waiting for the debounce: the session has handed
+  // control back, so there is no more activity to batch with -- and a
+  // one-shot run can exit before the timer ever fires. Only pending work
+  // runs; the timer remains the debounce for an active session.
+  function flush(id: string) {
+    if (disabled || disposed) return
+    const state = sessions.get(id)
+    if (!state) return
+    if (state.root === false) return
+    if (!state.pending || state.running) return
+    if (state.timer) {
+      clearTimeout(state.timer)
+      state.timer = undefined
+    }
+    void tick(id, state)
   }
 
   function schedule(id: string, state: TimelineState) {
@@ -296,7 +314,7 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
           return { ok: true, bullets: [] }
         } else {
           if (process.env.LACODE_TIMELINE_DEBUG === "1") {
-            log("no bullet lines", { sessionID: id, text: text.slice(0, 300) })
+            log("debug", "timeline: no bullet lines", { sessionID: id, text: text.slice(0, 300) })
           }
           return { ok: false, bullets: [], error: "no bullet lines" }
         }
@@ -327,6 +345,7 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
           return
         }
         title = info.title
+        state.title = info.title ?? state.title
         state.root = !info.parentID && !isInternalTitle(info.title)
         if (!state.root) {
           sessions.delete(id)
@@ -341,14 +360,14 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
         return
       }
 
-      const result = await summarize(id, info.title ?? "untitled", excerpt.text, readEntries(id, 4))
+      const result = await summarize(id, state.title ?? info?.title ?? "untitled", excerpt.text, readEntries(id, 4))
       if (result.ok) {
         if (result.bullets.length) appendEntries(id, result.bullets, Date.now(), excerpt.next)
         state.cursor = excerpt.next
         state.failures = 0
       } else {
         state.failures++
-        log("summarize failed", { sessionID: id, error: result.error })
+        log("warn", "timeline: summarize failed", { sessionID: id, error: result.error })
       }
     } catch (error) {
       debug("tick failed", { sessionID: id, error })
@@ -448,6 +467,11 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
     event: async ({ event }) => {
       try {
         switch (event.type) {
+          case "session.idle": {
+            const id = event.properties.sessionID
+            if (id) flush(id)
+            return
+          }
           case "message.updated": {
             const id = event.properties.info?.sessionID
             if (!id) return

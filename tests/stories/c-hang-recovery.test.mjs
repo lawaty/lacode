@@ -642,3 +642,54 @@ test("[US-31] a session that stalls with no limit signal is killed, cooled and r
   net.restore()
   await hooks.dispose()
 })
+
+// ---------------------------------------------------------------------------
+// Extension: proof of life from opencode session/task events
+// ---------------------------------------------------------------------------
+
+test("[US-8] claim kept alive by session.status busy is not aborted", async () => {
+  const clock = fakeClock()
+  const net = stubFetch()
+  const { hooks } = await bootPool("hang-busy")
+
+  await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "child-busy-status" })
+  assert.equal(net.aborted.length, 0, "a fresh claim is not a hang")
+
+  // Advance the clock minute-by-minute past STUCK_MIN_AGE while emitting the status
+  for (let i = 0; i < STUCK_MIN_AGE / MIN + STUCK_IDLE / MIN + 2; i++) {
+    clock.advance(MIN)
+    await emit(hooks, "session.status", { sessionID: "child-busy-status", status: { type: "busy" } })
+  }
+  // Trigger a sweep with a fresh spawn
+  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+
+  assert.deepEqual(net.aborted, [], `status busy must keep it alive, got ${JSON.stringify(net.aborted)}`)
+  const status = await hooks.tool.pool_status.execute({}, {})
+  assert.match(status.output, /hung .*: 0/, `pool_status must show no hung claims:\n${status.output}`)
+  net.restore()
+  await hooks.dispose()
+})
+
+test("[US-8] claim kept alive by todo.updated and session.updated is not aborted", async () => {
+  const clock = fakeClock()
+  const net = stubFetch()
+  const { hooks } = await bootPool("hang-todo")
+
+  await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "child-busy-todo" })
+  assert.equal(net.aborted.length, 0, "a fresh claim is not a hang")
+
+  // Alternate keep-alive events
+  for (let i = 0; i < STUCK_MIN_AGE / MIN + STUCK_IDLE / MIN + 2; i++) {
+    clock.advance(MIN)
+    if (i % 2 === 0) {
+      await emit(hooks, "todo.updated", { sessionID: "child-busy-todo" })
+    } else {
+      await emit(hooks, "session.updated", { info: { id: "child-busy-todo" } })
+    }
+  }
+  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+
+  assert.deepEqual(net.aborted, [], `todo/session updates must keep it alive, got ${JSON.stringify(net.aborted)}`)
+  net.restore()
+  await hooks.dispose()
+})

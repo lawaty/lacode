@@ -7,6 +7,31 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.3.0-beta.4] — session events count as life, and the timeline builds on idle
+
+### Fixed
+
+- **The hang reaper now treats opencode session and task events as proof of
+  life.** A pooled claim was only kept off the silence clock by message traffic.
+  `session.status` (`busy`/`retry`), `session.updated`, `todo.updated`,
+  `session.compacted`, `permission.asked` and `question.asked` now refresh the
+  same activity clock, so a session opencode is actively working on is not
+  condemned as hung. The two existing bounds are unchanged: a genuinely silent
+  task is still reaped after the idle window, and `MAX_CLAIM_AGE_MS` still kills
+  a task that never goes quiet.
+- **The timeline is built when a session goes idle, not only after the
+  five-minute debounce.** Pending work is flushed on `session.idle`, so a short
+  or one-shot run gets a timeline before the process can exit. The timer remains
+  the debounce for an active session.
+- **The timeline keeps the session title.** Only the first tick fetched session
+  info; every later summarizer prompt said "Session: untitled". The title is now
+  carried on the per-session state.
+- **A failed timeline summarization is logged with a level opencode accepts.**
+  The call passed the message as the log *level*, so the runtime rejected the
+  payload (`Expected "debug" | "info" | "error" | "warn"`) and the failure was
+  invisible. Failures now log at `warn` with a message, and the no-bullets line
+  at `debug`.
+
 ## [1.3.0-beta.3] — the 1.3.0-beta.2 notes
 
 ### Changed
