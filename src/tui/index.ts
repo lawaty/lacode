@@ -398,6 +398,24 @@ async function answerWithText(
 }
 
 const tui: TuiPlugin = async (api, options) => {
+  // The timeline sidebar is a separate feature from voice. Register it FIRST:
+  // a voice option that turns the rest off, or a throw anywhere in the voice
+  // setup below, must never cost the sidebar. This is also why it sits above
+  // the `enabled` gate -- "voice off" is not "timeline off".
+  const timelineOpts = (options ?? {}) as { timeline?: boolean | { enabled?: boolean } }
+  const timelineOff =
+    timelineOpts.timeline === false ||
+    (typeof timelineOpts.timeline === "object" && timelineOpts.timeline !== null && timelineOpts.timeline.enabled === false)
+  if (!timelineOff) {
+    try {
+      await timelineMod.tui(api, options)
+    } catch (error) {
+      // A broken sidebar must never cost dictation, but it must not be silent:
+      // this line is how a registration failure is diagnosed after the fact.
+      void api.client?.app?.log?.({ body: { service: "timeline", level: "warn", message: `timeline sidebar registration failed: ${String(error)}` } })?.catch?.(() => {})
+    }
+  }
+
   const opts = resolveOptions(options)
   if (!opts.enabled) return
 
@@ -641,18 +659,6 @@ const tui: TuiPlugin = async (api, options) => {
   }
 
   api.keymap.registerLayer({ mode: "base", commands, bindings } as any)
-
-  const timelineOpts = (options ?? {}) as { timeline?: boolean | { enabled?: boolean } }
-  const timelineOff =
-    timelineOpts.timeline === false ||
-    (typeof timelineOpts.timeline === "object" && timelineOpts.timeline !== null && timelineOpts.timeline.enabled === false)
-  if (!timelineOff) {
-    try {
-      await timelineMod.tui(api, options)
-    } catch {
-      // A broken sidebar must never cost dictation.
-    }
-  }
 }
 
 const mod: TuiPluginModule = {

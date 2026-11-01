@@ -7,6 +7,23 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.3.0-beta.5] — the timeline sidebar renders and updates
+
+### Fixed
+
+- **The timeline panel was never shown in the TUI.** Its slot registration sat
+  at the end of the voice plugin's setup, after the recorder, daemon and keymap
+  work, so an early return or a failure anywhere in that path skipped it. It is
+  now registered first and independently of voice, including when voice is
+  disabled with `enabled: false`. A registration failure is logged instead of
+  being swallowed.
+- **The panel could not update once rendered.** Its rows were driven by
+  `solid-js` signals, but the TUI gives the plugin a different Solid instance
+  from the renderer's, so signal updates never reached the screen: the panel
+  stayed on "No timeline yet" even while the JSONL file grew. The rows are now
+  static `text` renderables whose `content` is written on a one-second timer
+  through the renderable itself, which is independent of any Solid instance.
+
 ## [1.3.0-beta.4] — session events count as life, and the timeline builds on idle
 
 ### Fixed
