@@ -415,9 +415,9 @@ const cooling = (id, dir, models, ms) => {
   const result = await hooks.tool.pool_recheck.execute({ models: [model] }, {})
   assert(/agent-pool:/.test(result.title), `the recheck tool must report: ${result.title}`)
   assert(sent.length === 1, `a cleared slot must notify once, got ${sent.length}: ${sent.join(" | ")}`)
-  assert(sent[0].startsWith("LaCode: slot ready:"), `the notice must have a fixed title: ${sent[0]}`)
+  assert(sent[0].startsWith("LaCode: rate limit reset:"), `the notice must have a fixed title: ${sent[0]}`)
   assert(sent[0].includes(model), `the notice must name the recovered model: ${sent[0]}`)
-  assert(/ready for use/.test(sent[0]), `the notice must say the slot is usable: ${sent[0]}`)
+  assert(/rate limit has reset/.test(sent[0]), `the notice must say the rate limit has reset: ${sent[0]}`)
   assert(limitFiles(dir).length === 0, "the cooldown file must be gone")
   await hooks.dispose?.()
 }
@@ -447,9 +447,9 @@ const cooling = (id, dir, models, ms) => {
   await new Promise((resolve) => setTimeout(resolve, 1_500))
 
   assert(sent.length === 1, `a natural expiry must notify once, got ${sent.length}: ${sent.join(" | ")}`)
-  assert(sent[0].startsWith("LaCode: slot ready:"), `the notice must have a fixed title: ${sent[0]}`)
+  assert(sent[0].startsWith("LaCode: rate limit reset:"), `the notice must have a fixed title: ${sent[0]}`)
   assert(sent[0].includes(model), `the notice must name the recovered model: ${sent[0]}`)
-  assert(/ready for use/.test(sent[0]), `the notice must say the slot is usable: ${sent[0]}`)
+  assert(/rate limit has reset/.test(sent[0]), `the notice must say the rate limit has reset: ${sent[0]}`)
   await hooks.dispose?.()
 }
 
@@ -462,18 +462,82 @@ const cooling = (id, dir, models, ms) => {
   const previous = process.env.OC_NOTIFY_HELPER
   process.env.OC_NOTIFY_HELPER = helper
   try {
-    assert(desktop.notifyDesktop("LaCode: slot ready", "slot-1 is back — ready for use."), "a helper must be found and spawned")
+    assert(desktop.notifyDesktop("LaCode: rate limit reset", "slot-1 is available again — the rate limit has reset."), "a helper must be found and spawned")
     await new Promise((resolve) => setTimeout(resolve, 600))
     const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
     assert(lines.length === 1, `expected one helper call, got ${lines.length}: ${JSON.stringify(lines)}`)
     assert(
-      lines[0].includes("LaCode: slot ready") && lines[0].includes("ready for use"),
+      lines[0].includes("LaCode: rate limit reset") && lines[0].includes("rate limit has reset"),
       `the helper must receive title and message: ${lines[0]}`,
     )
   } finally {
     if (previous === undefined) delete process.env.OC_NOTIFY_HELPER
     else process.env.OC_NOTIFY_HELPER = previous
   }
+}
+
+// --- auth/missing-model expiries must NOT produce a desktop notice ------------
+{
+  const dir = scratch()
+  const model = SLOT_MODELS[2]
+  const sent = []
+  const hooks = await AgentPool(
+    { client, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    {
+      id: "expiry-watch-nonquota",
+      dir,
+      modelsFile: PRESET,
+      probeMs: 0,
+      watchMs: 0,
+      expiryMs: 50,
+      notify: (title, message) => sent.push(`${title}: ${message}`),
+    },
+  )
+  await hooks.config(shippedConfig())
+
+  cooling("expiry-watch-nonquota", dir, [model], 800)
+  const s2 = pool.state({ id: "expiry-watch-nonquota", dir, modelsFile: PRESET })
+  pool.init(s2, () => {})
+  pool.ensureSlots(s2, () => {})
+  // Replace with non-quota reason by recording again? recordStrike adds strikes; easier to just write directly
+  const { writeFileSync } = await import("node:fs")
+  const { join } = await import("node:path")
+  const limitFileName = `limit.${model.replace(/[^a-zA-Z0-9._-]/g, "__")}.json`
+  writeFileSync(join(dir, limitFileName), JSON.stringify({ model, until: Date.now() + 800, strikes: 1, reason: pool.AUTH_FAILURE_REASON, last: Date.now() }))
+  await new Promise((resolve) => setTimeout(resolve, 1_500))
+
+  assert(sent.length === 0, `an auth expiry must not notify, got ${sent.join(" | ")}`)
+  await hooks.dispose?.()
+}
+
+// --- a probe that re-admits a non-quota-cooled model must NOT notify ---------
+{
+  const dir = scratch()
+  const model = SLOT_MODELS[3]
+  const { provider, id: modelID } = pool.splitModel(model)
+  const stub = stubClient({ [model]: async () => ({ role: "assistant", providerID: provider, modelID }) })
+  const sent = []
+  const hooks = await AgentPool(
+    { client: { ...client, ...stub }, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    {
+      id: "notify-seam-nonquota",
+      dir,
+      modelsFile: PRESET,
+      probeMs: 0,
+      watchMs: 0,
+      notify: (title, message) => sent.push(`${title}: ${message}`),
+    },
+  )
+  await hooks.config(shippedConfig())
+
+  const { writeFileSync } = await import("node:fs")
+  const { join } = await import("node:path")
+  const limitFileName = `limit.${model.replace(/[^a-zA-Z0-9._-]/g, "__")}.json`
+  writeFileSync(join(dir, limitFileName), JSON.stringify({ model, until: Date.now() + 60_000, strikes: 1, reason: "custom-outage", last: Date.now() }))
+  const result = await hooks.tool.pool_recheck.execute({ models: [model] }, {})
+  assert(result && result.title, `result must exist: ${JSON.stringify(result)}`)
+  assert(sent.length === 0, `a non-quota reset must not notify, got ${sent.join(" | ")}`)
+  await hooks.dispose?.()
 }
 
 for (const dir of made) rmSync(dir, { recursive: true, force: true })

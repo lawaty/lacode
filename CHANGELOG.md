@@ -7,6 +7,18 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.3.0-beta.7] — only a rate-limit reset speaks
+
+### Changed
+
+- **The slot notice is now a rate-limit reset notice, not a generic "slot
+  ready".** It fires only when a slot that was cooling for a quota/rate-limit
+  reason becomes usable again — either because its window lapsed or a probe
+  found it answering. Outages, auth failures, missing models and other
+  non-quota cooldowns no longer raise it, which is what made it frequent. The
+  title is `LaCode: rate limit reset` and the message says the rate limit has
+  reset.
+
 ## [1.3.0-beta.6] — a recovered slot says it is ready
 
 ### Added

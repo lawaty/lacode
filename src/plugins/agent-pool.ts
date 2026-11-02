@@ -707,17 +707,17 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     return parts.join(", ")
   }
 
-  const readyMessage = (models: string[]) =>
+  const resetMessage = (models: string[]) =>
     models.length === 1
-      ? `${models[0]} is back in the pool — ready for use.`
-      : `${models.length} slots are back in the pool — ready for use: ${models.join(", ")}.`
+      ? `${models[0]} is available again — the rate limit has reset.`
+      : `${models.length} slots are available again — their rate limits have reset: ${models.join(", ")}.`
 
   const announceReady = (models: string[]) => {
     // Several opencode processes share one pool; only the first claim speaks.
     const fresh = models.filter((model) => claimDesktopNotice(model))
     if (fresh.length === 0) return
     try {
-      notify("LaCode: slot ready", readyMessage(fresh))
+      notify("LaCode: rate limit reset", resetMessage(fresh))
     } catch {
       /* a notification is best effort; the log line above is the record */
     }
@@ -731,7 +731,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
    * toast is best-effort: there is no TUI on a server-only run, and a prober that
    * cannot report is still a prober.
    */
-  const announce = async (report: probe.ProbeReport) => {
+  const announce = async (report: probe.ProbeReport, prior: ReturnType<typeof pool.readLimits>) => {
     if (!report.changed) return
     const message =
       report.cleared.length > 0
@@ -747,10 +747,17 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     } catch {
       /* no TUI attached; the log line above is the record */
     }
-    if (report.cleared.length > 0) announceReady(report.cleared)
+    const resets = report.cleared.filter((model) => pool.isQuotaReason(prior.get(model)?.reason ?? ""))
+    if (resets.length > 0) announceReady(resets)
   }
 
   const runProbe = async (models?: string[]): Promise<probe.ProbeReport> => {
+    let prior: ReturnType<typeof pool.readLimits> = new Map()
+    try {
+      prior = pool.readLimits(s)
+    } catch {
+      /* no state dir yet; nothing was cooling */
+    }
     let report = EMPTY_REPORT
     try {
       report = await probe.probeCooling(client as probe.ProbeClient, { state: s, directory, models })
@@ -758,7 +765,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       await log("error", `pool probe failed: ${String(error)}`)
       return EMPTY_REPORT
     }
-    await announce(report)
+    await announce(report, prior)
     return report
   }
 
@@ -798,15 +805,15 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           const back: string[] = []
           for (const [model, reason] of coolingSeen) {
             if (still.has(model)) continue
-            // Auth and missing-model windows are not rate limits, and time does
-            // not fix them; a "ready" notice for those would be a lie.
-            if (reason === pool.AUTH_FAILURE_REASON || reason === pool.MODEL_MISSING_REASON) continue
+            // Only a rate-limit window is a reset. Auth, missing-model and
+            // outage windows are not, and time does not fix them.
+            if (!pool.isQuotaReason(reason)) continue
             if (!pool.providerReady(s, model)) continue
             back.push(model)
           }
           coolingSeen = still
           if (back.length > 0) {
-            void log("info", `pool: ${readyMessage(back)}`, { cleared: back })
+            void log("info", `pool: ${resetMessage(back)}`, { cleared: back })
             announceReady(back)
           }
         }, expiryMs)
@@ -923,6 +930,12 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
    * never throw into the watcher.
    */
   const runValidation = async (models: string[]): Promise<probe.ProbeReport> => {
+    let prior: ReturnType<typeof pool.readLimits> = new Map()
+    try {
+      prior = pool.readLimits(s)
+    } catch {
+      /* no state dir yet */
+    }
     let report = EMPTY_REPORT
     try {
       report = await probe.probeModels(client as probe.ProbeClient, { state: s, directory, models })
@@ -930,7 +943,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       await log("error", `pool validation failed: ${String(error)}`)
       return EMPTY_REPORT
     }
-    await announce(report)
+    await announce(report, prior)
     return report
   }
 
