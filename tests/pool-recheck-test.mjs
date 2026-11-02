@@ -8,7 +8,7 @@
 // a whole provider, and that the periodic pass arms and reports.
 //
 // Run with: node tests/pool-recheck-test.mjs
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -23,6 +23,7 @@ const PLUGIN = join(HERE, "..", "src", "plugins", "agent-pool.ts")
 // (conventions.md).
 const pool = await import(join(HERE, "..", "src", "lib", "pool.ts"))
 const probe = await import(join(HERE, "..", "src", "lib", "probe.ts"))
+const desktop = await import(join(HERE, "..", "src", "lib", "desktop-notify.ts"))
 const SLOTS = JSON.parse(readFileSync(PRESET, "utf8")).slots.map((s, i) => ({ ...s, index: i + 1 }))
 const SLOT_MODELS = SLOTS.map((s) => s.model)
 
@@ -50,6 +51,7 @@ const scratch = () => {
   made.push(dir)
   return dir
 }
+process.env.LACODE_NOTIFY_DIR = scratch()
 const limitFiles = (dir) => readdirSync(dir).filter((e) => e.startsWith("limit.") && e.endsWith(".json"))
 
 /**
@@ -382,6 +384,95 @@ const cooling = (id, dir, models, ms) => {
   for (const m of [m1, m2]) {
     const st = limits.get(m)
     assert(!!st && st.reason === pool.AUTH_FAILURE_REASON, `model ${m} must be benched with auth reason, got ${JSON.stringify(st)}`)
+  }
+}
+
+// --- a re-admitted slot raises a permanent desktop notice --------------------
+{
+  const dir = scratch()
+  const model = SLOT_MODELS[0]
+  const { provider, id: modelID } = pool.splitModel(model)
+  const stub = stubClient({ [model]: async () => ({ role: "assistant", providerID: provider, modelID }) })
+  const sent = []
+  const hooks = await AgentPool(
+    { client: { ...client, ...stub }, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    {
+      id: "notify-seam",
+      dir,
+      modelsFile: PRESET,
+      probeMs: 0,
+      watchMs: 0,
+      notify: (title, message) => sent.push(`${title}: ${message}`),
+    },
+  )
+  await hooks.config(shippedConfig())
+
+  // A pass that changes nothing must not touch the desktop.
+  await hooks.tool.pool_recheck.execute({ models: ["fixture-provider/never-cooled"] }, {})
+  assert(sent.length === 0, `an idle pass must not notify, got ${sent.join(" | ")}`)
+
+  cooling("notify-seam", dir, [model], 60_000)
+  const result = await hooks.tool.pool_recheck.execute({ models: [model] }, {})
+  assert(/agent-pool:/.test(result.title), `the recheck tool must report: ${result.title}`)
+  assert(sent.length === 1, `a cleared slot must notify once, got ${sent.length}: ${sent.join(" | ")}`)
+  assert(sent[0].startsWith("LaCode: slot ready:"), `the notice must have a fixed title: ${sent[0]}`)
+  assert(sent[0].includes(model), `the notice must name the recovered model: ${sent[0]}`)
+  assert(/ready for use/.test(sent[0]), `the notice must say the slot is usable: ${sent[0]}`)
+  assert(limitFiles(dir).length === 0, "the cooldown file must be gone")
+  await hooks.dispose?.()
+}
+
+// --- a cooldown that simply times out also raises a notice -------------------
+{
+  const dir = scratch()
+  const model = SLOT_MODELS[1]
+  const sent = []
+  const hooks = await AgentPool(
+    { client, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    {
+      id: "expiry-watch",
+      dir,
+      modelsFile: PRESET,
+      probeMs: 0,
+      watchMs: 0,
+      expiryMs: 50,
+      notify: (title, message) => sent.push(`${title}: ${message}`),
+    },
+  )
+  await hooks.config(shippedConfig())
+
+  // Not cooling when the watcher starts: it must see it become cooling first,
+  // then notice the window lapse without any probe at all.
+  cooling("expiry-watch", dir, [model], 800)
+  await new Promise((resolve) => setTimeout(resolve, 1_500))
+
+  assert(sent.length === 1, `a natural expiry must notify once, got ${sent.length}: ${sent.join(" | ")}`)
+  assert(sent[0].startsWith("LaCode: slot ready:"), `the notice must have a fixed title: ${sent[0]}`)
+  assert(sent[0].includes(model), `the notice must name the recovered model: ${sent[0]}`)
+  assert(/ready for use/.test(sent[0]), `the notice must say the slot is usable: ${sent[0]}`)
+  await hooks.dispose?.()
+}
+
+// --- the session-less sender uses the same helper contract -------------------
+{
+  const dir = scratch()
+  const sent = join(dir, "sent.log")
+  const helper = join(dir, "oc-notify")
+  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+  const previous = process.env.OC_NOTIFY_HELPER
+  process.env.OC_NOTIFY_HELPER = helper
+  try {
+    assert(desktop.notifyDesktop("LaCode: slot ready", "slot-1 is back — ready for use."), "a helper must be found and spawned")
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
+    assert(lines.length === 1, `expected one helper call, got ${lines.length}: ${JSON.stringify(lines)}`)
+    assert(
+      lines[0].includes("LaCode: slot ready") && lines[0].includes("ready for use"),
+      `the helper must receive title and message: ${lines[0]}`,
+    )
+  } finally {
+    if (previous === undefined) delete process.env.OC_NOTIFY_HELPER
+    else process.env.OC_NOTIFY_HELPER = previous
   }
 }
 

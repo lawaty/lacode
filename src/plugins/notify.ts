@@ -1,8 +1,7 @@
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { existsSync } from "node:fs"
-import * as path from "node:path"
 import type { Hooks } from "@opencode-ai/plugin"
+import { findNotifyHelper } from "../lib/desktop-notify.ts"
 import {
   NOTIFY_CLOSE_ENV,
   NOTIFY_OUTCOMES,
@@ -26,7 +25,6 @@ import {
   type PermissionRequest,
   type SessionInfo,
 } from "../lib/notify.ts"
-import { PACKAGE_ROOT } from "../lib/pool.ts"
 
 // Desktop notification when a session needs you: a finished turn, or a question
 // it cannot proceed without.
@@ -175,40 +173,6 @@ const SOUND_ENV = "LACODE_SOUND"
 // truthy: the user who never asked for silence must not get it from a misspelt
 // variable.
 const SOUND_OFF_VALUES = ["0", "false", "off", "no"]
-
-// Where the notification helper lives, in order:
-//   1. OC_NOTIFY_HELPER -- an explicit override, so a user can point at their own
-//   2. ~/bin/lacode -- what a hand-made install of the CLI puts on PATH
-//   3. dist/lacode.js -- the BUILT cli, which is all an npm install ships. The
-//      shipped package carries compiled dist/, not TypeScript sources, so pointing at
-//      the package's bin/lacode there would hand a broken helper to every
-//      consumer: found, spawned, and dead on arrival with node refusing to strip
-//      types under node_modules. The built CLI is the same program with the
-//      types already gone -- but a different ENTRY: it takes a `notify`
-//      subcommand, so its argv is built differently (see helperArgv below).
-//   4. the package's own bin/lacode -- the author's checkout
-//   5. ~/bin/oc-notify -- the bash helper, kept only as a last-resort fallback:
-//      it execs bin/oc, whose OC_NOTIFY_ONLY path drops the sound name and has
-//      no permission action-button plumbing
-//   6. the package's own bin/oc-notify -- the author's checkout
-// Candidates are anchored on PACKAGE_ROOT rather than on this module's own
-// directory, because bundling moves this file from src/plugins/ to dist/ and a
-// relative hop would resolve outside the package.
-// Nothing here throws: a missing helper warns once and notifications are lost,
-// which is strictly better than taking the server down with them.
-const findHelper = (): string | undefined => {
-  const home = process.env.HOME ?? ""
-  const candidates = [
-    process.env.OC_NOTIFY_HELPER,
-    path.join(home, "bin", "lacode"),
-    path.join(PACKAGE_ROOT, "dist", "lacode.js"),
-    path.join(PACKAGE_ROOT, "bin", "lacode"),
-    path.join(home, "bin", "oc-notify"),
-    path.join(PACKAGE_ROOT, "bin", "oc-notify"),
-  ].filter((candidate): candidate is string => typeof candidate === "string" && candidate.length > 0)
-  for (const candidate of candidates) if (existsSync(candidate)) return candidate
-  return undefined
-}
 
 /**
  * The one seam in this file.
@@ -500,7 +464,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         resolve({ ok: false, detail: `too many notification helpers in flight (${inflight})` })
         return
       }
-      const helper = findHelper()
+      const helper = findNotifyHelper()
       if (!helper) {
         if (!warnedHelper) {
           warnedHelper = true
@@ -626,7 +590,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   // placeholder and the rest is empty.
   const closeViaHelper = (sessionID: string) => {
     try {
-      const helper = findHelper()
+      const helper = findNotifyHelper()
       if (!helper) {
         if (!warnedHelper) {
           warnedHelper = true

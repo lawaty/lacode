@@ -7,6 +7,22 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [1.3.0-beta.6] — a recovered slot says it is ready
+
+### Added
+
+- **A desktop notice when a cooled slot returns to the pool.** A probe that
+  clears a cooldown, and a cooldown whose window simply runs out (watched every
+  15s; `expiryMs` tunes it, `0` disables it), now raise one `LaCode: slot ready`
+  notification naming the recovered model or models. The notice is claimed per
+  model across processes, so several opencode processes sharing one pool speak
+  once, and auth/missing-model windows are never announced as "ready" because
+  time does not fix them.
+- **`notifyDesktop()` for notices that are not tied to an agent session.** It
+  owns the one impure step — finding the helper and spawning it fire-and-forget
+  — and the session notifier now shares that helper lookup instead of keeping a
+  second copy.
+
 ## [1.3.0-beta.5] — the timeline sidebar renders and updates
 
 ### Fixed

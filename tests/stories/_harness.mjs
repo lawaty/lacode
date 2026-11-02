@@ -163,7 +163,7 @@ export const bootLaCode = async (stub, options = {}) => {
   // so a developer's own slot list silently changes what these tests assert.
   // An inline `models` (which resolveModels prefers) still wins; a caller's own
   // `modelsFile` still wins via the spread.
-  const hooks = await LaCode(stub.input, { modelsFile: PRESET, ...options })
+  const hooks = await LaCode(stub.input, { modelsFile: PRESET, expiryMs: 0, ...options })
   return hooks
 }
 

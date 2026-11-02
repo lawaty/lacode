@@ -2,6 +2,7 @@ import { unwatchFile, watchFile } from "node:fs"
 import { tool, type Hooks, type PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
 import * as probe from "../lib/probe.ts"
+import { claimDesktopNotice, notifyDesktop } from "../lib/desktop-notify.ts"
 import type { Claim } from "../lib/pool.ts"
 
 // Task routing, limit detection and hang recovery for a shared set of models.
@@ -74,6 +75,10 @@ const HANG_FALLBACK_MS = 10 * 60 * 1000
  * model at a time.
  */
 const PROBE_INTERVAL_MS = 15 * 60 * 1000
+// How often we notice that a cooldown's window simply ran out. Routing already
+// re-admits such a slot on the next snapshot; this only makes the recovery
+// visible without waiting for the 15-minute probe.
+const EXPIRY_INTERVAL_MS = 15_000
 /** How often the pool files are polled for a change; 1s is cheap and feels instant. 0 disables. */
 const SLOT_WATCH_MS = 1000
 /** Editors write a file in more than one step; collapse a burst into one reload. */
@@ -149,12 +154,17 @@ export type AgentPoolOptions = {
   modelsFile?: string
   /** Inline `{ slots: [...] }`, highest priority in the resolution chain. */
   models?: unknown
+  /** Desktop notice seam; tests inject their own. Defaults to the notification helper. */
+  notify?: (title: string, message: string) => void
+  /** How often to watch for cooldowns that simply expire; 15s default, 0 disables. */
+  expiryMs?: number
 }
 
 // Typed as a factory returning hooks, NOT as a Plugin: only src/index.ts may
 // carry the Plugin type, because only it may be loaded as one.
 export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?: PluginOptions): Promise<Hooks> => {
   const opts = (options ?? {}) as AgentPoolOptions
+  const notify = opts.notify ?? ((title: string, message: string) => void notifyDesktop(title, message))
   const s = pool.state(opts)
   // Makes ~/.config/lacode/ exist so a user can drop a pool.json into it. Never
   // throws: an unwritable HOME just means the bundled preset is used.
@@ -697,7 +707,21 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     return parts.join(", ")
   }
 
+  const readyMessage = (models: string[]) =>
+    models.length === 1
+      ? `${models[0]} is back in the pool — ready for use.`
+      : `${models.length} slots are back in the pool — ready for use: ${models.join(", ")}.`
 
+  const announceReady = (models: string[]) => {
+    // Several opencode processes share one pool; only the first claim speaks.
+    const fresh = models.filter((model) => claimDesktopNotice(model))
+    if (fresh.length === 0) return
+    try {
+      notify("LaCode: slot ready", readyMessage(fresh))
+    } catch {
+      /* a notification is best effort; the log line above is the record */
+    }
+  }
 
   /**
    * Surface a change the user would otherwise never learn about.
@@ -723,6 +747,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     } catch {
       /* no TUI attached; the log line above is the record */
     }
+    if (report.cleared.length > 0) announceReady(report.cleared)
   }
 
   const runProbe = async (models?: string[]): Promise<probe.ProbeReport> => {
@@ -746,6 +771,47 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       ? `cooldown probe armed: every ${Math.round(probeMs / 60000)}m, checks the models that are cooling by using them (one request each, one at a time); 0 to disable`
       : "cooldown probe disabled (probeMs: 0); use the pool_recheck tool to check on demand",
   )
+
+  // A cooldown's `until` passing needs no probe: readLimits drops the model from
+  // the cooling map on the next look, and routing uses it again. Watch that
+  // transition so a slot the user is waiting for says so.
+  const expiryMs = opts.expiryMs ?? EXPIRY_INTERVAL_MS
+  let coolingSeen = new Map<string, string>()
+  try {
+    for (const [model, strike] of pool.readLimits(s)) coolingSeen.set(model, strike.reason ?? "")
+  } catch {
+    /* no state dir yet; the first tick will populate it */
+  }
+  const expiryTimer =
+    expiryMs > 0
+      ? setInterval(() => {
+          // A probe clears cooldowns itself and announces them; do not race it.
+          if (s.probing) return
+          let current: ReturnType<typeof pool.readLimits>
+          try {
+            current = pool.readLimits(s)
+          } catch {
+            return
+          }
+          const still = new Map<string, string>()
+          for (const [model, strike] of current) still.set(model, strike.reason ?? "")
+          const back: string[] = []
+          for (const [model, reason] of coolingSeen) {
+            if (still.has(model)) continue
+            // Auth and missing-model windows are not rate limits, and time does
+            // not fix them; a "ready" notice for those would be a lie.
+            if (reason === pool.AUTH_FAILURE_REASON || reason === pool.MODEL_MISSING_REASON) continue
+            if (!pool.providerReady(s, model)) continue
+            back.push(model)
+          }
+          coolingSeen = still
+          if (back.length > 0) {
+            void log("info", `pool: ${readyMessage(back)}`, { cleared: back })
+            announceReady(back)
+          }
+        }, expiryMs)
+      : undefined
+  expiryTimer?.unref?.()
 
   // The config object opencode handed us. It is retained because the variant
   // agents' models are written HERE, not read from `s.slots` at spawn time -- so
@@ -1632,6 +1698,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     dispose: async () => {
       clearInterval(timer)
       if (probeTimer) clearInterval(probeTimer)
+      if (expiryTimer) clearInterval(expiryTimer)
       if (reloadTimer) clearTimeout(reloadTimer)
       for (const source of sources) unwatchFile(source, scheduleReload)
       s.own.clear()
