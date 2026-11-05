@@ -371,6 +371,30 @@ export function parseBullets(text: string, max: number = 6): string[] {
   return result
 }
 
+export function salvageBullets(text: string, max: number = 6): string[] {
+  const result: string[] = []
+  const seen = new Set<string>()
+  for (const raw of text.split("\n")) {
+    let line = raw.trim()
+    if (!line) continue
+    if (line.startsWith("```")) continue
+    if (line.startsWith("#")) continue
+    if (line.length > 320) continue
+    line = line.replace(/^([-*+•]|\d+[.)])\s*/, "").trim()
+    if (!line) continue
+    line = line.replace(/`/g, "").replace(/\*\*/g, "").replace(/__/g, "").trim()
+    const cleaned = stripAnsiAndControls(line).trim()
+    if (!cleaned || cleaned.length > 320) continue
+    if (cleaned.endsWith(":")) continue
+    const key = cleaned.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push(cleaned)
+    if (result.length >= max) break
+  }
+  return result
+}
+
 export function isInternalTitle(title?: string): boolean {
   const t = (title ?? "").trim()
   return t.startsWith("context (auto") || t.startsWith("timeline (auto") || t.startsWith("pool probe")

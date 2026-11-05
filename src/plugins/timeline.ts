@@ -11,6 +11,7 @@ import {
   readEntriesAt,
   timelineFile,
   removeEntries,
+  salvageBullets,
   type TimelineCursor,
   type TimelineEntry,
   type TimelineMessage,
@@ -105,6 +106,21 @@ type SummarizerResult = {
 }
 
 type SummarizeResult = { ok: boolean; bullets: string[]; error?: string }
+
+function errorText(value: unknown): string {
+  if (value instanceof Error) return value.message
+  if (typeof value === "string") return value
+  if (value && typeof value === "object") {
+    const message = (value as { message?: unknown }).message
+    if (typeof message === "string" && message) return message
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return String(value)
+    }
+  }
+  return String(value)
+}
 
 export function timelineHooks(input: PluginInput, options?: PluginOptions): Hooks {
   const { client, directory } = input
@@ -302,23 +318,39 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
 
       const failure = result?.error ?? result?.data?.info?.error
       if (timedOut || failure !== undefined) {
-        return { ok: false, bullets: [], error: timedOut ? "timed out" : String(failure) }
-      } else {
-        const text = (result?.data?.parts ?? [])
-          .map((part) => (part.type === "text" ? (part.text ?? "") : ""))
-          .join("\n")
-        const bullets = parseBullets(text, maxEntries)
-        if (bullets.length > 0) {
-          return { ok: true, bullets }
-        } else if (text.trim() === "") {
-          return { ok: true, bullets: [] }
-        } else {
-          if (process.env.LACODE_TIMELINE_DEBUG === "1") {
-            log("debug", "timeline: no bullet lines", { sessionID: id, text: text.slice(0, 300) })
-          }
-          return { ok: false, bullets: [], error: "no bullet lines" }
-        }
+        return { ok: false, bullets: [], error: timedOut ? "timed out" : errorText(failure) }
       }
+      if (!result?.data) {
+        return { ok: false, bullets: [], error: "no response" }
+      }
+      const parts = result.data.parts ?? []
+      const textParts = parts
+        .filter((part) => part.type === "text")
+        .map((part) => part.text ?? "")
+        .join("\n")
+        .trim()
+      const reasoningParts = parts
+        .filter((part) => part.type === "reasoning")
+        .map((part) => part.text ?? "")
+        .join("\n")
+        .trim()
+      const text = textParts || reasoningParts
+      const bullets = parseBullets(text, maxEntries)
+      if (bullets.length > 0) {
+        return { ok: true, bullets }
+      }
+      if (text.trim() === "") {
+        return { ok: true, bullets: [] }
+      }
+      const salvaged = salvageBullets(text, maxEntries)
+      if (salvaged.length > 0) {
+        log("warn", "timeline: salvaged non-bulleted output", { sessionID: id, text: text.slice(0, 300) })
+        return { ok: true, bullets: salvaged }
+      }
+      if (process.env.LACODE_TIMELINE_DEBUG === "1") {
+        log("debug", "timeline: no bullet lines", { sessionID: id, text: text.slice(0, 300) })
+      }
+      return { ok: false, bullets: [], error: "no bullet lines" }
     } finally {
       if (abort && abortListener) abort.removeEventListener("abort", abortListener)
       if (claimed && claimKey) pool.release(poolState, claimKey)

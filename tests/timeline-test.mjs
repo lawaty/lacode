@@ -63,6 +63,26 @@ test("parseBullets long/dup/prose-only", () => {
   assert.deepEqual(tl.parseBullets("just prose\nno bullets"), [])
 })
 
+test("salvageBullets drops preamble and recovers bullets", () => {
+  assert.deepEqual(tl.salvageBullets("Here are the entries:\nConfig: silenced warnings\n- Pool: added routing\n"), ["Config: silenced warnings", "Pool: added routing"])
+})
+
+test("salvageBullets strips markers without following space", () => {
+  assert.deepEqual(tl.salvageBullets("-A\n*B\n1.C\n"), ["A", "B", "C"])
+})
+
+test("salvageBullets recovers fenced content", () => {
+  assert.deepEqual(tl.salvageBullets("```\n- A\n- B\n```\n"), ["A", "B"])
+})
+
+test("salvageBullets case-insensitive dedupe", () => {
+  assert.deepEqual(tl.salvageBullets("- A\n- a\n- B\n"), ["A", "B"])
+})
+
+test("salvageBullets drops markdown heading", () => {
+  assert.deepEqual(tl.salvageBullets("# Title\n- A\n"), ["A"])
+})
+
 test("appendEntries/readEntries/dedupe/removeEntries round trip", () => {
   const sid = "sess1"
   assert.equal(tl.appendEntries(sid, ["hello", "world", ""], 1000), 2)

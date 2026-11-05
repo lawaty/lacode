@@ -9,6 +9,14 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [1.3.0-beta.9] — a timeline reply without bullets still lands
+
+### Fixed
+
+- Timeline: a summarizer reply that arrives only as reasoning content is now read, so a rebuild no longer produces an empty timeline.
+- Timeline: a non-bulleted summary is salvaged into entries instead of aborting the rebuild with `no bullet lines`.
+- Timeline: summarizer failures now report the underlying message instead of `[object Object]`.
+
 ## [1.3.0-beta.8] — a blocked child is never silent
 
 ### Added
@@ -1097,7 +1105,8 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v1.3.0-beta.8...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v1.3.0-beta.9...HEAD
+[1.3.0-beta.9]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.9
 [1.3.0-beta.8]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.8
 [1.3.0-beta.0]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.0
 [1.2.0]: https://github.com/lawaty/lacode/compare/v1.1.0...v1.2.0

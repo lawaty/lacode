@@ -113,7 +113,7 @@ test("a failed summarization is logged with a level opencode accepts", async () 
   const { hooks, logs } = await boot({
     session,
     messages: transcript(session.id),
-    prompt: async () => ({ data: { info: {}, parts: [{ type: "text", text: "prose, but no bullet lines" }] } }),
+    prompt: async () => ({ data: { info: {}, parts: [{ type: "text", text: "Here are the entries:" }] } }),
   })
   process.env.LACODE_TIMELINE_DEBUG = "1"
   try {
@@ -137,4 +137,48 @@ test("a failed summarization is logged with a level opencode accepts", async () 
     delete process.env.LACODE_TIMELINE_DEBUG
     await hooks.dispose()
   }
+})
+
+test("a non-bulleted reply is salvaged and logged", async () => {
+  const session = { id: "root-salvaged", title: "Salvaged session" }
+  const { hooks, logs } = await boot({
+    session,
+    messages: transcript(session.id),
+    prompt: async () => ({ data: { info: {}, parts: [{ type: "text", text: "Pool: added routing" }] } }),
+  })
+
+  await hooks.event({
+    event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+  })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+  const salvaged = await waitFor(() => logs.some((line) => line.message === "timeline: salvaged non-bulleted output"))
+  assert.ok(salvaged, `expected a salvage log line, got ${JSON.stringify(logs)}`)
+  const entries = readEntries(session.id)
+  assert.ok(entries.some((entry) => entry.text === "Pool: added routing"), `expected salvaged entry, got ${JSON.stringify(entries)}`)
+  await hooks.dispose()
+})
+
+test("a reasoning-only reply becomes timeline entries", async () => {
+  const session = { id: "root-reasoning", title: "Reasoning session" }
+  const { hooks, logs } = await boot({
+    session,
+    messages: transcript(session.id),
+    prompt: async () => ({ data: { info: {}, parts: [{ type: "reasoning", text: "- Reasoned entry" }] } }),
+  })
+
+  await hooks.event({
+    event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+  })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+  const built = await waitFor(() => readEntries(session.id).length > 0)
+  assert.ok(built, "reasoning-only output should produce timeline entries")
+  const entries = readEntries(session.id)
+  assert.ok(entries.some((entry) => entry.text === "Reasoned entry"), `expected reasoning entry, got ${JSON.stringify(entries)}`)
+  assert.ok(
+    !logs.some((line) => line.message === "timeline: summarize failed"),
+    `expected no summarize failure, got ${JSON.stringify(logs)}`,
+  )
+  await hooks.dispose()
 })
