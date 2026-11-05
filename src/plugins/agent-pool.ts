@@ -327,6 +327,27 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
   const patchedCancelledParts = new Set<string>()
   const cancelledPrefix = "Task Cancelled by LaCode:"
 
+  // The card rewrite below is best-effort and fails in the field: the client the
+  // plugin is handed has no `part` sub-client (so the SDK path never runs), and
+  // the raw PATCH fallback goes out unauthenticated whenever the server holds a
+  // password the plugin's process cannot see -- a 401. A failed rewrite used to
+  // leave the caller with a bare "cancelled" and no reason at all. The toast
+  // travels over the same authenticated client as `app.log`, so it is the one
+  // channel that still reaches the user when the card cannot be corrected.
+  const showAbortToast = async (report: AbortReport) => {
+    const toast = (client as { tui?: { showToast?: (args: unknown) => Promise<unknown> } }).tui?.showToast
+    if (typeof toast !== "function") return
+    try {
+      const args: Record<string, unknown> = {
+        body: { message: `${cancelledPrefix} ${report.message}`, variant: "warning", duration: 8000 },
+      }
+      if (directory) args.query = { directory }
+      await toast(args)
+    } catch {
+      // A toast that fails is the silence that was already there, not a second fault.
+    }
+  }
+
   const patchCancelledPart = async (part: CancelledTaskPart, key: string, report: AbortReport) => {
     if (patchedCancelledParts.has(key)) return
     patchedCancelledParts.add(key)
@@ -378,6 +399,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         session: part.sessionID,
         callID: part.callID,
       })
+      await showAbortToast(report)
     }
   }
 
@@ -713,8 +735,11 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       : `${models.length} slots are available again — their rate limits have reset: ${models.join(", ")}.`
 
   const announceReady = (models: string[]) => {
+    // A slot can opt out (notify:off); filter before claiming so a silenced
+    // slot does not consume the cross-process claim.
+    const wanted = models.filter((model) => pool.announcesReset(s.slots, model))
     // Several opencode processes share one pool; only the first claim speaks.
-    const fresh = models.filter((model) => claimDesktopNotice(model))
+    const fresh = wanted.filter((model) => claimDesktopNotice(model))
     if (fresh.length === 0) return
     try {
       notify("LaCode: rate limit reset", resetMessage(fresh))

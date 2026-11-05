@@ -31,10 +31,12 @@ import {
 //
 // Two design points that are load-bearing rather than cosmetic:
 //
-//   * Subagents are suppressed. A root session that dispatched ten
-//     explore children would otherwise raise ten "ready" notifications.
-//     The whole value of this plugin is one notification per thing you asked
-//     for, and a subagent going idle is not a thing you asked for.
+//   * A subagent going idle is suppressed. A root session that dispatched ten
+//     explore children would otherwise raise ten "ready" notifications. The
+//     whole value of this plugin is one notification per thing you asked for,
+//     and a subagent going idle is not a thing you asked for. A subagent
+//     BLOCKED on a question or permission is different: the parent cannot
+//     proceed until the user answers, so those outcomes still notify.
 //   * The cartographer is suppressed too. context-autoupdate creates it through
 //     the session API with no parentID, so it is indistinguishable from a root
 //     session by structure alone; it is identified by its title prefix.
@@ -56,9 +58,11 @@ import {
 // notifies on the ASK and never on the reply: the user needs to know they are
 // being asked, and telling them what they then decided only adds noise.
 //
-// All of them are suppressed for subagents and the cartographer. A
-// session.started notification was removed: it interrupts to say nothing, and
-// it fires before there is any result to name.
+// Done and error are suppressed for subagents; question and permission are
+// not, because a blocked child waits on the user and a silent prompt is the
+// stall US-25 is about. The cartographer and pool probes are suppressed
+// entirely. A session.started notification was removed: it interrupts to say
+// nothing, and it fires before there is any result to name.
 //
 // Sound rides along with the notification (US-15), on the same wire field the
 // outcome already implies: four bundled WAVs, one per outcome, named after it --

@@ -24,14 +24,14 @@
 //   * It never writes pool.txt. It prints a SUGGESTED table for you to paste; the
 //     pool stays yours to decide.
 //   * It never probes a paid model. Only cost 0/0 models from the provider's
-//     catalog are candidates.
+//     catalog are candidates (non-chat/media/safety/meta-router models are skipped).
 //
 // OUTPUT
 //   a per-provider ranked table, an overall ranking, a suggested pool.txt block,
 //   and (unless --no-write) the raw rows in ~/.config/lacode/model-scores.json so
 //   a later run can compare.
 
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
@@ -39,6 +39,7 @@ import { dirname, join } from "node:path"
 const AUTH = join(homedir(), ".local", "share", "opencode", "auth.json")
 const OUT = join(homedir(), ".config", "lacode", "model-scores.json")
 const DEFAULT_PROVIDERS = ["opencode", "opencode-go", "openrouter", "console-openrouter"]
+const SESSION_PROVIDERS = new Set(["opencode", "opencode-go"])
 
 // ── scoring weights ─────────────────────────────────────────────────────────
 // Mechanical work prizes speed and availability over raw capability. Context is
@@ -59,8 +60,8 @@ const value = (flag, fallback) => {
   return hit.includes("=") ? hit.slice(hit.indexOf("=") + 1) : argv[argv.indexOf(hit) + 1]
 }
 
-if (has("--help") || has("-h")) {
-  console.log(`Usage: npm run score -- [options]
+  if (has("--help") || has("-h")) {
+    console.log(`Usage: npm run score -- [options]
 
   --providers a,b   providers to scan (default: ${DEFAULT_PROVIDERS.join(",")})
   --max N           probe at most N free models per provider (default: 12)
@@ -69,11 +70,14 @@ if (has("--help") || has("-h")) {
   --no-write        do not write ~/.config/lacode/model-scores.json
   -h, --help        this message
 
-Only cost 0/0 models are candidates. Credentials come from
-~/.local/share/opencode/auth.json; a provider with no entry falls back to the
-"opencode" key (which is how the console-openrouter connection authenticates).`)
-  process.exit(0)
-}
+Only cost 0/0 concrete text chat/completion models are candidates
+(non-chat/media generators, safety classifiers, and OpenRouter meta-routers are skipped).
+Credentials come from ~/.local/share/opencode/auth.json; a provider with no
+entry falls back to the "opencode" key (which is how the console-openrouter
+connection authenticates).
+opencode/opencode-go models are probed through a temporary local opencode serve --pure session, while the other providers are probed directly.`)
+    process.exit(0)
+  }
 
 const providers = String(value("--providers", DEFAULT_PROVIDERS.join(","))).split(",").map((s) => s.trim()).filter(Boolean)
 const maxPerProvider = Math.max(1, Number(value("--max", "12")) || 12)
@@ -119,6 +123,19 @@ function parseVerbose(text) {
   return rows
 }
 
+/** True for concrete text-in/text-out chat models, not media generators, classifiers, or OpenRouter meta-routers. */
+function isChatModel(model) {
+  const input = model?.capabilities?.input
+  const output = model?.capabilities?.output
+  if (input?.text === false) return false
+  if (output?.text === false) return false
+  if (output?.audio || output?.image || output?.video || output?.pdf) return false
+  const apiId = String(model?.api?.id ?? "").toLowerCase()
+  if (apiId.startsWith("openrouter/")) return false
+  if (/content[-_]safety|moderation|classifier/.test(apiId)) return false
+  return true
+}
+
 function freeModels(provider) {
   let text
   try {
@@ -135,6 +152,7 @@ function freeModels(provider) {
     .filter(({ model }) => model?.api?.url && model?.api?.id)
     .filter(({ model }) => (model.cost?.input ?? 1) === 0 && (model.cost?.output ?? 1) === 0)
     .filter(({ model }) => !model.status || model.status === "active")
+    .filter(({ model }) => isChatModel(model))
     .map(({ id, model }) => ({
       model: id,
       url: model.api.url,
@@ -166,11 +184,104 @@ const sessionHeader = (provider) =>
 // ── probing ─────────────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+function failureText(error) {
+  if (!error) return "error"
+  if (typeof error === "string") return error
+  if (error?.data?.message) return error.data.message
+  if (error?.message) return error.message
+  if (error?.name) return error.name
+  try {
+    return JSON.stringify(error).slice(0, 240)
+  } catch {
+    return "error"
+  }
+}
+
+let sessionServerPromise = null
+let sessionServerProc = null
+
+function startSessionServer() {
+  if (sessionServerPromise) return sessionServerPromise
+  sessionServerPromise = new Promise((resolve, reject) => {
+    let resolved = false
+    let output = ""
+    let proc
+    try {
+      proc = spawn("opencode", ["serve", "--hostname=127.0.0.1", "--port=0", "--pure"], {
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+    } catch (error) {
+      sessionServerPromise = null
+      sessionServerProc = null
+      reject(error)
+      return
+    }
+    sessionServerProc = proc
+
+    const timer = setTimeout(() => {
+      if (resolved) return
+      resolved = true
+      try {
+        proc.kill()
+      } catch {}
+      sessionServerPromise = null
+      sessionServerProc = null
+      reject(new Error("opencode serve timeout"))
+    }, 15000)
+
+    const onData = (chunk) => {
+      if (resolved) return
+      output += chunk.toString()
+      const match = output.match(/opencode server listening on (https?:\/\/\S+)/)
+      if (match) {
+        resolved = true
+        clearTimeout(timer)
+        const url = match[1].replace(/\/+$/, "")
+        resolve({ url, proc })
+      }
+    }
+    proc.stdout.on("data", onData)
+    proc.stderr.on("data", onData)
+
+    proc.on("error", (error) => {
+      if (resolved) return
+      resolved = true
+      clearTimeout(timer)
+      sessionServerPromise = null
+      sessionServerProc = null
+      reject(error)
+    })
+
+    proc.on("exit", () => {
+      if (sessionServerProc === proc) {
+        sessionServerProc = null
+        sessionServerPromise = null
+      }
+      if (resolved) return
+      resolved = true
+      clearTimeout(timer)
+      reject(new Error("opencode serve exited before ready"))
+    })
+  })
+  return sessionServerPromise
+}
+
+function stopSessionServer() {
+  if (sessionServerProc) {
+    try {
+      sessionServerProc.kill()
+    } catch {}
+    sessionServerProc = null
+  }
+  sessionServerPromise = null
+}
+process.on("exit", stopSessionServer)
+
 /**
  * One real request. Returns {ok, ms, reason}. A failure is named, never rounded
  * into a success, and `ms` is only reported for a request that actually ran.
  */
-async function probe(candidate, provider) {
+async function probeDirect(candidate, provider) {
   const key = keyFor(provider)
   if (!key) return { ok: false, ms: null, reason: "no credential in auth.json" }
 
@@ -226,6 +337,84 @@ async function probe(candidate, provider) {
   }
 }
 
+async function probeViaSession(candidate, provider) {
+  const started = performance.now()
+  let promptStarted = null
+  const directory = encodeURIComponent(process.cwd())
+  let id = null
+  let server = null
+  try {
+    server = await startSessionServer()
+    const createRes = await fetch(`${server.url}/session?directory=${directory}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: `score probe ${candidate.model}` }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    const createText = await createRes.text()
+    let createdJson = null
+    try {
+      createdJson = JSON.parse(createText)
+    } catch {}
+    if (!createRes.ok) {
+      const detail = createdJson?.error?.message ?? createdJson?.message ?? createText.slice(0, 160)
+      const ms = Math.round(performance.now() - started)
+      return { ok: false, ms, reason: `session create http ${createRes.status}: ${detail}` }
+    }
+    id = createdJson?.id ?? createdJson?.data?.id ?? null
+    if (!id) {
+      const ms = Math.round(performance.now() - started)
+      return { ok: false, ms, reason: `no session id: ${createText.slice(0, 160)}` }
+    }
+    promptStarted = performance.now()
+    const msgRes = await fetch(`${server.url}/session/${id}/message?directory=${directory}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: { providerID: provider, modelID: candidate.apiId },
+        system: "You are a connection health check. Reply with the single word: ok",
+        parts: [{ type: "text", text: "ok" }],
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    const msgText = await msgRes.text()
+    let parsed = null
+    try {
+      parsed = JSON.parse(msgText)
+    } catch {}
+    const ms = Math.round(performance.now() - (promptStarted ?? started))
+    if (!msgRes.ok) {
+      const detail = parsed?.error?.message ?? parsed?.message ?? msgText.slice(0, 160)
+      return { ok: false, ms, reason: `http ${msgRes.status}: ${detail}` }
+    }
+    const failure = parsed?.error ?? parsed?.info?.error
+    if (failure) {
+      return { ok: false, ms, reason: failureText(failure).slice(0, 240) }
+    }
+    if (!parsed?.info) {
+      return { ok: false, ms, reason: "no response" }
+    }
+    return { ok: true, ms, reason: "answered" }
+  } catch (error) {
+    const ms = Math.round(performance.now() - (promptStarted ?? started))
+    if (error?.name === "TimeoutError") {
+      return { ok: false, ms, reason: `timeout after ${timeoutMs}ms` }
+    }
+    return { ok: false, ms, reason: failureText(error).slice(0, 240) }
+  } finally {
+    if (id && server) {
+      try {
+        await fetch(`${server.url}/session/${id}?directory=${directory}`, { method: "DELETE" })
+      } catch {}
+    }
+  }
+}
+
+async function probe(candidate, provider) {
+  if (SESSION_PROVIDERS.has(provider)) return probeViaSession(candidate, provider)
+  return probeDirect(candidate, provider)
+}
+
 // ── scoring ─────────────────────────────────────────────────────────────────
 const clamp01 = (n) => Math.max(0, Math.min(1, n))
 const logScore = (n, max) => (n && n > 0 ? clamp01(Math.log2(1 + n) / Math.log2(1 + max)) : 0)
@@ -274,6 +463,7 @@ async function main() {
     }
     results.push({ provider: entry.provider, error: null, rows })
   }
+  stopSessionServer()
 
   // Per-provider ranked tables.
   for (const entry of results) {

@@ -621,6 +621,18 @@ test("[US-12] a question delivers a notification carrying the question's own tex
   assert.equal(sent[0].urgency, "normal", "a question is a request, not a failure, and must not go modal")
 })
 
+test("[US-12] a subagent blocked on a question still notifies", async () => {
+  // A subagent that finishes is noise; a subagent blocked on a question cannot
+  // finish and the parent cannot proceed. Suppressing it would strand the user.
+  const { sent, emit } = await notifier({ sessions: { c1: { id: "c1", parentID: "root", title: "explore" } } })
+  await busy(emit, "c1")
+  await emit("question.asked", { sessionID: "c1", questions: [{ question: "Which directory?" }] })
+  await settle()
+
+  assert.equal(sent.length, 1, `a subagent blocked on a question must notify, got ${JSON.stringify(sent)}`)
+  assert.match(sent[0].message, /Which directory/, `the question text must be included: ${sent[0].message}`)
+})
+
 test("[US-12] the idle event after a parked question sends no duplicate finished notification", async () => {
   // Nothing finished: the task is parked waiting on the user. Saying "finished"
   // there is actively wrong, not merely redundant.
@@ -737,6 +749,26 @@ test("[US-11] a remote session says so in the notification, so the tunnel is exp
 // `permission.asked`, not the SDK's `permission.updated`; `permission` and
 // `patterns`, not `type` and `pattern`. A fixture written from types.gen.d.ts
 // would pass these tests and produce "undefined" on a real server.
+
+test("[US-25] a subagent blocked on a permission prompt still notifies", async () => {
+  // A subagent going idle is noise, but a subagent BLOCKED cannot finish and
+  // the parent cannot proceed. Suppressing this was the silent stall: the user
+  // saw a permission prompt in another project and heard nothing.
+  const { sent, emit } = await notifier({ sessions: { c1: { id: "c1", parentID: "root", title: "explore" } } })
+  await busy(emit, "c1")
+  await emit("permission.asked", {
+    id: "p1",
+    sessionID: "c1",
+    permission: "external_directory",
+    patterns: ["/srv/shared/*"],
+    metadata: { parentDir: "/srv/shared" },
+  })
+  await settle(PERMISSION_SETTLE_MS)
+
+  assert.equal(sent.length, 1, `a subagent blocked on permission must notify, got ${JSON.stringify(sent)}`)
+  assert.match(sent[0].message, /permission/i, `the message must say why the child is blocked: ${sent[0].message}`)
+  assert.match(sent[0].message, /\/srv\/shared/, `the blocked directory must be named: ${sent[0].message}`)
+})
 
 test("[US-25] a permission request delivers exactly one notification naming the type and the pattern", async () => {
   const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Read the config" } } })

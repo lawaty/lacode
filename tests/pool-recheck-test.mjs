@@ -540,6 +540,115 @@ const cooling = (id, dir, models, ms) => {
   await hooks.dispose?.()
 }
 
+
+
+
+// --- US-34: notify:false suppresses rate-limit reset notice -------------------
+{
+  const dir = scratch()
+  const model = SLOT_MODELS[0]
+  const { provider, id: modelID } = pool.splitModel(model)
+  const stub = stubClient({ [model]: async () => ({ role: "assistant", providerID: provider, modelID }) })
+  const sent = []
+  const claimsDir = scratch()
+  const modelsInline = { slots: [{ model, weight: 1, notify: false }] }
+  const prevNotifyDir = process.env.LACODE_NOTIFY_DIR
+  process.env.LACODE_NOTIFY_DIR = scratch()
+  const hooks = await AgentPool(
+
+    { client: { ...client, ...stub }, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    {
+      id: "notify-off",
+      dir: claimsDir,
+      models: modelsInline,
+      probeMs: 0,
+      watchMs: 0,
+      notify: (title, message) => sent.push(`${title}: ${message}`),
+    },
+  )
+  await hooks.config(shippedConfig())
+  const sOff = pool.state({ id: "notify-off", dir: claimsDir, models: modelsInline })
+  pool.init(sOff, () => {})
+  pool.ensureSlots(sOff, () => {})
+  pool.recordStrike(sOff, model, "quota", 60_000)
+  const result = await hooks.tool.pool_recheck.execute({ models: [model] }, {})
+  assert(result && result.title, `[US-34] result must exist: ${JSON.stringify(result)}`)
+  assert(sent.length === 0, `[US-34] Recovering slot configured notify:false -> NO reset notice is raised, got ${sent.join(" | ")}`)
+  await hooks.dispose?.()
+  if (prevNotifyDir === undefined) delete process.env.LACODE_NOTIFY_DIR
+  else process.env.LACODE_NOTIFY_DIR = prevNotifyDir
+}
+
+// --- US-34 control: notify on -> exactly one reset notice ---------------------
+{
+  const dir = scratch()
+  const model = SLOT_MODELS[1]
+  const { provider, id: modelID } = pool.splitModel(model)
+  const stub = stubClient({ [model]: async () => ({ role: "assistant", providerID: provider, modelID }) })
+  const sent = []
+  const claimsDir = scratch()
+  const modelsInline = { slots: [{ model, weight: 1, notify: true }] }
+  const prevNotifyDir = process.env.LACODE_NOTIFY_DIR
+  process.env.LACODE_NOTIFY_DIR = scratch()
+  const hooks = await AgentPool(
+
+    { client: { ...client, ...stub }, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    {
+      id: "notify-on-x",
+      dir: claimsDir,
+      models: modelsInline,
+      probeMs: 0,
+      watchMs: 0,
+      notify: (title, message) => sent.push(`${title}: ${message}`),
+    },
+  )
+  await hooks.config(shippedConfig())
+  const sOnx = pool.state({ id: "notify-on-x", dir: claimsDir, models: modelsInline })
+  pool.init(sOnx, () => {})
+  pool.ensureSlots(sOnx, () => {})
+  pool.recordStrike(sOnx, model, "quota", 60_000)
+  const result = await hooks.tool.pool_recheck.execute({ models: [model] }, {})
+  assert(result && result.title, `[US-34] result must exist: ${JSON.stringify(result)}`)
+  assert(sent.length === 1, `[US-34] Control: notify on -> exactly one reset notice, got ${sent.length}: ${sent.join(" | ")}`)
+  await hooks.dispose?.()
+  if (prevNotifyDir === undefined) delete process.env.LACODE_NOTIFY_DIR
+  else process.env.LACODE_NOTIFY_DIR = prevNotifyDir
+}
+
+// --- US-34: non-opencode default-off suppresses reset notice ------------------
+{
+  const model = "groq/openai/gpt-oss-120b"
+  const { provider, id: modelID } = pool.splitModel(model)
+  const stub = stubClient({ [model]: async () => ({ role: "assistant", providerID: provider, modelID }) })
+  const sent = []
+  const claimsDir = scratch()
+  const modelsInline = { slots: [{ model, weight: 1 }] }
+  const prevNotifyDir = process.env.LACODE_NOTIFY_DIR
+  process.env.LACODE_NOTIFY_DIR = scratch()
+  const hooks = await AgentPool(
+    { client: { ...client, ...stub }, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    {
+      id: "notify-default-off",
+      dir: claimsDir,
+      models: modelsInline,
+      probeMs: 0,
+      watchMs: 0,
+      notify: (title, message) => sent.push(`${title}: ${message}`),
+    },
+  )
+  await hooks.config(shippedConfig())
+  const sOff = pool.state({ id: "notify-default-off", dir: claimsDir, models: modelsInline })
+  pool.init(sOff, () => {})
+  pool.ensureSlots(sOff, () => {})
+  pool.recordStrike(sOff, model, "quota", 60_000)
+  const result = await hooks.tool.pool_recheck.execute({ models: [model] }, {})
+  assert(result && result.title, `[US-34] result must exist: ${JSON.stringify(result)}`)
+  assert(sent.length === 0, `[US-34] a non-opencode slot with no explicit opt-in is silent by default, got ${sent.join(" | ")}`)
+  await hooks.dispose?.()
+  if (prevNotifyDir === undefined) delete process.env.LACODE_NOTIFY_DIR
+  else process.env.LACODE_NOTIFY_DIR = prevNotifyDir
+}
+
 for (const dir of made) rmSync(dir, { recursive: true, force: true })
 globalThis.fetch = realFetch
 if (failures === 0) console.log("\nALL POOL RECHECK CHECKS PASSED")

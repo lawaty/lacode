@@ -95,6 +95,7 @@ import { imagePasteHooks } from "./plugins/image-paste.ts"
 import { scrubSlotNames } from "./lib/prompt-guard.ts"
 import { notifyHooks } from "./plugins/notify.ts"
 import { omniRouteHooks } from "./plugins/omniroute.ts"
+import { providerCompatHooks } from "./plugins/provider-compat.ts"
 import { selfUpdateHooks } from "./plugins/selfupdate.ts"
 import { timelineHooks } from "./plugins/timeline.ts"
 
@@ -172,6 +173,9 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   const selfupdate = (await settled("self-update", () => selfUpdateHooks(input, options))) ?? inertHooks
   const feedback = (await settled("feedback", () => feedbackHooks(input, options))) ?? inertHooks
   const omniroute = (await settled("omniroute", () => omniRouteHooks(input, options))) ?? inertHooks
+  // Load-time, not per-request: the fetch swap must be in place before the first
+  // provider call, so it runs with the other factories rather than from a hook.
+  const compat = (await settled("provider-compat", () => providerCompatHooks(input))) ?? inertHooks
   const imagepaste = (await settled("image-paste", () => imagePasteHooks(input, opts.imagePaste as PluginOptions | undefined))) ?? inertHooks
   const timeline = (await settled("timeline", () => timelineHooks(input, options))) ?? inertHooks
 
@@ -225,6 +229,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       await selfupdate.dispose?.()
       await feedback.dispose?.()
       await omniroute.dispose?.()
+      await compat.dispose?.()
       await imagepaste.dispose?.()
       await timeline.dispose?.()
     },

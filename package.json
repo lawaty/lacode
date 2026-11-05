@@ -1,6 +1,6 @@
 {
   "name": "@lawaty/lacode",
-  "version": "1.3.0-beta.7",
+  "version": "1.3.0-beta.8",
   "description": "Ultimate opencode setup for Go users — cost-controlled pooled subagents, hang recovery, and notifications for opencode.",
   "license": "MIT",
   "type": "module",
@@ -55,7 +55,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "prepack": "npm run build",
-    "postpublish": "node scripts/sync-hosts.mjs",
+    "postpublish": "node scripts/sync-hosts.mjs && ./bin/oc-sync",
     "test": "node --test tests/",
     "benchmark": "node tests/benchmark/run.mjs",
     "score": "node scripts/score-models.mjs"

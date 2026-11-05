@@ -222,6 +222,7 @@ A limit does not always arrive as an error. Sometimes the provider accepts the r
 **Story ID(s) for tests:** US-12
 **Acceptance criteria:**
 - [ ] Given a question is asked, When the event fires, Then a `question` notification is delivered that includes the question's text.
+- [ ] Given a subagent session asks a question, When the question fires, Then the notification is still delivered, because the parent cannot proceed until the user answers and a blocked child is not background noise.
 - [ ] Given a session has a parked question, When the idle event that follows fires, Then no duplicate "finished" notification is sent.
 - [ ] Given a parked question is replied to, rejected, or the session errors, When that event fires, Then the pending entry is cleared and the next real completion notifies again.
 - [ ] Given a question and a completion occur inside the same cooldown window, When both are evaluated, Then they are not deduplicated against each other.
@@ -232,6 +233,7 @@ A limit does not always arrive as an error. Sometimes the provider accepts the r
 **Story ID(s) for tests:** US-25
 **Acceptance criteria:**
 - [ ] Given a permission is requested, When the `permission.asked` event fires, Then exactly one notification is delivered naming the permission type and the path or pattern being requested.
+- [ ] Given a subagent session asks for permission, When the prompt fires, Then the notification is still delivered, because the parent cannot proceed until the user answers and a suppressed subagent prompt is the silent stall this story removes.
 - [ ] Given opencode asks to reach a directory outside the worktree, When the prompt fires, Then the notification names that directory, resolved from `metadata.parentDir`/`metadata.filepath` and with the trailing glob trimmed, because a glob is not something the user can judge.
 - [ ] Given the permission is granted, denied, or dismissed, When `permission.replied` fires, Then no notification is sent — the prompt was the thing worth interrupting for, not the answer — and only the parked-session block is cleared.
 - [ ] Given a session is parked on a permission prompt, When the idle event fires, Then no "finished" notification is sent, because nothing finished.
@@ -271,6 +273,21 @@ The popup belongs to its session: working in one chat closes that chat's popup a
 - [ ] Given the user never works in that chat, When the notification was delivered, Then it stays until the user closes it, exactly as before.
 - [ ] Given a permission popup is closed this way, When the permission was already answered in the terminal, Then nothing is answered twice: the close takes the popup down and answers nothing.
 - [ ] Given the notification was delivered by a session on a remote host and reached the desktop over the tunnel, When the user works in that chat, Then the popup on the desktop closes too, because the popup lives on the desktop and only the desktop knows its notification id.
+
+### US-34: A recovered slot announces itself once, and each slot can stay quiet
+**As a** user running a pool whose slots are rate-limited at different times, **I want** a slot that becomes usable again to raise one notice — and to be able to silence that notice for individual slots, **so that** I hear about capacity coming back without being told about slots I do not care about.
+
+A cooldown that was a rate limit is the one kind of recovery worth announcing: when its window lapses or a probe finds the model answering, the capacity is genuinely back. An outage, an auth failure or a missing model is not fixed by waiting, and announcing those would be noise. Several opencode processes share one pool, so the notice is claimed per model and spoken once. The notice follows the provider: `opencode` and `opencode-go` slots announce by default, every other provider is quiet, and any slot can override either way with `notify:on`/`notify:off` (or `"notify": true`/`"notify": false`). The notice names a model, so a model declared on several lines is announced if any of its lines allows it.
+
+**Story ID(s) for tests:** US-34
+**Acceptance criteria:**
+- [ ] Given a slot was cooling for a quota/rate-limit reason, When its window lapses or a probe finds it answering, Then one desktop notice with the title `LaCode: rate limit reset` names the recovered model.
+- [ ] Given a slot was cooling for an auth failure, a missing model or a short outage, When that cooldown ends, Then no reset notice is raised, because waiting does not fix those and the alert would be noise.
+- [ ] Given the same pool is shared by several opencode processes, When a slot recovers, Then exactly one process speaks, and the others stay silent.
+- [ ] Given a slot's line sets `notify:off` (or its JSON entry sets `"notify": false`), When that slot recovers, Then no reset notice is raised for it and no cross-process claim is consumed, while other enabled slots still announce.
+- [ ] Given a model appears on several lines, When it recovers, Then it is announced if any of its lines has `notify` on, and is silent only when every line opts out.
+- [ ] Given a slot sets no notify, When it recovers, Then the notice is raised for an opencode or opencode-go slot and not raised for any other provider, because those providers stay quiet unless asked.
+- [ ] Given `notify` is changed in a watched pool file, When the file is saved, Then the new setting applies without a restart.
 
 ---
 
@@ -523,6 +540,7 @@ table was filled in.
 | US-25 | D | `tests/stories/d-notifications.test.mjs` |
 | US-29 | D | `tests/stories/d-notifications.test.mjs` |
 | US-30 | D | `tests/stories/d-notifications.test.mjs`, `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |
+| US-34 | D | `tests/pool-models-test.mjs`, `tests/pool-recheck-test.mjs` |
 | US-13 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/notify-test.mjs`, `tests/oc-test.mjs` |
 | US-14 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |
 | US-18 | E | `tests/stories/e-remote-ssh.test.mjs`, `tests/oc-test.mjs` |

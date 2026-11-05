@@ -7,7 +7,7 @@ The plugin options, where the model pool gets its slots, and exactly what LaCode
 The slot list is the first of these that yields usable slots:
 
 1. plugin options — `models` in the [tuple](../README.md#configure)
-2. `~/.config/lacode/pool.txt` — flat `model [weight]` per line, preferred
+2. `~/.config/lacode/pool.txt` — flat `model [weight] [b:<bucket>] [notify:on|off]` per line, preferred
 3. `~/.config/lacode/pool.json` (its parent directory is created for you)
 4. the bundled `presets/free-tier.json`
 5. a built-in fallback, so routing always works
@@ -32,6 +32,21 @@ A slot may also declare a shared quota bucket with `b:<name>` on the line (or a
 `bucket` field in JSON). A limit on any member benches the whole bucket, because
 the sibling would spend the same exhausted window; without one, the model is its
 own bucket. `pool_status` shows each shared bucket's effective capacity.
+
+Each slot gets a `notify` flag that controls the desktop "rate-limit reset"
+notice raised when a slot that was cooling for a quota/rate-limit reason becomes
+usable again. The default is **provider-based**: on for `opencode` and
+`opencode-go` slots, off for every other provider. On a `pool.txt` line, set
+`notify:on` to opt a quiet provider's slot into the notice, or `notify:off` to
+silence an `opencode`/`opencode-go` slot; `notify:on`/`notify:off` are accepted
+explicitly. In `pool.json`, set `"notify": true` or `"notify": false`
+(booleans; `on/off/1/0/yes/no` strings are also accepted). If the same model
+appears on several lines, it is announced if **any** of its slots has `notify`
+on — to fully silence a model, set `notify:off` on all of its lines. An
+invalid `notify` value falls back to the provider default and produces a
+warning. The flag gates only the desktop reset notice, not pool routing or
+status, and pool files are hot-reloaded so changes take effect without a
+restart.
 
 
 ## Which models run which agent

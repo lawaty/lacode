@@ -356,5 +356,117 @@ for (let i = 1; i <= shipped.slots.length; i++) {
   assert(resolvedJson.slots.length === 1 && resolvedJson.slots[0].model === "opencode-go/a", `JSON still works: ${JSON.stringify(resolvedJson.slots)}`)
 }
 
+// --- US-34: notify parsing and announcesReset --------------------------------
+{
+  // 1. "notify": false in JSON -> false; missing notify on opencode/bar -> true.
+  const parsedFalse = pool.parseSlots({ slots: [{ model: "opencode/foo", notify: false }] }, "test.json")
+  assert(parsedFalse.slots.length === 1, "[US-34] notify false JSON must produce one slot")
+  assert(parsedFalse.slots[0].notify === false, `[US-34] "notify": false in JSON -> slot.notify === false, got ${parsedFalse.slots[0].notify}`)
+
+  const parsedMissing = pool.parseSlots({ slots: [{ model: "opencode/bar" }] }, "test.json")
+  assert(parsedMissing.slots[0].notify === true, `[US-34] missing notify on opencode/bar -> true, got ${parsedMissing.slots[0].notify}`)
+
+  // 2. missing notify on groq/bar -> false.
+  const parsedMissingGroq = pool.parseSlots({ slots: [{ model: "groq/bar" }] }, "test.json")
+  assert(parsedMissingGroq.slots[0].notify === false, `[US-34] missing notify on groq/bar -> false, got ${parsedMissingGroq.slots[0].notify}`)
+
+  // 3. "notify": "off" on opencode/baz -> false; "notify": "yes" -> true.
+  const parsedOff = pool.parseSlots({ slots: [{ model: "opencode/baz", notify: "off" }] }, "test.json")
+  assert(parsedOff.slots[0].notify === false, `[US-34] "notify": "off" on opencode/baz -> false, got ${parsedOff.slots[0].notify}`)
+  const parsedYes = pool.parseSlots({ slots: [{ model: "opencode/qux", notify: "yes" }] }, "test.json")
+  assert(parsedYes.slots[0].notify === true, `[US-34] "notify": "yes" -> true, got ${parsedYes.slots[0].notify}`)
+
+  // 4. "notify": "on" on groq/baz -> true.
+  const parsedOnGroq = pool.parseSlots({ slots: [{ model: "groq/baz", notify: "on" }] }, "test.json")
+  assert(parsedOnGroq.slots[0].notify === true, `[US-34] "notify": "on" on groq/baz -> true, got ${parsedOnGroq.slots[0].notify}`)
+
+  // 5. invalid "notify": "maybe" on opencode/bad -> true and problems mention notify.
+  const parsedBad = pool.parseSlots({ slots: [{ model: "opencode/bad", notify: "maybe" }] }, "test.json")
+  assert(parsedBad.slots[0].notify === true, `[US-34] invalid "notify": "maybe" on opencode/bad -> true, got ${parsedBad.slots[0].notify}`)
+  assert(parsedBad.problems.some((p) => p.includes("notify")), `[US-34] invalid notify problems must mention notify, got ${parsedBad.problems.join(" | ")}`)
+
+  // 6. invalid "notify": "maybe" on groq/bad -> false and problems mention notify.
+  const parsedBadGroq = pool.parseSlots({ slots: [{ model: "groq/bad", notify: "maybe" }] }, "test.json")
+  assert(parsedBadGroq.slots[0].notify === false, `[US-34] invalid "notify": "maybe" on groq/bad -> false, got ${parsedBadGroq.slots[0].notify}`)
+  assert(parsedBadGroq.problems.some((p) => p.includes("notify")), `[US-34] invalid notify problems must mention notify, got ${parsedBadGroq.problems.join(" | ")}`)
+
+  // 7. flat text: keep opencode/foo notify:off -> false and opencode/bar 2 b:shared notify:off -> weight 2/bucket shared/false; add groq/foo (no token) -> false, opencode/foo (no token) -> true, groq/foo notify:on -> true.
+  const flat1 = pool.parseTextSlots("opencode/foo notify:off", "pool.txt")
+  assert(flat1.slots[0].notify === false, `[US-34] flat opencode/foo notify:off -> false, got ${flat1.slots[0].notify}`)
+  const flat2 = pool.parseTextSlots("opencode/bar 2 b:shared notify:off", "pool.txt")
+  assert(flat2.slots[0].weight === 2, `[US-34] flat weight 2 with tokens, got ${flat2.slots[0].weight}`)
+  assert(flat2.slots[0].bucket === "shared", `[US-34] flat bucket shared, got ${flat2.slots[0].bucket}`)
+  assert(flat2.slots[0].notify === false, `[US-34] flat notify false with other tokens, got ${flat2.slots[0].notify}`)
+  const flat3 = pool.parseTextSlots("opencode/baz notify:off 2", "pool.txt")
+  assert(flat3.slots[0].weight === 2, `[US-34] token order p/m notify:off 2 still weight 2, got ${flat3.slots[0].weight}`)
+  assert(flat3.slots[0].notify === false, `[US-34] token order notify still false, got ${flat3.slots[0].notify}`)
+  const flatGroqNoToken = pool.parseTextSlots("groq/foo", "pool.txt")
+  assert(flatGroqNoToken.slots[0].notify === false, `[US-34] flat groq/foo (no token) -> false, got ${flatGroqNoToken.slots[0].notify}`)
+  const flatOpencodeNoToken = pool.parseTextSlots("opencode/foo", "pool.txt")
+  assert(flatOpencodeNoToken.slots[0].notify === true, `[US-34] flat opencode/foo (no token) -> true, got ${flatOpencodeNoToken.slots[0].notify}`)
+  const flatGroqOn = pool.parseTextSlots("groq/foo notify:on", "pool.txt")
+  assert(flatGroqOn.slots[0].notify === true, `[US-34] flat groq/foo notify:on -> true, got ${flatGroqOn.slots[0].notify}`)
+
+  // 8. announcesReset: mix(false+true) -> true; all-false -> false; empty opencode/z -> true; empty groq/z -> false; groq slot notify:true -> true.
+  const slotsMix = [
+    { index: 1, model: "opencode/x", weight: 1, notify: false },
+    { index: 2, model: "opencode/x", weight: 1, notify: true },
+  ]
+  assert(pool.announcesReset(slotsMix, "opencode/x") === true, "[US-34] announcesReset mix (false+true) -> true")
+  const slotsAllFalse = [
+    { index: 1, model: "opencode/y", weight: 1, notify: false },
+    { index: 2, model: "opencode/y", weight: 1, notify: false },
+  ]
+  assert(pool.announcesReset(slotsAllFalse, "opencode/y") === false, "[US-34] announcesReset all false -> false")
+  assert(pool.announcesReset([], "opencode/z") === true, "[US-34] announcesReset empty opencode/z -> true")
+  assert(pool.announcesReset([], "groq/z") === false, "[US-34] announcesReset empty groq/z -> false")
+  const slotsGroqOn = [{ index: 1, model: "groq/z", weight: 1, notify: true }]
+  assert(pool.announcesReset(slotsGroqOn, "groq/z") === true, "[US-34] announcesReset groq slot notify:true -> true")
+}
+
+import { test } from "node:test"
+
+test("[US-34] notify parsing and announcesReset in pool-models-test", () => {
+  // already asserted above in the script style; repeat minimal checks via imported API
+  const parsedFalse = pool.parseSlots({ slots: [{ model: "opencode/foo", notify: false }] }, "test.json")
+  assert(parsedFalse.slots[0].notify === false, "[US-34] parsedFalse notify === false")
+  const parsedMissing = pool.parseSlots({ slots: [{ model: "opencode/bar" }] }, "test.json")
+  assert(parsedMissing.slots[0].notify === true, "[US-34] parsedMissing notify === true")
+  const parsedMissingGroq = pool.parseSlots({ slots: [{ model: "groq/bar" }] }, "test.json")
+  assert(parsedMissingGroq.slots[0].notify === false, "[US-34] parsedMissingGroq notify === false")
+  const parsedOff = pool.parseSlots({ slots: [{ model: "opencode/baz", notify: "off" }] }, "test.json")
+  assert(parsedOff.slots[0].notify === false, "[US-34] parsedOff notify === false")
+  const parsedOnGroq = pool.parseSlots({ slots: [{ model: "groq/baz", notify: "on" }] }, "test.json")
+  assert(parsedOnGroq.slots[0].notify === true, "[US-34] parsedOnGroq notify === true")
+  const parsedBad = pool.parseSlots({ slots: [{ model: "opencode/bad", notify: "maybe" }] }, "test.json")
+  assert(parsedBad.slots[0].notify === true, "[US-34] parsedBad notify === true")
+  assert(parsedBad.problems.some((p) => p.includes("notify")))
+  const parsedBadGroq = pool.parseSlots({ slots: [{ model: "groq/bad", notify: "maybe" }] }, "test.json")
+  assert(parsedBadGroq.slots[0].notify === false, "[US-34] parsedBadGroq notify === false")
+  assert(parsedBadGroq.problems.some((p) => p.includes("notify")))
+  const flat1 = pool.parseTextSlots("opencode/foo notify:off", "pool.txt")
+  assert(flat1.slots[0].notify === false, "[US-34] flat1 notify === false")
+  const flatGroqNoToken = pool.parseTextSlots("groq/foo", "pool.txt")
+  assert(flatGroqNoToken.slots[0].notify === false, "[US-34] flatGroqNoToken notify === false")
+  const flatOpencodeNoToken = pool.parseTextSlots("opencode/foo", "pool.txt")
+  assert(flatOpencodeNoToken.slots[0].notify === true, "[US-34] flatOpencodeNoToken notify === true")
+  const flatGroqOn = pool.parseTextSlots("groq/foo notify:on", "pool.txt")
+  assert(flatGroqOn.slots[0].notify === true, "[US-34] flatGroqOn notify === true")
+  const slotsMix = [
+    { index: 1, model: "opencode/x", weight: 1, notify: false },
+    { index: 2, model: "opencode/x", weight: 1, notify: true },
+  ]
+  assert(pool.announcesReset(slotsMix, "opencode/x") === true, "[US-34] announcesReset mix === true")
+  const slotsAllFalse = [
+    { index: 1, model: "opencode/y", weight: 1, notify: false },
+    { index: 2, model: "opencode/y", weight: 1, notify: false },
+  ]
+  assert(pool.announcesReset(slotsAllFalse, "opencode/y") === false, "[US-34] announcesReset allFalse === false")
+  assert(pool.announcesReset([], "opencode/z") === true, "[US-34] announcesReset empty opencode === true")
+  assert(pool.announcesReset([], "groq/z") === false, "[US-34] announcesReset empty groq === false")
+  const slotsGroqOn = [{ index: 1, model: "groq/z", weight: 1, notify: true }]
+  assert(pool.announcesReset(slotsGroqOn, "groq/z") === true, "[US-34] announcesReset groq notify:true === true")
+})
+
 rmSync(dir, { recursive: true, force: true })
 console.log("\nALL POOL-MODEL CHECKS PASSED")

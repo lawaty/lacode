@@ -233,7 +233,14 @@ export const shouldNotify = (input: {
   // explore/implement child session idles when it finishes, and a
   // session that dispatched ten of them would otherwise announce ten "ready"
   // notifications for work the user never asked about individually.
-  if (info.parentID) return { notify: false, reason: "subagent" }
+  //
+  // It applies only to the non-blocking outcomes. A subagent blocked on a
+  // question or a permission prompt is the opposite of background work: the
+  // parent cannot proceed until the user answers, so suppressing it turns a
+  // blocked child into the exact silent stall this plugin exists to remove.
+  if (info.parentID && outcome !== "permission" && outcome !== "question") {
+    return { notify: false, reason: "subagent" }
+  }
 
   const sessionTitle = safeTitle(info.title)
 

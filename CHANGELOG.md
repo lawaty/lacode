@@ -7,6 +7,31 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [Unreleased]
+
+## [1.3.0-beta.8] — a blocked child is never silent
+
+### Added
+
+- **Provider compatibility: object-shaped reasoning no longer crashes a spawn.** OpenAI-compatible gateways that stream `choices[].delta.reasoning` as an object (`{ encrypted_content, content, summary }`) are normalized to the string opencode's chunk schema expects, so the spawn survives the first reasoning chunk instead of dying with `invalid_union`.
+- **Pool: the rate-limit-reset notice is on by default only for `opencode` and `opencode-go` slots.** Every other provider stays quiet unless its slot sets `notify:on` on the `pool.txt` line (or `"notify": true` in `pool.json`); `notify:off` silences an `opencode`/`opencode-go` slot, and a model listed on several lines is announced if any of its slots is on (US-34).
+
+### Changed
+
+- **Build agent prompt: delegation is now the default.** The root agent's prompt carries the delegate-first gate and hard rules requiring a `task` spawn before repository inspection or edits, with bash reserved for applying and verifying a subagent's result.
+- **`score-models`: probe `opencode`/`opencode-go` through a local `opencode serve --pure` session** instead of direct HTTP, and restrict candidates to concrete text chat/completion models (media generators, safety classifiers and OpenRouter meta-routers are skipped).
+- **Cancelled tasks now surface their reason via a toast** when the task card cannot be rewritten (no `part` sub-client or an unauthenticated PATCH), so the user still sees why the slot was aborted.
+- **Publishing now syncs the config tree too.** `postpublish` runs `scripts/sync-hosts.mjs` and then the repo's `bin/oc-sync`, so a release deploys both the registry package and the working config without a second manual step.
+
+### Fixed
+
+- **A subagent blocked on a permission or question now notifies.** Every subagent outcome used to be suppressed, so a permission prompt in another project could be completely silent; `done` and `error` remain suppressed (US-12, US-25).
+
+### Documented
+
+- **README / CONFIGURATION:** per-slot `notify` semantics and provider-based defaults (US-34).
+- **USER-STORIES:** US-34 added; US-12 and US-25 now record that a blocked subagent still notifies.
+
 ## [1.3.0-beta.7] — only a rate-limit reset speaks
 
 ### Changed
@@ -1072,7 +1097,8 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v1.3.0-beta.8...HEAD
+[1.3.0-beta.8]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.8
 [1.3.0-beta.0]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.0
 [1.2.0]: https://github.com/lawaty/lacode/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/lawaty/lacode/compare/v1.0.0...v1.1.0

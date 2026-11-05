@@ -75,6 +75,31 @@ export const slotCeiling = (slot: Slot) => slot.weight
 
 /** The quota group a slot belongs to. Default: the model is its own bucket. */
 export const slotBucket = (slot: Slot) => slot.bucket ?? slot.model
+
+const NOTIFY_DEFAULT_ON_PROVIDERS = new Set(["opencode", "opencode-go"])
+
+/** opencode and opencode-go slots announce the reset notice by default; every other provider is quiet. */
+export const notifyDefault = (model: string): boolean => {
+  const slash = model.indexOf("/")
+  const provider = slash < 0 ? model : model.slice(0, slash)
+  return NOTIFY_DEFAULT_ON_PROVIDERS.has(provider)
+}
+
+/** The effective setting for one slot: an explicit boolean wins, otherwise the provider default. */
+const slotNotify = (slot: Slot): boolean =>
+  typeof slot.notify === "boolean" ? slot.notify : notifyDefault(slot.model)
+
+/**
+ * Whether a recovered model should raise the rate-limit-reset notice.
+ *
+ * opencode/opencode-go announce by default, other providers do not; an explicit
+ * `notify` overrides. A model on several lines is announced if any of its slots
+ * is effectively on; a model not in the table follows its provider default.
+ */
+export const announcesReset = (slots: Slot[], model: string): boolean => {
+  const matching = slots.filter((slot) => slot.model === model)
+  return matching.length > 0 ? matching.some((slot) => slotNotify(slot)) : notifyDefault(model)
+}
 // The pool has no fixed slot count: src/agents.ts generates exactly one hidden
 // variant per base per resolved slot, and the watcher creates a variant when the
 // table grows. This is a loud sanity threshold, not a cap -- a malformed file
@@ -143,7 +168,11 @@ const AUTH_FAILURE_PATTERN =
 
 export const isAuthFailureText = (text: string) => AUTH_FAILURE_PATTERN.test(text)
 
-export type Slot = { index: number; model: string; weight: number; bucket?: string }
+/**
+ * A pool slot. `notify` defaults to on for `opencode`/`opencode-go` models and
+ * off for every other provider; an explicit value overrides.
+ */
+export type Slot = { index: number; model: string; weight: number; bucket?: string; notify?: boolean }
 
 export type Claim = {
   v: string
@@ -221,6 +250,20 @@ export type SlotFile = { slots: Slot[]; problems: string[] }
 /** Human-readable origin of a slot list, used in log lines and warnings. */
 export type ModelsSource = { slots: Slot[]; problems: string[]; origin: string }
 
+const coerceNotify = (raw: unknown, at: string, model: string, problems: string[]): boolean => {
+  if (raw === undefined) return notifyDefault(model)
+  if (typeof raw === "boolean") return raw
+  if (typeof raw === "string") {
+    const s = raw.trim().toLowerCase()
+    if (s === "true" || s === "1" || s === "on" || s === "yes") return true
+    if (s === "false" || s === "0" || s === "off" || s === "no") return false
+    problems.push(`${at} (${model}): notify must be a boolean or one of on/off, got ${JSON.stringify(raw)}; keeping the provider default`)
+    return notifyDefault(model)
+  }
+  problems.push(`${at} (${model}): notify must be a boolean or one of on/off, got ${JSON.stringify(raw)}; keeping the provider default`)
+  return notifyDefault(model)
+}
+
 // Slot indices are the array position, so the source is the only place a slot
 // number exists; nothing downstream can disagree with it. Every entry is
 // validated on its own: one bad slot is dropped with a warning, the rest still
@@ -229,6 +272,7 @@ export type ModelsSource = { slots: Slot[]; problems: string[]; origin: string }
 // Weight is the slot's active-session budget, so a bad one warns and falls back to 1
 // rather than dropping the slot -- losing a model because of a typo in a count would
 // cost real capacity. A slot with no weight at all is weight 1.
+
 export function parseSlots(parsed: unknown, origin: string): SlotFile {
   const problems: string[] = []
   const entries = (parsed as { slots?: unknown })?.slots
@@ -249,7 +293,8 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
     if (rawBucket !== undefined && !bucket) {
       problems.push(`${at} (${model}): bucket must be a non-empty name; using the model id`)
     }
-    slots.push({ index: slots.length + 1, model, weight, ...(bucket ? { bucket } : {}) })
+    const notify = coerceNotify((entry as { notify?: unknown }).notify, at, model, problems)
+    slots.push({ index: slots.length + 1, model, weight, ...(bucket ? { bucket } : {}), notify })
   })
   if (slots.length > SLOTS_WARN_AT) {
     problems.push(`${origin}: ${slots.length} slots is unusually large, but every entry is kept (the pool has no slot cap)`)
@@ -263,7 +308,7 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
 
 /**
  * Parse the flat, hand-edited pool file: one
- * `<provider>/<model-id> [weight] [b:<bucket>]` per line. `#` starts a comment
+ * `<provider>/<model-id> [weight] [b:<bucket>] [notify:on|off]` per line. `#` starts a comment
  * (whole-line or trailing); blank lines are ignored; a missing weight is 1. A
  * `b:<bucket>` token declares a shared quota group: a limit on any line in the
  * bucket benches every line in it. Without one, the model id is its own bucket.
@@ -272,21 +317,26 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
  * are identical everywhere.
  */
 export function parseTextSlots(text: string, origin: string): SlotFile {
-  const entries: Array<{ model: string; weight?: string; bucket?: string }> = []
+  const entries: Array<{ model: string; weight?: string; bucket?: string; notify?: string }> = []
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.split("#")[0].trim()
     if (!line) continue
     const [model, ...rest] = line.split(/\s+/)
     let weight: string | undefined
     let bucket: string | undefined
+    let notify: string | undefined
     for (const token of rest) {
+      if (token.startsWith("notify:")) {
+        if (notify === undefined) notify = token.slice("notify:".length)
+        continue
+      }
       if (token.startsWith("b:")) {
         if (bucket === undefined) bucket = token.slice(2)
       } else if (weight === undefined) {
         weight = token
       }
     }
-    entries.push({ model, ...(weight === undefined ? {} : { weight }), ...(bucket === undefined ? {} : { bucket }) })
+    entries.push({ model, ...(weight === undefined ? {} : { weight }), ...(bucket === undefined ? {} : { bucket }), ...(notify === undefined ? {} : { notify }) })
   }
   return parseSlots({ slots: entries }, origin)
 }
@@ -691,7 +741,7 @@ export function ensureSlots(s: State, onWarn: (m: string) => void) {
  * changes where the table came from, and the status line must say so.
  */
 const slotSignature = (origin: string, slots: Slot[]) =>
-  `${origin}\u0000${slots.map((slot) => `${slot.index}:${slot.model}:${slot.weight}:${slot.bucket ?? ""}`).join("|")}`
+  `${origin}\u0000${slots.map((slot) => `${slot.index}:${slot.model}:${slot.weight}:${slot.bucket ?? ""}:${slotNotify(slot) ? "1" : "0"}`).join("|")}`
 
 export type SlotReload = { changed: boolean; slots: Slot[]; origin: string }
 
