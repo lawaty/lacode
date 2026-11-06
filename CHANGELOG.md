@@ -9,6 +9,26 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.1.0-beta.0] — every provider counts, and the timer installs itself
+
+### Added
+
+- Pool: `npm run score` scans every configured provider in one `opencode models --verbose` call. `--min-context` (default 200000) and `--min-score` (default 60) exclude weak models, and both floors are recorded in `model-scores.json`.
+- Timer migration: plugin startup installs or refreshes the pool-refresh systemd user timer once per package version, from a stable copy at `~/.local/lib/lacode/refresh-pool.mjs`. Opt out with `LACODE_NO_TIMER_MIGRATION=1`.
+- `scripts/refresh-pool.mjs --install-timer --stable` installs that stable timer by hand.
+- Timeline: a root `task` part expands into the child session's title and outcome, and `NO_PROJECT_CHANGES` is the explicit success token for a summary that found no project changes.
+
+### Changed
+
+- Pool: `scripts/refresh-pool.mjs` rebuilds `~/.config/lacode/pool.txt` from the best scored models across all providers — every opencode-go model at weight 4, then the best `10 - n` others at weight 2. Unscored/paid lines are no longer preserved.
+- Pool: the refresh timer runs daily at 01:00 with no randomized delay; the 15-minute in-process cooldown probe is unchanged.
+- Timer units are written atomically, and the installer enables user linger best-effort.
+- Timeline: side-maintenance sessions and their tool parts are excluded from the summarizer prompt and the rendered timeline; an empty summarizer reply is now a failure instead of an empty success.
+
+### Fixed
+
+- Timeline: a `NO_PROJECT_CHANGES` slice still advances the durable cursor, and `/reprocess-timeline` no longer aborts on it.
+
 ## [2.0.0-beta.0] — The timeline remembers, and the map has one job
 
 ### Added
@@ -1132,7 +1152,8 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v2.0.0-beta.0...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v2.1.0-beta.0...HEAD
+[2.1.0-beta.0]: https://github.com/lawaty/lacode/compare/v2.0.0-beta.0...v2.1.0-beta.0
 [2.0.0-beta.0]: https://github.com/lawaty/lacode/compare/v1.3.1...v2.0.0-beta.0
 [1.3.1]: https://github.com/lawaty/lacode/releases/tag/v1.3.1
 [1.3.0-beta.9]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.9

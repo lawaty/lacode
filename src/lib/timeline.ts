@@ -19,8 +19,24 @@ export type TimelinePart = {
   text?: string
   synthetic?: boolean
   ignored?: boolean
+  side?: boolean
   tool?: string
-  state?: { status?: string; input?: unknown; title?: string; output?: string; error?: unknown }
+  childTitle?: string
+  childOutcome?: string
+  state?: {
+    status?: string
+    input?: unknown
+    title?: string
+    output?: string
+    error?: unknown
+    metadata?: {
+      sessionId?: string
+      parentSessionId?: string
+      model?: { providerID?: string; modelID?: string }
+      truncated?: boolean
+    }
+    time?: { start?: number; end?: number }
+  }
 }
 export type TimelineMessage = {
   info: {
@@ -335,6 +351,53 @@ function summarizeToolResult(state: TimelinePart["state"]): string {
   return ""
 }
 
+export function isSideTool(tool: string, input?: unknown): boolean {
+  if (tool === "timeline_reprocess" || tool === "pool_status" || tool === "pool_recheck") return true
+  if (tool === "task" && input !== null && input !== undefined && typeof input === "object") {
+    return (input as Record<string, unknown>).subagent_type === "context"
+  }
+  return false
+}
+
+export function mentionsSideMaintenance(text: string): boolean {
+  return /\b(?:timeline_reprocess|pool_status|pool_recheck|reprocess-timeline|cartographer)\b/i.test(text)
+}
+
+export function isSideMaintenanceTask(input: unknown, rootDirectory: string, projectOwnsTooling: boolean): boolean {
+  if (projectOwnsTooling) return false
+  let description = ""
+  let prompt = ""
+  if (input !== null && input !== undefined && typeof input === "object") {
+    const rec = input as Record<string, unknown>
+    if (typeof rec.description === "string") description = rec.description
+    if (typeof rec.prompt === "string") prompt = rec.prompt
+  }
+  const text = [description, prompt].filter((s) => typeof s === "string" && s.length > 0).join("\n")
+  if (text === "") return false
+  if (/\.config\/(?:opencode|lacode)|\.local\/share\/opencode/i.test(text)) return true
+  if (mentionsSideMaintenance(text)) return true
+  const root = rootDirectory.replace(/\\/g, "/").replace(/\/+$/, "")
+  for (const match of text.matchAll(/\/(?:home|Users|root|opt|srv|mnt|workspace|workspaces)\/[^\s"'`),;]+/gi)) {
+    const cleaned = match[0].replace(/[.,:;!?]+$/, "")
+    if (!(cleaned.includes("/Projects/") || cleaned.includes("/projects/"))) continue
+    if (cleaned === root || cleaned.startsWith(root + "/")) continue
+    return true
+  }
+  return false
+}
+
+export function taskChildSessionId(part: TimelinePart): string | undefined {
+  const sessionId = part.state?.metadata?.sessionId
+  if (typeof sessionId === "string" && sessionId.length > 0) return sessionId
+  const output = part.state?.output
+  if (typeof output !== "string") return undefined
+  const taskMatch = output.match(/task id="([A-Za-z0-9_.-]+)"/)
+  if (taskMatch) return taskMatch[1]
+  const sesMatch = output.match(/ses_[A-Za-z0-9]+/)
+  if (sesMatch) return sesMatch[0]
+  return undefined
+}
+
 function renderMessage(m: TimelineMessage): string[] {
   const role = m.info.role
   const lines: string[] = []
@@ -348,18 +411,29 @@ function renderMessage(m: TimelineMessage): string[] {
     }
   } else if (role === "assistant") {
     for (const p of m.parts) {
+      if (p.side === true) continue
       if (p.type === "text") {
         const text = collapse(p.text ?? "")
         lines.push(`[assistant] ${trunc(text, 1500)}`)
       } else if (p.type === "tool") {
+        if (p.side === true) continue
         const tool = p.tool ?? ""
-        if (tool === "timeline_reprocess") continue
+        if (isSideTool(tool, p.state?.input)) continue
         const status = p.state?.status
         const summary = inputSummary(p.state?.input)
-        const result = summarizeToolResult(p.state)
+        let result = summarizeToolResult(p.state)
+        let suppressInput = false
+        if (tool === "task" && typeof p.childTitle === "string" && collapse(p.childTitle) !== "") {
+          const title = trunc(collapse(p.childTitle), 160)
+          result = title
+          if (typeof p.childOutcome === "string" && collapse(p.childOutcome) !== "") {
+            result = `${title}: ${trunc(collapse(p.childOutcome), 600)}`
+          }
+          if (summary && title.startsWith(summary)) suppressInput = true
+        }
         let line = `[tool] ${tool}`
         if (status) line += ` (${status})`
-        const inputPart = summary ? trunc(summary, 220) : ""
+        const inputPart = summary && !suppressInput ? trunc(summary, 220) : ""
         let rest = ""
         if (inputPart) rest += ` ${inputPart}`
         if (result) rest += ` -> ${result}`

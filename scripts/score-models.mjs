@@ -12,7 +12,8 @@
 //   npm run score -- --no-write         print only, touch nothing
 //
 // WHAT IT MEASURES
-//   context      limit.context from `opencode models --verbose`
+//   context      limit.context from `opencode models --verbose`; a known limit
+//                below --min-context is excluded from ranking, not scored low
 //   output       limit.output  (the token ceiling for one reply)
 //   speed        wall-clock ms for one tiny completion, one request per model
 //   reliability  did the model actually answer? A 429/401/404 is recorded as the
@@ -21,6 +22,8 @@
 // WHAT IT DOES NOT DO
 //   * It never invents a latency or a score. A model it could not reach is shown
 //     as unreachable with the reason and is NOT ranked.
+//   * It never ranks a model whose known context is below --min-context, or whose
+//     measured score is below --min-score: those are listed as excluded instead.
 //   * It never writes pool.txt. It prints a SUGGESTED table for you to paste; the
 //     pool stays yours to decide.
 //   * It never probes a paid model. Only cost 0/0 models from the provider's
@@ -38,7 +41,8 @@ import { dirname, join } from "node:path"
 
 const AUTH = join(homedir(), ".local", "share", "opencode", "auth.json")
 const OUT = join(homedir(), ".config", "lacode", "model-scores.json")
-const DEFAULT_PROVIDERS = ["opencode", "opencode-go", "openrouter", "console-openrouter"]
+// No default provider list: `opencode models --verbose` with no argument returns
+// every provider opencode knows about, and that is what we scan by default.
 const SESSION_PROVIDERS = new Set(["opencode", "opencode-go"])
 
 // ── scoring weights ─────────────────────────────────────────────────────────
@@ -46,6 +50,8 @@ const SESSION_PROVIDERS = new Set(["opencode", "opencode-go"])
 // scored on a log curve so 256k vs 1M is a difference, not a cliff.
 const W = { speed: 0.35, context: 0.3, output: 0.15, reliability: 0.2 }
 const MAX_CONTEXT = 1_000_000
+const MIN_CONTEXT = 200_000 // below this, a model is excluded instead of ranked
+const MIN_SCORE = 60 // below this, a probed model is excluded from ranking
 const FAST_MS = 300 // at or below this, speed scores 1.0
 const SLOW_MS = 8_000 // at or above this, speed scores 0
 const PROMPT = "Reply with the single word: ok"
@@ -63,8 +69,10 @@ const value = (flag, fallback) => {
   if (has("--help") || has("-h")) {
     console.log(`Usage: npm run score -- [options]
 
-  --providers a,b   providers to scan (default: ${DEFAULT_PROVIDERS.join(",")})
+  --providers a,b   restrict the scan to these providers (default: all configured)
   --max N           probe at most N free models per provider (default: 12)
+  --min-context N   exclude models whose context limit is below N (default: ${MIN_CONTEXT})
+  --min-score N     do not rank models scoring below N (default: ${MIN_SCORE})
   --timeout MS      per-request deadline in ms (default: 20000)
   --delay MS        pause between requests in ms (default: 300)
   --no-write        do not write ~/.config/lacode/model-scores.json
@@ -79,8 +87,11 @@ opencode/opencode-go models are probed through a temporary local opencode serve 
     process.exit(0)
   }
 
-const providers = String(value("--providers", DEFAULT_PROVIDERS.join(","))).split(",").map((s) => s.trim()).filter(Boolean)
+const providerArg = value("--providers", null)
+const providers = providerArg ? String(providerArg).split(",").map((s) => s.trim()).filter(Boolean) : null
 const maxPerProvider = Math.max(1, Number(value("--max", "12")) || 12)
+const minContext = Math.max(0, Number(value("--min-context", String(MIN_CONTEXT))) || MIN_CONTEXT)
+const minScore = Math.max(0, Number(value("--min-score", String(MIN_SCORE))) || MIN_SCORE)
 const timeoutMs = Math.max(1_000, Number(value("--timeout", "20000")) || 20_000)
 const delayMs = Math.max(0, Number(value("--delay", "300")) || 300)
 const writeResults = !has("--no-write")
@@ -136,18 +147,7 @@ function isChatModel(model) {
   return true
 }
 
-function freeModels(provider) {
-  let text
-  try {
-    text = execFileSync("opencode", ["models", "--verbose", provider], {
-      encoding: "utf8",
-      maxBuffer: 64 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-  } catch (error) {
-    return { provider, error: `opencode models failed: ${String(error?.message ?? error)}`, models: [] }
-  }
-  const rows = parseVerbose(text)
+function buildProviderEntry(provider, rows) {
   const models = rows
     .filter(({ model }) => model?.api?.url && model?.api?.id)
     .filter(({ model }) => (model.cost?.input ?? 1) === 0 && (model.cost?.output ?? 1) === 0)
@@ -161,7 +161,57 @@ function freeModels(provider) {
       output: model.limit?.output ?? null,
       name: model.name ?? id,
     }))
-  return { provider, error: null, models }
+  const excluded = models
+    .filter((m) => m.context != null && m.context < minContext)
+    .map((m) => ({
+      model: m.model,
+      context: m.context,
+      output: m.output,
+      reason: `context ${m.context} < minimum ${minContext}`,
+    }))
+  return {
+    provider,
+    error: null,
+    models: models.filter((m) => m.context == null || m.context >= minContext),
+    excluded,
+  }
+}
+
+function freeModels(provider) {
+  let text
+  try {
+    text = execFileSync("opencode", ["models", "--verbose", provider], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+  } catch (error) {
+    return { provider, error: `opencode models failed: ${String(error?.message ?? error)}`, models: [], excluded: [] }
+  }
+  return buildProviderEntry(provider, parseVerbose(text))
+}
+
+function freeModelsAll() {
+  let text
+  try {
+    text = execFileSync("opencode", ["models", "--verbose"], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+  } catch (error) {
+    return [{ provider: "all", error: `opencode models failed: ${String(error?.message ?? error)}`, models: [], excluded: [] }]
+  }
+  const groups = new Map()
+  for (const row of parseVerbose(text)) {
+    const provider = String(row.model?.providerID ?? row.id.split("/")[0] ?? "")
+    if (!provider) continue
+    if (!groups.has(provider)) groups.set(provider, [])
+    groups.get(provider).push(row)
+  }
+  return [...groups.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([provider, rows]) => buildProviderEntry(provider, rows))
 }
 
 // ── credentials ─────────────────────────────────────────────────────────────
@@ -436,19 +486,24 @@ const pad = (s, n) => String(s).padEnd(n)
 const padL = (s, n) => String(s).padStart(n)
 
 async function main() {
-  const scanned = providers.map(freeModels)
+  const scanned = providers ? providers.map((provider) => freeModels(provider)) : freeModelsAll()
   const results = []
 
   for (const entry of scanned) {
     if (entry.error) {
       console.log(`\n${entry.provider}: ${entry.error}`)
-      results.push({ provider: entry.provider, error: entry.error, rows: [] })
+      results.push({ provider: entry.provider, error: entry.error, rows: [], excluded: [] })
       continue
     }
     const candidates = entry.models.slice(0, maxPerProvider)
-    console.log(`\n${entry.provider}: probing ${candidates.length} free model(s)${entry.models.length > candidates.length ? ` of ${entry.models.length}` : ""}`)
+    const excludedNote = entry.excluded.length ? `, ${entry.excluded.length} excluded (context < ${minContext})` : ""
+    console.log(`\n${entry.provider}: probing ${candidates.length} free model(s)${entry.models.length > candidates.length ? ` of ${entry.models.length}` : ""}${excludedNote}`)
+    if (entry.excluded.length) {
+      console.log(`  excluded — context below ${minContext}:`)
+      for (const x of entry.excluded) console.log(`    ${pad(x.model.replace(`${entry.provider}/`, ""), 52)} ${padL(x.context, 9)}`)
+    }
     if (candidates.length === 0) {
-      results.push({ provider: entry.provider, error: null, rows: [] })
+      results.push({ provider: entry.provider, error: null, rows: [], excluded: entry.excluded })
       continue
     }
     const rows = []
@@ -456,12 +511,21 @@ async function main() {
       const outcome = await probe(candidate, entry.provider)
       const row = { provider: entry.provider, ...candidate, ...outcome, score: null }
       row.score = score(row)
+      if (row.score && row.score.value < minScore) {
+        entry.excluded.push({
+          model: row.model,
+          context: row.context,
+          output: row.output,
+          score: row.score.value,
+          reason: `score ${row.score.value} < minimum ${minScore}`,
+        })
+      }
       rows.push(row)
       const verdict = outcome.ok ? `${outcome.ms}ms` : outcome.reason.slice(0, 60)
       console.log(`  ${pad(candidate.model.replace(`${entry.provider}/`, ""), 52)} ${padL(verdict, 16)}`)
       await sleep(delayMs)
     }
-    results.push({ provider: entry.provider, error: null, rows })
+    results.push({ provider: entry.provider, error: null, rows, excluded: entry.excluded })
   }
   stopSessionServer()
 
@@ -470,7 +534,7 @@ async function main() {
     if (entry.error || entry.rows.length === 0) continue
     console.log(`\n${entry.provider} — ranked`)
     console.log(`  ${pad("#", 3)}${pad("model", 52)}${padL("ctx", 9)}${padL("out", 9)}${padL("ms", 7)}${padL("score", 7)}`)
-    const ranked = [...entry.rows].filter((r) => r.score).sort((a, b) => b.score.value - a.score.value)
+    const ranked = [...entry.rows].filter((r) => r.score && r.score.value >= minScore).sort((a, b) => b.score.value - a.score.value)
     ranked.forEach((r, i) => {
       console.log(`  ${pad(i + 1, 3)}${pad(r.model.replace(`${entry.provider}/`, ""), 52)}${padL(r.context ?? "?", 9)}${padL(r.output ?? "?", 9)}${padL(r.ms ?? "?", 7)}${padL(r.score.value, 7)}`)
     })
@@ -481,8 +545,15 @@ async function main() {
     }
   }
 
+  // Models dropped for a too-small context or a too-low score are reported, never ranked.
+  const excluded = results.flatMap((e) => e.excluded ?? [])
+  if (excluded.length) {
+    console.log(`\nexcluded — below the context or score floor (not ranked)`)
+    for (const x of excluded) console.log(`  ${pad(x.model, 58)}${padL(x.context ?? "?", 9)}  ${x.reason}`)
+  }
+
   // Overall ranking across providers.
-  const all = results.flatMap((e) => e.rows).filter((r) => r.score)
+  const all = results.flatMap((e) => e.rows).filter((r) => r.score && r.score.value >= minScore)
   all.sort((a, b) => b.score.value - a.score.value)
   if (all.length) {
     console.log(`\noverall — best free models right now`)
@@ -491,21 +562,21 @@ async function main() {
     })
   }
 
-  // A SUGGESTED pool: the best model from each provider, weights 4/3/2/1 by rank.
+  // A SUGGESTED pool: every opencode-go model (weight 4), then the best
+  // (10 - n) models from the other providers (weight 2), by measured score.
   // Printed, never written — pool.txt stays the user's decision.
-  const bestPerProvider = []
-  for (const entry of results) {
-    const top = entry.rows.filter((r) => r.score).sort((a, b) => b.score.value - a.score.value)[0]
-    if (top) bestPerProvider.push(top)
-  }
-  bestPerProvider.sort((a, b) => b.score.value - a.score.value)
-  if (bestPerProvider.length) {
+  const poolSize = 10
+  const goRows = all.filter((r) => r.model.startsWith("opencode-go/"))
+  const otherRows = all.filter((r) => !r.model.startsWith("opencode-go/"))
+  const pickedOthers = otherRows.slice(0, Math.max(0, poolSize - goRows.length))
+  const suggested = [
+    ...goRows.map((r) => ({ row: r, weight: 4 })),
+    ...pickedOthers.map((r) => ({ row: r, weight: 2 })),
+  ]
+  if (suggested.length) {
     console.log(`\nsuggested pool.txt (paste if it matches your judgement — nothing was changed)`)
-    console.log(`# scored ${new Date().toISOString()} — one best free model per provider`)
-    bestPerProvider.forEach((r, i) => {
-      const weight = Math.max(1, 4 - i)
-      console.log(`${pad(r.model, 60)}${weight}`)
-    })
+    console.log(`# scored ${new Date().toISOString()} — opencode-go first (weight 4), then the best others (weight 2)`)
+    for (const { row, weight } of suggested) console.log(`${pad(row.model, 60)}${weight}`)
   }
 
   if (writeResults) {
@@ -514,9 +585,12 @@ async function main() {
       const payload = {
         generatedAt: new Date().toISOString(),
         weights: W,
+        minContext,
+        minScore,
         providers: results.map((e) => ({
           provider: e.provider,
           error: e.error,
+          excluded: e.excluded ?? [],
           rows: e.rows.map((r) => ({
             model: r.model,
             context: r.context,

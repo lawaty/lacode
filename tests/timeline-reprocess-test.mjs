@@ -251,3 +251,51 @@ test("falls back to the given session when the parent lookup throws", async () =
   assert.match(out.output, /^Rebuilt 2 messages into 2 entries/)
   assert.deepEqual(s.calls.messages, ["throw-1"])
 })
+
+test("a NO_PROJECT_CHANGES slice does not abort the reprocess", async () => {
+  writeFileSync(timelineFile("sentinel-1"), JSON.stringify({ ts: 1, text: "previous entry" }) + "\n")
+  const long = "a".repeat(1900)
+  const messages = [
+    user("m1", long, 1),
+    user("m2", long, 2),
+    user("m3", long, 3),
+    user("m4", long, 4),
+    user("m5", long, 5),
+    user("m6", long, 6),
+  ]
+  const s = stub({
+    sessions: { "sentinel-1": { id: "sentinel-1", title: "Sentinel" } },
+    sessionMessages: { "sentinel-1": messages },
+  })
+  let n = 0
+  s.client.session.prompt = async (input) => {
+    s.calls.prompt.push(input)
+    n++
+    if (n === 1) return { data: { parts: [{ type: "text", text: "NO_PROJECT_CHANGES" }] } }
+    return { data: { parts: [{ type: "text", text: "- Second slice work" }] } }
+  }
+  const out = await run(boot(s), "sentinel-1")
+  assert.match(out.output, /^Rebuilt 6 messages into 1 entries with 2 summarizer calls\./)
+  assert.equal(s.calls.prompt.length, 2)
+  assert.deepEqual(readEntries("sentinel-1").map((e) => e.text), ["Second slice work"])
+  const state = readTimelineState("sentinel-1")
+  assert.equal(state?.cursor?.messageID, "m6")
+  assert.equal(state?.pending, false)
+  assert.equal(state?.failures, 0)
+})
+
+test("an empty summarizer response keeps the previous timeline in reprocess", async () => {
+  writeFileSync(timelineFile("empty-response-1"), JSON.stringify({ ts: 1, text: "previous entry" }) + "\n")
+  const s = stub({
+    sessions: { "empty-response-1": { id: "empty-response-1", title: "Empty response" } },
+    sessionMessages: { "empty-response-1": [user("u1", "question", 1), assistant("a1", "answer", 2)] },
+  })
+  s.client.session.prompt = async (input) => {
+    s.calls.prompt.push(input)
+    return { data: { parts: [{ type: "text", text: "" }] } }
+  }
+  const out = await run(boot(s), "empty-response-1")
+  assert.equal(out.output, "Stopped after 1 summarizer calls: empty summarizer output. Previous timeline kept.")
+  assert.equal(s.calls.prompt.length, 1)
+  assert.deepEqual(readEntries("empty-response-1").map((e) => e.text), ["previous entry"])
+})

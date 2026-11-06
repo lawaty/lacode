@@ -58,6 +58,8 @@ export const cleanupAll = () => {
 // state directory would fight over the same session ids, and one of them would
 // lose a notification it was supposed to raise.
 process.env.LACODE_NOTIFY_DIR = scratch("lacode-notify-")
+// Story tests must never install real systemd timers.
+process.env.LACODE_NO_TIMER_MIGRATION = "1"
 
 /**
  * A controllable clock.

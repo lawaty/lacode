@@ -6,20 +6,19 @@
 // writes on a fail-closed condition.
 //
 // Layout (exact, per spec):
-//   1. every free opencode-go model with ok:true and a numeric score, one slot
-//      each, sorted by score descending, weight 4
-//   2. every slot from the current pool whose provider is NOT present in the
-//      score file, preserved exactly (raw line text, weight/bucket/notify, order)
-//   3. exactly one free opencode model — the best ok:true numeric score —
-//      weight 2, with b:opencode
+//   1. every opencode-go model with ok:true, a numeric score at or above the
+//      score floor and a context at or above the context floor, sorted by score
+//      descending, weight 4
+//   2. the best (10 - n) models from every other provider, sorted by score
+//      descending, weight 2; opencode models get b:opencode
 //
-// Total = #opencode-go free + #preserved unscored + 1.
+// Total = n + min(10 - n, #others), where n = #1.
 //
 // This file ships as source and must run with plain `node` (ESM, no TS).
 
-import { mkdirSync, renameSync, writeFileSync, readFileSync, existsSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { execFileSync } from "node:child_process"
-import { homedir } from "node:os"
+import { homedir, userInfo } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -27,6 +26,8 @@ const HOME = homedir()
 export const DEFAULT_SCORES_PATH = join(HOME, ".config", "lacode", "model-scores.json")
 export const DEFAULT_POOL_PATH = join(HOME, ".config", "lacode", "pool.txt")
 export const SYSTEMD_USER_DIR = (home = HOME) => join(home, ".config", "systemd", "user")
+export const STABLE_LIB_DIR = (home = HOME) => join(home, ".local", "lib", "lacode")
+export const STABLE_SCRIPT = (home = HOME) => join(STABLE_LIB_DIR(home), "refresh-pool.mjs")
 export const REFRESH_SERVICE_NAME = "lacode-refresh-pool.service"
 export const REFRESH_TIMER_NAME = "lacode-refresh-pool.timer"
 
@@ -42,17 +43,12 @@ const providerOf = (modelOrLine) => {
   return slash < 0 ? token : token.slice(0, slash)
 }
 
-const isFree = (modelId) => {
-  const id = String(modelId || "")
-  return id.endsWith(":free") || id.endsWith("-free")
-}
-
 const numericScore = (row) => typeof row?.score === "number" && Number.isFinite(row.score)
 
-const okFreeRows = (providerEntry) => {
-  const rows = Array.isArray(providerEntry?.rows) ? providerEntry.rows : []
-  return rows.filter((row) => row?.ok === true && numericScore(row) && isFree(row.model))
-}
+// Fallbacks for score files written before the floors were recorded there.
+const MIN_CONTEXT = 200_000
+const MIN_SCORE = 60
+const POOL_SIZE = 10
 
 function splitHeaderAndSlots(text) {
   const lines = String(text ?? "").split(/\r?\n/)
@@ -70,7 +66,7 @@ function splitHeaderAndSlots(text) {
 function refreshComment(now, scoresGeneratedAt) {
   const when = now instanceof Date ? now.toISOString() : String(now)
   const gen = scoresGeneratedAt ? ` (scores generated ${scoresGeneratedAt})` : ""
-  return `# Refreshed ${when} from model-scores.json${gen}: opencode-go free models first, best opencode last.`
+  return `# Refreshed ${when} from model-scores.json${gen}: opencode-go first (weight 4), then the best others (weight 2).`
 }
 
 function withRefreshComment(headerLines, comment) {
@@ -88,7 +84,7 @@ function formatGeneratedLine(model, weight, bucket) {
  * Pure builder. Throws on every fail-closed condition; never touches the filesystem.
  *
  * @param {{ scores: any, currentPoolText: string, now?: Date|string }} input
- * @returns {{ text: string, slots: string[], warnings: string[], chosen: { opencodeGo: string[], opencode: string, preserved: string[] } }}
+ * @returns {{ text: string, slots: string[], warnings: string[], chosen: { opencodeGo: string[], others: string[] } }}
  */
 export function buildPool(input) {
   const warnings = []
@@ -97,33 +93,34 @@ export function buildPool(input) {
     throw new Error("score file is missing or invalid (expected { providers: [...] })")
   }
 
-  const providerEntries = scores.providers
-  const scoredProviders = new Set(
-    providerEntries.map((p) => String(p?.provider ?? "").trim()).filter(Boolean),
-  )
+  const minScore = Number(scores.minScore) || MIN_SCORE
+  const minContext = Number(scores.minContext) || MIN_CONTEXT
+  const rankable = (row) =>
+    row?.ok === true &&
+    numericScore(row) &&
+    row.score >= minScore &&
+    (row.context == null || row.context >= minContext)
+  const byScore = (a, b) => b.score - a.score || String(a.model).localeCompare(String(b.model))
 
-  const goEntry = providerEntries.find((p) => p?.provider === "opencode-go")
-  const goRows = okFreeRows(goEntry).sort((a, b) => b.score - a.score)
-  if (goRows.length === 0) {
-    throw new Error("no free opencode-go model with ok:true and a numeric score is available; refusing to write pool.txt")
+  const rows = scores.providers.flatMap((entry) => (Array.isArray(entry?.rows) ? entry.rows : []))
+  const goRows = rows.filter((row) => providerOf(row.model) === "opencode-go" && rankable(row)).sort(byScore)
+  const others = rows.filter((row) => providerOf(row.model) !== "opencode-go" && rankable(row)).sort(byScore)
+  const otherRows = others.slice(0, Math.max(0, POOL_SIZE - goRows.length))
+
+  if (goRows.length + otherRows.length === 0) {
+    throw new Error("no scorable model at or above the minimum score is available; refusing to write pool.txt")
+  }
+  if (goRows.length + otherRows.length < POOL_SIZE) {
+    warnings.push(`only ${goRows.length + otherRows.length} scorable model(s) available, wanted ${POOL_SIZE}`)
   }
 
-  const opEntry = providerEntries.find((p) => p?.provider === "opencode")
-  const opRows = okFreeRows(opEntry).sort((a, b) => b.score - a.score)
-  if (opRows.length === 0) {
-    throw new Error("no free opencode model with ok:true and a numeric score is available; refusing to write pool.txt")
-  }
-  const bestOp = opRows[0].model
-
-  const { header, slots: currentSlots } = splitHeaderAndSlots(input?.currentPoolText ?? "")
-  const preserved = currentSlots.filter((line) => {
-    if (!isSlotLine(line)) return false
-    return !scoredProviders.has(providerOf(line))
-  })
-
-  const block1 = goRows.map((row) => formatGeneratedLine(row.model, 4))
-  const block3 = [formatGeneratedLine(bestOp, 2, "opencode")]
-  const outSlots = [...block1, ...preserved, ...block3]
+  const { header } = splitHeaderAndSlots(input?.currentPoolText ?? "")
+  const outSlots = [
+    ...goRows.map((row) => formatGeneratedLine(row.model, 4)),
+    ...otherRows.map((row) =>
+      formatGeneratedLine(row.model, 2, providerOf(row.model) === "opencode" ? "opencode" : undefined),
+    ),
+  ]
 
   const comment = refreshComment(input?.now ?? new Date(), scores.generatedAt)
   const outHeader = withRefreshComment(header, comment)
@@ -135,8 +132,7 @@ export function buildPool(input) {
     warnings,
     chosen: {
       opencodeGo: goRows.map((r) => r.model),
-      opencode: bestOp,
-      preserved: preserved.map((l) => String(l).split("#")[0].trim().split(/\s+/)[0]),
+      others: otherRows.map((r) => r.model),
     },
   }
 }
@@ -159,6 +155,12 @@ function readTextFile(path) {
 function atomicWriteSimple(path, text) {
   const dir = dirname(path)
   const tmp = join(dir, `.pool.txt.tmp-${process.pid}-${Date.now()}`)
+  writeFileSync(tmp, text, "utf8")
+  renameSync(tmp, path)
+}
+
+function writeFileAtomic(path, text) {
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`
   writeFileSync(tmp, text, "utf8")
   renameSync(tmp, path)
 }
@@ -192,8 +194,7 @@ Nice=10
 Description=Daily LaCode model pool refresh
 
 [Timer]
-OnCalendar=daily
-RandomizedDelaySec=2h
+OnCalendar=*-*-* 01:00:00
 Persistent=true
 Unit=${REFRESH_SERVICE_NAME}
 
@@ -203,18 +204,23 @@ WantedBy=timers.target
   return { service, timer, servicePath, timerPath }
 }
 
-function installTimerUnits() {
-  const units = renderTimerUnits({
-    nodePath: process.execPath,
-    scriptPath: fileURLToPath(import.meta.url),
-    home: HOME,
-  })
-  mkdirSync(dirname(units.servicePath), { recursive: true })
-  writeFileSync(units.servicePath, units.service, "utf8")
-  writeFileSync(units.timerPath, units.timer, "utf8")
+function installTimerUnits(stable = false) {
+  const live = fileURLToPath(import.meta.url)
+  const scriptPath = stable ? STABLE_SCRIPT(HOME) : live
+  const units = renderTimerUnits({ nodePath: process.execPath, scriptPath, home: HOME })
   try {
+    if (stable) {
+      mkdirSync(STABLE_LIB_DIR(HOME), { recursive: true })
+      copyFileSync(live, scriptPath)
+    }
+    mkdirSync(dirname(units.servicePath), { recursive: true })
+    writeFileAtomic(units.servicePath, units.service)
+    writeFileAtomic(units.timerPath, units.timer)
     execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "inherit" })
     execFileSync("systemctl", ["--user", "enable", "--now", REFRESH_TIMER_NAME], { stdio: "inherit" })
+    try {
+      execFileSync("loginctl", ["enable-linger", userInfo().username], { stdio: "ignore" })
+    } catch {}
   } catch (error) {
     console.error(`failed to install systemd user timer: ${String(error?.message ?? error)}`)
     console.error(`unit files written:`)
@@ -226,6 +232,7 @@ function installTimerUnits() {
     process.exitCode = 1
     return false
   }
+  if (stable) console.log(`copied ${live} to ${scriptPath}`)
   console.log(`installed ${units.servicePath}`)
   console.log(`installed ${units.timerPath}`)
   console.log(`enabled ${REFRESH_TIMER_NAME}`)
@@ -237,6 +244,8 @@ function usage() {
 
   --from-scores     skip scoring, use the existing ~/.config/lacode/model-scores.json
   --install-timer   install and enable a user systemd oneshot service + daily timer
+                    (add --stable to copy the script to ~/.local/lib/lacode and
+                    point ExecStart there, so plugin-cache updates do not break it)
   --print           print the proposed pool.txt and make no changes (alias: --dry-run)
   --dry-run         same as --print
   --max N           models per provider passed to the scorer (default: 20)
@@ -248,10 +257,10 @@ function usage() {
 async function main() {
   const argv = process.argv.slice(2)
   if (argv.includes("--help") || argv.includes("-h")) { usage(); return }
-  if (argv.includes("--install-timer")) {
-    installTimerUnits()
-    return
-  }
+    if (argv.includes("--install-timer")) {
+      installTimerUnits(argv.includes("--stable"))
+      return
+    }
   const fromScores = argv.includes("--from-scores")
   const printOnly = argv.includes("--print") || argv.includes("--dry-run")
   const value = (flag, fallback) => {
@@ -294,10 +303,12 @@ async function main() {
 
   const oldSlotCount = splitHeaderAndSlots(currentPoolText).slots.filter(isSlotLine).length
   const newSlotCount = built.slots.filter(isSlotLine).length
+  const dropped = scores.providers.flatMap((entry) => (Array.isArray(entry?.excluded) ? entry.excluded : []))
   const summary = [
     `opencode-go [${built.chosen.opencodeGo.join(", ")}]`,
-    `preserved-unscored [${built.chosen.preserved.join(", ")}]`,
-    `opencode-last [${built.chosen.opencode}]`,
+    `others [${built.chosen.others.join(", ")}]`,
+    ...(dropped.length ? [`dropped [${dropped.map((x) => x.model).join(", ")}]`] : []),
+    ...(built.warnings.length ? [`warnings [${built.warnings.join("; ")}]`] : []),
   ].join(" | ")
 
   if (printOnly) {

@@ -15,11 +15,18 @@
 
 import { test, after } from "node:test"
 import assert from "node:assert/strict"
-import { existsSync, mkdtempSync, rmSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { timelineHooks } from "../src/plugins/timeline.ts"
-import { readEntries, readTimelineState, removeTimelineState, timelineStateFile } from "../src/lib/timeline.ts"
+import {
+  TIMELINE_STATE_VERSION,
+  readEntries,
+  readTimelineState,
+  removeTimelineState,
+  timelineStateFile,
+  writeTimelineState,
+} from "../src/lib/timeline.ts"
 
 const ROOT = mkdtempSync(join(tmpdir(), "lacode-timeline-plugin-"))
 process.env.LACODE_TIMELINE_DIR = join(ROOT, "timeline")
@@ -32,9 +39,14 @@ const LOG_LEVELS = ["debug", "info", "warn", "error"]
  * event hook should see, `messages` its transcript, and `prompt` the
  * summarizer's answer.
  */
-const boot = async ({ session, messages = [], prompt, timeline } = {}) => {
+const boot = async ({ session, messages = [], prompt, timeline, childSessions = {}, childMessages = {}, throwSessionGetFor = [], directory = "/tmp/timeline-plugin" } = {}) => {
   const logs = []
   const created = []
+  const getCalls = []
+  const messagesCalls = []
+  const promptTexts = []
+  const systemTexts = []
+  const throwSet = new Set(throwSessionGetFor)
   const client = {
     app: {
       log: async ({ body }) => {
@@ -42,17 +54,31 @@ const boot = async ({ session, messages = [], prompt, timeline } = {}) => {
       },
     },
     session: {
-      get: async ({ path }) => ({ data: path.id === session.id ? session : undefined }),
-      messages: async ({ path }) => ({ data: path.id === session.id ? messages : [] }),
+      get: async ({ path }) => {
+        getCalls.push(path.id)
+        if (throwSet.has(path.id)) throw new Error(`fake session.get failure for ${path.id}`)
+        if (path.id === session.id) return { data: session }
+        if (Object.prototype.hasOwnProperty.call(childSessions, path.id)) return { data: childSessions[path.id] }
+        return { data: undefined }
+      },
+      messages: async ({ path }) => {
+        messagesCalls.push(path.id)
+        if (path.id === session.id) return { data: messages }
+        if (Object.prototype.hasOwnProperty.call(childMessages, path.id)) return { data: childMessages[path.id] }
+        return { data: [] }
+      },
       create: async ({ body }) => {
         created.push(body)
         return { data: { id: `summarizer-${created.length}` } }
       },
-      prompt:
-        prompt ??
-        (async () => ({
+      prompt: async ({ body }) => {
+        promptTexts.push(body?.parts?.[0]?.text ?? "")
+        systemTexts.push(body?.system ?? "")
+        if (prompt) return prompt({ body })
+        return {
           data: { info: {}, parts: [{ type: "text", text: "- Built the thing\n- Ran the tests" }] },
-        })),
+        }
+      },
       delete: async () => ({ data: true }),
       abort: async () => ({ data: true }),
     },
@@ -60,7 +86,7 @@ const boot = async ({ session, messages = [], prompt, timeline } = {}) => {
   const hooks = timelineHooks(
     {
       client,
-      directory: "/tmp/timeline-plugin",
+      directory,
       serverUrl: new URL("http://127.0.0.1:59999"),
       worktree: ROOT,
     },
@@ -70,7 +96,7 @@ const boot = async ({ session, messages = [], prompt, timeline } = {}) => {
       ...(timeline ? { timeline } : {}),
     },
   )
-  return { hooks, logs }
+  return { hooks, logs, getCalls, messagesCalls, promptTexts, systemTexts }
 }
 
 const transcript = (sessionID) => [
@@ -206,13 +232,13 @@ test("after a successful idle flush, the state file records a settled cursor", a
   await hooks.dispose()
 })
 
-test("a successful summarization that produces no bullets still persists the advanced cursor", async () => {
+test("a NO_PROJECT_CHANGES summarization that produces no bullets still persists the advanced cursor", async () => {
   const session = { id: "root-state-no-bullets", title: "No bullets state" }
   const messages = transcript(session.id)
   const { hooks } = await boot({
     session,
     messages,
-    prompt: async () => ({ data: { info: {}, parts: [{ type: "text", text: "" }] } }),
+    prompt: async () => ({ data: { info: {}, parts: [{ type: "text", text: "NO_PROJECT_CHANGES" }] } }),
   })
 
   await hooks.event({
@@ -227,6 +253,90 @@ test("a successful summarization that produces no bullets still persists the adv
   assert.equal(state?.pending, false)
   assert.equal(state?.failures, 0)
   await hooks.dispose()
+})
+
+test("NO_PROJECT_CHANGES produces no entries and advances pending and cursor", async () => {
+  const session = { id: "root-no-project-changes", title: "No project changes" }
+  const messages = transcript(session.id)
+  const { hooks, logs } = await boot({
+    session,
+    messages,
+    prompt: async () => ({ data: { info: {}, parts: [{ type: "text", text: "  NO_PROJECT_CHANGES\n" }] } }),
+  })
+
+  await hooks.event({
+    event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+  })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+  const settled = await waitFor(
+    () => readTimelineState(session.id)?.cursor?.messageID === messages[messages.length - 1].info.id && readTimelineState(session.id)?.pending === false,
+  )
+  assert.ok(settled, "expected NO_PROJECT_CHANGES to advance the cursor and clear pending")
+  assert.deepEqual(readEntries(session.id), [])
+  const state = readTimelineState(session.id)
+  assert.equal(state?.pending, false)
+  assert.equal(state?.failures, 0)
+  assert.ok(!logs.some((line) => line.message === "timeline: summarize failed"), `expected no summarize failure, got ${JSON.stringify(logs)}`)
+  await hooks.dispose()
+})
+
+test("an empty summarizer response is a failure that keeps pending work", async () => {
+  const session = { id: "root-empty-response", title: "Empty response" }
+  const messages = transcript(session.id)
+  const { hooks } = await boot({
+    session,
+    messages,
+    prompt: async () => ({ data: { info: {}, parts: [{ type: "text", text: "" }] } }),
+  })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const failed = await waitFor(
+      () => readTimelineState(session.id)?.pending === true && (readTimelineState(session.id)?.failures ?? 0) >= 1,
+    )
+    assert.ok(failed, "expected an empty summarizer response to be recorded as a failure with pending work")
+    assert.deepEqual(readEntries(session.id), [])
+    const state = readTimelineState(session.id)
+    assert.equal(state?.pending, true)
+    assert.ok((state?.failures ?? 0) >= 1, `expected failures to be incremented, got ${JSON.stringify(state)}`)
+    assert.equal(typeof state?.nextAttemptAt, "number")
+    assert.notEqual(state?.cursor?.messageID, messages[messages.length - 1].info.id, "expected the cursor not to advance on an empty response")
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+  }
+})
+
+test("the summarizer prompt names NO_PROJECT_CHANGES and excludes side maintenance", async () => {
+  const session = { id: "root-prompt-sentinel", title: "Prompt sentinel" }
+  const { hooks, systemTexts } = await boot({ session, messages: transcript(session.id) })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => systemTexts.length > 0)
+    assert.ok(prompted, "expected a summarizer prompt to be sent")
+    const system = systemTexts.join("\n")
+    assert.ok(system.includes("NO_PROJECT_CHANGES"), `expected prompt to contain NO_PROJECT_CHANGES, got ${system.slice(0, 400)}`)
+    assert.ok(/cartographer/i.test(system), `expected prompt to mention cartographer as excluded, got ${system.slice(0, 400)}`)
+    assert.ok(/timeline/i.test(system), `expected prompt to mention timeline as excluded, got ${system.slice(0, 400)}`)
+    assert.ok(/pool/i.test(system), `expected prompt to mention pool as excluded, got ${system.slice(0, 400)}`)
+    assert.ok(/context map/i.test(system), `expected prompt to mention the context map as excluded, got ${system.slice(0, 400)}`)
+    assert.ok(/1-8/.test(system), `expected prompt to keep the 1-8 entry range, got ${system.slice(0, 400)}`)
+    assert.ok(/6-16 words/i.test(system), `expected prompt to keep the 6-16 word rule, got ${system.slice(0, 400)}`)
+    assert.ok(/past tense/i.test(system), `expected prompt to keep the past tense rule, got ${system.slice(0, 400)}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+  }
 })
 
 test("session.deleted removes both the timeline file and the state file", async () => {
@@ -338,6 +448,267 @@ test("a pending timeline resumes after a restart", async () => {
   }
 })
 
+test("a root task part expands to the child session title and outcome", async () => {
+  const session = { id: "root-child-expand", title: "Child expand" }
+  const childTitle = "Explore child investigation"
+  const childOutcome = "Traced the summarizer path and identified the fix"
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "please investigate" }] },
+    {
+      info: { id: "m2", role: "assistant", time: { created: 2 } },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: { description: "Investigate the summarizer path", subagent_type: "explore" },
+            output: '<task id="ses_child" state="completed">\nchild task output',
+            metadata: { sessionId: "ses_child" },
+          },
+        },
+      ],
+    },
+  ]
+  const { hooks, getCalls, messagesCalls, promptTexts } = await boot({
+    session,
+    messages,
+    childSessions: { ses_child: { id: "ses_child", title: childTitle } },
+    childMessages: {
+      ses_child: [
+        { info: { id: "c1", role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: childOutcome }] },
+      ],
+    },
+  })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => promptTexts.length > 0)
+    assert.ok(prompted, `expected a summarizer prompt, got ${JSON.stringify(promptTexts)}`)
+    const promptText = promptTexts.join("\n")
+    assert.ok(getCalls.includes("ses_child"), `expected session.get for the child, got ${JSON.stringify(getCalls)}`)
+    assert.ok(messagesCalls.includes("ses_child"), `expected session.messages for the child, got ${JSON.stringify(messagesCalls)}`)
+    assert.ok(promptText.includes(childTitle), `expected child title in prompt, got ${promptText}`)
+    assert.ok(promptText.includes(childOutcome), `expected child outcome in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes("<task id="), `expected no raw task markup in prompt, got ${promptText}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+  }
+})
+
+test("a context task part is not expanded and never reaches the prompt", async () => {
+  const session = { id: "root-child-context", title: "Child context" }
+  const cartographerTitle = "Cartographer marker title"
+  const cartographerOutcome = "Cartographer marker outcome"
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "please update the map" }] },
+    {
+      info: { id: "m2", role: "assistant", time: { created: 2 } },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: { description: "Update the context map", subagent_type: "context" },
+            output: '<task id="ses_child" state="completed">\ncartographer output',
+            metadata: { sessionId: "ses_child" },
+          },
+        },
+      ],
+    },
+  ]
+  const { hooks, getCalls, messagesCalls, promptTexts } = await boot({
+    session,
+    messages,
+    childSessions: { ses_child: { id: "ses_child", title: cartographerTitle } },
+    childMessages: {
+      ses_child: [
+        { info: { id: "c1", role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: cartographerOutcome }] },
+      ],
+    },
+  })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => promptTexts.length > 0)
+    assert.ok(prompted, `expected a summarizer prompt, got ${JSON.stringify(promptTexts)}`)
+    assert.ok(!getCalls.includes("ses_child"), `expected no session.get for a context child, got ${JSON.stringify(getCalls)}`)
+    assert.ok(!messagesCalls.includes("ses_child"), `expected no session.messages for a context child, got ${JSON.stringify(messagesCalls)}`)
+    const promptText = promptTexts.join("\n")
+    assert.ok(!promptText.includes(cartographerTitle), `expected no cartographer title in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes(cartographerOutcome), `expected no cartographer outcome in prompt, got ${promptText}`)
+    assert.ok(!promptText.toLowerCase().includes("cartographer"), `expected no cartographer markers in prompt, got ${promptText}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+  }
+})
+
+test("side tool parts never appear in the summarizer prompt", async () => {
+  const session = { id: "root-side-tools", title: "Side tools" }
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "please do the work" }] },
+    {
+      info: { id: "m2", role: "assistant", time: { created: 2 } },
+      parts: [
+        { type: "tool", tool: "timeline_reprocess", state: { status: "completed", input: {}, output: "side-marker-reprocess-output" } },
+        { type: "tool", tool: "pool_status", state: { status: "completed", input: {}, output: "side-marker-pool-status-output" } },
+        { type: "tool", tool: "pool_recheck", state: { status: "completed", input: {}, output: "side-marker-pool-recheck-output" } },
+        { type: "text", text: "finished the work" },
+      ],
+    },
+  ]
+  const { hooks, promptTexts } = await boot({ session, messages })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => promptTexts.length > 0)
+    assert.ok(prompted, `expected a summarizer prompt, got ${JSON.stringify(promptTexts)}`)
+    const promptText = promptTexts.join("\n")
+    assert.ok(!promptText.includes("timeline_reprocess"), `expected no timeline_reprocess in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes("pool_status"), `expected no pool_status in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes("pool_recheck"), `expected no pool_recheck in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes("side-marker-reprocess-output"), `expected no reprocess output in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes("side-marker-pool-status-output"), `expected no pool_status output in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes("side-marker-pool-recheck-output"), `expected no pool_recheck output in prompt, got ${promptText}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+  }
+})
+
+test("assistant text naming side tools never appears in the summarizer prompt", async () => {
+  const session = { id: "root-side-text", title: "Side text" }
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "please do the work" }] },
+    {
+      info: { id: "m2", role: "assistant", time: { created: 2 } },
+      parts: [
+        { type: "text", text: "side-marker: ran pool_recheck and pool_status for maintenance" },
+        { type: "text", text: "finished the real work" },
+      ],
+    },
+  ]
+  const { hooks, promptTexts } = await boot({ session, messages })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => promptTexts.length > 0)
+    assert.ok(prompted, `expected a summarizer prompt, got ${JSON.stringify(promptTexts)}`)
+    const promptText = promptTexts.join("\n")
+    assert.ok(!promptText.includes("pool_recheck"), `expected no pool_recheck in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes("pool_status"), `expected no pool_status in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes("side-marker"), `expected no side text in prompt, got ${promptText}`)
+    assert.ok(promptText.includes("finished the real work"), `expected normal assistant text in prompt, got ${promptText}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+  }
+})
+
+test("assistant text naming side tools is kept when the root owns the tooling", async () => {
+  const ownsDir = mkdtempSync(join(tmpdir(), "lacode-timeline-owns-"))
+  mkdirSync(join(ownsDir, "src/plugins"), { recursive: true })
+  writeFileSync(join(ownsDir, "src/plugins/timeline.ts"), "")
+  const session = { id: "root-side-text-owns", title: "Side text owns" }
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "please do the work" }] },
+    {
+      info: { id: "m2", role: "assistant", time: { created: 2 } },
+      parts: [
+        { type: "text", text: "side-marker: ran pool_recheck and pool_status for maintenance" },
+        { type: "text", text: "finished the real work" },
+      ],
+    },
+  ]
+  const { hooks, promptTexts } = await boot({ session, messages, directory: ownsDir })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => promptTexts.length > 0)
+    assert.ok(prompted, `expected a summarizer prompt, got ${JSON.stringify(promptTexts)}`)
+    const promptText = promptTexts.join("\n")
+    assert.ok(promptText.includes("pool_recheck"), `expected pool_recheck in prompt, got ${promptText}`)
+    assert.ok(promptText.includes("pool_status"), `expected pool_status in prompt, got ${promptText}`)
+    assert.ok(promptText.includes("side-marker"), `expected side text in prompt, got ${promptText}`)
+    assert.ok(promptText.includes("finished the real work"), `expected normal assistant text in prompt, got ${promptText}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+    rmSync(ownsDir, { recursive: true, force: true })
+  }
+})
+
+test("a child fetch failure does not abort the tick", async () => {
+  const session = { id: "root-child-throw", title: "Child throw" }
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "please investigate" }] },
+    {
+      info: { id: "m2", role: "assistant", time: { created: 2 } },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: { description: "Investigate the summarizer path", subagent_type: "explore" },
+            output: '<task id="ses_child" state="completed">\nchild task output',
+            metadata: { sessionId: "ses_child" },
+          },
+        },
+      ],
+    },
+  ]
+  const { hooks, promptTexts } = await boot({
+    session,
+    messages,
+    childSessions: { ses_child: { id: "ses_child", title: "Explore child investigation" } },
+    childMessages: {
+      ses_child: [
+        { info: { id: "c1", role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: "Traced the summarizer path" }] },
+      ],
+    },
+    throwSessionGetFor: ["ses_child"],
+  })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => promptTexts.length > 0)
+    assert.ok(prompted, `expected a prompt despite the child fetch failure, got ${JSON.stringify(promptTexts)}`)
+    const built = await waitFor(() => readEntries(session.id).length > 0)
+    assert.ok(built, `expected timeline entries despite the child fetch failure, got ${JSON.stringify(readEntries(session.id))}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+  }
+})
+
 test("session.idle during backoff does not bypass the wait", async () => {
   const session = { id: "root-idle-backoff", title: "Idle backoff" }
   let prompts = 0
@@ -365,5 +736,327 @@ test("session.idle during backoff does not bypass the wait", async () => {
   } finally {
     await hooks.dispose()
     cleanupSession(session.id)
+  }
+})
+
+test("task expansion starts after the seeded cursor and does not refetch older children", async () => {
+  const session = { id: "root-cursor-expand", title: "Cursor expand" }
+  const firstTitle = "Early child marker title"
+  const firstOutcome = "Early child marker outcome"
+  const secondTitle = "Late child marker title"
+  const secondOutcome = "Late child marker outcome"
+  const messages = [
+    {
+      info: { id: "m1", role: "assistant", time: { created: 1 } },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: { description: "Early investigation", subagent_type: "explore" },
+            output: '<task id="ses_first" state="completed">\nearly child task output',
+            metadata: { sessionId: "ses_first" },
+          },
+        },
+      ],
+    },
+    {
+      info: { id: "m2", role: "assistant", time: { created: 2 } },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: { description: "Late investigation", subagent_type: "explore" },
+            output: '<task id="ses_second" state="completed">\nlate child task output',
+            metadata: { sessionId: "ses_second" },
+          },
+        },
+      ],
+    },
+  ]
+  writeTimelineState(session.id, {
+    version: TIMELINE_STATE_VERSION,
+    cursor: { messageID: messages[0].info.id, time: messages[0].info.time.created },
+    failures: 0,
+    pending: false,
+    updatedAt: Date.now(),
+  })
+  const { hooks, getCalls, messagesCalls, promptTexts } = await boot({
+    session,
+    messages,
+    childSessions: {
+      ses_first: { id: "ses_first", title: firstTitle },
+      ses_second: { id: "ses_second", title: secondTitle },
+    },
+    childMessages: {
+      ses_first: [
+        { info: { id: "c1", role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: firstOutcome }] },
+      ],
+      ses_second: [
+        { info: { id: "c2", role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: secondOutcome }] },
+      ],
+    },
+  })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => promptTexts.length > 0)
+    assert.ok(prompted, `expected a summarizer prompt, got ${JSON.stringify(promptTexts)}`)
+    const promptText = promptTexts.join("\n")
+    assert.ok(!getCalls.includes("ses_first"), `expected no session.get for the first child, got ${JSON.stringify(getCalls)}`)
+    assert.ok(!messagesCalls.includes("ses_first"), `expected no session.messages for the first child, got ${JSON.stringify(messagesCalls)}`)
+    assert.ok(getCalls.includes("ses_second"), `expected session.get for the second child, got ${JSON.stringify(getCalls)}`)
+    assert.ok(messagesCalls.includes("ses_second"), `expected session.messages for the second child, got ${JSON.stringify(messagesCalls)}`)
+    assert.deepEqual(
+      getCalls.filter((id) => id === "ses_first" || id === "ses_second"),
+      ["ses_second"],
+    )
+    assert.deepEqual(
+      messagesCalls.filter((id) => id === "ses_first" || id === "ses_second"),
+      ["ses_second"],
+    )
+    assert.ok(!promptText.includes(firstTitle), `expected no first child title in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes(firstOutcome), `expected no first child outcome in prompt, got ${promptText}`)
+    assert.ok(promptText.includes(secondTitle), `expected second child title in prompt, got ${promptText}`)
+    assert.ok(promptText.includes(secondOutcome), `expected second child outcome in prompt, got ${promptText}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+  }
+})
+
+test("a side-maintenance task part is not expanded and never reaches the prompt", async () => {
+  const session = { id: "root-side-maintenance-task", title: "Side maintenance task" }
+  const sideTitle = "Side maintenance child title marker"
+  const sideOutcome = "Side maintenance child outcome marker"
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "please do the work" }] },
+    {
+      info: { id: "m2", role: "assistant", time: { created: 2 } },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: {
+              description: "Side maintenance work",
+              subagent_type: "explore",
+              prompt: "Repo: /home/lawaty/Projects/lacode\nUpdate the tooling there",
+            },
+            output: '<task id="ses_side" state="completed">\nside task output',
+            metadata: { sessionId: "ses_side" },
+          },
+        },
+      ],
+    },
+  ]
+  const { hooks, getCalls, messagesCalls, promptTexts } = await boot({
+    session,
+    messages,
+    childSessions: { ses_side: { id: "ses_side", title: sideTitle } },
+    childMessages: {
+      ses_side: [
+        { info: { id: "c1", role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: sideOutcome }] },
+      ],
+    },
+  })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => promptTexts.length > 0)
+    assert.ok(prompted, `expected a summarizer prompt, got ${JSON.stringify(promptTexts)}`)
+    assert.ok(!getCalls.includes("ses_side"), `expected no session.get for a side-maintenance child, got ${JSON.stringify(getCalls)}`)
+    assert.ok(!messagesCalls.includes("ses_side"), `expected no session.messages for a side-maintenance child, got ${JSON.stringify(messagesCalls)}`)
+    const promptText = promptTexts.join("\n")
+    assert.ok(!promptText.includes(sideTitle), `expected no side-maintenance title in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes(sideOutcome), `expected no side-maintenance outcome in prompt, got ${promptText}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+  }
+})
+
+test("a normal project task with relative paths still expands", async () => {
+  const session = { id: "root-normal-relative-task", title: "Normal relative task" }
+  const localTitle = "Local project investigation marker"
+  const localOutcome = "Local project investigation outcome marker"
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "please investigate the routing" }] },
+    {
+      info: { id: "m2", role: "assistant", time: { created: 2 } },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: {
+              description: "Investigate local routing",
+              subagent_type: "explore",
+              prompt: "Read .opencode/context/architecture.md and src/lib/pool.ts and investigate the routing",
+            },
+            output: '<task id="ses_local" state="completed">\nlocal task output',
+            metadata: { sessionId: "ses_local" },
+          },
+        },
+      ],
+    },
+  ]
+  const { hooks, getCalls, messagesCalls, promptTexts } = await boot({
+    session,
+    messages,
+    childSessions: { ses_local: { id: "ses_local", title: localTitle } },
+    childMessages: {
+      ses_local: [
+        { info: { id: "c1", role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: localOutcome }] },
+      ],
+    },
+  })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => promptTexts.length > 0)
+    assert.ok(prompted, `expected a summarizer prompt, got ${JSON.stringify(promptTexts)}`)
+    assert.ok(getCalls.includes("ses_local"), `expected session.get for a normal project child, got ${JSON.stringify(getCalls)}`)
+    assert.ok(messagesCalls.includes("ses_local"), `expected session.messages for a normal project child, got ${JSON.stringify(messagesCalls)}`)
+    const promptText = promptTexts.join("\n")
+    assert.ok(promptText.includes(localTitle), `expected local child title in prompt, got ${promptText}`)
+    assert.ok(promptText.includes(localOutcome), `expected local child outcome in prompt, got ${promptText}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+  }
+})
+
+test("a context task part remains skipped as a side tool", async () => {
+  const session = { id: "root-context-side-task", title: "Context side task" }
+  const contextTitle = "Context side child title marker"
+  const contextOutcome = "Context side child outcome marker"
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "please update the map" }] },
+    {
+      info: { id: "m2", role: "assistant", time: { created: 2 } },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: {
+              description: "Update the context map",
+              subagent_type: "context",
+              prompt: "Update the context map",
+            },
+            output: '<task id="ses_context_side" state="completed">\ncontext task output',
+            metadata: { sessionId: "ses_context_side" },
+          },
+        },
+      ],
+    },
+  ]
+  const { hooks, getCalls, messagesCalls, promptTexts } = await boot({
+    session,
+    messages,
+    childSessions: { ses_context_side: { id: "ses_context_side", title: contextTitle } },
+    childMessages: {
+      ses_context_side: [
+        { info: { id: "c1", role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: contextOutcome }] },
+      ],
+    },
+  })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => promptTexts.length > 0)
+    assert.ok(prompted, `expected a summarizer prompt, got ${JSON.stringify(promptTexts)}`)
+    assert.ok(!getCalls.includes("ses_context_side"), `expected no session.get for a context child, got ${JSON.stringify(getCalls)}`)
+    assert.ok(!messagesCalls.includes("ses_context_side"), `expected no session.messages for a context child, got ${JSON.stringify(messagesCalls)}`)
+    const promptText = promptTexts.join("\n")
+    assert.ok(!promptText.includes(contextTitle), `expected no context title in prompt, got ${promptText}`)
+    assert.ok(!promptText.includes(contextOutcome), `expected no context outcome in prompt, got ${promptText}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+  }
+})
+
+test("a side-maintenance task is not filtered when the root owns the tooling", async () => {
+  const ownsDir = mkdtempSync(join(tmpdir(), "lacode-timeline-owns-"))
+  mkdirSync(join(ownsDir, "src/plugins"), { recursive: true })
+  writeFileSync(join(ownsDir, "src/plugins/timeline.ts"), "")
+  const session = { id: "root-owns-tooling-task", title: "Owns tooling task" }
+  const ownedTitle = "Owned tooling child title marker"
+  const ownedOutcome = "Owned tooling child outcome marker"
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "please do the tooling work" }] },
+    {
+      info: { id: "m2", role: "assistant", time: { created: 2 } },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: {
+              description: "Tooling work",
+              subagent_type: "explore",
+              prompt: "Repo: /home/lawaty/Projects/lacode\nUpdate the tooling there",
+            },
+            output: '<task id="ses_owns" state="completed">\nowned task output',
+            metadata: { sessionId: "ses_owns" },
+          },
+        },
+      ],
+    },
+  ]
+  const { hooks, getCalls, messagesCalls, promptTexts } = await boot({
+    session,
+    messages,
+    directory: ownsDir,
+    childSessions: { ses_owns: { id: "ses_owns", title: ownedTitle } },
+    childMessages: {
+      ses_owns: [
+        { info: { id: "c1", role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: ownedOutcome }] },
+      ],
+    },
+  })
+
+  try {
+    await hooks.event({
+      event: { type: "message.updated", properties: { info: { sessionID: session.id, role: "assistant" } } },
+    })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } })
+
+    const prompted = await waitFor(() => promptTexts.length > 0)
+    assert.ok(prompted, `expected a summarizer prompt, got ${JSON.stringify(promptTexts)}`)
+    assert.ok(getCalls.includes("ses_owns"), `expected session.get for an owned-tooling child, got ${JSON.stringify(getCalls)}`)
+    assert.ok(messagesCalls.includes("ses_owns"), `expected session.messages for an owned-tooling child, got ${JSON.stringify(messagesCalls)}`)
+    const promptText = promptTexts.join("\n")
+    assert.ok(promptText.includes(ownedTitle), `expected owned child title in prompt, got ${promptText}`)
+    assert.ok(promptText.includes(ownedOutcome), `expected owned child outcome in prompt, got ${promptText}`)
+  } finally {
+    await hooks.dispose()
+    cleanupSession(session.id)
+    rmSync(ownsDir, { recursive: true, force: true })
   }
 })

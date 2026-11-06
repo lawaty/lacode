@@ -98,6 +98,7 @@ import { omniRouteHooks } from "./plugins/omniroute.ts"
 import { providerCompatHooks } from "./plugins/provider-compat.ts"
 import { selfUpdateHooks } from "./plugins/selfupdate.ts"
 import { timelineHooks } from "./plugins/timeline.ts"
+import { timerMigrationHooks } from "./plugins/timer-migration.ts"
 
 export type LacodeOptions = {
   enabled?: boolean
@@ -171,6 +172,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   const autoupdate = (await settled("context-autoupdate", () => contextAutoUpdateHooks(input, options))) ?? inertHooks
   const notifier = (await settled("notify", () => notifyHooks(input, options))) ?? inertHooks
   const selfupdate = (await settled("self-update", () => selfUpdateHooks(input, options))) ?? inertHooks
+  void timerMigrationHooks(input, options)
   const feedback = (await settled("feedback", () => feedbackHooks(input, options))) ?? inertHooks
   const omniroute = (await settled("omniroute", () => omniRouteHooks(input, options))) ?? inertHooks
   // Load-time, not per-request: the fetch swap must be in place before the first

@@ -1,4 +1,5 @@
-import { writeFileSync, renameSync, rmSync } from "node:fs"
+import { existsSync, writeFileSync, renameSync, rmSync } from "node:fs"
+import { join } from "node:path"
 import { tool, type Hooks, type PluginInput, type PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
 import {
@@ -6,6 +7,9 @@ import {
   appendEntriesAt,
   buildExcerpt,
   isInternalTitle,
+  mentionsSideMaintenance,
+  isSideMaintenanceTask,
+  isSideTool,
   listTimelineStates,
   parseBullets,
   readEntries,
@@ -14,6 +18,7 @@ import {
   removeEntries,
   removeTimelineState,
   salvageBullets,
+  taskChildSessionId,
   timelineFile,
   TIMELINE_STATE_VERSION,
   writeTimelineState,
@@ -37,12 +42,17 @@ const MAX_ENTRIES = 10
 const PROMPT_TIMEOUT_MS = 90_000
 
 const SYSTEM = `You are the session timeline summarizer. You receive a slice of a coding session transcript.
-Write 1-8 timeline entries describing the work as tasks, features, fixes, or stages.
+Maintain a timeline of the project's own work: features, fixes, refactors, behavior changes, user-visible capabilities, architectural decisions, data/model changes, and documentation that defines project behavior.
+Write 1-8 timeline entries describing that project work.
 
 Rules:
 - One entry per line, each starting with "- ".
 - Each entry is 6-16 words, past tense, plain text.
-- Cover each distinct task in the slice. Do not drop a provider, feature, fix, config, docs, or test change; merge only exact duplicates.
+- Cover each distinct project task in the slice. Do not drop a feature, fix, refactor, behavior change, user-visible capability, architectural decision, data/model change, or documentation that defines project behavior; merge only exact duplicates.
+- Record project test changes at the capability level, not as housekeeping; do not report counts.
+- Ignore self-maintenance and infrastructure: the context map/cartographer, timeline rebuilding/summarization, model-pool status/rechecks, plugin install/update, agent/command configuration, formatting/lint/dependency churn, and build/dist artifacts.
+- Name modules, components, services, or capabilities when they are the subject. Do not list file paths, line numbers, counts, commit hashes, or build artifacts.
+- Record decisions or findings that changed the plan, not routine searches or reads.
 - Describe the TASK or OUTCOME, not the implementation. "Pool: added bucket-based routing" is right; "added b:<name> to pool.ts and agent-pool.ts" is too detailed.
 - Never describe the mechanism: no flags, aliases, overrides, endpoints, probes, config keys, declarations, tags, or file changes. State what changed for the system: which capability now works, which bug is fixed, which behavior changed.
 - Never use these words in an entry: tag, alias, override, flag, probe, endpoint, config key, catalog, file, line, count.
@@ -50,13 +60,12 @@ Rules:
 - Use a short area prefix when it clarifies: "Pool:", "Providers:", "Config:", "Docs:", "Tests:", "Fix:", "Feature:".
 - Name the capability, behavior, feature, bug, or decision. Do not name files, paths, functions, commands, environment variables, API keys, raw model IDs, test file names, or build artifacts. Provider and product names are allowed when they identify the task.
 - Do not include counts of slots, providers, tests, lines, or files.
-- Omit internal housekeeping: builds, dist rebuilds, test-file additions, formatting, and dependency churn. If the slice only contains housekeeping, output nothing.
 - Describe what was DONE or DECIDED. Never write "User asked...", "Assistant said...", "Discussed...", "Reviewed...", "Explained...", or "Considered...".
 - Merge related changes into one stage; do not repeat the same task in different words.
 - No markdown: no bold, italics, backticks, or code blocks.
 - If a technical detail is the essence of the task, name it at the capability level: "Added Cloudflare Workers AI as a provider", not its account-id variables.
-- If the slice contains no substantive work or decision, output nothing.
-- Output only the entries. No headings, no preamble, no closing sentence.
+- If the slice contains no project work, output exactly NO_PROJECT_CHANGES and nothing else. Otherwise output only the bullets.
+- Output only the entries or NO_PROJECT_CHANGES. No headings, no preamble, no closing sentence.
 
 Example output:
 - Pool: added bucket-based routing for model groups.
@@ -84,7 +93,7 @@ This:
 - Pool: moved shared-window models to the end.
 - Providers: replaced the retired Gemini 2.5 Flash with Gemini 3.5 Flash.
 
-Your entire response must consist only of lines beginning with "- ".`
+Your entire response must consist only of lines beginning with "- ", or exactly NO_PROJECT_CHANGES.`
 
 type TimelineConfig = {
   enabled?: boolean
@@ -128,6 +137,98 @@ function errorText(value: unknown): string {
     }
   }
   return String(value)
+}
+
+const MAX_TASK_CHILDREN_EXPANDED = 40
+
+async function expandTaskSessions(
+  client: any,
+  messages: TimelineMessage[],
+  directory: string,
+  owned: Set<string>,
+  onError?: (...args: unknown[]) => void,
+  cursor?: string,
+): Promise<TimelineMessage[]> {
+  const projectOwnsTooling = existsSync(join(directory, "src/plugins/timeline.ts"))
+  let attempts = 0
+  const expandedMessages: TimelineMessage[] = []
+  let startIndex = 0
+  if (cursor) {
+    const cursorIndex = messages.findIndex((m) => m.info.id === cursor)
+    if (cursorIndex >= 0) startIndex = cursorIndex + 1
+  }
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+    const message = messages[messageIndex]
+    if (messageIndex < startIndex) {
+      expandedMessages.push(message)
+      continue
+    }
+    const parts = message.parts ?? []
+    let changed = false
+    const nextParts: TimelineMessage["parts"] = []
+    for (const part of parts) {
+      if (message.info.role === "assistant" && part.type === "text" && !projectOwnsTooling && mentionsSideMaintenance(part.text ?? "")) {
+        nextParts.push({ ...part, side: true })
+        changed = true
+        continue
+      }
+      if (part.type !== "tool" || part.tool !== "task" || attempts >= MAX_TASK_CHILDREN_EXPANDED) {
+        nextParts.push(part)
+        continue
+      }
+      if (isSideMaintenanceTask(part.state?.input, directory, projectOwnsTooling)) {
+        nextParts.push({ ...part, side: true })
+        continue
+      }
+      if (isSideTool("task", part.state?.input)) {
+        nextParts.push({ ...part, side: true })
+        continue
+      }
+      if (typeof part.childTitle === "string" && part.childTitle.trim() !== "") {
+        nextParts.push(part)
+        continue
+      }
+      const childId = taskChildSessionId(part)
+      if (!childId || owned.has(childId)) {
+        nextParts.push(part)
+        continue
+      }
+      attempts++
+      try {
+        const fetched = await client.session.get({ path: { id: childId }, query: { directory } })
+        const info = fetched?.data
+        const rawTitle = typeof info?.title === "string" ? info.title.trim() : ""
+        if (!rawTitle || isInternalTitle(info?.title)) {
+          nextParts.push(part)
+          continue
+        }
+        const childRes = await client.session.messages({ path: { id: childId }, query: { directory } })
+        const childMessages = (childRes?.data ?? []) as TimelineMessage[]
+        let childOutcome: string | undefined
+        for (let i = childMessages.length - 1; i >= 0; i--) {
+          const childMessage = childMessages[i]
+          if (childMessage?.info?.role !== "assistant") continue
+          const textParts = (childMessage.parts ?? [])
+            .filter((p) => p.type === "text" && typeof p.text === "string")
+            .map((p) => p.text ?? "")
+          const joined = textParts.join("\n").replace(/\s+/g, " ").trim()
+          if (!joined) continue
+          childOutcome = joined.length > 800 ? joined.slice(0, 800) : joined
+          break
+        }
+        const cloned = childOutcome
+          ? { ...part, childTitle: rawTitle, childOutcome }
+          : { ...part, childTitle: rawTitle }
+        nextParts.push(cloned)
+        changed = true
+      } catch (error) {
+        if (onError) onError("expand-task-session failed", { childId, error })
+        nextParts.push(part)
+      }
+    }
+    expandedMessages.push(changed ? { ...message, parts: nextParts } : message)
+  }
+  return expandedMessages
 }
 
 export function timelineHooks(input: PluginInput, options?: PluginOptions): Hooks {
@@ -385,12 +486,16 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
         .join("\n")
         .trim()
       const text = textParts || reasoningParts
+      const trimmed = text.trim()
+      if (trimmed === "NO_PROJECT_CHANGES") {
+        return { ok: true, bullets: [] }
+      }
+      if (trimmed === "") {
+        return { ok: false, bullets: [], error: "empty summarizer output" }
+      }
       const bullets = parseBullets(text, maxEntries)
       if (bullets.length > 0) {
         return { ok: true, bullets }
-      }
-      if (text.trim() === "") {
-        return { ok: true, bullets: [] }
       }
       const salvaged = salvageBullets(text, maxEntries)
       if (salvaged.length > 0) {
@@ -438,7 +543,8 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
 
       const response = await client.session.messages({ path: { id }, query: { directory } })
       const messages = response?.data ?? []
-      const excerpt = buildExcerpt(messages as TimelineMessage[], state.cursor)
+      const expanded = await expandTaskSessions(client, messages as TimelineMessage[], directory, owned, debug, state.cursor?.messageID)
+      const excerpt = buildExcerpt(expanded, state.cursor)
       if (!excerpt.text) {
         state.pending = false
         state.failures = 0
@@ -502,13 +608,14 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
       const info = infoRes?.data
       if (!info) return "Session not found."
       const msgRes = await client.session.messages({ path: { id: rootId }, query: { directory } })
-      const messages = (msgRes?.data ?? []) as TimelineMessage[]
+      let messages = (msgRes?.data ?? []) as TimelineMessage[]
       writeFileSync(temp, "")
       for (let i = 0; i < MAX_REPROCESS_SLICES; i++) {
         if (abort?.aborted) {
           try { rmSync(temp, { force: true }) } catch {}
           return `Aborted after ${calls} summarizer calls; previous timeline kept.`
         }
+        messages = await expandTaskSessions(client, messages, directory, owned, debug, cursor?.messageID)
         const excerpt = buildExcerpt(messages, cursor)
         if (!excerpt.text) break
         const prior = readEntriesAt(temp, 4)

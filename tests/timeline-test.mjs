@@ -269,3 +269,183 @@ test("writeTimelineState leaves no temp file behind on success", () => {
   assert.deepEqual(temps, [])
   tl.removeTimelineState(sid)
 })
+
+test("isSideTool classification", () => {
+  assert.equal(tl.isSideTool("timeline_reprocess"), true)
+  assert.equal(tl.isSideTool("pool_status"), true)
+  assert.equal(tl.isSideTool("pool_recheck"), true)
+  assert.equal(tl.isSideTool("task", { subagent_type: "context" }), true)
+  assert.equal(tl.isSideTool("task", { subagent_type: "explore" }), false)
+  assert.equal(tl.isSideTool("task"), false)
+  assert.equal(tl.isSideTool("task", { description: "x" }), false)
+  assert.equal(tl.isSideTool("bash", { command: "ls" }), false)
+  assert.equal(tl.isSideTool("read", { filePath: "/a" }), false)
+})
+
+test("isSideMaintenanceTask marks an outside lacode project path", () => {
+  const input = { prompt: "Work in Repo: /home/lawaty/Projects/lacode and fix the timeline" }
+  assert.equal(tl.isSideMaintenanceTask(input, "/home/lawaty/Projects/fahemmacro/brain", false), true)
+})
+
+test("isSideMaintenanceTask marks config dirs and side tooling names", () => {
+  assert.equal(tl.isSideMaintenanceTask({ prompt: "edit ~/.config/opencode/opencode.jsonc" }, "/home/lawaty/Projects/fahemmacro/brain", false), true)
+  assert.equal(tl.isSideMaintenanceTask({ prompt: "check ~/.local/share/opencode/agent-pool" }, "/home/lawaty/Projects/fahemmacro/brain", false), true)
+  assert.equal(tl.isSideMaintenanceTask({ description: "run timeline_reprocess now" }, "/home/lawaty/Projects/fahemmacro/brain", false), true)
+  assert.equal(tl.isSideMaintenanceTask({ prompt: "pool_status please" }, "/home/lawaty/Projects/fahemmacro/brain", false), true)
+  assert.equal(tl.isSideMaintenanceTask({ prompt: "pool_recheck" }, "/home/lawaty/Projects/fahemmacro/brain", false), true)
+  assert.equal(tl.isSideMaintenanceTask({ prompt: "ask the cartographer" }, "/home/lawaty/Projects/fahemmacro/brain", false), true)
+})
+
+test("isSideMaintenanceTask is false when the project owns tooling", () => {
+  const input = { prompt: "Work in Repo: /home/lawaty/Projects/lacode and fix the timeline" }
+  assert.equal(tl.isSideMaintenanceTask(input, "/home/lawaty/Projects/fahemmacro/brain", true), false)
+})
+
+test("isSideMaintenanceTask ignores normal relative project paths", () => {
+  assert.equal(
+    tl.isSideMaintenanceTask({ prompt: "edit src/lib/foo.ts, write tmp/out.txt, read .opencode/context/conventions.md" }, "/home/lawaty/Projects/fahemmacro/brain", false),
+    false,
+  )
+})
+
+test("isSideMaintenanceTask ignores an absolute path under the root", () => {
+  assert.equal(
+    tl.isSideMaintenanceTask({ prompt: "read /home/lawaty/Projects/fahemmacro/brain/src/lib/timeline.ts" }, "/home/lawaty/Projects/fahemmacro/brain", false),
+    false,
+  )
+})
+
+test("isSideMaintenanceTask ignores an outside path not under /Projects/", () => {
+  assert.equal(
+    tl.isSideMaintenanceTask({ prompt: "run /usr/lib/foo/bar" }, "/home/lawaty/Projects/fahemmacro/brain", false),
+    false,
+  )
+  assert.equal(
+    tl.isSideMaintenanceTask({ prompt: "run /home/lawaty/Downloads/tool" }, "/home/lawaty/Projects/fahemmacro/brain", false),
+    false,
+  )
+})
+
+test("buildExcerpt omits a tool part with side true", () => {
+  const msgs = [
+    {
+      info: { id: "a1", role: "assistant", time: { created: 1 } },
+      parts: [
+        { type: "tool", tool: "task", side: true, state: { status: "completed", input: { description: "lacode side work" }, output: "side done" } },
+        { type: "tool", tool: "bash", state: { status: "completed", input: { command: "ls" }, output: "files" } },
+      ],
+    },
+  ]
+  const r = tl.buildExcerpt(msgs)
+  assert.doesNotMatch(r.text, /lacode side work/)
+  assert.doesNotMatch(r.text, /side done/)
+  assert.match(r.text, /\[tool\] bash \(completed\) ls -> files/)
+})
+
+test("buildExcerpt omits an assistant text part marked side while keeping a normal assistant text part", () => {
+  const msgs = [
+    {
+      info: { id: "a1", role: "assistant", time: { created: 1 } },
+      parts: [
+        { type: "text", text: "pool_recheck maintenance note", side: true },
+        { type: "text", text: "normal answer" },
+      ],
+    },
+  ]
+  const r = tl.buildExcerpt(msgs)
+  assert.doesNotMatch(r.text, /pool_recheck maintenance note/)
+  assert.match(r.text, /\[assistant\] normal answer/)
+})
+
+test("taskChildSessionId from metadata and output fallback", () => {
+  assert.equal(
+    tl.taskChildSessionId({ type: "tool", tool: "task", state: { metadata: { sessionId: "ses_abc123" }, output: '<task id="other">' } }),
+    "ses_abc123",
+  )
+  assert.equal(
+    tl.taskChildSessionId({ type: "tool", tool: "task", state: { output: '<task id="task-1_2.3" state="completed">\nhello' } }),
+    "task-1_2.3",
+  )
+  assert.equal(
+    tl.taskChildSessionId({ type: "tool", tool: "task", state: { output: "child ses_XYZ789 done" } }),
+    "ses_XYZ789",
+  )
+  assert.equal(tl.taskChildSessionId({ type: "tool", tool: "task", state: { output: "no id here" } }), undefined)
+  assert.equal(tl.taskChildSessionId({ type: "tool", tool: "task", state: {} }), undefined)
+  assert.equal(
+    tl.taskChildSessionId({ type: "tool", tool: "task", state: { metadata: { sessionId: "" }, output: '<task id="fallback1">' } }),
+    "fallback1",
+  )
+})
+
+test("buildExcerpt omits side tools", () => {
+  const msgs = [
+    {
+      info: { id: "a1", role: "assistant", time: { created: 1 } },
+      parts: [
+        { type: "tool", tool: "pool_status", state: { status: "completed", input: {}, output: "pool ok" } },
+        { type: "tool", tool: "pool_recheck", state: { status: "completed", input: {}, output: "rechecked" } },
+        {
+          type: "tool",
+          tool: "task",
+          state: { status: "completed", input: { subagent_type: "context", description: "cartographer" }, output: "map done" },
+        },
+        { type: "tool", tool: "bash", state: { status: "completed", input: { command: "ls" }, output: "files" } },
+      ],
+    },
+  ]
+  const r = tl.buildExcerpt(msgs)
+  assert.doesNotMatch(r.text, /pool_status/)
+  assert.doesNotMatch(r.text, /pool_recheck/)
+  assert.doesNotMatch(r.text, /cartographer/)
+  assert.doesNotMatch(r.text, /map done/)
+  assert.match(r.text, /\[tool\] bash \(completed\) ls -> files/)
+})
+
+test("buildExcerpt renders childTitle and childOutcome for a task part", () => {
+  const msgs = [
+    {
+      info: { id: "a1", role: "assistant", time: { created: 1 } },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          childTitle: "Investigate timeline filtering",
+          childOutcome: "Found the summarizer path",
+          state: {
+            status: "completed",
+            input: { description: "Investigate timeline filtering", subagent_type: "explore" },
+            output: '<task id="ses_child1" state="completed">\nfirst line',
+          },
+        },
+      ],
+    },
+  ]
+  const r = tl.buildExcerpt(msgs)
+  assert.match(r.text, /\[tool\] task \(completed\) -> Investigate timeline filtering: Found the summarizer path/)
+  assert.doesNotMatch(r.text, /<task id=/)
+  assert.equal(r.text.split("Investigate timeline filtering").length - 1, 1)
+})
+
+test("buildExcerpt keeps input when childTitle does not repeat description", () => {
+  const msgs = [
+    {
+      info: { id: "a1", role: "assistant", time: { created: 1 } },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          childTitle: "Child summary",
+          state: {
+            status: "completed",
+            input: { description: "Explore code", subagent_type: "explore" },
+            output: '<task id="ses_child2" state="completed">\nfirst line',
+          },
+        },
+      ],
+    },
+  ]
+  const r = tl.buildExcerpt(msgs)
+  assert.match(r.text, /\[tool\] task \(completed\) Explore code -> Child summary/)
+  assert.doesNotMatch(r.text, /<task id=/)
+})
