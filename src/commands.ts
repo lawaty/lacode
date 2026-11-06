@@ -213,9 +213,13 @@ $ARGUMENTS
 Report the tool's output as it came back, then add one short line naming what changed: re-admitted, still limited, or benched because the provider does not serve the model. If a model was benched as \`model-missing\`, say so and name the replacement in \`~/.config/lacode/pool.txt\` — but change nothing yourself.`,
   },
 
+  // `agent: "implement"` is a subagent, so without `subtask: false` this command
+  // would run in a child session and `timeline_reprocess` would rebuild the
+  // child's timeline instead of the caller's.
   "reprocess-timeline": {
     description: "Rebuild this session's timeline from its full transcript",
     agent: "implement",
+    subtask: false,
     template: "Call the `timeline_reprocess` tool exactly once with no arguments. Then reply with only its output.",
   },
 

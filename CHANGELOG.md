@@ -9,6 +9,16 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [1.3.1] — reprocess-timeline rebuilds the caller's timeline, and the pool refreshes daily
+
+### Added
+
+- Pool: `scripts/refresh-pool.mjs` rebuilds `~/.config/lacode/pool.txt` from the score output — opencode-go free models first, preserved unscored providers in the middle, the best opencode model last — with an atomic, fail-closed write. `--install-timer` installs a daily systemd user timer; `--from-scores` reuses an existing `model-scores.json`.
+
+### Fixed
+
+- Timeline: `/reprocess-timeline` now runs inline (`subtask: false`) instead of in a child session, so `timeline_reprocess` rebuilds the caller's timeline rather than the child's.
+
 ## [1.3.0-beta.9] — a timeline reply without bullets still lands
 
 ### Fixed
@@ -1105,7 +1115,8 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v1.3.0-beta.9...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/lawaty/lacode/releases/tag/v1.3.1
 [1.3.0-beta.9]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.9
 [1.3.0-beta.8]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.8
 [1.3.0-beta.0]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.0

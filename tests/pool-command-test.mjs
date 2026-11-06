@@ -90,6 +90,17 @@ const assert = (cond, msg) => {
   assert(cfg.command.pool === sentinel, "it must be byte-identical (sentinel preserved)")
 }
 
+// --- /reprocess-timeline: must run inline, not as a subtask ---
+{
+  assert(COMMANDS["reprocess-timeline"], "COMMANDS['reprocess-timeline'] must exist")
+  const cfg = { agent: {}, command: {} }
+  applyCommands(cfg)
+  const def = cfg.command["reprocess-timeline"]
+  assert(def, "the reprocess-timeline command must be injected")
+  assert(def.agent === "implement", `it must still target the implement agent, got ${def.agent}`)
+  assert(def.subtask === false, `it must run inline (subtask === false), got ${def.subtask}`)
+}
+
 if (failures === 0) console.log("\nALL POOL COMMAND CHECKS PASSED")
 else {
   console.error(`\n${failures} FAILURE(S)`)
