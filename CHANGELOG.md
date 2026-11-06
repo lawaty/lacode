@@ -9,6 +9,23 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.0.0-beta.0] — The timeline remembers, and the map has one job
+
+### Added
+
+- Durable timeline state: each session's cursor, pending flag, failure count, and next retry time are written beside the timeline JSONL. Pending work resumes after a restart, a successful summary with no bullet text still advances the durable cursor, and deleting a session removes both files.
+- Exponential backoff for failed timeline summarizations. A failure marks the slice pending and schedules a retry; repeated failures grow the wait up to a cap; an idle event during the wait re-arms the timer instead of bypassing it.
+- `timeline.retryMs` and `timeline.maxBackoffMs` options.
+- User stories US-35 (a timeline survives a restart and resumes unfinished work) and US-36 (a failed timeline summary retries with backoff), with story tests in `tests/stories/j-timeline-reliability.test.mjs`.
+
+### Changed
+
+- The `.opencode/context/` map is now five navigation files only. The cartographer no longer creates or maintains `active.md`, the context plugin no longer normalizes a backlog, and `/context-init` and `/context-review` no longer mention one.
+
+### Removed
+
+- `src/lib/active-backlog.ts`, the `.opencode/context/active.md` map file, and its finished-task retention window. The timeline is the single record of work in flight.
+
 ## [1.3.1] — reprocess-timeline rebuilds the caller's timeline, and the pool refreshes daily
 
 ### Added
@@ -1115,7 +1132,8 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/lawaty/lacode/compare/v2.0.0-beta.0...HEAD
+[2.0.0-beta.0]: https://github.com/lawaty/lacode/compare/v1.3.1...v2.0.0-beta.0
 [1.3.1]: https://github.com/lawaty/lacode/releases/tag/v1.3.1
 [1.3.0-beta.9]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.9
 [1.3.0-beta.8]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.8

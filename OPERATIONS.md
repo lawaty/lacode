@@ -538,17 +538,6 @@ Two operational rules:
 
 Force a run with `/context-update` rather than waiting for the idle trigger.
 
-The map directory holds a sixth file, `active.md`: the active backlog of work in
-flight, grouped by the ISO week each task was opened in. A task that is not marked
-`[x]` is open and is never removed, however old it is; a task that is finished and
-dated is kept for a week after it was finished and is then dropped. The window is
-enforced by the plugin, not by the cartographer: `src/lib/active-backlog.ts` owns
-the arithmetic, and `context-autoupdate` normalizes the file on every edit of it
-and once at session start. A line that vanishes from `active.md` was aged out by
-that rule, not lost — the boundary is strict, so a task finished exactly seven
-days ago is still kept. A task that is finished but carries no date cannot age
-out at all, and stays until it is dated or removed.
-
 ### The entry contract, budgets and validation
 
 Every navigation entry is `- [binding|provisional|disputed] <rule, ≤3 lines> —

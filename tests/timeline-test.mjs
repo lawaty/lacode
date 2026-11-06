@@ -1,6 +1,6 @@
 import { test, after } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import * as tl from "../src/lib/timeline.ts"
@@ -162,4 +162,110 @@ test("buildExcerpt skips reprocess command turn", () => {
 })
 test("parseBullets strips markdown noise", () => {
   assert.deepEqual(tl.parseBullets("- **Pool:** added `bucket` routing\n"), ["Pool: added bucket routing"])
+})
+
+test("timelineStateFile validates sessionID and path", () => {
+  assert.throws(() => tl.timelineStateFile("a/b"))
+  assert.ok(tl.timelineStateFile("abc_1").endsWith("abc_1.state.json"))
+})
+
+test("timeline state write/read round trip preserves fields and version", () => {
+  const sid = "state_roundtrip"
+  const state = {
+    version: 99,
+    cursor: { messageID: "m9", time: 123 },
+    failures: 4,
+    pending: true,
+    nextAttemptAt: 456,
+    updatedAt: 789,
+  }
+  tl.writeTimelineState(sid, state)
+  assert.deepEqual(tl.readTimelineState(sid), {
+    version: tl.TIMELINE_STATE_VERSION,
+    cursor: { messageID: "m9", time: 123 },
+    failures: 4,
+    pending: true,
+    nextAttemptAt: 456,
+    updatedAt: 789,
+  })
+  tl.removeTimelineState(sid)
+})
+
+test("timeline state missing and malformed JSON return undefined", () => {
+  assert.equal(tl.readTimelineState("state_missing"), undefined)
+  const bad = "state_malformed"
+  writeFileSync(tl.timelineStateFile(bad), "{not json")
+  assert.equal(tl.readTimelineState(bad), undefined)
+  tl.removeTimelineState(bad)
+})
+
+test("timeline state normalizes invalid values", () => {
+  const sid = "state_normalize"
+  tl.writeTimelineState(sid, {
+    version: 0,
+    cursor: { messageID: "", time: Infinity },
+    failures: -3,
+    pending: "yes",
+    nextAttemptAt: 0,
+    updatedAt: NaN,
+  })
+  const first = tl.readTimelineState(sid)
+  assert.ok(first)
+  assert.equal(first.version, tl.TIMELINE_STATE_VERSION)
+  assert.equal(first.cursor, undefined)
+  assert.equal(first.failures, 0)
+  assert.equal(first.pending, false)
+  assert.equal(first.nextAttemptAt, undefined)
+  assert.equal(typeof first.updatedAt, "number")
+  assert.ok(Number.isFinite(first.updatedAt))
+
+  tl.writeTimelineState(sid, {
+    version: 1,
+    failures: NaN,
+    pending: false,
+    nextAttemptAt: -5,
+    updatedAt: 1,
+  })
+  const second = tl.readTimelineState(sid)
+  assert.equal(second.failures, 0)
+  assert.equal(second.nextAttemptAt, undefined)
+  tl.removeTimelineState(sid)
+})
+
+test("removeTimelineState deletes the file", () => {
+  const sid = "state_remove"
+  tl.writeTimelineState(sid, { version: 1, failures: 0, pending: false, updatedAt: 1 })
+  assert.ok(tl.readTimelineState(sid))
+  tl.removeTimelineState(sid)
+  assert.equal(tl.readTimelineState(sid), undefined)
+})
+
+test("listTimelineStates finds only valid state files", () => {
+  const sidA = "state_list_a"
+  const sidB = "state_list_b"
+  const bad = "state_list_bad"
+  tl.writeTimelineState(sidA, { version: 1, failures: 1, pending: true, updatedAt: 1 })
+  tl.writeTimelineState(sidB, { version: 1, failures: 0, pending: false, updatedAt: 2, cursor: { messageID: "m" } })
+  tl.appendEntries("state_list_timeline", ["not state"], 1)
+  writeFileSync(join(dir, bad + ".state.json"), "{broken")
+  writeFileSync(join(dir, "bad name.state.json"), JSON.stringify({ version: 1, failures: 0, pending: false, updatedAt: 1 }))
+
+  const listed = tl.listTimelineStates().filter((x) => x.sessionID.startsWith("state_list_"))
+  const ids = listed.map((x) => x.sessionID).sort()
+  assert.deepEqual(ids, [sidA, sidB])
+  assert.equal(listed.find((x) => x.sessionID === sidA).state.pending, true)
+
+  tl.removeTimelineState(sidA)
+  tl.removeTimelineState(sidB)
+  tl.removeEntries("state_list_timeline")
+  rmSync(join(dir, bad + ".state.json"), { force: true })
+  rmSync(join(dir, "bad name.state.json"), { force: true })
+})
+
+test("writeTimelineState leaves no temp file behind on success", () => {
+  const sid = "state_tmp"
+  tl.writeTimelineState(sid, { version: 1, failures: 0, pending: false, updatedAt: 1 })
+  const temps = readdirSync(dir).filter((n) => n.includes(sid) && n.includes(".tmp"))
+  assert.deepEqual(temps, [])
+  tl.removeTimelineState(sid)
 })

@@ -46,8 +46,7 @@ exploration (README → existing docs → manifests → top-level structure → 
 and framework config → entry points → selective source), then write the five
 context files inside their line budgets, using the entry schema (provenance
 marker, rule of at most three lines, \`— See <path>[ §Section] (verified
-YYYY-MM-DD)\`). Also create \`.opencode/context/active.md\` with its heading and no
-tasks.
+YYYY-MM-DD)\`).
 
 Remember: write conclusions, not inventories. Point at the project's existing
 documentation instead of restating it. Run the drift pass and report a
@@ -97,7 +96,7 @@ Follow the review procedure and entry schema in your system prompt. Everything
 outside \`.opencode/context/\` is read-only for this run. Do not modify source
 code under any circumstances.
 
-Audit the context files and the backlog for:
+Audit the context files for:
 
 - schema — every entry has one provenance marker, at most three lines, a
   pointer, and a \`(verified YYYY-MM-DD)\` date
@@ -116,8 +115,6 @@ Audit the context files and the backlog for:
 - missing canonical entry points for significant subsystems
 - unsupported assumptions — anything that is not \`[binding]\` or \`[disputed]\`
   should be \`[provisional]\`
-- backlog tasks that are finished but carry no date — the retention window
-  cannot age those out, so they stay forever
 
 Fix what you find in \`.opencode/context/\` only, then report: findings, fixes,
 and anything you could not verify.`,

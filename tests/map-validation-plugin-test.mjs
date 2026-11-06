@@ -10,12 +10,12 @@
 //     after the run, because it may be the only copy and the page owner has to
 //     resolve the disagreement;
 //   * the old provisional entry is removed by the sweep while the binding one
-//     survives -- the active-backlog window generalised to every map file;
+//     survives.
 //   * the user message the cartographer is handed repeats the entry contract.
 //
-// Mirrors the boot in tests/active-backlog-plugin-test.mjs: the real factory, a
-// stub client, a temp project root, a temp HOME (so the pool never touches the
-// developer's data dir) and modelsFile pinned to the bundled preset.
+// Mirrors the standard hook test boot: the real factory, a stub client, a
+// temp project root, a temp HOME (so the pool never touches the developer's
+// data dir) and modelsFile pinned to the bundled preset.
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
@@ -88,7 +88,6 @@ const validMap = () => ({
     `- [provisional] The boundary may be revisited after the first release. — See \`docs/DESIGN.md\` §The shape (verified ${daysAgo(45)})`,
     "",
   ].join("\n"),
-  "active.md": ["# Active backlog", "", "## 2026-W43", "", "- [ ] Ship the split — opened 2026-W43", ""].join("\n"),
 })
 
 test("a completed run applies the lifecycle, validates, reports and never rewrites a disagreement", async () => {

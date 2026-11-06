@@ -39,7 +39,7 @@ for (const name of ["small", "large"]) {
     // The target is clean and every file still answers its charter.
     assert.deepEqual(result.after.violations, [], JSON.stringify(result.after.violations, null, 2))
     assert.ok(!afterKinds.has("charter"))
-    assert.ok(result.after.files.every((file) => file.entries.length >= file.spec.minEntries || file.spec.kind === "backlog"))
+    assert.ok(result.after.files.every((file) => file.entries.length >= file.spec.minEntries))
 
     // The lifecycle is a real write, not a report: it removed the expired
     // provisional entries and left the binding constraint in place.

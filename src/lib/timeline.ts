@@ -1,9 +1,19 @@
-import { appendFileSync, mkdirSync, readFileSync, rmSync } from "node:fs"
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 
 export type TimelineEntry = { ts: number; text: string; through?: TimelineCursor }
 export type TimelineCursor = { messageID?: string; time?: number }
+export const TIMELINE_STATE_VERSION = 1
+
+export type TimelinePersistedState = {
+  version: number
+  cursor?: TimelineCursor
+  failures: number
+  pending: boolean
+  nextAttemptAt?: number
+  updatedAt: number
+}
 export type TimelinePart = {
   type: string
   text?: string
@@ -31,16 +41,25 @@ export function timelineDir(): string {
   return join(homedir(), ".local/share/opencode/lacode/timeline")
 }
 
-export function timelineFile(sessionID: string): string {
+function assertValidSessionID(sessionID: string): void {
   if (!/^[A-Za-z0-9_.-]+$/.test(sessionID)) throw new Error("invalid sessionID")
+}
+
+export function timelineFile(sessionID: string): string {
+  assertValidSessionID(sessionID)
   return join(timelineDir(), sessionID + ".jsonl")
+}
+
+export function timelineStateFile(sessionID: string): string {
+  assertValidSessionID(sessionID)
+  return join(timelineDir(), sessionID + ".state.json")
 }
 
 function normalizeThrough(through?: TimelineCursor): TimelineCursor | undefined {
   if (!through || typeof through !== "object") return undefined
   const out: TimelineCursor = {}
-  if (typeof through.messageID === "string") out.messageID = through.messageID
-  if (typeof through.time === "number") out.time = through.time
+  if (typeof through.messageID === "string" && through.messageID.length > 0) out.messageID = through.messageID
+  if (typeof through.time === "number" && Number.isFinite(through.time)) out.time = through.time
   if (out.messageID === undefined && out.time === undefined) return undefined
   return out
 }
@@ -121,6 +140,84 @@ export function removeEntries(sessionID: string): void {
   } catch {
     // swallow
   }
+}
+
+function normalizePersistedState(raw: unknown): TimelinePersistedState {
+  const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}
+  const cursor = normalizeThrough(obj.cursor as TimelineCursor | undefined)
+  const failures =
+    typeof obj.failures === "number" && Number.isFinite(obj.failures)
+      ? Math.max(0, Math.trunc(obj.failures))
+      : 0
+  const pending = obj.pending === true
+  const nextAttemptAt =
+    typeof obj.nextAttemptAt === "number" && Number.isFinite(obj.nextAttemptAt) && obj.nextAttemptAt > 0
+      ? obj.nextAttemptAt
+      : undefined
+  const updatedAt =
+    typeof obj.updatedAt === "number" && Number.isFinite(obj.updatedAt) ? obj.updatedAt : Date.now()
+  const state: TimelinePersistedState = {
+    version: TIMELINE_STATE_VERSION,
+    failures,
+    pending,
+    updatedAt,
+  }
+  if (cursor) state.cursor = cursor
+  if (nextAttemptAt !== undefined) state.nextAttemptAt = nextAttemptAt
+  return state
+}
+
+export function readTimelineState(sessionID: string): TimelinePersistedState | undefined {
+  try {
+    const raw = readFileSync(timelineStateFile(sessionID), "utf8")
+    return normalizePersistedState(JSON.parse(raw))
+  } catch {
+    return undefined
+  }
+}
+
+export function writeTimelineState(sessionID: string, state: TimelinePersistedState): void {
+  const file = timelineStateFile(sessionID)
+  mkdirSync(dirname(file), { recursive: true })
+  const tmp = file + ".tmp." + process.pid + "." + Math.random().toString(36).slice(2)
+  try {
+    writeFileSync(tmp, JSON.stringify(state) + "\n")
+    renameSync(tmp, file)
+  } catch (err) {
+    try {
+      rmSync(tmp, { force: true })
+    } catch {
+      // ignore cleanup failure
+    }
+    throw err
+  }
+}
+
+export function removeTimelineState(sessionID: string): void {
+  try {
+    rmSync(timelineStateFile(sessionID), { force: true })
+  } catch {
+    // swallow
+  }
+}
+
+export function listTimelineStates(): Array<{ sessionID: string; state: TimelinePersistedState }> {
+  let names: string[]
+  try {
+    names = readdirSync(timelineDir())
+  } catch {
+    return []
+  }
+  const out: Array<{ sessionID: string; state: TimelinePersistedState }> = []
+  for (const name of names) {
+    if (!name.endsWith(".state.json")) continue
+    const sessionID = name.slice(0, -".state.json".length)
+    if (!/^[A-Za-z0-9_.-]+$/.test(sessionID)) continue
+    const state = readTimelineState(sessionID)
+    if (!state) continue
+    out.push({ sessionID, state })
+  }
+  return out
 }
 
 function collapse(s: string): string {

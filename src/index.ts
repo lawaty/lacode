@@ -110,7 +110,7 @@ export type LacodeOptions = {
   selfUpdate?: boolean
   feedbackHint?: boolean
   imagePaste?: ImagePasteOptions
-  timeline?: { enabled?: boolean; intervalMs?: number; maxEntries?: number } | false
+  timeline?: { enabled?: boolean; intervalMs?: number; maxEntries?: number; retryMs?: number; maxBackoffMs?: number } | false
   [key: string]: unknown
 }
 

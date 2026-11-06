@@ -6,12 +6,17 @@ import {
   appendEntriesAt,
   buildExcerpt,
   isInternalTitle,
+  listTimelineStates,
   parseBullets,
   readEntries,
   readEntriesAt,
-  timelineFile,
+  readTimelineState,
   removeEntries,
+  removeTimelineState,
   salvageBullets,
+  timelineFile,
+  TIMELINE_STATE_VERSION,
+  writeTimelineState,
   type TimelineCursor,
   type TimelineEntry,
   type TimelineMessage,
@@ -85,6 +90,8 @@ type TimelineConfig = {
   enabled?: boolean
   intervalMs?: number
   maxEntries?: number
+  retryMs?: number
+  maxBackoffMs?: number
 }
 
 type TimelineState = {
@@ -94,6 +101,7 @@ type TimelineState = {
   root?: boolean
   cursor?: TimelineCursor
   failures: number
+  nextAttemptAt?: number
   title?: string
 }
 
@@ -142,6 +150,12 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
   const maxEntries = Number.isFinite(rawMaxEntries)
     ? Math.min(MAX_ENTRIES, Math.max(1, Math.trunc(rawMaxEntries)))
     : DEFAULT_MAX_ENTRIES
+  const rawRetryMs = Number(config?.retryMs ?? 30_000)
+  const retryMs = Number.isFinite(rawRetryMs) ? Math.max(1, rawRetryMs) : 30_000
+  const rawMaxBackoffMs = Number(config?.maxBackoffMs ?? 30 * 60_000)
+  const maxBackoffMs = Math.max(retryMs, Number.isFinite(rawMaxBackoffMs) ? Math.max(1, rawMaxBackoffMs) : 30 * 60_000)
+  const retryDelay = (failures: number) =>
+    Math.min(retryMs * 2 ** Math.min(Math.max(failures - 1, 0), 20), maxBackoffMs)
 
   const shared = ((globalThis as any)[Symbol.for("lacode:timeline:state")] ??= {
     sessions: new Map<string, TimelineState>(),
@@ -160,21 +174,38 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
     return { providerID: provider, modelID: id }
   }
 
+  const persist = (id: string, state: TimelineState) => {
+    try {
+      writeTimelineState(id, {
+        version: TIMELINE_STATE_VERSION,
+        cursor: state.cursor,
+        failures: state.failures,
+        pending: state.pending,
+        nextAttemptAt: state.nextAttemptAt,
+        updatedAt: Date.now(),
+      })
+    } catch (error) {
+      debug("persist failed", { sessionID: id, error })
+    }
+  }
+
   const stateFor = (id: string): TimelineState => {
     let state = sessions.get(id)
     if (!state) {
+      const persisted = readTimelineState(id)
       state = {
         running: false,
-        pending: false,
-        failures: 0,
-        cursor: readEntries(id, 1)[0]?.through,
+        pending: persisted?.pending ?? false,
+        failures: persisted?.failures ?? 0,
+        cursor: persisted?.cursor ?? readEntries(id, 1)[0]?.through,
+        nextAttemptAt: persisted?.nextAttemptAt,
       }
       sessions.set(id, state)
       while (sessions.size > 500) {
         let evicted = false
         for (const [key, st] of sessions) {
           if (key === id) continue
-          if (!st.timer && !st.running) {
+          if (!st.timer && !st.running && !st.pending && st.nextAttemptAt === undefined) {
             sessions.delete(key)
             evicted = true
             break
@@ -190,7 +221,9 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
     if (disabled || disposed) return
     const state = stateFor(id)
     if (state.root === false) return
+    const wasPending = state.pending
     state.pending = true
+    if (!wasPending) persist(id, state)
     if (state.timer || state.running) return
     schedule(id, state)
   }
@@ -201,10 +234,21 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
   // runs; the timer remains the debounce for an active session.
   function flush(id: string) {
     if (disabled || disposed) return
-    const state = sessions.get(id)
-    if (!state) return
+    let state = sessions.get(id)
+    if (!state) {
+      if (readTimelineState(id)?.pending === true) state = stateFor(id)
+      else return
+    }
     if (state.root === false) return
     if (!state.pending || state.running) return
+    if (state.nextAttemptAt && state.nextAttemptAt > Date.now()) {
+      if (state.timer) {
+        clearTimeout(state.timer)
+        state.timer = undefined
+      }
+      schedule(id, state)
+      return
+    }
     if (state.timer) {
       clearTimeout(state.timer)
       state.timer = undefined
@@ -214,10 +258,16 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
 
   function schedule(id: string, state: TimelineState) {
     if (state.timer) clearTimeout(state.timer)
+    const delay =
+      typeof state.nextAttemptAt === "number"
+        ? Math.max(0, state.nextAttemptAt - Date.now())
+        : state.failures > 0
+          ? retryDelay(state.failures)
+          : intervalMs
     state.timer = setTimeout(() => {
       state.timer = undefined
       void tick(id, state)
-    }, intervalMs)
+    }, delay)
     state.timer.unref?.()
   }
 
@@ -364,7 +414,6 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
     if (reprocessing.has(id)) return
     try {
       state.running = true
-      state.pending = false
       let title: string | undefined
       let info: any = {}
       if (state.root === undefined) {
@@ -374,6 +423,7 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
           .catch(() => undefined)
         if (!info) {
           sessions.delete(id)
+          removeTimelineState(id)
           return
         }
         title = info.title
@@ -381,6 +431,7 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
         state.root = !info.parentID && !isInternalTitle(info.title)
         if (!state.root) {
           sessions.delete(id)
+          removeTimelineState(id)
           return
         }
       }
@@ -389,6 +440,10 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
       const messages = response?.data ?? []
       const excerpt = buildExcerpt(messages as TimelineMessage[], state.cursor)
       if (!excerpt.text) {
+        state.pending = false
+        state.failures = 0
+        state.nextAttemptAt = undefined
+        persist(id, state)
         return
       }
 
@@ -397,8 +452,14 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
         if (result.bullets.length) appendEntries(id, result.bullets, Date.now(), excerpt.next)
         state.cursor = excerpt.next
         state.failures = 0
+        state.pending = false
+        state.nextAttemptAt = undefined
+        persist(id, state)
       } else {
         state.failures++
+        state.pending = true
+        state.nextAttemptAt = Date.now() + retryDelay(state.failures)
+        persist(id, state)
         log("warn", "timeline: summarize failed", { sessionID: id, error: result.error })
       }
     } catch (error) {
@@ -476,7 +537,15 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
         state.cursor = cursor
         state.failures = 0
         state.pending = false
+        state.nextAttemptAt = undefined
       }
+      persist(rootId, {
+        running: state?.running ?? false,
+        pending: false,
+        failures: 0,
+        cursor,
+        nextAttemptAt: undefined,
+      })
       return `Rebuilt ${messages.length} messages into ${entries} entries with ${calls} summarizer calls.`
     } catch (error) {
       try { rmSync(temp, { force: true }) } catch {}
@@ -485,6 +554,30 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
       reprocessing.delete(rootId)
     }
   }
+
+  function resume() {
+    if (disabled || disposed) return
+    let listed: Array<{ sessionID: string; state: { pending: boolean; updatedAt: number } }>
+    try {
+      listed = listTimelineStates()
+    } catch (error) {
+      debug("resume failed", error)
+      return
+    }
+    listed.sort((a, b) => b.state.updatedAt - a.state.updatedAt)
+    let scheduled = 0
+    for (const { sessionID, state } of listed) {
+      if (state.pending !== true) continue
+      if (sessions.has(sessionID)) continue
+      if (scheduled >= 50) continue
+      const loaded = stateFor(sessionID)
+      if (loaded.root === false) continue
+      schedule(sessionID, loaded)
+      scheduled++
+    }
+  }
+
+  resume()
 
   const timelineReprocess = tool({
     description: "Rebuild the root session's entire timeline from its transcript, replacing the existing entries. Used by /reprocess-timeline.",
@@ -536,6 +629,7 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
             }
             sessions.delete(id)
             removeEntries(id)
+            removeTimelineState(id)
             owned.delete(id)
             return
           }

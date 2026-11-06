@@ -21,7 +21,6 @@ import {
   MAP_SPECS,
   NAVIGATION_FILES,
   auditMap,
-  maintainMap,
   normalizeMapText,
   parseMapEntries,
   validateMapText,
@@ -111,7 +110,6 @@ const validMap = (today = TODAY) => ({
     `- [provisional] The retention window may be tuned in a later release. — See \`docs/DESIGN.md\` §Retention (verified ${today})`,
     "",
   ].join("\n"),
-  "active.md": ["# Active backlog", "", "## 2026-W43", "", "- [ ] Ship the split — opened 2026-W43", ""].join("\n"),
 })
 
 const writeMap = (map, files) => {
@@ -128,8 +126,8 @@ test("the budget covers every file, and decisions is tightly bounded", () => {
     "conventions.md",
     "workflows.md",
     "decisions.md",
-    "active.md",
   ])
+  assert.deepEqual(NAVIGATION_FILES, MAP_FILES)
   assert.equal(NAVIGATION_FILES.length, 5)
   for (const spec of MAP_SPECS) {
     assert.ok(spec.budget > 0, `${spec.file} needs a budget`)
@@ -355,34 +353,6 @@ test("lifecycle drops only old provisional entries whose source still resolves",
   const again = normalizeMapText(spec, result.text, { now: NOW, canResolve: (pointer) => pointer === "docs/DESIGN.md" })
   assert.equal(again.text, result.text)
   assert.deepEqual(again.removed, [])
-})
-
-test("the generalized sweep keeps the active backlog's 7-day window", () => {
-  const root = scratch("map-active-")
-  const map = join(root, ".opencode", "context")
-  mkdirSync(map, { recursive: true })
-  const finishedRecent = daysAgo(2)
-  const finishedStale = daysAgo(9)
-  write(
-    root,
-    ".opencode/context/active.md",
-    [
-      "# Active backlog",
-      "",
-      "## 2026-W43",
-      "",
-      `- [x] Stale chore — opened 2026-W43, finished ${finishedStale}`,
-      `- [ ] Open work — opened 2026-W43`,
-      `- [x] Recent chore — opened 2026-W43, finished ${finishedRecent}`,
-      "",
-    ].join("\n"),
-  )
-  const result = maintainMap(root, map, NOW)
-  const after = readFileSync(join(map, "active.md"), "utf8")
-  assert.equal(result.removedTotal, 1)
-  assert.ok(!after.includes("Stale chore"))
-  assert.ok(after.includes("Open work"))
-  assert.ok(after.includes("Recent chore"))
 })
 
 test("the same rule stated in two files is a duplicate", () => {

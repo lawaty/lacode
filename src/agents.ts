@@ -554,7 +554,7 @@ if the blocker is understanding rather than execution, report that instead.`,
     },
   },
   "context": {
-    "description": "Repository cartographer and memory maintainer. Bootstraps and incrementally maintains .opencode/context/ (architecture, contexts, conventions, workflows, decisions) as a small navigation map for future agents, and keeps .opencode/context/active.md — the active backlog of work in flight, grouped by week. Runs automatically after sessions that changed files; can also be invoked with /context-init, /context-update, /context-review. Never use it for general coding tasks.",
+    "description": "Repository cartographer and memory maintainer. Bootstraps and incrementally maintains .opencode/context/ (architecture, contexts, conventions, workflows, decisions) as a small navigation map for future agents. Runs automatically after sessions that changed files; can also be invoked with /context-init, /context-update, /context-review. Never use it for general coding tasks.",
     "mode": "subagent",
     "temperature": 0.1,
     prompt: CARTOGRAPHER_PROMPT,

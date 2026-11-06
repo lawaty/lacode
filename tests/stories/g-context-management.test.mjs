@@ -38,10 +38,6 @@ test.after(cleanupAll)
 /** The five navigation files the cartographer owns, and the map is exactly these. */
 const MAP_FILES = ["architecture.md", "contexts.md", "conventions.md", "workflows.md", "decisions.md"]
 
-// The map is not only these five: the cartographer also owns `active.md`, the
-// active backlog, which is a work list rather than a navigation file and is
-// therefore not part of the map.
-
 /** A file inside the map, in the form opencode evaluates it from a normal root. */
 const MAP_FILE = ".opencode/context/architecture.md"
 

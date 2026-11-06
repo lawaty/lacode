@@ -2,10 +2,8 @@
 //
 // The map is a DERIVED navigation index: the prompt tells the cartographer what
 // to write, and this module measures what it actually wrote. It is deliberately
-// the deterministic half of the contract, for the same reason the active
-// backlog's window lives in code rather than in a prompt (see
-// active-backlog.ts): a rule a model applies is a rule it applies when it feels
-// like it, and the failure is silent.
+// the deterministic half of the contract: a rule a model applies is a rule it
+// applies when it feels like it, and the failure is silent.
 //
 // Three things this module will NOT do, because each one turns a derived index
 // into an authority it is not:
@@ -27,10 +25,9 @@
 
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import * as path from "node:path"
-import { ACTIVE_BACKLOG_FILE, normalizeBacklog } from "./active-backlog.ts"
 
 export type MapMarker = "binding" | "provisional" | "disputed"
-export type MapFileKind = "entries" | "backlog"
+export type MapFileKind = "entries"
 
 export type MapSpec = {
   /** File name inside `.opencode/context/`. */
@@ -108,21 +105,12 @@ export const MAP_SPECS: MapSpec[] = [
     provisionalDays: PROVISIONAL_DAYS,
     sectionRequired: true,
   },
-  {
-    file: ACTIVE_BACKLOG_FILE,
-    charter: "work in flight, grouped by the ISO week it was opened",
-    budget: 60,
-    minEntries: 0,
-    kind: "backlog",
-    provisionalDays: PROVISIONAL_DAYS,
-    sectionRequired: false,
-  },
 ]
 
+/** The five navigation files. */
+export const NAVIGATION_FILES = MAP_SPECS.map((spec) => spec.file)
 export const MAP_SPEC_BY_FILE = new Map(MAP_SPECS.map((spec) => [spec.file, spec]))
-export const MAP_FILES = MAP_SPECS.map((spec) => spec.file)
-/** The five navigation files, i.e. everything except the active backlog. */
-export const NAVIGATION_FILES = MAP_SPECS.filter((spec) => spec.kind === "entries").map((spec) => spec.file)
+export const MAP_FILES = NAVIGATION_FILES
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -446,10 +434,7 @@ export type FileValidation = {
   violations: Violation[]
 }
 
-/**
- * Validate one map file's TEXT. The active backlog is checked for its budget
- * and charters only; its entry shape belongs to active-backlog.ts.
- */
+/** Validate one map file's TEXT. */
 export const validateMapText = (spec: MapSpec, text: string, options: ValidateOptions): FileValidation => {
   const violations: Violation[] = []
   const lines = text.split(/\r?\n/)
@@ -460,11 +445,6 @@ export const validateMapText = (spec: MapSpec, text: string, options: ValidateOp
   if (nonBlank === 0) push("charter", `empty file; charter is ${spec.charter}`)
   if (nonBlank > spec.budget) {
     push("budget", `${nonBlank} non-blank lines exceeds the ${spec.budget}-line budget; consolidate, do not pad`)
-  }
-
-  if (spec.kind === "backlog") {
-    if (!text.startsWith("# ")) push("charter", "active backlog must start with a top-level heading")
-    return { spec, lines: nonBlank, entries: [], violations }
   }
 
   const entries = parseMapEntries(text)
@@ -597,15 +577,6 @@ export const normalizeMapText = (
 ): NormalizeMapResult => {
   const now = options.now ?? Date.now()
 
-  if (spec.kind === "backlog") {
-    const result = normalizeBacklog(text, now)
-    return {
-      text: result.text,
-      removed: result.removed.map((title) => ({ line: 0, text: title })),
-      kept: 0,
-    }
-  }
-
   const entries = parseMapEntries(text)
   const drop = new Set<number>()
   const removed: RemovedEntry[] = []
@@ -660,10 +631,6 @@ export const maintainMap = (root: string, mapDir: string, now = Date.now()): Map
     if (result.removed.length > 0) {
       removedTotal += result.removed.length
       files.push({ file: spec.file, changed, removed: result.removed })
-    } else if (changed) {
-      // The backlog rewrites to canonical form without necessarily dropping a
-      // task; report the rewrite so the caller can log it.
-      files.push({ file: spec.file, changed, removed: [] })
     }
   }
   return { files, removedTotal }
@@ -699,21 +666,19 @@ export const auditMap = (root: string, mapDir: string, now = Date.now()): MapAud
     files.push(result)
     violations.push(...result.violations)
 
-    if (spec.kind === "entries") {
-      for (const entry of result.entries) {
-        const key = normalizeRule(entry.rule)
-        if (key.length < 12) continue
-        const home = rulesSeen.get(key)
-        if (home !== undefined && home !== spec.file) {
-          violations.push({
-            file: spec.file,
-            line: entry.startLine + 1,
-            kind: "duplicate",
-            detail: `same rule is already stated in ${home}; one fact has one home`,
-          })
-        } else if (home === undefined) {
-          rulesSeen.set(key, spec.file)
-        }
+    for (const entry of result.entries) {
+      const key = normalizeRule(entry.rule)
+      if (key.length < 12) continue
+      const home = rulesSeen.get(key)
+      if (home !== undefined && home !== spec.file) {
+        violations.push({
+          file: spec.file,
+          line: entry.startLine + 1,
+          kind: "duplicate",
+          detail: `same rule is already stated in ${home}; one fact has one home`,
+        })
+      } else if (home === undefined) {
+        rulesSeen.set(key, spec.file)
       }
     }
   }

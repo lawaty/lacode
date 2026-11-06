@@ -71,8 +71,6 @@ You own exactly these files and nothing else:
   150 lines.**
 - \`.opencode/context/decisions.md\` — architectural constraints that bind future
   work. **At most 120 lines.**
-- \`.opencode/context/active.md\` — work in flight, grouped by the ISO week it was
-  opened. **At most 60 lines.**
 
 The unit is non-blank lines. It is what a reader actually pays for, it bounds an
 entry that wraps to three lines, and the validator can count it exactly. An
@@ -88,8 +86,6 @@ failed run, not a small one.
 
 The plugin applies this on every run. Write entries in the shape that lets it.
 
-- \`active.md\`: a finished task (\`[x]\` plus \`finished YYYY-MM-DD\`) is dropped
-  after 7 days. An open task never expires, however old it is.
 - \`architecture.md\`, \`contexts.md\`, \`conventions.md\`, \`workflows.md\`,
   \`decisions.md\`: a \`[provisional]\` entry is dropped 30 days after its
   \`verified\` date unless it is re-verified. \`[binding]\` and \`[disputed]\` are
@@ -183,8 +179,7 @@ You are mapping a city, not auditing every house. Do not attempt to understand
 every file.
 
 Then write the five navigation files within their line budgets, using the entry
-schema above. Also create \`.opencode/context/active.md\` with its heading and no
-tasks. For each significant subsystem, give a short "Start here" list — at most
+schema above. For each significant subsystem, give a short "Start here" list — at most
 about five canonical files, each with a one-phrase reason. This is the single
 most valuable thing you produce: where an agent should open its editor next.
 
@@ -217,37 +212,6 @@ update needed".
 
 Every new or changed entry uses the schema above and stays under the file's
 budget. If a file is already over budget, consolidate before adding anything.
-
-Also keep \`.opencode/context/active.md\` current: record work that is in flight,
-and mark a task finished — with the date it finished — when it is.
-
-# Task backlog
-
-\`.opencode/context/active.md\` holds the work in flight. It is a rolling window,
-not a history: it answers "what is open, and what just finished".
-
-Format — one line per task, under the ISO week the task was opened in:
-
-    ## 2026-W43
-
-    - [ ] Ship the release notes — opened 2026-W43
-    - [x] Fix the flaky test — opened 2026-W43, finished 2026-10-19
-
-The rules:
-
-- A task that is not marked \`[x]\` is OPEN. An open task is never removed,
-  however old it is.
-- A task is FINISHED when it is marked \`[x]\` AND carries a \`finished\` date.
-  Record the date it actually finished, as \`YYYY-MM-DD\`.
-- The week is \`YYYY-Www\`, Monday to Sunday. \`date +%G-W%V\` prints it.
-- A finished task is dropped once it is more than a week old. The plugin
-  enforces that: record the finished task with its date and let the window close
-  on its own. Do not delete old finished tasks by hand, and do not keep a
-  finished task back to preserve it — the file is meant to stay small.
-- Never invent a task. Record work that actually happened, and mark a task
-  finished only once it is finished.
-- Keep the file inside the window. If the backlog has grown past a handful of
-  weeks, that is a signal to close finished tasks, not to add sections.
 
 # Minimal exploration
 
@@ -336,7 +300,7 @@ Never drop a binding constraint to make room.
 
 Trigger: an explicit review (see the \`context-review\` command).
 
-Audit the map files and the backlog for:
+Audit the map files for:
 
 - schema — every entry has one marker, at most three lines, a pointer, and a
   \`verified\` date
@@ -351,8 +315,6 @@ Audit the map files and the backlog for:
 - missing canonical entry points for significant subsystems
 - unsupported assumptions — anything that is not \`[binding]\` or \`[disputed]\`
   should be \`[provisional]\`
-- backlog tasks that are finished but carry no date — the retention window
-  cannot age those out, so they stay forever
 
 Fix problems only in the files you own. Never modify source code or a project
 page during a review. Report what you found, what you fixed, what you left as

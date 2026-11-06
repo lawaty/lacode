@@ -5,7 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { timelineHooks } from "../src/plugins/timeline.ts"
-import { readEntries, timelineFile } from "../src/lib/timeline.ts"
+import { readEntries, readTimelineState, timelineFile } from "../src/lib/timeline.ts"
 import { PRESET } from "./stories/_harness.mjs"
 
 const dir = mkdtempSync(join(tmpdir(), "lacode-timeline-reprocess-"))
@@ -123,6 +123,11 @@ test("root session still reprocesses itself and replaces the previous file", asy
   assert.match(out.output, /^Rebuilt 2 messages into 2 entries/)
   assert.deepEqual(s.calls.messages, ["solo-1"])
   assert.deepEqual(readEntries("solo-1").map((e) => e.text), ["Root bullet one", "Root bullet two"])
+  const state = readTimelineState("solo-1")
+  assert.ok(state)
+  assert.ok(state.cursor)
+  assert.equal(state.failures, 0)
+  assert.equal(state.pending, false)
 })
 
 test("terminates on a cyclic parent chain", async () => {

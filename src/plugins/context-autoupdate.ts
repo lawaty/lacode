@@ -1,9 +1,8 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import * as path from "node:path"
 import type { Hooks, PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
-import { ACTIVE_BACKLOG_FILE, normalizeBacklog } from "../lib/active-backlog.ts"
 import { auditMap, formatViolations, maintainMap } from "../lib/map-schema.ts"
 import { verifyWriterRule } from "../lib/writer-rule.ts"
 
@@ -253,7 +252,6 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
 
   const root = path.resolve(directory)
   const contextAbs = path.join(root, CONTEXT_DIR)
-  const activeBacklogPath = path.join(contextAbs, ACTIVE_BACKLOG_FILE)
 
   // Fail loudly and immediately rather than weeks later as a silently stale map.
   const config = findProjectConfig()
@@ -272,46 +270,9 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
   }
 
   /**
-   * Apply the backlog's rolling window to the file on disk.
+   * Apply the lifecycle of the map files.
    *
-   * The cartographer records what happened; this decides what is still worth
-   * keeping. That split is deliberate: deciding when a task has aged out is
-   * arithmetic, and arithmetic belongs in code where a test can pin the
-   * boundary, not in a prompt where a model applies it when it feels like it.
-   *
-   * The file is rewritten only when the canonical form differs from what is
-   * on disk, which is what makes this safe to run on every edit: a second
-   * pass over a clean file changes nothing, so the write cannot loop.
-   *
-   * A drop is reported, never silent. A task that vanishes from the file is
-   * the one change a reader of the backlog cannot reconstruct, and "it aged
-   * out" is the whole explanation it needs.
-   *
-   * Never throws. Housekeeping must not be able to fail the run that
-   * triggered it.
-   */
-  const normalizeActiveBacklog = async () => {
-    try {
-      if (!existsSync(activeBacklogPath)) return { removed: 0 }
-      const before = readFileSync(activeBacklogPath, "utf8")
-      const { text, removed } = normalizeBacklog(before)
-      if (text !== before) writeFileSync(activeBacklogPath, text)
-      if (removed.length > 0) {
-        await log("info", `active backlog: dropped ${removed.length} task(s) finished more than a week ago`, {
-          removed: removed.length,
-        })
-      }
-      return { removed: removed.length }
-    } catch {
-      return { removed: 0 }
-    }
-  }
-
-  /**
-   * Apply the lifecycle of EVERY map file, not just the backlog.
-   *
-   * This is the same split active-backlog.ts already made, generalised: the
-   * cartographer records what is true, and code decides what is still worth
+   * The cartographer records what is true, and code decides what is still worth
    * keeping. Only PROVISIONAL entries whose cited source still exists can be
    * dropped, and only after their window; a binding constraint never expires
    * by age, and an entry with no resolvable source is kept (it may be the only
@@ -394,7 +355,7 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           "",
           ENTRY_CONTRACT,
           "",
-          "Follow the bootstrap procedure in your system prompt: progressive exploration, then write the five context files within their line budgets. Also create `.opencode/context/active.md` with its heading and no tasks. When the project already has architecture or decision documentation, link to it instead of duplicating it. Write conclusions, not inventories.",
+          "Follow the bootstrap procedure in your system prompt: progressive exploration, then write the five context files within their line budgets. When the project already has architecture or decision documentation, link to it instead of duplicating it. Write conclusions, not inventories.",
         ].join("\n")
       : [
           "Incremental context update. Project root: " + directory,
@@ -406,7 +367,7 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
           "",
           ENTRY_CONTRACT,
           "",
-          'Follow the incremental-update procedure in your system prompt. Update a context file only if this work introduced or revealed information that will materially help future agents: a new boundary or module, a new or moved canonical entry point, a changed workflow, a new convention, an architectural decision, a new dependency between subsystems, a renamed or moved subsystem, or an invariant not yet recorded. Do not edit documentation merely because source files changed. If nothing material changed, make no edits and report "no update needed". Also keep `.opencode/context/active.md` current: record work that is in flight, and mark a task finished — with the date it finished — when it is.',
+          'Follow the incremental-update procedure in your system prompt. Update a context file only if this work introduced or revealed information that will materially help future agents: a new boundary or module, a new or moved canonical entry point, a changed workflow, a new convention, an architectural decision, a new dependency between subsystems, a renamed or moved subsystem, or an invariant not yet recorded. Do not update documentation merely because source files changed. If nothing material changed, make no edits and report "no update needed".',
         ].join("\n")
 
   return {
@@ -414,15 +375,6 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
       try {
         if (event.type === "file.edited") {
           const file = event.properties.file
-          // The active backlog is the one file in the map the PLUGIN maintains:
-          // the cartographer records what happened, and the window below decides
-          // what is still worth keeping. A hand edit is normalized on the spot,
-          // so the file is grouped and pruned whether the cartographer ran or
-          // not.
-          if (path.resolve(root, file) === activeBacklogPath) {
-            await normalizeActiveBacklog()
-            return
-          }
           if (isTracked(file)) pending.add(file)
           return
         }

@@ -471,6 +471,29 @@ Enforcement is split deliberately, and the split matters: **what the permission 
 - [ ] Given the user's config already defines one of the three commands, When the config hook runs, Then that command is left byte-identical while the other two are still added.
 - [ ] Given the commands are injected, When each one's target agent is resolved against the same config object, Then all three resolve to an agent that actually exists there — a command must never point at a missing agent.
 
+### US-35: A timeline survives a restart and resumes unfinished work
+**As a** user whose opencode process restarts in the middle of a session, **I want** the timeline to remember what it has already summarized and to finish the slice it had not written yet, **so that** a crash or restart never silently loses part of the session's work record.
+
+The cursor and retry state used to live only in memory; a process that stopped between messages and the next idle flush forgot that a slice was pending, and a successful summary that produced no bullet text advanced the cursor only in memory, so a restart could summarize the same slice again. The plugin now writes a small per-session state file next to the JSONL timeline (cursor, pending flag, failure count, next retry time); startup resumes pending work, and a deleted session removes both files.
+
+**Story ID(s) for tests:** US-35
+**Acceptance criteria:**
+- [ ] Given a session has a pending timeline slice recorded on disk, When the process restarts, Then the timeline resumes and completes that slice without waiting for a new message event.
+- [ ] Given a summarization succeeds but produces no bullet text, When the process restarts, Then the advanced cursor is still known and the same transcript slice is not summarized again.
+- [ ] Given a session is deleted, When its timeline is removed, Then its durable state file is removed with it.
+
+### US-36: A failed timeline summary retries with backoff
+**As a** user whose summarizer call fails transiently, **I want** the timeline to retry on its own with an increasing delay, **so that** a temporary model or network failure does not leave the timeline permanently behind the session.
+
+A failed summarization used to clear the pending flag and never reschedule, so only new session activity could try again. A failure now marks the slice pending, records the next attempt time, and schedules a retry; repeated failures back off exponentially up to a cap, and an idle event during the wait re-arms the timer instead of bypassing it. A successful retry clears the failure count.
+
+**Story ID(s) for tests:** US-36
+**Acceptance criteria:**
+- [ ] Given a summarization fails transiently, When the retry interval elapses, Then the timeline retries without waiting for new session activity.
+- [ ] Given repeated failures, When retries are scheduled, Then the wait grows with each failure up to a configured cap.
+- [ ] Given a retry is waiting, When the session goes idle before the backoff window elapses, Then the idle event does not bypass the wait.
+- [ ] Given a retry succeeds, When entries are appended, Then the failure count resets to zero and the timeline is no longer pending.
+
 ---
 
 ## Epic H — Retention (sweeps)
@@ -554,6 +577,8 @@ table was filled in.
 | US-20 | G | `tests/stories/g-context-management.test.mjs` |
 | US-21 | G | `tests/stories/g-context-management.test.mjs`, `tests/permission-test.mjs` |
 | US-22 | G | `tests/stories/g-context-management.test.mjs` |
+| US-35 | G | `tests/stories/j-timeline-reliability.test.mjs` |
+| US-36 | G | `tests/stories/j-timeline-reliability.test.mjs` |
 | US-32 | H | `tests/retire-old-sessions-test.mjs` |
 | US-33 | H | `tests/prune-old-events-test.mjs` |
 
@@ -561,8 +586,8 @@ The nine suites under `tests/` are unit-style; the `tests/stories/` suites are
 the behavioural layer, written one epic per file with every test name carrying
 its story id. Run everything with `npm test`.
 
-**No story is uncovered.** The guard reports 33 stories, 325 test cases, and
-33/33 stories with at least one behavioural test; US-1, US-2, US-3, US-6, and
+**No story is uncovered.** The guard reports 36 stories, 348 test cases, and
+36/36 stories with at least one behavioural test; US-1, US-2, US-3, US-6, and
 all of epic F have tests, and the coverage guard fails the build if any of them
 loses one. The scan covers the `tests/stories/` suites and the root-level
 `tests/*-test.mjs` suites.
