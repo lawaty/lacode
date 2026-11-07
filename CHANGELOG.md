@@ -9,6 +9,19 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.2.0-beta.0] — context-aware pool routing
+
+### Added
+
+- Pool: context-aware routing. `pool.txt` lines carry a `c:<context>` token, and the router prefers the smallest model whose context fits the task prompt, so large-context models are reserved for large tasks.
+- Pool: `npm run score` probes providers with no direct HTTP endpoint (or an unexpanded `${...}` URL) through the local opencode session, and considers catalogue-priced models on providers other than `opencode`/`opencode-go`, whose credits cover them.
+- Pool: a rate-limit reset or a `402 out of credits` answer schedules a transient retry; a transient failure keeps the model's previous score until the retry.
+
+### Changed
+
+- Pool: the context floor is now 100k. Slots are ordered as `opencode-go` (weight 4), small-context providers (weight 2), large-context providers (weight 1), and at most one `opencode` model last.
+- Pool: small-context models are preferred for ordinary work; large-context models are used when the estimated task size needs them or when small slots are full.
+
 ## [2.1.0-beta.0] — every provider counts, and the timer installs itself
 
 ### Added

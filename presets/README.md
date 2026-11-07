@@ -36,15 +36,15 @@ change here takes effect without a restart. Plugin CODE still needs one.
 in place, no JSON and no objects:
 
 ```text
-# provider/model-id                       weight
-opencode/big-pickle                       3
-opencode-go/beam-free       2
-opencode/deepseek-v4.1-flash-free         1
-opencode/glm-5.3-flash-free               1
+# provider/model-id                       weight  c:<context>
+opencode/big-pickle                       3       c:200000
+opencode-go/beam-free       2       c:200000
+opencode/deepseek-v4.1-flash-free         1       c:200000
+opencode/glm-5.3-flash-free               1       c:200000
 ```
 
 `#` starts a comment (whole-line or trailing), blank lines are ignored, and the
-weight is optional (default 1). The rules are exactly the same as the JSON form
+weight is optional (default 1). `c:<context>` is the model's context window in tokens; the router uses it to prefer the smallest model that fits the task, and it is optional for hand-written lines. The rules are exactly the same as the JSON form
 below: any number of slots, a model may repeat on another line, split on the
 first slash only. The loader accepts either shape in the same file, so a leading
 `{` means JSON and anything else means the flat form.

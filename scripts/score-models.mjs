@@ -26,8 +26,10 @@
 //     measured score is below --min-score: those are listed as excluded instead.
 //   * It never writes pool.txt. It prints a SUGGESTED table for you to paste; the
 //     pool stays yours to decide.
-//   * It never probes a paid model. Only cost 0/0 models from the provider's
-//     catalog are candidates (non-chat/media/safety/meta-router models are skipped).
+//   * opencode and opencode-go stay free-only. Every other provider is probed
+//     even when its catalogue lists a price, because provider credits cover it;
+//     --free-only restores the cost-0 rule everywhere. Non-chat/media/safety/
+//     meta-router models are always skipped.
 //
 // OUTPUT
 //   a per-provider ranked table, an overall ranking, a suggested pool.txt block,
@@ -38,24 +40,27 @@ import { execFileSync, spawn } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
+import { MIN_CONTEXT, MIN_SCORE, retryAfterMs, selectPool } from "./pool-selection.mjs"
 
 const AUTH = join(homedir(), ".local", "share", "opencode", "auth.json")
 const OUT = join(homedir(), ".config", "lacode", "model-scores.json")
 // No default provider list: `opencode models --verbose` with no argument returns
 // every provider opencode knows about, and that is what we scan by default.
 const SESSION_PROVIDERS = new Set(["opencode", "opencode-go"])
+const FREE_ONLY_PROVIDERS = new Set(["opencode", "opencode-go"])
 
 // ── scoring weights ─────────────────────────────────────────────────────────
 // Mechanical work prizes speed and availability over raw capability. Context is
 // scored on a log curve so 256k vs 1M is a difference, not a cliff.
 const W = { speed: 0.35, context: 0.3, output: 0.15, reliability: 0.2 }
 const MAX_CONTEXT = 1_000_000
-const MIN_CONTEXT = 200_000 // below this, a model is excluded instead of ranked
-const MIN_SCORE = 60 // below this, a probed model is excluded from ranking
 const FAST_MS = 300 // at or below this, speed scores 1.0
 const SLOW_MS = 8_000 // at or above this, speed scores 0
 const PROMPT = "Reply with the single word: ok"
 const MAX_TOKENS = 8
+const PROBE_ATTEMPTS = 2 // one retry for a timeout or a dropped connection
+const isTransientProbe = (reason) =>
+  /timeout|timed out|ECONNRESET|ETIMEDOUT|fetch failed|socket hang up|no answer/i.test(String(reason ?? ""))
 
 // ── args ────────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2)
@@ -70,31 +75,36 @@ const value = (flag, fallback) => {
     console.log(`Usage: npm run score -- [options]
 
   --providers a,b   restrict the scan to these providers (default: all configured)
-  --max N           probe at most N free models per provider (default: 12)
+  --max N           probe at most N candidate models per provider (default: 50)
   --min-context N   exclude models whose context limit is below N (default: ${MIN_CONTEXT})
   --min-score N     do not rank models scoring below N (default: ${MIN_SCORE})
-  --timeout MS      per-request deadline in ms (default: 20000)
+  --free-only        only probe catalogue cost 0/0 models on every provider
+  --timeout MS      per-request deadline in ms (default: 45000)
   --delay MS        pause between requests in ms (default: 300)
   --no-write        do not write ~/.config/lacode/model-scores.json
   -h, --help        this message
 
-Only cost 0/0 concrete text chat/completion models are candidates
-(non-chat/media generators, safety classifiers, and OpenRouter meta-routers are skipped).
+opencode and opencode-go stay free-only; every other provider is probed even
+when its catalogue lists a price, because provider credits cover it. Use
+--free-only to apply the cost-0 rule everywhere. Non-chat/media generators,
+safety classifiers, and OpenRouter meta-routers are always skipped.
 Credentials come from ~/.local/share/opencode/auth.json; a provider with no
 entry falls back to the "opencode" key (which is how the console-openrouter
 connection authenticates).
-opencode/opencode-go models are probed through a temporary local opencode serve --pure session, while the other providers are probed directly.`)
+opencode/opencode-go models are probed through a temporary local opencode serve --pure session, while the other providers are probed directly.
+Providers with no direct HTTP endpoint (or an unexpanded \${...} URL) are probed through the same local opencode session as opencode/opencode-go.`)
     process.exit(0)
   }
 
 const providerArg = value("--providers", null)
 const providers = providerArg ? String(providerArg).split(",").map((s) => s.trim()).filter(Boolean) : null
-const maxPerProvider = Math.max(1, Number(value("--max", "12")) || 12)
+const maxPerProvider = Math.max(1, Number(value("--max", "50")) || 50)
 const minContext = Math.max(0, Number(value("--min-context", String(MIN_CONTEXT))) || MIN_CONTEXT)
 const minScore = Math.max(0, Number(value("--min-score", String(MIN_SCORE))) || MIN_SCORE)
-const timeoutMs = Math.max(1_000, Number(value("--timeout", "20000")) || 20_000)
+const timeoutMs = Math.max(1_000, Number(value("--timeout", "45000")) || 45_000)
 const delayMs = Math.max(0, Number(value("--delay", "300")) || 300)
 const writeResults = !has("--no-write")
+const freeOnlyFlag = has("--free-only")
 
 // ── discovery ───────────────────────────────────────────────────────────────
 /** Parse `opencode models --verbose <provider>`: alternating id line + JSON block. */
@@ -148,9 +158,10 @@ function isChatModel(model) {
 }
 
 function buildProviderEntry(provider, rows) {
+  const freeOnly = freeOnlyFlag || FREE_ONLY_PROVIDERS.has(provider)
   const models = rows
-    .filter(({ model }) => model?.api?.url && model?.api?.id)
-    .filter(({ model }) => (model.cost?.input ?? 1) === 0 && (model.cost?.output ?? 1) === 0)
+    .filter(({ model }) => model?.api?.id)
+    .filter(({ model }) => !freeOnly || ((model.cost?.input ?? 1) === 0 && (model.cost?.output ?? 1) === 0))
     .filter(({ model }) => !model.status || model.status === "active")
     .filter(({ model }) => isChatModel(model))
     .map(({ id, model }) => ({
@@ -372,10 +383,17 @@ async function probeDirect(candidate, provider) {
             : response.status === 404
               ? "not served"
               : `http ${response.status}`
-      return { ok: false, ms, reason: `${kind}: ${detail}` }
+      const retryAfter =
+        kind === "rate-limited" || /credit|402/i.test(detail)
+          ? retryAfterMs(body, response.headers.get("retry-after"))
+          : undefined
+      return { ok: false, ms, reason: `${kind}: ${detail}`, retryAfter }
     }
     // A 200 can still carry an error object (OpenRouter does this).
-    if (parsed?.error) return { ok: false, ms, reason: `${parsed.error.message ?? "error"} `.trim() }
+    if (parsed?.error) {
+      const reason = `${parsed.error.message ?? "error"} `.trim()
+      return { ok: false, ms, reason, retryAfter: retryAfterMs(reason) }
+    }
     if (!Array.isArray(parsed?.choices) || parsed.choices.length === 0) {
       return { ok: false, ms, reason: "no choices in response" }
     }
@@ -409,7 +427,7 @@ async function probeViaSession(candidate, provider) {
     if (!createRes.ok) {
       const detail = createdJson?.error?.message ?? createdJson?.message ?? createText.slice(0, 160)
       const ms = Math.round(performance.now() - started)
-      return { ok: false, ms, reason: `session create http ${createRes.status}: ${detail}` }
+      return { ok: false, ms, reason: `session create http ${createRes.status}: ${detail}`, retryAfter: retryAfterMs(detail) }
     }
     id = createdJson?.id ?? createdJson?.data?.id ?? null
     if (!id) {
@@ -435,11 +453,12 @@ async function probeViaSession(candidate, provider) {
     const ms = Math.round(performance.now() - (promptStarted ?? started))
     if (!msgRes.ok) {
       const detail = parsed?.error?.message ?? parsed?.message ?? msgText.slice(0, 160)
-      return { ok: false, ms, reason: `http ${msgRes.status}: ${detail}` }
+      return { ok: false, ms, reason: `http ${msgRes.status}: ${detail}`, retryAfter: retryAfterMs(detail) }
     }
     const failure = parsed?.error ?? parsed?.info?.error
     if (failure) {
-      return { ok: false, ms, reason: failureText(failure).slice(0, 240) }
+      const reason = failureText(failure).slice(0, 240)
+      return { ok: false, ms, reason, retryAfter: retryAfterMs(reason) }
     }
     if (!parsed?.info) {
       return { ok: false, ms, reason: "no response" }
@@ -450,7 +469,8 @@ async function probeViaSession(candidate, provider) {
     if (error?.name === "TimeoutError") {
       return { ok: false, ms, reason: `timeout after ${timeoutMs}ms` }
     }
-    return { ok: false, ms, reason: failureText(error).slice(0, 240) }
+    const reason = failureText(error).slice(0, 240)
+    return { ok: false, ms, reason, retryAfter: retryAfterMs(reason) }
   } finally {
     if (id && server) {
       try {
@@ -460,9 +480,22 @@ async function probeViaSession(candidate, provider) {
   }
 }
 
+function usesSession(provider, candidate) {
+  if (SESSION_PROVIDERS.has(provider)) return true
+  const url = String(candidate.url ?? "")
+  return url.length === 0 || url.includes("${")
+}
+
 async function probe(candidate, provider) {
-  if (SESSION_PROVIDERS.has(provider)) return probeViaSession(candidate, provider)
-  return probeDirect(candidate, provider)
+  if (usesSession(provider, candidate)) return probeViaSession(candidate, provider)
+  const outcome = await probeDirect(candidate, provider)
+  if (outcome.ok) return outcome
+  // A provider whose direct URL is misconfigured can still be reachable
+  // through opencode's own provider resolution.
+  if (/credential|no credential|not served|invalid request path|could not route/i.test(String(outcome.reason ?? ""))) {
+    return probeViaSession(candidate, provider)
+  }
+  return outcome
 }
 
 // ── scoring ─────────────────────────────────────────────────────────────────
@@ -497,7 +530,7 @@ async function main() {
     }
     const candidates = entry.models.slice(0, maxPerProvider)
     const excludedNote = entry.excluded.length ? `, ${entry.excluded.length} excluded (context < ${minContext})` : ""
-    console.log(`\n${entry.provider}: probing ${candidates.length} free model(s)${entry.models.length > candidates.length ? ` of ${entry.models.length}` : ""}${excludedNote}`)
+    console.log(`\n${entry.provider}: probing ${candidates.length} candidate model(s)${entry.models.length > candidates.length ? ` of ${entry.models.length}` : ""}${excludedNote}`)
     if (entry.excluded.length) {
       console.log(`  excluded — context below ${minContext}:`)
       for (const x of entry.excluded) console.log(`    ${pad(x.model.replace(`${entry.provider}/`, ""), 52)} ${padL(x.context, 9)}`)
@@ -508,7 +541,12 @@ async function main() {
     }
     const rows = []
     for (const candidate of candidates) {
-      const outcome = await probe(candidate, entry.provider)
+      let outcome = await probe(candidate, entry.provider)
+      for (let attempt = 1; attempt < PROBE_ATTEMPTS && !outcome.ok && isTransientProbe(outcome.reason); attempt++) {
+        console.log(`  retrying ${candidate.model.replace(`${entry.provider}/`, "")} after ${String(outcome.reason).slice(0, 60)}`)
+        await sleep(delayMs)
+        outcome = await probe(candidate, entry.provider)
+      }
       const row = { provider: entry.provider, ...candidate, ...outcome, score: null }
       row.score = score(row)
       if (row.score && row.score.value < minScore) {
@@ -556,28 +594,41 @@ async function main() {
   const all = results.flatMap((e) => e.rows).filter((r) => r.score && r.score.value >= minScore)
   all.sort((a, b) => b.score.value - a.score.value)
   if (all.length) {
-    console.log(`\noverall — best free models right now`)
+    console.log(`\noverall — best candidate models right now`)
     all.slice(0, 12).forEach((r, i) => {
       console.log(`  ${pad(i + 1, 3)}${pad(r.model, 58)}${padL(`${r.ms}ms`, 8)}${padL(r.score.value, 7)}`)
     })
   }
 
-  // A SUGGESTED pool: every opencode-go model (weight 4), then the best
-  // (10 - n) models from the other providers (weight 2), by measured score.
-  // Printed, never written — pool.txt stays the user's decision.
-  const poolSize = 10
-  const goRows = all.filter((r) => r.model.startsWith("opencode-go/"))
-  const otherRows = all.filter((r) => !r.model.startsWith("opencode-go/"))
-  const pickedOthers = otherRows.slice(0, Math.max(0, poolSize - goRows.length))
-  const suggested = [
-    ...goRows.map((r) => ({ row: r, weight: 4 })),
-    ...pickedOthers.map((r) => ({ row: r, weight: 2 })),
-  ]
-  if (suggested.length) {
+  // Previous scores let a transient outage keep the pool it had.
+  const previousScores = (() => {
+    try {
+      return JSON.parse(readFileSync(OUT, "utf8"))
+    } catch {
+      return null
+    }
+  })()
+  const { selection, warnings, retry } = selectPool({
+    providers: results.map((entry) => ({
+      provider: entry.provider,
+      error: entry.error,
+      rows: entry.rows.map((row) => ({ ...row, score: row.score?.value ?? null })),
+      excluded: entry.excluded,
+    })),
+    previousProviders: previousScores?.providers,
+    minContext,
+    minScore,
+  })
+
+  if (selection.length) {
     console.log(`\nsuggested pool.txt (paste if it matches your judgement — nothing was changed)`)
-    console.log(`# scored ${new Date().toISOString()} — opencode-go first (weight 4), then the best others (weight 2)`)
-    for (const { row, weight } of suggested) console.log(`${pad(row.model, 60)}${weight}`)
+    console.log(`# scored ${new Date().toISOString()} — opencode-go first (weight 4), small-context providers (weight 2), large-context providers (weight 1), opencode last (max 1)`)
+    for (const entry of selection) {
+      const bucket = entry.bucket ? `  b:${entry.bucket}` : ""
+      console.log(`${pad(entry.model, 60)}${entry.weight}${bucket}`)
+    }
   }
+  if (retry) console.log(`\nlimited: ${retry.models.length} model(s); retry after ${retry.after}`)
 
   if (writeResults) {
     try {
@@ -587,6 +638,9 @@ async function main() {
         weights: W,
         minContext,
         minScore,
+        selection,
+        warnings,
+        retry,
         providers: results.map((e) => ({
           provider: e.provider,
           error: e.error,
@@ -599,6 +653,7 @@ async function main() {
             ms: r.ms,
             reason: r.reason,
             score: r.score?.value ?? null,
+            retryAfter: r.retryAfter ?? null,
           })),
         })),
       }

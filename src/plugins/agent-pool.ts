@@ -126,6 +126,14 @@ export const reportText = (report: probe.ProbeReport): string => {
   ].join("\n")
 }
 
+export const CONTEXT_HEADROOM_TOKENS = 20_000
+
+/** Rough need for a subagent task: the prompt plus room for tools and files. */
+export function estimateContextTokens(prompt: unknown): number | undefined {
+  if (typeof prompt !== "string" || prompt.length === 0) return undefined
+  return Math.ceil(prompt.length / 4) + CONTEXT_HEADROOM_TOKENS
+}
+
 type AbortReport = {
   slot: number
   model: string
@@ -1492,7 +1500,8 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         const snap = pool.snapshot(s)
 
         if (pool.BASES.includes(requested)) {
-          const slot = pool.pickSlot(s, snap)
+          const neededContext = estimateContextTokens(output.args?.prompt)
+          const slot = pool.pickSlot(s, snap, neededContext)
           const variant = pool.agentFor(requested, slot.index)
           if (s.known.size > 0 && !s.known.has(variant)) {
             await warnOnce(`variant ${variant} missing from config; spawn left unchanged`)

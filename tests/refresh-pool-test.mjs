@@ -1,119 +1,70 @@
-// refresh-pool: build a rewritten pool.txt from scorer output.
-//
-// The scorer measures; this module decides. It never writes on a fail-closed
-// condition and never partially writes. These tests pin the pure buildPool()
-// contract with fixtures and no filesystem/network side effects.
+// refresh-pool: the writer consumes the scorer's selection and schedules retries.
 //
 // Run with: node --test tests/refresh-pool-test.mjs
 
-import test from "node:test"
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { test } from "node:test"
 import { fileURLToPath } from "node:url"
-
-import { buildPool, renderTimerUnits } from "../scripts/refresh-pool.mjs"
+import { buildPool, renderTimerUnits, scheduleRetry } from "../scripts/refresh-pool.mjs"
 
 const NOW = new Date("2026-11-06T12:00:00.000Z")
-
-function makeScores(overrides = {}) {
-  return {
-    generatedAt: "2026-11-06T03:41:14.089Z",
-    providers: [
-      {
-        provider: "opencode-go",
-        error: null,
-        rows: [
-          // out of score order on purpose
-          { model: "opencode-go/beam-free", ok: true, score: 96.0, reason: "answered" },
-          { model: "opencode-go/crouton-alpha-free", ok: true, score: 88.7, reason: "answered" },
-          { model: "opencode-go/iceman-contributor-free", ok: true, score: 88.6, reason: "answered" },
-          { model: "opencode-go/broken-free", ok: false, score: 40, reason: "timeout" },
-          { model: "opencode-go/unscored-free", ok: true, score: null, reason: "answered" },
-        ],
-      },
-      {
-        provider: "opencode",
-        error: null,
-        rows: [
-          { model: "opencode/crouton-alpha-free", ok: true, score: 94.5, reason: "answered" },
-          { model: "opencode/pulse-alpha-free", ok: true, score: 90.9, reason: "answered" },
-          { model: "opencode/big-pickle", ok: true, score: 59.0, reason: "answered" },
-          { model: "opencode/deepseek-v4.1-flash-free", ok: true, score: 59.0, reason: "answered" },
-          { model: "opencode/not-ok-free", ok: false, score: 99.9, reason: "http 429" },
-        ],
-      },
-      {
-        provider: "openrouter",
-        error: null,
-        rows: [
-          { model: "openrouter/cohere/north-mini-code:free", ok: true, score: 90.6, reason: "answered" },
-          { model: "openrouter/small-context:free", ok: true, score: 99, context: 100000, reason: "answered" },
-        ],
-      },
-      {
-        provider: "console-openrouter",
-        error: null,
-        rows: [
-          { model: "console-openrouter/cohere/north-mini-code:free", ok: true, score: 89.0, reason: "answered" },
-        ],
-      },
-    ],
-    ...overrides,
-  }
-}
+const GENERATED = "2026-11-06T03:41:14.089Z"
 
 const CURRENT_POOL = `# LaCode pool — one model per line:  <provider>/<model-id>  [weight]
 #
 # weight is optional (default 1).
 
 cerebras/gpt-oss-120b                            2
-groq/openai/gpt-oss-120b                         2
-  mistral/codestral-latest                         2  # keep my indent/comment
-openrouter/cohere/north-mini-code:free           2
-console-openrouter/cohere/north-mini-code:free   2
 opencode/deepseek-v4.1-flash-free                2  b:opencode
-opencode/big-pickle                              2  b:opencode
 `
 
-test("buildPool ranks opencode-go first, then the best others, and applies the floors", () => {
-  const { text, slots, chosen, warnings } = buildPool({ scores: makeScores(), currentPoolText: CURRENT_POOL, now: NOW })
+const SELECTION = [
+  { model: "opencode-go/beam-free", weight: 4, context: 1048576 },
+  { model: "opencode-go/crouton-alpha-free", weight: 4, context: 1048576 },
+  { model: "opencode-go/iceman-contributor-free", weight: 4, context: 262144 },
+  { model: "openrouter/cohere/north-mini-code:free", weight: 2, context: 256000 },
+  { model: "console-openrouter/cohere/north-mini-code:free", weight: 2, context: 256000 },
+  { model: "opencode/crouton-alpha-free", weight: 2, bucket: "opencode", context: 1048576 },
+]
 
-  assert.deepEqual(chosen.opencodeGo, ["opencode-go/beam-free", "opencode-go/crouton-alpha-free", "opencode-go/iceman-contributor-free"])
-  assert.deepEqual(chosen.others, ["opencode/crouton-alpha-free", "opencode/pulse-alpha-free", "openrouter/cohere/north-mini-code:free", "console-openrouter/cohere/north-mini-code:free"])
-  assert.equal(warnings.length, 1)
-  assert.match(warnings[0], /only 7 scorable model\(s\) available, wanted 10/)
+const makeScores = (overrides = {}) => ({
+  generatedAt: GENERATED,
+  providers: [],
+  selection: SELECTION,
+  warnings: ["only 6 scorable model(s) available, wanted 10"],
+  ...overrides,
+})
 
-  assert.equal(slots.length, 7)
+test("buildPool writes the scorer selection in order", () => {
+  const { text, slots, chosen, warnings } = buildPool({
+    scores: makeScores(),
+    currentPoolText: CURRENT_POOL,
+    now: NOW,
+  })
+
+  assert.deepEqual(chosen.selected, SELECTION.map((entry) => entry.model))
+  assert.deepEqual(warnings, ["only 6 scorable model(s) available, wanted 10"])
   assert.deepEqual(slots, [
-    "opencode-go/beam-free  4",
-    "opencode-go/crouton-alpha-free  4",
-    "opencode-go/iceman-contributor-free  4",
-    "opencode/crouton-alpha-free  2  b:opencode",
-    "opencode/pulse-alpha-free  2  b:opencode",
-    "openrouter/cohere/north-mini-code:free  2",
-    "console-openrouter/cohere/north-mini-code:free  2",
+    "opencode-go/beam-free  4  c:1048576",
+    "opencode-go/crouton-alpha-free  4  c:1048576",
+    "opencode-go/iceman-contributor-free  4  c:262144",
+    "openrouter/cohere/north-mini-code:free  2  c:256000",
+    "console-openrouter/cohere/north-mini-code:free  2  c:256000",
+    "opencode/crouton-alpha-free  2  c:1048576  b:opencode",
   ])
 
+  assert.ok(text.includes("# LaCode pool — one model per line"))
   assert.ok(!text.includes("cerebras/gpt-oss-120b"))
-  assert.ok(!text.includes("groq/openai/gpt-oss-120b"))
-  assert.ok(!text.includes("mistral/codestral-latest"))
-  assert.ok(!text.includes("openrouter/small-context:free"))
-  assert.ok(!text.includes("opencode/big-pickle"))
   assert.ok(!text.includes("opencode/deepseek-v4.1-flash-free"))
 
-  // header preserved (original comment survived)
-  assert.ok(text.includes("# LaCode pool — one model per line"))
-  assert.ok(text.includes("# weight is optional (default 1)."))
-
-  // one generated refresh comment
-  const refreshLines = text.split("\n").filter((l) => /^#\s*Refreshed\b/.test(l))
+  const refreshLines = text.split("\n").filter((line) => /^#\s*Refreshed\b/.test(line))
   assert.equal(refreshLines.length, 1)
   assert.match(refreshLines[0], /Refreshed 2026-11-06T12:00:00\.000Z/)
   assert.match(refreshLines[0], /scores generated 2026-11-06T03:41:14\.089Z/)
-  assert.match(refreshLines[0], /opencode-go first \(weight 4\)/)
 })
 
 test("consecutive runs do not duplicate the refresh comment", () => {
@@ -123,59 +74,106 @@ test("consecutive runs do not duplicate the refresh comment", () => {
     currentPoolText: first.text,
     now: new Date("2026-11-07T12:00:00.000Z"),
   })
-  const refreshLines = second.text.split("\n").filter((l) => /^#\s*Refreshed\b/.test(l))
+
+  assert.deepEqual(second.slots, first.slots)
+  const refreshLines = second.text.split("\n").filter((line) => /^#\s*Refreshed\b/.test(line))
   assert.equal(refreshLines.length, 1)
   assert.match(refreshLines[0], /2026-11-07T12:00:00\.000Z/)
-  assert.deepEqual(second.slots, first.slots)
 })
 
-test("builds from the other providers when opencode-go has no usable rows", () => {
-  let scores = makeScores()
-  scores.providers = scores.providers.map((p) =>
-    p.provider === "opencode-go"
-      ? { ...p, rows: p.rows.map((r) => ({ ...r, ok: false, score: null })) }
-      : p,
-  )
-  const { chosen, slots } = buildPool({ scores, currentPoolText: CURRENT_POOL, now: NOW })
-  assert.deepEqual(chosen.opencodeGo, [])
-  assert.deepEqual(chosen.others, ["opencode/crouton-alpha-free", "opencode/pulse-alpha-free", "openrouter/cohere/north-mini-code:free", "console-openrouter/cohere/north-mini-code:free"])
-  assert.deepEqual(slots, ["opencode/crouton-alpha-free  2  b:opencode", "opencode/pulse-alpha-free  2  b:opencode", "openrouter/cohere/north-mini-code:free  2", "console-openrouter/cohere/north-mini-code:free  2"])
+test("fail-closed on missing or invalid scores shape", () => {
+  for (const scores of [null, { nope: true }, "bad", { providers: [] }]) {
+    assert.throws(
+      () => buildPool({ scores, currentPoolText: CURRENT_POOL, now: NOW }),
+      /missing or invalid/,
+    )
+  }
 })
 
-test("builds without opencode when it has no usable rows", () => {
-  let scores = makeScores()
-  scores.providers = scores.providers.map((p) =>
-    p.provider === "opencode"
-      ? { ...p, rows: p.rows.map((r) => ({ ...r, ok: false })) }
-      : p,
-  )
-  const { chosen, slots } = buildPool({ scores, currentPoolText: CURRENT_POOL, now: NOW })
-  assert.deepEqual(chosen.opencodeGo, ["opencode-go/beam-free", "opencode-go/crouton-alpha-free", "opencode-go/iceman-contributor-free"])
-  assert.deepEqual(chosen.others, ["openrouter/cohere/north-mini-code:free", "console-openrouter/cohere/north-mini-code:free"])
-  assert.equal(slots.length, 5)
+test("fail-closed when the selection is empty or entirely invalid", () => {
+  for (const selection of [[], [{ model: "no-provider", weight: 0 }]]) {
+    assert.throws(
+      () => buildPool({ scores: makeScores({ selection }), currentPoolText: CURRENT_POOL, now: NOW }),
+      /no selected models/,
+    )
+  }
 })
 
-test("fail-closed when no row clears the score floor", () => {
-  let scores = makeScores()
-  scores.providers = scores.providers.map((p) => ({
-    ...p,
-    rows: p.rows.map((r) => ({ ...r, ok: true, score: 10 })),
-  }))
-  assert.throws(() => buildPool({ scores, currentPoolText: CURRENT_POOL, now: NOW }), /no scorable model/i)
-})
-
-test("fail-closed on missing/invalid scores shape", () => {
-  assert.throws(() => buildPool({ scores: null, currentPoolText: CURRENT_POOL, now: NOW }), /missing or invalid/)
-  assert.throws(() => buildPool({ scores: { nope: true }, currentPoolText: CURRENT_POOL, now: NOW }), /missing or invalid/)
-  assert.throws(() => buildPool({ scores: "bad", currentPoolText: "", now: NOW }), /missing or invalid/)
-})
-
-test("empty current pool keeps header semantics and still builds blocks", () => {
-  const { text, slots } = buildPool({ scores: makeScores(), currentPoolText: "# header only\n\n", now: NOW })
+test("empty current pool keeps header semantics", () => {
+  const { text, slots } = buildPool({
+    scores: makeScores(),
+    currentPoolText: "# header only\n\n",
+    now: NOW,
+  })
   assert.ok(text.includes("# header only"))
-  assert.equal(slots.length, 7)
-  assert.equal(slots[0], "opencode-go/beam-free  4")
-  assert.equal(slots[slots.length - 1], "console-openrouter/cohere/north-mini-code:free  2")
+  assert.equal(slots.length, 6)
+  assert.equal(slots[0], "opencode-go/beam-free  4  c:1048576")
+})
+
+test("a selection entry with context null produces no c: token", () => {
+  const { slots } = buildPool({
+    scores: makeScores({ selection: [{ model: "openrouter/no-context:free", weight: 2, context: null }] }),
+    currentPoolText: CURRENT_POOL,
+    now: NOW,
+  })
+  assert.equal(slots[0], "openrouter/no-context:free  2")
+})
+
+test("scheduleRetry runs systemd-run at the reset", () => {
+  const calls = []
+  const exec = (file, args) => calls.push([file, ...args])
+  const result = scheduleRetry(
+    { after: "2026-11-06T13:00:00.000Z", models: ["openrouter/limited:free"] },
+    {
+      now: () => Date.parse("2026-11-06T12:00:00.000Z"),
+      exec,
+      scriptPath: "/repo/scripts/refresh-pool.mjs",
+      nodePath: "/usr/bin/node",
+      home: "/home/tester",
+    },
+  )
+
+  assert.deepEqual(result, { scheduled: true, seconds: 3600, after: "2026-11-06T13:00:00.000Z" })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0][0], "systemd-run")
+  assert.ok(calls[0].some((arg) => arg.startsWith("--unit=lacode-refresh-pool-retry-")))
+  assert.ok(calls[0].includes("--on-active=3600"))
+  assert.ok(calls[0].includes("--setenv=HOME=/home/tester"))
+  assert.ok(calls[0].includes("--setenv=PATH=/home/tester/.opencode/bin:/usr/local/bin:/usr/bin:/bin"))
+  assert.ok(calls[0].includes("/usr/bin/node"))
+  assert.ok(calls[0].includes("/repo/scripts/refresh-pool.mjs"))
+})
+
+test("scheduleRetry skips a past reset, a too-far reset, or no reset", () => {
+  const exec = () => {
+    throw new Error("must not run")
+  }
+  const now = () => Date.parse("2026-11-06T12:00:00.000Z")
+  assert.deepEqual(
+    scheduleRetry({ after: "2026-11-06T11:00:00.000Z", models: [] }, { now, exec }),
+    { scheduled: false, reason: "reset is not in the future" },
+  )
+  assert.deepEqual(
+    scheduleRetry({ after: "2026-11-07T14:00:00.000Z", models: [] }, { now, exec }),
+    { scheduled: false, reason: "reset is more than a day away" },
+  )
+  assert.deepEqual(scheduleRetry(undefined, { now, exec }), {
+    scheduled: false,
+    reason: "no reset time",
+  })
+})
+
+test("scheduleRetry reports an exec failure", () => {
+  const result = scheduleRetry(
+    { after: "2026-11-06T13:00:00.000Z", models: [] },
+    {
+      now: () => Date.parse("2026-11-06T12:00:00.000Z"),
+      exec: () => {
+        throw new Error("unit already exists")
+      },
+    },
+  )
+  assert.deepEqual(result, { scheduled: false, reason: "unit already exists" })
 })
 
 test("renderTimerUnits returns user systemd service and daily timer", () => {
@@ -204,7 +202,7 @@ test("renderTimerUnits returns user systemd service and daily timer", () => {
   assert.match(units.timer, /WantedBy=timers\.target/)
 })
 
-test("--install-timer --stable copies the script and points ExecStart at it", () => {
+test("--install-timer --stable copies all three modules and points ExecStart at the stable script", () => {
   const home = mkdtempSync(join(tmpdir(), "refresh-pool-install-"))
   const stubDir = join(home, "stub-bin")
   mkdirSync(stubDir, { recursive: true })
@@ -217,11 +215,16 @@ test("--install-timer --stable copies the script and points ExecStart at it", ()
     encoding: "utf8",
   })
   assert.equal(result.status, 0, result.stderr)
+
   const stable = join(home, ".local", "lib", "lacode", "refresh-pool.mjs")
   assert.ok(existsSync(stable), "stable copy must exist")
+  assert.ok(existsSync(join(home, ".local", "lib", "lacode", "score-models.mjs")), "stable scorer must exist")
+  assert.ok(existsSync(join(home, ".local", "lib", "lacode", "pool-selection.mjs")), "stable selection module must exist")
+
   const service = readFileSync(join(home, ".config", "systemd", "user", "lacode-refresh-pool.service"), "utf8")
   assert.ok(service.includes(`ExecStart=${process.execPath} ${stable}`), service)
   const timer = readFileSync(join(home, ".config", "systemd", "user", "lacode-refresh-pool.timer"), "utf8")
   assert.match(timer, /OnCalendar=\*-\*-\* 01:00:00/)
+
   rmSync(home, { recursive: true, force: true })
 })

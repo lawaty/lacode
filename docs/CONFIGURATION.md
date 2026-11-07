@@ -7,7 +7,7 @@ The plugin options, where the model pool gets its slots, and exactly what LaCode
 The slot list is the first of these that yields usable slots:
 
 1. plugin options — `models` in the [tuple](../README.md#configure)
-2. `~/.config/lacode/pool.txt` — flat `model [weight] [b:<bucket>] [notify:on|off]` per line, preferred
+2. `~/.config/lacode/pool.txt` — flat `model [weight] [b:<bucket>] [c:<context>] [notify:on|off]` per line, preferred
 3. `~/.config/lacode/pool.json` (its parent directory is created for you)
 4. the bundled `presets/free-tier.json`
 5. a built-in fallback, so routing always works
@@ -32,6 +32,8 @@ A slot may also declare a shared quota bucket with `b:<name>` on the line (or a
 `bucket` field in JSON). A limit on any member benches the whole bucket, because
 the sibling would spend the same exhausted window; without one, the model is its
 own bucket. `pool_status` shows each shared bucket's effective capacity.
+
+`c:<context>` is the model's context window in tokens; the router uses it to prefer the smallest model that fits the task, and it is optional for hand-written lines.
 
 Each slot gets a `notify` flag that controls the desktop "rate-limit reset"
 notice raised when a slot that was cooling for a quota/rate-limit reason becomes

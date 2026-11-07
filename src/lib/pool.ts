@@ -172,7 +172,7 @@ export const isAuthFailureText = (text: string) => AUTH_FAILURE_PATTERN.test(tex
  * A pool slot. `notify` defaults to on for `opencode`/`opencode-go` models and
  * off for every other provider; an explicit value overrides.
  */
-export type Slot = { index: number; model: string; weight: number; bucket?: string; notify?: boolean }
+export type Slot = { index: number; model: string; weight: number; bucket?: string; notify?: boolean; context?: number }
 
 export type Claim = {
   v: string
@@ -294,7 +294,14 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
       problems.push(`${at} (${model}): bucket must be a non-empty name; using the model id`)
     }
     const notify = coerceNotify((entry as { notify?: unknown }).notify, at, model, problems)
-    slots.push({ index: slots.length + 1, model, weight, ...(bucket ? { bucket } : {}), notify })
+    const rawContext = (entry as { context?: unknown })?.context
+    let context: number | undefined
+    if (rawContext !== undefined) {
+      const parsedContext = typeof rawContext === "number" ? rawContext : Number(rawContext)
+      if (Number.isFinite(parsedContext) && parsedContext > 0) context = parsedContext
+      else problems.push(`${at} (${model}): context must be a positive number, got ${JSON.stringify(rawContext)}; ignoring it`)
+    }
+    slots.push({ index: slots.length + 1, model, weight, ...(bucket ? { bucket } : {}), notify, ...(context === undefined ? {} : { context }) })
   })
   if (slots.length > SLOTS_WARN_AT) {
     problems.push(`${origin}: ${slots.length} slots is unusually large, but every entry is kept (the pool has no slot cap)`)
@@ -317,7 +324,7 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
  * are identical everywhere.
  */
 export function parseTextSlots(text: string, origin: string): SlotFile {
-  const entries: Array<{ model: string; weight?: string; bucket?: string; notify?: string }> = []
+  const entries: Array<{ model: string; weight?: string; bucket?: string; notify?: string; context?: number }> = []
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.split("#")[0].trim()
     if (!line) continue
@@ -325,9 +332,17 @@ export function parseTextSlots(text: string, origin: string): SlotFile {
     let weight: string | undefined
     let bucket: string | undefined
     let notify: string | undefined
+    let context: number | undefined
     for (const token of rest) {
       if (token.startsWith("notify:")) {
         if (notify === undefined) notify = token.slice("notify:".length)
+        continue
+      }
+      if (token.startsWith("c:")) {
+        if (context === undefined) {
+          const parsedContext = Number(token.slice(2))
+          if (Number.isFinite(parsedContext) && parsedContext > 0) context = parsedContext
+        }
         continue
       }
       if (token.startsWith("b:")) {
@@ -336,7 +351,7 @@ export function parseTextSlots(text: string, origin: string): SlotFile {
         weight = token
       }
     }
-    entries.push({ model, ...(weight === undefined ? {} : { weight }), ...(bucket === undefined ? {} : { bucket }), ...(notify === undefined ? {} : { notify }) })
+    entries.push({ model, ...(weight === undefined ? {} : { weight }), ...(bucket === undefined ? {} : { bucket }), ...(notify === undefined ? {} : { notify }), ...(context === undefined ? {} : { context }) })
   }
   return parseSlots({ slots: entries }, origin)
 }
@@ -1320,27 +1335,61 @@ export const underCeiling = (slot: Slot, counts: Map<number, number>) => loadOf(
  */
 export type PoolPass = 1 | "overflow"
 
-export function pickSlot(s: State, snap: Snapshot): Slot {
+export function pickSlot(s: State, snap: Snapshot, neededContext?: number): Slot {
   const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
   const configured = slots.filter((slot) => providerReady(s, slot.model))
   const usable = configured.filter((slot) => isAvailable(s, slot.model, snap.cooling))
   const pool = usable.length > 0 ? usable : configured.length > 0 ? configured : slots
-  for (const slot of usable) {
-    if (loadOf(snap.counts, slot.index) < slot.weight) return slot
+  if (neededContext === undefined) {
+    for (const slot of usable) {
+      if (loadOf(snap.counts, slot.index) < slot.weight) return slot
+    }
+    // Every usable slot is at its weight, so the pool is at its summed capacity:
+    // spread the burst over the least-loaded usable slot rather than refusing the
+    // work. The condition is not "every slot is full" -- a cooling slot frees the
+    // others.
+    return pool.reduce((best, slot) => (loadOf(snap.counts, slot.index) < loadOf(snap.counts, best.index) ? slot : best), pool[0])
   }
-  // Every usable slot is at its weight, so the pool is at its summed capacity:
-  // spread the burst over the least-loaded usable slot rather than refusing the
-  // work. The condition is not "every slot is full" -- a cooling slot frees the
-  // others.
-  return pool.reduce((best, slot) => (loadOf(snap.counts, slot.index) < loadOf(snap.counts, best.index) ? slot : best), pool[0])
+  const adequate = usable.filter((slot) => slot.context == null || slot.context >= neededContext)
+  const adequateKnown = adequate.filter((slot) => slot.context != null)
+  const candidates = adequate.length > 0 ? adequate : usable
+  const fallbackPool = adequate.length > 0 ? adequate : pool
+  if (adequateKnown.length === 0) {
+    // No known adequate slot: prefer the largest known context among the
+    // candidates (best chance of fitting), then normal load rules. Unknown
+    // slots are not preferred over known ones, so an adequate pool of only
+    // unknown slots still lands here.
+    const known = usable.filter((slot) => slot.context != null)
+    if (known.length > 0) {
+      const largest = Math.max(...known.map((slot) => slot.context as number))
+      const largestSlots = known.filter((slot) => slot.context === largest)
+      for (const slot of largestSlots) {
+        if (loadOf(snap.counts, slot.index) < slot.weight) return slot
+      }
+      return largestSlots.reduce((best, slot) => (loadOf(snap.counts, slot.index) < loadOf(snap.counts, best.index) ? slot : best), largestSlots[0])
+    }
+    for (const slot of candidates) {
+      if (loadOf(snap.counts, slot.index) < slot.weight) return slot
+    }
+    return fallbackPool.reduce((best, slot) => (loadOf(snap.counts, slot.index) < loadOf(snap.counts, best.index) ? slot : best), fallbackPool[0])
+  }
+  const underWeight = candidates.filter((slot) => loadOf(snap.counts, slot.index) < slot.weight)
+  if (underWeight.length > 0) {
+    const known = underWeight.filter((slot) => slot.context != null)
+    if (known.length === 0) return underWeight[0]
+    return known.reduce((best, slot) => ((slot.context as number) < (best.context as number) ? slot : best), known[0])
+  }
+  return candidates.reduce((best, slot) => (loadOf(snap.counts, slot.index) < loadOf(snap.counts, best.index) ? slot : best), candidates[0])
 }
 
 /** Which fill state routing is in: 1 while any usable slot is below its weight,
  * otherwise overflow (the pool is at its summed capacity). */
-export function poolPass(s: State, snap: Snapshot): PoolPass {
+export function poolPass(s: State, snap: Snapshot, neededContext?: number): PoolPass {
   const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
   const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
-  if (usable.some((slot) => loadOf(snap.counts, slot.index) < slot.weight)) return 1
+  const candidates = neededContext === undefined ? usable : usable.filter((slot) => slot.context == null || slot.context >= neededContext)
+  const pool = candidates.length > 0 ? candidates : usable
+  if (pool.some((slot) => loadOf(snap.counts, slot.index) < slot.weight)) return 1
   return "overflow"
 }
 
