@@ -633,6 +633,57 @@ if [[ $WITH_CONFIG -eq 1 && ! -f "$CONFIG_DIR/opencode.jsonc" ]]; then
   exit 1
 fi
 
+# The local config names this machine's dev build as a file:// path. A remote
+# host cannot resolve that path, so it must never be copied verbatim. Prepare a
+# copy whose LaCode entry is the exact published package spec instead, while
+# leaving every other plugin and option untouched. This is textual on purpose:
+# opencode.jsonc carries comments and a JSON parse/serialize would delete them.
+PREPARED_CONFIG=""
+PREPARED_CONFIG_VERSION=""
+PREPARED_CONFIG_REPLACED=""
+cleanup_prepared_config() { [[ -n "$PREPARED_CONFIG" ]] && rm -f "$PREPARED_CONFIG"; }
+trap cleanup_prepared_config EXIT
+prepare_config() {
+  local src="$CONFIG_DIR/opencode.jsonc" tmp info
+  tmp="$(mktemp "${TMPDIR:-/tmp}/oc-sync-opencode.XXXXXX.jsonc")" || return 1
+  info="$(python3 - "$src" "$tmp" "$REPO_DIR" <<'PY'
+import json, os, re, sys
+
+src, dest, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(os.path.join(repo, "package.json"), encoding="utf-8") as fh:
+    version = json.load(fh)["version"]
+with open(src, encoding="utf-8") as fh:
+    raw = fh.read()
+
+spec = f"@lawaty/lacode@{version}"
+# A local dev entry is file://.../lacode/dist/index.js; an older sync may have
+# left a package spec. Both become the version this run is syncing.
+pattern = re.compile(r'"file://[^"]*/lacode/dist/index\.js"|"@lawaty/lacode(?:@[^"]+)?"')
+new, count = pattern.subn(f'"{spec}"', raw)
+with open(dest, "w", encoding="utf-8") as fh:
+    fh.write(new)
+print(f"{version} {count}")
+PY
+)" || { rm -f "$tmp"; return 1; }
+  PREPARED_CONFIG="$tmp"
+  PREPARED_CONFIG_VERSION="${info%% *}"
+  PREPARED_CONFIG_REPLACED="${info##* }"
+  return 0
+}
+
+if [[ $WITH_CONFIG -eq 1 && $DRY_RUN -eq 0 ]]; then
+  if prepare_config; then
+    if [[ "$PREPARED_CONFIG_REPLACED" -gt 0 ]]; then
+      ok "opencode.jsonc prepared: LaCode entry -> @lawaty/lacode@${PREPARED_CONFIG_VERSION} (${PREPARED_CONFIG_REPLACED} replaced)"
+    else
+      ok "opencode.jsonc prepared: no LaCode dev path found (synced unchanged)"
+    fi
+  else
+    bad "could not prepare opencode.jsonc for remote sync"
+    exit 1
+  fi
+fi
+
 # One ssh call per host: report identity, ensure ~/bin, put ~/bin on PATH,
 # and set OC_LOCAL_USER. Prints "oc-sync|..." lines the caller renders.
 remote_prepare() {
@@ -1282,7 +1333,7 @@ for HOST in "${HOSTS[@]}"; do
   if [[ $WITH_CONFIG -eq 1 ]]; then
     echo "  --- opencode config ---"
     if [[ $DRY_RUN -eq 1 ]]; then
-      ok "[dry-run] would rsync src/, presets/, plugins/ (from $REPO_DIR) and opencode.jsonc, AGENTS.md, commands/, rules/, .opencode/prompts/ (from $CONFIG_DIR) (remote backed up first)"
+      ok "[dry-run] would rsync src/, presets/, plugins/ (from $REPO_DIR) and opencode.jsonc (LaCode dev path rewritten to the published spec), AGENTS.md, commands/, rules/, .opencode/prompts/ (from $CONFIG_DIR) (remote backed up first)"
     else
       if timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" \
            "tar czf ~/opencode-config-backup-\$(date +%Y%m%d-%H%M%S).tar.gz --ignore-failed-read -C ~/.config/opencode opencode.jsonc presets src plugins .opencode AGENTS.md commands rules 2>/dev/null" >/dev/null 2>&1; then
@@ -1317,7 +1368,13 @@ for HOST in "${HOSTS[@]}"; do
       fi
 
       # --- from CONFIG_DIR: this machine's opencode config -------------------
-      push "opencode.jsonc" "$CONFIG_DIR/opencode.jsonc" "${HOST}:~/.config/opencode/" || continue
+      # NEVER the raw local file: its LaCode entry is a file:// path only this
+      # machine can resolve. PREPARED_CONFIG rewrites that entry to the exact
+      # published package spec and is prepared once before the host loop.
+      # NEVER the raw local file: its LaCode entry is a file:// path only this
+      # machine can resolve. PREPARED_CONFIG rewrites that entry to the exact
+      # published package spec and is prepared once before the host loop.
+      push "opencode.jsonc" "${PREPARED_CONFIG:-$CONFIG_DIR/opencode.jsonc}" "${HOST}:~/.config/opencode/" || continue
       # AGENTS.md is the global instruction file opencode auto-loads into every
       # session, and commands/ + rules/ back it. Without these three a host runs
       # agents that were never told the .opencode/context map exists: one host
