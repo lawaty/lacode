@@ -19,7 +19,8 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { SYNTHETIC_RETRY_MS, selectPool } from "../../scripts/pool-selection.mjs"
-import { renderTimerUnits } from "../../scripts/refresh-pool.mjs"
+import { degradedRetryDelay, renderTimerUnits, shouldKeepPool } from "../../scripts/refresh-pool.mjs"
+import { statusDegradedProviders } from "../../scripts/provider-status.mjs"
 
 const NOW = Date.parse("2026-11-10T20:00:00.000Z")
 
@@ -165,4 +166,34 @@ test("[US-39] a provider-degraded breaker keeps previous rows and is named in wa
     warnings.some((w) => w.includes("google: degraded")),
     `the degraded provider must be named in the warnings, got ${JSON.stringify(warnings)}`,
   )
+})
+
+test("[US-40] a two-slot scan never replaces a ten-slot pool", () => {
+  const healthy = makeProviders().flatMap((entry) => entry.rows.map((row) => `${row.model}  2`)).join("\n") + "\n"
+  const kept = shouldKeepPool({ currentPoolText: `# pool\n${healthy}`, newSlotCount: 2 })
+  assert.equal(kept.keep, true)
+  assert.match(kept.reason, /refusing to shrink the pool/)
+})
+
+test("[US-40] an opencode outage keeps the pool and rechecks in five minutes", () => {
+  const { providers } = statusDegradedProviders({
+    status: "degraded",
+    components: [
+      { service: "inference", status: "operational", reason: "none" },
+      { service: "go", status: "operational", reason: "none" },
+      { service: "free", status: "degraded", reason: "elevated errors" },
+    ],
+  })
+  assert.deepEqual(providers, ["opencode"])
+  assert.equal(
+    degradedRetryDelay({ after: new Date(NOW + 6 * 60 * 60 * 1000).toISOString(), models: [] }, NOW),
+    300,
+    "a reset hours out must not stop the 5-minute rechecks",
+  )
+})
+
+test("[US-40] recovery is always allowed: a fuller scan replaces a thin pool", () => {
+  const thin = "# pool\nopencode-go/a  4\nopencode/zen  2  b:opencode\n"
+  assert.equal(shouldKeepPool({ currentPoolText: thin, newSlotCount: 8 }).keep, false)
+  assert.equal(shouldKeepPool({ currentPoolText: "", newSlotCount: 2 }).keep, false)
 })

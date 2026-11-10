@@ -180,11 +180,25 @@ A daily scan was killed by a reboot mid-run, and because systemd records a trigg
 **Acceptance criteria:**
 - [ ] Given the installed timer, When it is rendered, Then it has `OnCalendar=*-*-* 00/6:00:00`, `OnStartupSec=5min`, and `Persistent=true`, and the service has `TimeoutStartSec=infinity`.
 - [ ] Given a scan reaches its wall-clock budget, When the scores are written, Then unscanned and truncated providers keep their previous rows, so a partial run cannot shrink the pool.
-- [ ] Given a model failed transiently (timeout, rate limit, credit), When selection runs, Then its last measured score is retained and a retry is scheduled at the stated reset or 45 minutes later.
+- [ ] Given a model failed transiently (timeout, rate limit, credit), When selection runs, Then its last measured score is retained and a retry is scheduled; the refresh rechecks within 5 minutes while anything failed, even when the stated reset is hours out.
 - [ ] Given a permanent failure (401, 403 agreement, 404), When selection runs, Then the model is not retried and does not fall back to a previous score.
 - [ ] Given three consecutive provider-level timeouts or network errors during a scan, When the breaker trips, Then the scan stops probing that provider, keeps its previous rows, and names the provider as degraded.
 - [ ] Given enough other providers to fill the pool, When selection runs, Then exactly one `opencode` slot is reserved last with weight 2.
 - [ ] Given two refreshes overlap, When the second starts, Then it skips while the lock is held, and a lock left by a dead PID is reclaimed.
+
+### US-40: A degraded scan never shrinks the pool, and recovery is detected within minutes
+**As a** user whose providers degrade for minutes to hours, **I want** the refresh to keep the working pool through the outage and restore it as soon as the degradation lifts, **so that** a transient outage never strands me on two slots and I never wait a full cycle for the recovery.
+
+A refresh once replaced a healthy ten-slot pool with a two-slot scan because nothing stopped a degenerate selection from being written. The writer now refuses any selection below half the previous pool (minimum four slots) and keeps the previous file, and before scanning it checks the live opencode status: when opencode's serving path reports degraded and the pool is intact, the scan is skipped entirely and a recheck is scheduled in 5 minutes. The same 5-minute cadence applies after any failed run, so the moment the status clears — or a scan comes back full — the pool is restored on the next recheck instead of the next 6-hour slot.
+
+**Story ID(s) for tests:** US-40
+**Acceptance criteria:**
+- [ ] Given a healthy pool and a scan that returns fewer slots than half of it (minimum four), When the refresh finishes, Then the previous pool file is left untouched, the refusal is logged, and a recheck is scheduled in 5 minutes.
+- [ ] Given opencode's serving path reports degraded on the live status and the current pool is intact, When the refresh runs, Then no scan is started, the pool is kept, and a recheck is scheduled in 5 minutes.
+- [ ] Given any failed run with a stated reset hours out, When the retry is scheduled, Then the recheck still happens within 5 minutes; a sooner provider reset is honoured.
+- [ ] Given the degradation lifts, When the next 5-minute recheck runs, Then a full scan restores the pool instead of waiting for the next 6-hour slot.
+- [ ] Given a thin or missing pool, When a fuller scan completes, Then it is always written — the guard only ever blocks shrinking, never recovery.
+- [ ] Given the status endpoint is unreachable, When the refresh runs, Then the scan proceeds as before, because an unknown signal must never block a refresh and the write guard still protects the pool.
 
 ---
 
@@ -606,6 +620,7 @@ table was filled in.
 | US-28 | B | `tests/stories/i-omniroute.test.mjs` |
 | US-31 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/stories/c-hang-recovery.test.mjs` |
 | US-39 | B | `tests/stories/l-pool-refresh.test.mjs` |
+| US-40 | B | `tests/stories/l-pool-refresh.test.mjs`, `tests/refresh-pool-test.mjs`, `tests/provider-status-test.mjs` |
 | US-8 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs` |
 | US-9 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs`, `tests/pool-shared-test.mjs` |
 | US-10 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs`, `tests/pool-timer-test.mjs` |
@@ -639,6 +654,6 @@ The root-level suites under `tests/` are unit-style; the `tests/stories/` suites
 the behavioural layer, written one epic per file with every test name carrying
 its story id. Run everything with `npm test`.
 
-39/39 stories covered by 372 test case(s); thinnest story has 1.
+40/40 stories covered by 375 test case(s); thinnest story has 1.
 No story is untested. The scan covers the `tests/stories/` suites and the root-level
 `tests/*-test.mjs` suites.

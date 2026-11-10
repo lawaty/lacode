@@ -9,6 +9,19 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.3.0-beta.2] — degenerate refreshes never shrink the pool
+
+### Added
+
+- Pool: the refresh checks the live opencode status (`https://status.opencode.ai/api/status`) before scanning. When opencode's serving path (`inference`, `go`, `free`, `payg`) reports degraded and the current pool is intact, the scan is skipped, the pool is kept untouched, and a recheck is scheduled in 5 minutes. The signal is cached for 5 minutes and an unreachable status endpoint never blocks a refresh.
+- Pool: the refresh writer now refuses any selection below half the previous pool (minimum four slots). A degenerate scan keeps the previous `pool.txt`, logs the refusal, and schedules a 5-minute recheck. A thin or missing pool is always allowed to recover.
+- Pool: after any failed run, the recheck happens within 5 minutes even when the stated reset is hours out; a sooner provider reset is still honoured.
+
+### Changed
+
+- Pool: the transient retry cadence while degraded is 5 minutes instead of waiting out the full stated reset, so recovery is detected on the next recheck rather than the next 6-hour slot.
+- `refresh-pool --install-timer --stable` now also copies `scripts/provider-status.mjs` to the stable lib dir.
+
 ## [2.3.0-beta.1] — provider degradation backoff
 
 ### Added

@@ -9,7 +9,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
-import { buildPool, renderTimerUnits, scheduleRetry } from "../scripts/refresh-pool.mjs"
+import { buildPool, degradedRetryDelay, poolSlotCount, renderTimerUnits, scheduleRetry, scheduleRetrySoon, shouldKeepPool } from "../scripts/refresh-pool.mjs"
 
 const NOW = new Date("2026-11-06T12:00:00.000Z")
 const GENERATED = "2026-11-06T03:41:14.089Z"
@@ -204,7 +204,7 @@ test("renderTimerUnits returns user systemd service and a 6-hourly timer", () =>
   assert.match(units.timer, /WantedBy=timers\.target/)
 })
 
-test("--install-timer --stable copies all three modules and points ExecStart at the stable script", () => {
+test("--install-timer --stable copies all four modules and points ExecStart at the stable script", () => {
   const home = mkdtempSync(join(tmpdir(), "refresh-pool-install-"))
   const stubDir = join(home, "stub-bin")
   mkdirSync(stubDir, { recursive: true })
@@ -222,6 +222,7 @@ test("--install-timer --stable copies all three modules and points ExecStart at 
   assert.ok(existsSync(stable), "stable copy must exist")
   assert.ok(existsSync(join(home, ".local", "lib", "lacode", "score-models.mjs")), "stable scorer must exist")
   assert.ok(existsSync(join(home, ".local", "lib", "lacode", "pool-selection.mjs")), "stable selection module must exist")
+  assert.ok(existsSync(join(home, ".local", "lib", "lacode", "provider-status.mjs")), "stable status module must exist")
 
   const service = readFileSync(join(home, ".config", "systemd", "user", "lacode-refresh-pool.service"), "utf8")
   assert.ok(service.includes(`ExecStart=${process.execPath} ${stable}`), service)
@@ -261,6 +262,108 @@ test("a second refresh skips while one holds the lock, and a dead PID's lock is 
   assert.equal(reclaimed.status, 0, reclaimed.stderr)
   assert.ok(readFileSync(pool, "utf8").includes("opencode-go/beam-free"), "the reclaimed run must write the pool")
   assert.equal(existsSync(lock), false, "a completed run must release the lock")
+
+  rmSync(home, { recursive: true, force: true })
+})
+
+const TEN_SLOT_POOL = `# LaCode pool
+opencode-go/a  4  c:1048576
+opencode-go/b  4  c:1048576
+opencode-go/c  4  c:262144
+google/small  2  c:131072
+groq/a  2  c:131072
+groq/b  2  c:131072
+mistral/a  2  c:262144
+console-openrouter/a  2  c:131072
+openrouter/a  2  c:131072
+opencode/zen  2  b:opencode  c:1048576
+`
+
+const TWO_SLOT_SELECTION = [
+  { model: "google/gemini-3-flash-preview", weight: 1, context: 1048576 },
+  { model: "opencode/inkling-2-small-free", weight: 2, bucket: "opencode", context: 1048576 },
+]
+
+test("poolSlotCount ignores comments and blanks", () => {
+  assert.equal(poolSlotCount(TEN_SLOT_POOL), 10)
+  assert.equal(poolSlotCount("# only comments\n\n"), 0)
+  assert.equal(poolSlotCount(""), 0)
+})
+
+test("shouldKeepPool refuses a degenerate selection against a healthy pool", () => {
+  const kept = shouldKeepPool({ currentPoolText: TEN_SLOT_POOL, newSlotCount: 2 })
+  assert.equal(kept.keep, true)
+  assert.equal(kept.prev, 10)
+  assert.equal(kept.threshold, 5)
+  assert.match(kept.reason, /refusing to shrink the pool/)
+})
+
+test("shouldKeepPool passes a healthy selection and a first-ever run", () => {
+  assert.equal(shouldKeepPool({ currentPoolText: TEN_SLOT_POOL, newSlotCount: 9 }).keep, false)
+  assert.equal(shouldKeepPool({ currentPoolText: TEN_SLOT_POOL, newSlotCount: 5 }).keep, false)
+  assert.equal(shouldKeepPool({ currentPoolText: "", newSlotCount: 2 }).keep, false)
+  assert.equal(shouldKeepPool({ currentPoolText: "# header only\n", newSlotCount: 1 }).keep, false)
+})
+
+test("shouldKeepPool allows recovery from a previously clobbered pool", () => {
+  const thin = "opencode-go/a  4  c:1048576\nopencode/b  2  b:opencode  c:1048576\n"
+  assert.equal(shouldKeepPool({ currentPoolText: thin, newSlotCount: 8 }).keep, false)
+})
+
+test("degradedRetryDelay rechecks within 5 minutes while degraded", () => {
+  const now = Date.parse("2026-11-10T12:00:00.000Z")
+  assert.equal(
+    degradedRetryDelay({ after: "2026-11-10T18:00:00.000Z", models: [] }, now),
+    300,
+    "a reset hours out must not stop the 5-minute rechecks",
+  )
+  assert.equal(
+    degradedRetryDelay({ after: "2026-11-10T12:02:00.000Z", models: [] }, now),
+    120,
+    "an earlier provider reset is honoured",
+  )
+  assert.equal(degradedRetryDelay({ after: "2026-11-10T11:00:00.000Z", models: [] }, now), 300)
+  assert.equal(degradedRetryDelay(undefined, now), 300)
+})
+
+test("scheduleRetrySoon schedules a recheck on the degraded cadence", () => {
+  const calls = []
+  const exec = (file, args) => calls.push([file, ...args])
+  const result = scheduleRetrySoon(300, {
+    now: () => 1_000_000,
+    exec,
+    scriptPath: "/repo/scripts/refresh-pool.mjs",
+    nodePath: "/usr/bin/node",
+    home: "/home/tester",
+  })
+  assert.deepEqual(result, { scheduled: true, seconds: 300 })
+  assert.ok(calls[0].includes("--on-active=300"))
+})
+
+test("a degenerate scan never replaces a healthy pool file", () => {
+  const home = mkdtempSync(join(tmpdir(), "refresh-pool-guard-"))
+  const conf = join(home, ".config", "lacode")
+  mkdirSync(conf, { recursive: true })
+  writeFileSync(
+    join(conf, "model-scores.json"),
+    JSON.stringify({ generatedAt: GENERATED, providers: [], selection: TWO_SLOT_SELECTION, warnings: [] }),
+  )
+  writeFileSync(join(conf, "pool.txt"), TEN_SLOT_POOL)
+
+  const script = fileURLToPath(new URL("../scripts/refresh-pool.mjs", import.meta.url))
+  const run = () =>
+    spawnSync(process.execPath, [script, "--from-scores", "--no-retry", "--scores", join(conf, "model-scores.json"), "--pool", join(conf, "pool.txt")], {
+      env: { ...process.env, HOME: home },
+      encoding: "utf8",
+    })
+
+  const result = run()
+  assert.equal(readFileSync(join(conf, "pool.txt"), "utf8"), TEN_SLOT_POOL, "the healthy pool must survive a degenerate scan")
+  assert.ok(
+    (result.status === 1 && /fail closed|refusing to shrink/.test(result.stderr)) ||
+      (result.status === 0 && /status degraded/.test(result.stdout)),
+    `either the write guard or the status early-out must keep the pool (status=${result.status} out=${result.stdout} err=${result.stderr})`,
+  )
 
   rmSync(home, { recursive: true, force: true })
 })

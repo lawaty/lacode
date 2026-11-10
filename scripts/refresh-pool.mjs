@@ -23,6 +23,7 @@ import { execFileSync } from "node:child_process"
 import { homedir, userInfo } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+import { fetchProviderStatus } from "./provider-status.mjs"
 
 const HOME = homedir()
 export const DEFAULT_SCORES_PATH = join(HOME, ".config", "lacode", "model-scores.json")
@@ -32,8 +33,20 @@ export const STABLE_LIB_DIR = (home = HOME) => join(home, ".local", "lib", "laco
 export const STABLE_SCRIPT = (home = HOME) => join(STABLE_LIB_DIR(home), "refresh-pool.mjs")
 export const STABLE_SCORER = (home = HOME) => join(STABLE_LIB_DIR(home), "score-models.mjs")
 export const STABLE_SELECTION = (home = HOME) => join(STABLE_LIB_DIR(home), "pool-selection.mjs")
+export const STABLE_STATUS = (home = HOME) => join(STABLE_LIB_DIR(home), "provider-status.mjs")
 export const REFRESH_SERVICE_NAME = "lacode-refresh-pool.service"
 export const REFRESH_TIMER_NAME = "lacode-refresh-pool.timer"
+
+/**
+ * A refresh must never replace a working pool with a degenerate one. When the
+ * new selection falls below the keep threshold, the previous pool.txt is left
+ * untouched, the failure is logged loudly, and a fast retry is scheduled.
+ * The threshold is half the previous pool (rounded down), with a floor of
+ * MIN_POOL_SLOTS so a thin-but-real pool is still protected.
+ */
+export const MIN_POOL_SLOTS = 4
+/** While degraded, recheck on this cadence instead of waiting out a long reset. */
+export const DEGRADED_RETRY_S = 5 * 60
 
 const REFRESH_LOCK_DIR = join(HOME, ".config", "lacode", "refresh.lock")
 const REFRESH_LOCK_STALE_MS = 60 * 60 * 1000
@@ -189,18 +202,56 @@ function runScorer(max) {
   execFileSync(process.execPath, args, { stdio: "inherit" })
 }
 
-export function scheduleRetry(retry, options = {}) {
+/**
+ * Count the usable model slots in a pool.txt text (comments and blanks ignored).
+ */
+export function poolSlotCount(text) {
+  return splitHeaderAndSlots(text).slots.filter(isSlotLine).length
+}
+
+/**
+ * Pure fail-closed guard. A refresh must never replace a working pool with a
+ * degenerate selection: when the new slot count falls below half the previous
+ * pool (floored at MIN_POOL_SLOTS), the previous pool is kept. There is no
+ * previous pool on a first-ever run, so there is nothing to protect and the
+ * guard passes.
+ */
+export function shouldKeepPool({ currentPoolText, newSlotCount }) {
+  const prev = poolSlotCount(currentPoolText ?? "")
+  if (prev <= 0) return { keep: false, prev, threshold: 0, reason: "no previous pool to protect" }
+  const threshold = Math.max(MIN_POOL_SLOTS, Math.floor(prev / 2))
+  if (newSlotCount >= threshold) return { keep: false, prev, threshold, reason: "" }
+  return {
+    keep: true,
+    prev,
+    threshold,
+    reason: `new selection has ${newSlotCount} usable slot(s), below the keep threshold of ${threshold} (previous pool had ${prev}); refusing to shrink the pool`,
+  }
+}
+
+/**
+ * How long until the next look while degraded. A provider reset in the future
+ * is honoured, but the wait never exceeds the degraded cadence: a reset hours
+ * out must not stop the 5-minute rechecks, and a reset that already passed
+ * means recheck on the cadence. No retry information at all also means the
+ * cadence.
+ */
+export function degradedRetryDelay(retry, now = Date.now()) {
   const at = Date.parse(retry?.after ?? "")
-  if (!Number.isFinite(at)) return { scheduled: false, reason: "no reset time" }
-  const now = options.now ?? Date.now
-  const nowMs = now()
-  const seconds = Math.ceil((at - nowMs) / 1000)
-  if (!Number.isFinite(seconds) || seconds <= 0) return { scheduled: false, reason: "reset is not in the future" }
-  if (seconds > 24 * 60 * 60) return { scheduled: false, reason: "reset is more than a day away" }
+  if (!Number.isFinite(at)) return DEGRADED_RETRY_S
+  const wait = Math.ceil((at - now) / 1000)
+  if (wait <= 0) return DEGRADED_RETRY_S
+  return Math.min(wait, DEGRADED_RETRY_S)
+}
+
+export function scheduleRetryIn(seconds, options = {}) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return { scheduled: false, reason: "delay is not in the future" }
+  if (seconds > 24 * 60 * 60) return { scheduled: false, reason: "delay is more than a day away" }
   const exec = options.exec ?? execFileSync
   const scriptPath = options.scriptPath ?? fileURLToPath(import.meta.url)
   const nodePath = options.nodePath ?? process.execPath
   const home = options.home ?? HOME
+  const nowMs = (options.now ?? Date.now)()
   const path = `${home}/.opencode/bin:/usr/local/bin:/usr/bin:/bin`
   const unit = `lacode-refresh-pool-retry-${Math.floor(nowMs / 1000).toString(36)}`
   try {
@@ -218,10 +269,27 @@ export function scheduleRetry(retry, options = {}) {
       ],
       { stdio: "ignore" },
     )
-    return { scheduled: true, seconds, after: retry.after }
+    return { scheduled: true, seconds }
   } catch (error) {
     return { scheduled: false, reason: String(error?.message ?? error) }
   }
+}
+
+export function scheduleRetry(retry, options = {}) {
+  const at = Date.parse(retry?.after ?? "")
+  if (!Number.isFinite(at)) return { scheduled: false, reason: "no reset time" }
+  const nowMs = (options.now ?? Date.now)()
+  const seconds = Math.ceil((at - nowMs) / 1000)
+  if (!Number.isFinite(seconds) || seconds <= 0) return { scheduled: false, reason: "reset is not in the future" }
+  if (seconds > 24 * 60 * 60) return { scheduled: false, reason: "reset is more than a day away" }
+  const scheduled = scheduleRetryIn(seconds, options)
+  if (scheduled.scheduled) return { ...scheduled, after: retry.after }
+  return scheduled
+}
+
+/** Schedule a recheck on the degraded cadence (default 5 minutes). */
+export function scheduleRetrySoon(seconds = DEGRADED_RETRY_S, options = {}) {
+  return scheduleRetryIn(seconds, options)
 }
 
 export function renderTimerUnits(input = {}) {
@@ -271,6 +339,7 @@ function installTimerUnits(stable = false) {
       copyFileSync(live, scriptPath)
       copyFileSync(resolve(dirname(live), "score-models.mjs"), STABLE_SCORER(HOME))
       copyFileSync(resolve(dirname(live), "pool-selection.mjs"), STABLE_SELECTION(HOME))
+      copyFileSync(resolve(dirname(live), "provider-status.mjs"), STABLE_STATUS(HOME))
     }
     mkdirSync(dirname(units.servicePath), { recursive: true })
     writeFileAtomic(units.servicePath, units.service)
@@ -314,7 +383,15 @@ function usage() {
   --max N           models per provider passed to the scorer (default: 50)
   --scores PATH     scores file (default: ${DEFAULT_SCORES_PATH})
   --pool PATH       pool file to read/compare/write (default: ${DEFAULT_POOL_PATH})
-  -h, --help        this message`)
+  -h, --help        this message
+
+Degradation behaviour: before scanning, the refresh checks
+https://status.opencode.ai/api/status. When opencode's serving path reports
+degraded and the current pool is intact, the scan is skipped, the pool is kept,
+and a recheck is scheduled in 5 minutes. After a scan, a selection below half
+the previous pool (minimum ${MIN_POOL_SLOTS} slots) is never written; the previous pool
+is kept and a 5-minute recheck is scheduled. A retry is always rechecked
+within 5 minutes while anything failed, even when the stated reset is hours out.`)
 }
 
 async function main() {
@@ -344,6 +421,37 @@ async function main() {
     process.once("exit", releaseRefreshLock)
   }
 
+  const currentPoolText = readTextFile(poolPath)
+
+  // Live degradation signal. When opencode's own serving path reports degraded
+  // and the current pool is intact, probing now can only shrink it: keep the
+  // pool untouched and recheck in 5 minutes. A thin pool is still scanned, so
+  // a first-ever run (or a previously clobbered one) can recover, and the
+  // write guard below protects it if the scan comes back degenerate.
+  let providerStatus = { ok: false, providers: [], services: [] }
+  if (!printOnly) {
+    try {
+      providerStatus = await fetchProviderStatus()
+    } catch (error) {
+      providerStatus = { ok: false, providers: [], services: [], reason: String(error?.message ?? error) }
+    }
+    if (providerStatus.ok && providerStatus.providers.length > 0 && poolSlotCount(currentPoolText) >= MIN_POOL_SLOTS) {
+      const detail = providerStatus.services.map((entry) => `${entry.service}=${entry.status}`).join(", ")
+      console.log(
+        `opencode status degraded (${detail}); keeping the current pool of ${poolSlotCount(currentPoolText)} slots and rechecking in ${DEGRADED_RETRY_S / 60} minutes`,
+      )
+      if (!noRetry) {
+        const scheduled = scheduleRetrySoon()
+        console.log(
+          scheduled.scheduled
+            ? `scheduled degraded recheck in ${scheduled.seconds}s`
+            : `degraded recheck not scheduled: ${scheduled.reason}`,
+        )
+      }
+      return
+    }
+  }
+
   if (!fromScores) {
     try {
       runScorer(max)
@@ -363,7 +471,6 @@ async function main() {
     return
   }
 
-  const currentPoolText = readTextFile(poolPath)
   let built
   try {
     built = buildPool({ scores, currentPoolText, now: new Date() })
@@ -373,7 +480,7 @@ async function main() {
     return
   }
 
-  const oldSlotCount = splitHeaderAndSlots(currentPoolText).slots.filter(isSlotLine).length
+  const oldSlotCount = poolSlotCount(currentPoolText)
   const newSlotCount = built.slots.filter(isSlotLine).length
   const dropped = scores.providers.flatMap((entry) => (Array.isArray(entry?.excluded) ? entry.excluded : []))
   const summary = [
@@ -382,11 +489,30 @@ async function main() {
     ...(built.warnings.length ? [`warnings [${built.warnings.join("; ")}]`] : []),
   ].join(" | ")
 
-  if (!printOnly && !noRetry) {
-    const scheduled = scheduleRetry(scores.retry)
+  // Fail closed on a degenerate selection: keep the previous pool, say so
+  // loudly, and recheck in 5 minutes instead of waiting out a long reset.
+  if (!printOnly) {
+    const kept = shouldKeepPool({ currentPoolText, newSlotCount })
+    if (kept.keep) {
+      console.error(`refresh refused (fail closed): ${kept.reason}`)
+      if (!noRetry) {
+        const scheduled = scheduleRetrySoon()
+        console.log(
+          scheduled.scheduled
+            ? `scheduled degraded recheck in ${scheduled.seconds}s`
+            : `degraded recheck not scheduled: ${scheduled.reason}`,
+        )
+      }
+      process.exitCode = 1
+      return
+    }
+  }
+
+  if (!printOnly && !noRetry && scores.retry) {
+    const scheduled = scheduleRetrySoon(degradedRetryDelay(scores.retry))
     if (scheduled.scheduled) {
-      console.log(`scheduled retry in ${scheduled.seconds}s for ${scores.retry.models.length} model(s) at ${scheduled.after}`)
-    } else if (scores.retry) {
+      console.log(`scheduled retry in ${scheduled.seconds}s for ${scores.retry.models.length} model(s) (reset ${scores.retry.after})`)
+    } else {
       console.log(`retry not scheduled: ${scheduled.reason}`)
     }
   }
