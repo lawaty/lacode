@@ -71,6 +71,22 @@ const spawnChild = async (hooks, cfg, { callID, sessionID = "parent", childID })
 }
 
 /**
+ * Sweep the pool by routing the trigger spawn. The reaper runs before routing,
+ * so a hang has already been aborted and its model cooled even when the spawn
+ * that triggered the sweep is then refused: with every slot cooling there is
+ * nothing left to route to, and the pool says so instead of degrading onto a
+ * dead slot. Tests that only care about the reap tolerate that refusal here.
+ */
+const spawnSweep = async (hooks, cfg = { agent: {} }, options = {}) => {
+  try {
+    return await spawn(hooks, cfg, { subagent: "explore", callID: "trigger", sessionID: "trigger", ...options })
+  } catch (error) {
+    if (!/no slots to route to/i.test(String(error?.message))) throw error
+    return undefined
+  }
+}
+
+/**
  * A config whose variant agents EXIST, so the config hook binds the pool's
  * models to them and a routing decision can be read back as a model and not
  * only as a slot name. The pool numbers its slots by position, so the Nth
@@ -110,7 +126,7 @@ test("[US-8] a claim past its TTL with no activity is aborted when the reaper sw
 
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
   // Any pooled spawn sweeps before it routes, so the reaper needs no timer.
-  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks)
 
   assert.deepEqual(net.aborted, ["child-wedged"], `the wedged session must be aborted, got ${JSON.stringify(net.aborted)}`)
   net.restore()
@@ -143,7 +159,7 @@ test("[US-8] a young and active claim is left alone", async () => {
   clock.advance(STUCK_IDLE * 2)
   // Still producing output: message traffic is proof of life.
   await emit(hooks, "message.part.updated", { part: { sessionID: "child-busy", type: "text" } })
-  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks)
 
   assert.deepEqual(net.aborted, [], "a working subagent must never be killed")
   net.restore()
@@ -157,7 +173,7 @@ test("[US-8] a claim too young to be hung is left alone even when silent", async
 
   await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "child-new" })
   clock.advance(STUCK_MIN_AGE - MIN) // silent, but not old enough to be a hang
-  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks)
 
   assert.deepEqual(net.aborted, [], "age alone must not condemn a young claim")
   net.restore()
@@ -174,7 +190,7 @@ test("[US-8] a swept claim raises the reaped total and is named in a greppable l
 
   await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "child-gone" })
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
-  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks)
 
   const after = await hooks.tool.pool_status.execute({}, {})
   assert.match(after.output, /reaped total: 1/, `the reaped count must increase:\n${after.output}`)
@@ -213,7 +229,7 @@ test("[US-8] a claim that keeps emitting output is still reaped once it outlives
     }
   }
 
-  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks)
 
   assert.deepEqual(
     net.aborted,
@@ -238,7 +254,7 @@ test("[US-8] a chatty claim under the ceiling keeps its slot for as long as it t
     await keepAlive(hooks, "child-prolific")
   }
   // 29 minutes old and never silent for three: a sweep must pass it by.
-  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks)
 
   assert.deepEqual(net.aborted, [], `a working subagent must not be killed for being busy, got ${JSON.stringify(net.aborted)}`)
   const reaped = await hooks.tool.pool_status.execute({}, {})
@@ -326,9 +342,10 @@ test("[US-9] a reaped claim's capacity is available to the next routing decision
   assert.match(full.output, /load=2\/2/, `control: the slot is filling:\n${full.output}`)
 
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
-  await spawn(hooks, cfg, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks, cfg)
   // Release the sweep trigger itself, so what remains on the slot is only
-  // whatever failed to be reaped.
+  // whatever failed to be reaped. When the sweep refused the trigger, there is
+  // no claim to release and this is a no-op.
   await hooks["tool.execute.after"]({ tool: "task", sessionID: "trigger", callID: "trigger" }, {})
 
   const after = await hooks.tool.pool_status.execute({}, {})
@@ -336,10 +353,23 @@ test("[US-9] a reaped claim's capacity is available to the next routing decision
   assert.match(after.output, /\[idle[;\]]/, `the slot must carry nothing:\n${after.output}`)
   assert.match(after.output, /0 claim\(s\) in flight/, `the slot must be free again:\n${after.output}`)
 
-  // And routing still works with no restart, no manual step. The model is
-  // cooled by the hang, and the pool must degrade to routing anyway.
-  const { routed } = await spawn(hooks, cfg, { callID: "next", sessionID: "next" })
-  assert.equal(routed, "explore-1", "routing must resume immediately after a sweep")
+  // The hang cooled the model on its way out, so the capacity is free but not
+  // routable yet: the pool must refuse explicitly, naming the cooled slot,
+  // instead of degrading onto it.
+  await assert.rejects(
+    spawn(hooks, cfg, { callID: "next", sessionID: "next" }),
+    (error) =>
+      /no slots to route to/i.test(error.message) &&
+      /hang\/model/.test(error.message) &&
+      /\bhang\b/i.test(error.message),
+    "a reaped model must refuse routing until its cooldown clears",
+  )
+
+  // Once the cooldown lapses, routing resumes with no restart: the capacity the
+  // reaper reclaimed is what the next spawn lands on.
+  clock.advance(pool.HANG_COOLDOWN_MS + MIN)
+  const { routed } = await spawn(hooks, cfg, { callID: "later", sessionID: "later" })
+  assert.equal(routed, "explore-1", "routing must resume once the cooldown lapses, with no restart")
   net.restore()
   await hooks.dispose()
 })
@@ -388,9 +418,19 @@ test("[US-9] routing resumes after a sweep with no restart and no manual interve
 
   await spawnChild(hooks, cfg, { callID: "a", childID: "stuck" })
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
-  await spawn(hooks, cfg, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks, cfg)
 
-  // No dispose, no re-boot: the same hooks object keeps routing.
+  // The sweep benched the model for HANG_COOLDOWN_MS. Refusing is the correct
+  // answer while it is benched -- degrading onto it is the bug this story used
+  // to bless. Once the cooldown lapses, the same hooks object routes again with
+  // no restart and no manual step: only time passing.
+  await assert.rejects(
+    spawn(hooks, cfg, { callID: "blocked", sessionID: "blocked" }),
+    /no slots to route to/i,
+    "a sweep that cooled every slot must refuse the next spawn",
+  )
+  clock.advance(pool.HANG_COOLDOWN_MS + MIN)
+
   const routed = []
   for (let i = 0; i < 3; i++) {
     routed.push((await spawn(hooks, cfg, { subagent: "implement", callID: `r${i}`, sessionID: `r${i}` })).routed)
@@ -410,7 +450,7 @@ test("[US-10] the reaper log names the reaped session and why it was reaped", as
   const { hooks, stub } = await bootPool("us10-log")
   await spawnChild(hooks, { agent: {} }, { callID: "c1", childID: "victim" })
   clock.advance(STUCK_MIN_AGE + STUCK_IDLE + MIN)
-  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks)
 
   const line = stub.text().find((l) => l.startsWith("warn hung"))
   assert.ok(line, `the hang must be logged, not silent:\n${stub.text().join("\n")}`)
@@ -438,7 +478,7 @@ test("[US-10] a claim killed at the ceiling is reported as 'overran', never as a
     clock.advance(MIN)
     await keepAlive(hooks, "victim-overran")
   }
-  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks)
 
   const killed = stub.text().filter((l) => l.includes("aborted session"))
   assert.equal(killed.length, 1, `exactly one reaped session:\n${stub.text().join("\n")}`)
@@ -661,7 +701,7 @@ test("[US-8] claim kept alive by session.status busy is not aborted", async () =
     await emit(hooks, "session.status", { sessionID: "child-busy-status", status: { type: "busy" } })
   }
   // Trigger a sweep with a fresh spawn
-  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks)
 
   assert.deepEqual(net.aborted, [], `status busy must keep it alive, got ${JSON.stringify(net.aborted)}`)
   const status = await hooks.tool.pool_status.execute({}, {})
@@ -687,7 +727,7 @@ test("[US-8] claim kept alive by todo.updated and session.updated is not aborted
       await emit(hooks, "session.updated", { info: { id: "child-busy-todo" } })
     }
   }
-  await spawn(hooks, { agent: {} }, { subagent: "explore", callID: "trigger", sessionID: "trigger" })
+  await spawnSweep(hooks)
 
   assert.deepEqual(net.aborted, [], `todo/session updates must keep it alive, got ${JSON.stringify(net.aborted)}`)
   net.restore()

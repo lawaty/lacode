@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { PACKAGE_ROOT } from "./package-root.ts"
 import { readInstalledVersion } from "./selfupdate.ts"
 
@@ -50,6 +50,12 @@ const defaultRun = (
       else resolve()
     })
   })
+
+function resolveNodeBinary(execPath = process.execPath): string {
+  if (/^node(\.exe)?$/i.test(basename(execPath))) return execPath
+  if (existsSync("/usr/bin/node")) return "/usr/bin/node"
+  return "node"
+}
 
 export function timerMigrationStatePath(home = homedir()): string {
   return join(home, ".local", "share", "opencode", "lacode", "migrations.json")
@@ -103,7 +109,7 @@ export async function runTimerMigration(options: TimerMigrationOptions = {}): Pr
   if (!existsSync(script)) return { action: "failed", version, error: `timer script not found: ${script}` }
 
   try {
-    await run(process.execPath, [script, "--install-timer", "--stable"], { stdio: "ignore" })
+    await run(resolveNodeBinary(), [script, "--install-timer", "--stable"], { stdio: "ignore" })
   } catch (error) {
     return { action: "failed", version, error: String((error as Error)?.message ?? error) }
   }

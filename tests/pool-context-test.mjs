@@ -70,4 +70,58 @@ const snap = { counts: new Map(), cooling: new Map(), siblings: [], own: new Map
   console.log("pickSlot() ->", picked.model)
 }
 
+// MIN_SLOT_CONTEXT: a sub-threshold slot is dropped and reported (text).
+{
+  const { slots, problems } = pool.parseTextSlots(
+    "opencode/tiny 1 c:8192\nopencode/ok 1 c:131072\n",
+    "test",
+  )
+  assert(slots.length === 1, `expected 1 surviving slot, got ${slots.length}`)
+  assert(slots[0].model === "opencode/ok", `survivor must be opencode/ok, got ${slots[0].model}`)
+  assert(slots[0].context === 131072, `survivor context must be 131072, got ${slots[0].context}`)
+  const mentioned = problems.some((p) => /opencode\/tiny/.test(p) && /8192/.test(p) && /dropping/i.test(p))
+  assert(mentioned, `problems must mention the dropped 8192 slot, got ${JSON.stringify(problems)}`)
+  console.log("text sub-threshold drop ok", slots.map((s) => s.model), "problems:", problems)
+}
+
+// MIN_SLOT_CONTEXT: a sub-threshold slot is dropped and reported (JSON).
+{
+  const { slots, problems } = pool.parseSlots(
+    { slots: [{ model: "a/b", context: 8192 }, { model: "c/d", context: 131072 }] },
+    "test",
+  )
+  assert(slots.length === 1, `expected 1 surviving slot, got ${slots.length}`)
+  assert(slots[0].model === "c/d", `survivor must be c/d, got ${slots[0].model}`)
+  assert(slots[0].context === 131072, `survivor context must be 131072, got ${slots[0].context}`)
+  const mentioned = problems.some((p) => /a\/b/.test(p) && /8192/.test(p) && /dropping/i.test(p))
+  assert(mentioned, `problems must mention the dropped 8192 slot, got ${JSON.stringify(problems)}`)
+  console.log("JSON sub-threshold drop ok", slots.map((s) => s.model), "problems:", problems)
+}
+
+// MIN_SLOT_CONTEXT: every slot sub-threshold resolves to the built-in fallback.
+{
+  const { slots, problems } = pool.parseSlots(
+    { slots: [{ model: "a/b", context: 8192 }, { model: "c/d", context: 99999 }] },
+    "test",
+  )
+  assert(slots === pool.FALLBACK_SLOTS, "all-sub-threshold pool must resolve to FALLBACK_SLOTS (same reference)")
+  const mentioned = problems.some((p) => /no usable slot|built-in defaults/i.test(p))
+  assert(mentioned, `problems must mention the fallback, got ${JSON.stringify(problems)}`)
+  console.log("all sub-threshold -> fallback ok", "problems:", problems)
+}
+
+// MIN_SLOT_CONTEXT: an unknown-context slot is still kept.
+{
+  const { slots, problems } = pool.parseSlots(
+    { slots: [{ model: "a/b" }, { model: "c/d", context: 131072 }] },
+    "test",
+  )
+  assert(slots.length === 2, `expected 2 slots, got ${slots.length}`)
+  const unknown = slots.find((s) => s.model === "a/b")
+  assert(unknown, "unknown-context slot a/b must be kept")
+  assert(unknown.context === undefined, `unknown-context slot must have context undefined, got ${unknown.context}`)
+  assert(!problems.some((p) => /a\/b/.test(p) && /dropping/i.test(p)), `unknown-context slot must not be dropped: ${JSON.stringify(problems)}`)
+  console.log("unknown context kept ok", slots.map((s) => [s.model, s.context]), "problems:", problems)
+}
+
 console.log("\nALL CHECKS PASSED")

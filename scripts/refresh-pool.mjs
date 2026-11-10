@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Daily-refreshable pool builder.
+// Refreshable pool builder; the installed systemd timer runs it every 6 hours.
 //
 // Reads the scorer's output (~/.config/lacode/model-scores.json) and proposes a
 // rewritten ~/.config/lacode/pool.txt. It never partially writes and never
@@ -11,13 +11,14 @@
 //      descending, weight 4
 //   2. the best (10 - n) models from every provider other than opencode,
 //      sorted by score descending, weight 2
-//   3. at most one opencode model as a last resort, weight 2, with b:opencode
+//   3. exactly one opencode model as the reserved last slot, weight 2, with
+//      b:opencode, when a rankable opencode model exists
 //
-// Total = n + min(10 - n, #others), where n = #1.
+// Total = n + (others up to 10 - n - zen) + zen, where n = #1.
 //
 // This file ships as source and must run with plain `node` (ESM, no TS).
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { execFileSync } from "node:child_process"
 import { homedir, userInfo } from "node:os"
 import { dirname, join, resolve } from "node:path"
@@ -33,6 +34,51 @@ export const STABLE_SCORER = (home = HOME) => join(STABLE_LIB_DIR(home), "score-
 export const STABLE_SELECTION = (home = HOME) => join(STABLE_LIB_DIR(home), "pool-selection.mjs")
 export const REFRESH_SERVICE_NAME = "lacode-refresh-pool.service"
 export const REFRESH_TIMER_NAME = "lacode-refresh-pool.timer"
+
+const REFRESH_LOCK_DIR = join(HOME, ".config", "lacode", "refresh.lock")
+const REFRESH_LOCK_STALE_MS = 60 * 60 * 1000
+
+/**
+ * One refresh at a time. The 6-hourly service and a transient retry timer can
+ * otherwise overlap and race on model-scores.json. A killed run leaves the lock
+ * behind, so a live PID keeps it only for an hour; a dead PID or a stale lock is
+ * reclaimed by the next run.
+ */
+function acquireRefreshLock() {
+  const take = () => {
+    mkdirSync(REFRESH_LOCK_DIR)
+    writeFileSync(join(REFRESH_LOCK_DIR, "pid"), String(process.pid))
+    return true
+  }
+  try {
+    return take()
+  } catch {}
+  try {
+    const stat = statSync(REFRESH_LOCK_DIR)
+    let pid = 0
+    try {
+      pid = Number(readFileSync(join(REFRESH_LOCK_DIR, "pid"), "utf8"))
+    } catch {}
+    let alive = false
+    if (Number.isFinite(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0)
+        alive = true
+      } catch {}
+    }
+    if (alive && Date.now() - stat.mtimeMs < REFRESH_LOCK_STALE_MS) return false
+    rmSync(REFRESH_LOCK_DIR, { recursive: true, force: true })
+    return take()
+  } catch {
+    return false
+  }
+}
+
+function releaseRefreshLock() {
+  try {
+    rmSync(REFRESH_LOCK_DIR, { recursive: true, force: true })
+  } catch {}
+}
 
 const isSlotLine = (line) => {
   const stripped = String(line).split("#")[0].trim()
@@ -191,15 +237,21 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=infinity
 ExecStart=${nodePath} ${scriptPath}
 Environment=PATH=${home}/.opencode/bin:/usr/local/bin:/usr/bin:/bin
 Nice=10
 `
   const timer = `[Unit]
-Description=Daily LaCode model pool refresh
+Description=LaCode model pool refresh every 6 hours
 
 [Timer]
-OnCalendar=*-*-* 01:00:00
+OnCalendar=*-*-* 00/6:00:00
+# A reboot kills a run mid-scan. Persistent=true does NOT retry that, because
+# systemd records the trigger when the service starts, not when it succeeds, so
+# the 6-hour slot is already spent even though the run never finished. A startup
+# trigger gives the next boot a fresh run even if the previous one was killed.
+OnStartupSec=5min
 Persistent=true
 Unit=${REFRESH_SERVICE_NAME}
 
@@ -243,6 +295,7 @@ function installTimerUnits(stable = false) {
   console.log(`installed ${units.servicePath}`)
   console.log(`installed ${units.timerPath}`)
   console.log(`enabled ${REFRESH_TIMER_NAME}`)
+  console.log(`refresh now: systemctl --user start ${REFRESH_SERVICE_NAME}`)
   return true
 }
 
@@ -251,9 +304,11 @@ function usage() {
 
   --from-scores     skip scoring, use the existing ~/.config/lacode/model-scores.json
   --no-retry        do not schedule a transient retry after a rate-limited run
-  --install-timer   install and enable a user systemd oneshot service + daily timer
-                    (add --stable to copy the script to ~/.local/lib/lacode and
-                    point ExecStart there, so plugin-cache updates do not break it)
+  --install-timer   install and enable a user systemd oneshot service + 6-hourly
+                    timer (add --stable to copy the script to ~/.local/lib/lacode
+                    and point ExecStart there, so plugin-cache updates do not break
+                    it). Refresh on demand with:
+                    systemctl --user start lacode-refresh-pool.service
   --print           print the proposed pool.txt and make no changes (alias: --dry-run)
   --dry-run         same as --print
   --max N           models per provider passed to the scorer (default: 50)
@@ -280,6 +335,14 @@ async function main() {
   const max = Math.max(1, Number(value("--max", "50")) || 50)
   const scoresPath = value("--scores", DEFAULT_SCORES_PATH)
   const poolPath = value("--pool", DEFAULT_POOL_PATH)
+
+  if (!printOnly) {
+    if (!acquireRefreshLock()) {
+      console.log("another LaCode pool refresh is already running; skipping this run")
+      return
+    }
+    process.once("exit", releaseRefreshLock)
+  }
 
   if (!fromScores) {
     try {

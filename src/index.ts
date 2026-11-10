@@ -92,6 +92,7 @@ import { contextAutoUpdateHooks } from "./plugins/context-autoupdate.ts"
 import { feedbackHooks } from "./plugins/feedback.ts"
 import type { ImagePasteOptions } from "./plugins/image-paste.ts"
 import { imagePasteHooks } from "./plugins/image-paste.ts"
+import { modesHooks } from "./plugins/modes.ts"
 import { scrubSlotNames } from "./lib/prompt-guard.ts"
 import { notifyHooks } from "./plugins/notify.ts"
 import { omniRouteHooks } from "./plugins/omniroute.ts"
@@ -110,8 +111,11 @@ export type LacodeOptions = {
   modelsFile?: string
   selfUpdate?: boolean
   feedbackHint?: boolean
+  yolo?: boolean
+  ykb?: boolean
   imagePaste?: ImagePasteOptions
   timeline?: { enabled?: boolean; intervalMs?: number; maxEntries?: number; retryMs?: number; maxBackoffMs?: number } | false
+  contextAutoUpdate?: boolean
   [key: string]: unknown
 }
 
@@ -169,7 +173,9 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   // creates any variant added by a later reload.
   const agentSet = buildAgentSet(resolveModels({ models: opts.models, modelsFile: opts.modelsFile }).slots.length)
   const pool = (await settled("agent-pool", () => agentPoolHooks(input, options))) ?? inertHooks
-  const autoupdate = (await settled("context-autoupdate", () => contextAutoUpdateHooks(input, options))) ?? inertHooks
+  const autoupdate = opts.contextAutoUpdate === false
+    ? inertHooks
+    : (await settled("context-autoupdate", () => contextAutoUpdateHooks(input, options))) ?? inertHooks
   const notifier = (await settled("notify", () => notifyHooks(input, options))) ?? inertHooks
   const selfupdate = (await settled("self-update", () => selfUpdateHooks(input, options))) ?? inertHooks
   void timerMigrationHooks(input, options)
@@ -180,6 +186,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   const compat = (await settled("provider-compat", () => providerCompatHooks(input))) ?? inertHooks
   const imagepaste = (await settled("image-paste", () => imagePasteHooks(input, opts.imagePaste as PluginOptions | undefined))) ?? inertHooks
   const timeline = (await settled("timeline", () => timelineHooks(input, options))) ?? inertHooks
+  const modes = (await settled("modes", () => modesHooks(input, options))) ?? inertHooks
 
   // Order is the whole design: the pool must see variant agents that already
   // exist, and the agent set must exist before the pool writes models into it.
@@ -206,12 +213,38 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
     }
   }
 
+  const EVENT_FAIL_LOG_INTERVAL_MS = 60_000
+  const lastEventFailLog = new Map<string, number>()
+  const fanoutEvent = async (
+    name: string,
+    run: ((payload: Parameters<NonNullable<Hooks["event"]>>[0]) => Promise<void> | void) | undefined,
+    payload: Parameters<NonNullable<Hooks["event"]>>[0],
+  ) => {
+    try {
+      await run?.(payload)
+    } catch (error) {
+      const now = Date.now()
+      const last = lastEventFailLog.get(name) ?? 0
+      if (now - last < EVENT_FAIL_LOG_INTERVAL_MS) return
+      lastEventFailLog.set(name, now)
+      const message = error instanceof Error ? error.message : String(error)
+      const stack = error instanceof Error ? error.stack : undefined
+      await log("error", `event handler failed: ${name}`, {
+        handler: name,
+        event: payload.type,
+        message,
+        ...(stack ? { stack } : {}),
+      })
+    }
+  }
+
   const event = async (payload: Parameters<NonNullable<Hooks["event"]>>[0]) => {
     await Promise.all([
-      pool.event?.(payload).catch(() => {}),
-      autoupdate.event?.(payload).catch(() => {}),
-      notifier.event?.(payload).catch(() => {}),
-      timeline.event?.(payload).catch(() => {}),
+      fanoutEvent("pool", pool.event, payload),
+      fanoutEvent("autoupdate", autoupdate.event, payload),
+      fanoutEvent("notifier", notifier.event, payload),
+      fanoutEvent("timeline", timeline.event, payload),
+      fanoutEvent("modes", modes.event, payload),
     ])
   }
 
@@ -223,6 +256,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
     "tool.execute.before": pool["tool.execute.before"],
     "tool.execute.after": pool["tool.execute.after"],
     tool: { ...(pool.tool ?? {}), ...(timeline.tool ?? {}) },
+    "permission.ask": modes["permission.ask"],
     "command.execute.before": imagepaste["command.execute.before"],
     dispose: async () => {
       await pool.dispose?.()
@@ -234,8 +268,9 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       await compat.dispose?.()
       await imagepaste.dispose?.()
       await timeline.dispose?.()
+      await modes.dispose?.()
     },
-    "experimental.chat.system.transform": async (_input, output) => {
+    "experimental.chat.system.transform": async (input, output) => {
       if (!Array.isArray(output?.system)) return
       let changed = false
       for (let i = 0; i < output.system.length; i++) {
@@ -249,6 +284,11 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       }
       if (changed) {
         await warnPromptDrift()
+      }
+      try {
+        await modes["experimental.chat.system.transform"]?.(input, output)
+      } catch (error) {
+        await log("error", `modes system prompt failed: ${String(error)}`)
       }
     },
   } satisfies Hooks

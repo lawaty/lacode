@@ -236,13 +236,21 @@ const dirB = scratch()
   assert(!hasLimit(), "a fully decayed strike record should be pruned on read")
 }
 
-// 9. routing still works when every model is cooling (must not refuse to route)
+// 9. when every model is cooling, routing refuses explicitly instead of handing
+//    out a dead slot and pretending it routed.
 {
   const j = await mk("p9", scratch())
   for (const { provider, modelID } of SLOTS)
     await j.limitEvent(provider, modelID, rateError("Rate limit exceeded"))
-  const pick = await j.spawn("j1")
-  assert(/^explore-[1-4]$/.test(pick), `must still route when all models cool, got ${pick}`)
+  let error
+  try {
+    await j.spawn("j1")
+  } catch (caught) {
+    error = caught
+  }
+  assert(error instanceof Error, "an all-cooling pool must fail the spawn, not route")
+  assert(/no slots to route to/i.test(String(error?.message)), `error must name the refusal, got ${String(error?.message)}`)
+  assert(/cooling/i.test(String(error?.message)), `error must name a cooling reason, got ${String(error?.message)}`)
 }
 
 // 10. catalog status gates retired models: a non-active/non-unknown status removes a
@@ -534,6 +542,63 @@ const dirB = scratch()
     entry2.until > Date.now() + 5 * 60 * 60 * 1000,
     `auth failure via session.error must bench for the long window (~6h), got until=${entry2.until}, now=${Date.now()}`,
   )
+}
+
+// 20. context overflow is classified separately from quota/rate limits.
+//     isContextOverflowText() matches prompt/context-too-large errors so the retry
+//     can land on a larger slot with a short, non-strike cooldown; isLimitText()
+//     must stay false for these so they are never treated as quota/rate-limit strikes.
+{
+  const overflows = [
+    "Input too long: 275934 input tokens, limit is 202752 for this model",
+    "Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.",
+    '{"type":"invalid_request_error","message":"context_length_exceeded"}',
+    "prompt is too long: 210000 tokens > 128000 maximum",
+    "This model's maximum context length is 8192 tokens.",
+  ]
+  const notOverflows = [
+    "Tokens per minute limit exceeded - too many tokens processed.",
+    "rate limit reached",
+    "usage limit exceeded",
+    "429 Too Many Requests",
+    "Insufficient credits. This account never purchased credits.",
+  ]
+  for (const text of overflows) {
+    assert(pool.isContextOverflowText(text) === true, `must detect context overflow: ${text}`)
+  }
+  for (const text of notOverflows) {
+    assert(pool.isContextOverflowText(text) === false, `must NOT detect context overflow: ${text}`)
+  }
+  assert(
+    pool.isLimitText("Your request resulted in more tokens than this model's maximum context length allows.") === false,
+    "context overflow must not be classified as a quota/rate limit",
+  )
+}
+
+// 21. request-too-large / per-request budget rejections are classified separately:
+//     they are neither context overflow nor quota/rate limits, and carry a stated
+//     token limit the router can compare to MIN_SLOT_CONTEXT.
+{
+  const groq =
+    "Request too large for model `openai/gpt-oss-120b` in organization `org_...` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Requested 9584, please reduce your message size and try again."
+  assert(pool.isRequestTooLargeText(groq) === true, "must detect the exact Groq request-too-large error")
+  assert(
+    pool.isRequestTooLargeText("Request too large for model x on tokens per minute (TPM): Limit 8000, Requested 9584") === true,
+    "must detect a short TPM request-too-large error",
+  )
+  assert(
+    pool.isRequestTooLargeText("Tokens per minute limit exceeded - too many tokens processed.") === false,
+    "TPM rate-limit exceeded must stay a rate limit, not request-too-large",
+  )
+  assert(pool.isRequestTooLargeText("rate limit reached") === false, "rate limit reached is not request-too-large")
+  assert(pool.isRequestTooLargeText("429 Too Many Requests") === false, "429 is not request-too-large")
+  assert(pool.parseStatedTokenLimit(groq) === 8000, `Groq stated limit must parse to 8000, got ${pool.parseStatedTokenLimit(groq)}`)
+  assert(
+    pool.parseStatedTokenLimit("Input too long: 275934 input tokens, limit is 202752 for this model") === 202752,
+    `context-limit form must parse to 202752, got ${pool.parseStatedTokenLimit("Input too long: 275934 input tokens, limit is 202752 for this model")}`,
+  )
+  assert(pool.parseStatedTokenLimit("something with no numbers") === undefined, "text with no limit must parse as undefined")
+  assert(pool.isLimitText(groq) === false, "Groq request-too-large must not be classified as a quota/rate limit")
 }
 
 globalThis.fetch = realFetch

@@ -156,9 +156,23 @@ option is optional:
 | `feedbackHint` | `true` | Show the one-time feedback note on the first interactive run. `false` — or `LACODE_NO_FEEDBACK_HINT=1` — turns it off. The flag lives in `~/.local/share/opencode/lacode/feedback.json`; nothing is sent anywhere. |
 | `sound` | `true` | Play a short tone with each notification, one per outcome, so you can tell a finished session from a question or a permission prompt without reading the popup. It is opt-out: `false` — or `LACODE_SOUND=0` (`false`, `off`, `no` work too, and beat the option) — turns the sound off, and anything else, a typo included, leaves it on. |
 | `omniroute` | — | Optional [OmniRoute](docs/OMNIROUTE.md) gateway integration. Absent or `{ enabled: false }` changes nothing. |
+| `yolo` | `false` | Start with YOLO mode on: permission requests that would ask are auto-approved. Explicit `deny` rules still win. Toggle live with `/yolo`. |
+| `ykb` | `false` | Start with YKB (You Know Better) mode on: the agent is told not to ask, and questions that still appear are answered with the recommended option. Toggle live with `/ykb`. |
 | `watchMs` | `1000` | How often the pool files are checked for changes. `0` disables live reload. |
 | `watchDebounceMs` | `250` | Collapse a burst of editor writes into one reload. |
 | `imagePaste` | — | Image attachments: `maxBytes` (4 MiB), `maxImages` (10) and `dir`. |
+
+## Modes
+
+Two runtime modes can be seeded from plugin options and toggled from the TUI:
+
+| Command | Effect |
+| --- | --- |
+| `/yolo` | Toggle YOLO. Every permission request that would `ask` is approved automatically; an explicit `deny` still wins. |
+| `/ykb` | Toggle YKB (You Know Better). The agent is told not to ask questions and to continue with its recommendation. A question that still appears is answered with its `(Recommended)` option, or its first option when none is marked. |
+| `/modes` | Show both switches. |
+
+The toggles write `~/.config/lacode/modes.json` (override with `LACODE_MODES_FILE`) and the server picks the change up on the next decision — no restart. Turning a mode on also answers requests that are already pending. The `yolo` / `ykb` plugin options only seed the file on first run; after that, the file wins. A free-text question with no options is left for the user, since there is no option to choose.
 
 ### Staying up to date
 

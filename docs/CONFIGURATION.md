@@ -50,6 +50,18 @@ warning. The flag gates only the desktop reset notice, not pool routing or
 status, and pool files are hot-reloaded so changes take effect without a
 restart.
 
+## Modes
+
+Two runtime modes can be seeded from plugin options and toggled from the TUI:
+
+| Command | Effect |
+| --- | --- |
+| `/yolo` | Toggle YOLO. Every permission request that would `ask` is approved automatically; an explicit `deny` still wins. |
+| `/ykb` | Toggle YKB (You Know Better). The agent is told not to ask questions and to continue with its recommendation. A question that still appears is answered with its `(Recommended)` option, or its first option when none is marked. |
+| `/modes` | Show both switches. |
+
+The toggles write `~/.config/lacode/modes.json` (override with `LACODE_MODES_FILE`) and the server picks the change up on the next decision — no restart. Turning a mode on also answers requests that are already pending. The `yolo` / `ykb` plugin options only seed the file on first run; after that, the file wins. A free-text question with no options is left for the user, since there is no option to choose.
+
 
 ## Which models run which agent
 

@@ -9,6 +9,35 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.3.0-beta.0] — reliable pool refresh, autonomy modes, and empty-response failover
+
+### Added
+
+- Modes: YOLO (`/yolo`) approves permission requests that would ask, while an explicit `deny` still wins; YKB (`/ykb`) tells the agent not to ask and answers questions with the `(Recommended)` option (or the first option when none is marked); `/modes` shows both. The `yolo`/`ykb` options only seed the live file, and toggles apply without a restart. (US-37, US-38)
+- Pool: an empty task result is now a failure. The model is benched for `empty response`, the task result explains the bench, and the next spawn routes to another slot. This fixes the “routed only to one slot, and it returns nothing” case. (US-4)
+- Pool: the refresh now runs every 6 hours and also after a startup, so a run killed by a reboot is retried. A `--budget-min` wall-clock budget (default 30) writes what was measured, core providers are scanned first, and unscanned or truncated providers keep their previous rows. (US-39)
+- Pool: one shared failure classifier (`credit`, `rate-limited`, `agreement`, `credential`, `not-served`, `timeout`, `network`, `server`) is persisted as `status`/`kind`. Transient rows with no reset get a 45-minute retry, and per-provider warnings name the dominant failure.
+- Pool: a refresh lock serializes the 6-hour run and transient retry timers; a lock left by a dead PID is reclaimed.
+- Pool: a slot can carry a tokens-per-minute budget (`tpm:`), and the router keeps a learned TPM record; a sub-threshold slot is dropped with a warning instead of being sent a task it cannot finish.
+- Config: `contextAutoUpdate: false` disables the automatic context-map refresh.
+- TUI: `/yolo`, `/ykb`, and `/modes` commands.
+
+### Changed
+
+- Pool: the last slot is now a reserved `opencode` (Zen) slot at weight 2, so a full field of other providers cannot squeeze Zen out.
+- Pool: a transient failure keeps the last measured rankable row in `model-scores.json` instead of erasing it on the next write.
+- Pool: routing never falls back to a cooling or unavailable slot. When no slot is usable, the spawn fails with a message naming every cooling slot and its reason; a reaped model refuses routing until its cooldown lapses.
+- Timer: the service has no start timeout, and the timer has a 5-minute startup catch-up trigger in addition to the 6-hour calendar.
+- Event fan-out: a failing plugin event handler is logged once per minute with its message and stack instead of being silently swallowed.
+- Timer migration: resolves a real `node` binary when the host executable is not named `node`.
+- Notifications: `dispose` clears pending claim-release and popup timers.
+
+### Fixed
+
+- Pool: empty task results were treated as successes, so the same empty model kept winning every small task.
+- Pool: a killed refresh wrote nothing; partial scans now keep the previous pool and the next run is triggered after a reboot.
+- Docs: USER-STORIES covers the refresh and empty-response behavior (US-39), and US-4/US-5 no longer claim the pool never refuses work.
+
 ## [2.2.0-beta.0] — context-aware pool routing
 
 ### Added

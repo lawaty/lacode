@@ -89,4 +89,258 @@ const assert = (cond, msg) => {
   rmSync(dir, { recursive: true, force: true })
 }
 
+// Hook-level: a context-overflow session.error must cool the model for the
+// context-overflow window, attempt to abort the session, release the claim,
+// and must NOT be recorded as a rate-limit/quota strike.
+{
+  const { readFileSync, readdirSync, existsSync } = await import("node:fs")
+  const dir = mkdtempSync(join(tmpdir(), "agent-pool-overflow-"))
+  const logs = []
+  const aborted = []
+  const client = {
+    app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) },
+    session: {
+      abort: async ({ path }) => {
+        aborted.push(path.id)
+        return { data: true, response: { ok: true }, error: undefined, request: undefined }
+      },
+    },
+  }
+  const hooks = await agentPoolHooks(
+    { client, serverUrl: undefined, directory: HERE },
+    {
+      id: "agent-pool-overflow-test",
+      dir,
+      reapMs: 60000,
+      probeMs: 0,
+      watchMs: 0,
+      expiryMs: 0,
+      models: {
+        slots: [
+          { model: "unit/overflow-a", weight: 2, context: 131072 },
+          { model: "unit/overflow-b", weight: 2, context: 131072 },
+        ],
+      },
+    },
+  )
+  const cfg = shippedConfig()
+  cfg.provider.unit = { whitelist: [] }
+  await hooks.config(cfg)
+
+  const out = { args: { subagent_type: "explore", prompt: "read something" } }
+  await hooks["tool.execute.before"]({ tool: "task", sessionID: "parent-overflow", callID: "overflow-1" }, out)
+  const variant = out.args.subagent_type
+  assert(/^explore-\d$/.test(variant), `spawn must route to a variant, got ${variant}`)
+
+  await hooks.event({ event: { type: "session.created", properties: { info: { id: "child-overflow", parentID: "parent-overflow" } } } })
+  await hooks.event({
+    event: {
+      type: "session.error",
+      properties: {
+        sessionID: "child-overflow",
+        error: { data: { message: "This model's maximum context length is 8192 tokens." } },
+      },
+    },
+  })
+
+  assert(aborted.includes("child-overflow"), `overflow must attempt abort, got ${JSON.stringify(aborted)}; logs: ${logs.join(" | ")}`)
+
+  const claimFile = join(dir, "claims.agent-pool-overflow-test.json")
+  const claims = existsSync(claimFile) ? readFileSync(claimFile, "utf8") : "{}"
+  assert(claims === "{}", `overflow claim must be released, got ${claims}`)
+
+  const limits = readdirSync(dir).filter((f) => f.startsWith("limit."))
+  assert(limits.length > 0, `overflow must create a cooldown/limit file, got ${JSON.stringify(readdirSync(dir))}`)
+  const limit = JSON.parse(readFileSync(join(dir, limits[0]), "utf8"))
+  assert(limit.reason === "context overflow", `overflow reason must be "context overflow", got ${JSON.stringify(limit.reason)}`)
+  assert(/overflow/.test(limit.model) && !/quota|rate|429|too-many|overloaded/i.test(limit.reason), "overflow must not be recorded as a rate-limit/quota reason")
+  const untilMs = limit.until - Date.now()
+  assert(untilMs > 8 * 60 * 1000 && untilMs < 12 * 60 * 1000, `overflow cooldown must be ~10m, got ${Math.round(untilMs / 1000)}s (${JSON.stringify(limit)})`)
+
+  if (hooks.tool?.pool_status?.execute) {
+    const status = (await hooks.tool.pool_status.execute({}, {})).output
+    assert(/COOLING/i.test(status) || /overflow/i.test(status) || /context/i.test(status), `pool_status should reflect cooled model, got: ${status}`)
+  }
+
+  console.log("hook session.error context overflow -> aborted, claim released, cooled ~10m (reason context overflow)")
+
+  await hooks.dispose?.()
+  rmSync(dir, { recursive: true, force: true })
+}
+
+// Shared harness for the request-too-large / input-too-long failover cases.
+async function runOverflowCase({ id, message, minMs, maxMs, logNeedle, expectLearnedTpm }) {
+  const { readFileSync, readdirSync, existsSync } = await import("node:fs")
+  const dir = mkdtempSync(join(tmpdir(), `agent-pool-${id}-`))
+  const logs = []
+  const aborted = []
+  const client = {
+    app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) },
+    session: {
+      abort: async ({ path }) => {
+        aborted.push(path.id)
+        return { data: true, response: { ok: true }, error: undefined, request: undefined }
+      },
+    },
+  }
+  const hooks = await agentPoolHooks(
+    { client, serverUrl: undefined, directory: HERE },
+    {
+      id: `agent-pool-${id}`,
+      dir,
+      reapMs: 60000,
+      probeMs: 0,
+      watchMs: 0,
+      expiryMs: 0,
+      models: {
+        slots: [
+          { model: "unit/overflow-a", weight: 2, context: 131072 },
+          { model: "unit/overflow-b", weight: 2, context: 131072 },
+        ],
+      },
+    },
+  )
+  const cfg = shippedConfig()
+  cfg.provider.unit = { whitelist: [] }
+  await hooks.config(cfg)
+
+  const out = { args: { subagent_type: "explore", prompt: "read something" } }
+  await hooks["tool.execute.before"]({ tool: "task", sessionID: `parent-${id}`, callID: `${id}-1` }, out)
+  const variant = out.args.subagent_type
+  assert(/^explore-\d$/.test(variant), `${id}: spawn must route to a variant, got ${variant}`)
+
+  await hooks.event({ event: { type: "session.created", properties: { info: { id: `child-${id}`, parentID: `parent-${id}` } } } })
+  await hooks.event({
+    event: { type: "session.error", properties: { sessionID: `child-${id}`, error: { data: { message } } } },
+  })
+
+  assert(aborted.includes(`child-${id}`), `${id}: must attempt abort, got ${JSON.stringify(aborted)}; logs: ${logs.join(" | ")}`)
+
+  const claimFile = join(dir, `claims.agent-pool-${id}.json`)
+  const claims = existsSync(claimFile) ? readFileSync(claimFile, "utf8") : "{}"
+  assert(claims === "{}", `${id}: claim must be released, got ${claims}`)
+
+  const limits = readdirSync(dir).filter((f) => f.startsWith("limit."))
+  assert(limits.length > 0, `${id}: must create a limit file, got ${JSON.stringify(readdirSync(dir))}`)
+  const limit = JSON.parse(readFileSync(join(dir, limits[0]), "utf8"))
+  assert(limit.reason === "context overflow", `${id}: reason must be "context overflow", got ${JSON.stringify(limit.reason)}`)
+  const untilMs = limit.until - Date.now()
+  assert(untilMs > minMs && untilMs <= maxMs, `${id}: cooldown out of range, got ${Math.round(untilMs / 1000)}s (${JSON.stringify(limit)})`)
+  assert(logs.some((l) => l.includes(logNeedle)), `${id}: log must mention ${JSON.stringify(logNeedle)}; logs: ${logs.join(" | ")}`)
+
+  if (expectLearnedTpm !== undefined) {
+    const learnedPath = join(dir, "learned-tpm.json")
+    assert(existsSync(learnedPath), `${id}: learned-tpm.json must be written when TPM is observed`)
+    const learned = JSON.parse(readFileSync(learnedPath, "utf8"))
+    assert(learned["unit/overflow-a"] === expectLearnedTpm || learned["unit/overflow-b"] === expectLearnedTpm, `${id}: learned-tpm.json must map the routed overflow model to ${expectLearnedTpm}, got ${JSON.stringify(learned)}`)
+  } else {
+    // A context-window limit is not a TPM: it must not be persisted as one.
+    assert(!existsSync(join(dir, "learned-tpm.json")), `${id}: a context limit must not write learned-tpm.json`)
+  }
+
+  await hooks.dispose?.()
+  rmSync(dir, { recursive: true, force: true })
+}
+
+// Groq free tier: "Request too large ... (TPM): Limit 8000". The stated limit is
+// below MIN_SLOT_CONTEXT, so the model is dropped for the long cooldown instead
+// of the normal 10-minute overflow window.
+await runOverflowCase({
+  id: "request-too-large",
+  message:
+    "Request too large for model `openai/gpt-oss-120b` in organization `org_01m5tp9dvdegvv766grf16409v` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Requested 9584, please reduce your message size and try again.",
+  minMs: 5 * 60 * 60 * 1000,
+  maxMs: 6 * 60 * 60 * 1000,
+  logNeedle: "8000",
+  expectLearnedTpm: 8000,
+})
+console.log("hook request-too-large -> aborted, claim released, dropped ~6h, learned-tpm.json written (reason context overflow)")
+
+// A real, large stated limit is still just a normal overflow cooldown.
+await runOverflowCase({
+  id: "input-too-long",
+  message: "Input too long: 275934 input tokens, limit is 202752 for this model",
+  minMs: 8 * 60 * 1000,
+  maxMs: 12 * 60 * 1000,
+  logNeedle: "cooling it",
+})
+console.log("hook input-too-long -> aborted, claim released, cooled ~10m (reason context overflow)")
+
+// session.error with response header only (no stated limit in text) must learn TPM from x-ratelimit-limit-tokens.
+{
+  const { readFileSync, readdirSync, existsSync } = await import("node:fs")
+  const dir = mkdtempSync(join(tmpdir(), "agent-pool-header-tpm-"))
+  const logs = []
+  const aborted = []
+  const client = {
+    app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) },
+    session: {
+      abort: async ({ path }) => {
+        aborted.push(path.id)
+        return { data: true, response: { ok: true }, error: undefined, request: undefined }
+      },
+    },
+  }
+  const hooks = await agentPoolHooks(
+    { client, serverUrl: undefined, directory: HERE },
+    {
+      id: "agent-pool-header-tpm",
+      dir,
+      reapMs: 60000,
+      probeMs: 0,
+      watchMs: 0,
+      expiryMs: 0,
+      models: {
+        slots: [
+          { model: "unit/overflow-a", weight: 2, context: 131072 },
+          { model: "unit/overflow-b", weight: 2, context: 131072 },
+        ],
+      },
+    },
+  )
+  const cfg = shippedConfig()
+  cfg.provider.unit = { whitelist: [] }
+  await hooks.config(cfg)
+
+  const out = { args: { subagent_type: "explore", prompt: "read something" } }
+  await hooks["tool.execute.before"]({ tool: "task", sessionID: "parent-header-tpm", callID: "header-tpm-1" }, out)
+  assert(/^explore-\d$/.test(out.args.subagent_type), `spawn must route to a variant, got ${out.args.subagent_type}`)
+
+  await hooks.event({ event: { type: "session.created", properties: { info: { id: "child-header-tpm", parentID: "parent-header-tpm" } } } })
+  await hooks.event({
+    event: {
+      type: "session.error",
+      properties: {
+        sessionID: "child-header-tpm",
+        error: {
+          data: {
+            message: "Request too large for this model",
+            responseHeaders: { "x-ratelimit-limit-tokens": "8000" },
+          },
+        },
+      },
+    },
+  })
+
+  assert(aborted.includes("child-header-tpm"), `header TPM overflow must attempt abort, got ${JSON.stringify(aborted)}; logs: ${logs.join(" | ")}`)
+  const claimFile = join(dir, "claims.agent-pool-header-tpm.json")
+  const claims = existsSync(claimFile) ? readFileSync(claimFile, "utf8") : "{}"
+  assert(claims === "{}", `header TPM overflow claim must be released, got ${claims}`)
+
+  const learnedPath = join(dir, "learned-tpm.json")
+  assert(existsSync(learnedPath), "header TPM overflow must write learned-tpm.json")
+  const learned = JSON.parse(readFileSync(learnedPath, "utf8"))
+  assert(learned["unit/overflow-a"] === 8000 || learned["unit/overflow-b"] === 8000, `learned-tpm.json must map the routed model to 8000, got ${JSON.stringify(learned)}`)
+
+  const limits = readdirSync(dir).filter((f) => f.startsWith("limit."))
+  assert(limits.length > 0, "header TPM overflow must create a limit file")
+  const limit = JSON.parse(readFileSync(join(dir, limits[0]), "utf8"))
+  assert(limit.reason === "context overflow", `header TPM overflow reason must be "context overflow", got ${JSON.stringify(limit.reason)}`)
+
+  console.log("hook session.error header x-ratelimit-limit-tokens:8000 -> aborted, claim released, learned-tpm.json written")
+
+  await hooks.dispose?.()
+  rmSync(dir, { recursive: true, force: true })
+}
+
 console.log("\nALL CHECKS PASSED")

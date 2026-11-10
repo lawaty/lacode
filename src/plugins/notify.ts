@@ -704,7 +704,11 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
     if (claimReleases.has(key)) return
     const timer = setTimeout(() => {
       claimReleases.delete(key)
-      releaseNotificationClaim(sessionID, kind)
+      try {
+        releaseNotificationClaim(sessionID, kind)
+      } catch (error) {
+        void log("warn", `claim release failed: ${String(error)}`, { sessionID, kind })
+      }
     }, COOLDOWN_MS)
     timer.unref?.()
     claimReleases.set(key, timer)
@@ -1110,6 +1114,15 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         if (sessionID) void announce(sessionID, "done")
       } catch (error) {
         void log("error", `handler failed: ${String(error)}`)
+      }
+    },
+    dispose: async () => {
+      for (const timer of claimReleases.values()) clearTimeout(timer)
+      claimReleases.clear()
+      for (const timer of pendingPermissionPopups.values()) clearTimeout(timer)
+      pendingPermissionPopups.clear()
+      for (const popup of live.values()) {
+        if (popup.timer) clearTimeout(popup.timer)
       }
     },
   }

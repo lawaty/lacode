@@ -5,6 +5,7 @@ import type { Hooks, PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
 import { auditMap, formatViolations, maintainMap } from "../lib/map-schema.ts"
 import { verifyWriterRule } from "../lib/writer-rule.ts"
+import { isInternalTitle } from "../lib/timeline.ts"
 
 // Auto-maintains .opencode/context/ in every project.
 //
@@ -238,6 +239,8 @@ const pruneTranscripts = (dir: string) => {
 
 // A factory returning hooks, not a Plugin -- see the note in ./agent-pool.ts.
 export const contextAutoUpdateHooks = (async ({ client, directory }, options?: PluginOptions): Promise<Hooks> => {
+  const opts = (options ?? {}) as { contextAutoUpdate?: boolean }
+  if (opts.contextAutoUpdate === false) return { config: async () => {}, event: async () => {}, dispose: async () => {} }
   const pending = new Set<string>()
   const owned = new Map<string, number>()
   let lastRun = 0
@@ -408,6 +411,10 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
         // Child sessions (subagents) go idle mid-task; the root session always
         // idles last.
         if (info.parentID) return
+        // belt-and-suspenders — `owned` is memory-only and lost on reload; the
+        // title check keeps an orphaned cartographer/probe/timeline session from
+        // re-triggering autoupdate.
+        if (isInternalTitle(info.title)) return
 
         // Consume only the paths this run covers: edits made while the cartographer
         // is working must survive for the next window. Requeue them if we fail to
@@ -429,6 +436,15 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
         pool.init(state, (m) => void log("warn", m))
         const snap = pool.snapshot(state)
         const slot = pool.pickSlot(state, snap)
+        if (!slot) {
+          // No routable slot: defer rather than borrowing a cooling one. The files
+          // go back on the pending set so a later idle can retry after a cooldown
+          // clears, and the cooldown window keeps this from logging on every idle.
+          lastRun = Date.now()
+          requeue()
+          await log("warn", "no routable pool slot; context update deferred")
+          return
+        }
         const agent = pool.agentFor("context", slot.index)
 
         const created = await client.session.create({
@@ -437,6 +453,8 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
         })
         const target = created.data?.id
         if (!target) {
+          // a failed attempt must still pay the cooldown; otherwise every idle retries the create
+          lastRun = Date.now()
           requeue()
           await log("warn", "could not create context session")
           return
@@ -546,6 +564,8 @@ export const contextAutoUpdateHooks = (async ({ client, directory }, options?: P
 
           })
       } catch (error) {
+        // a failed attempt must still pay the cooldown; otherwise every idle retries the create
+        lastRun = Date.now()
         await log("error", `handler failed: ${String(error)}`)
       }
     },

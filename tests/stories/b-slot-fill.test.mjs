@@ -246,6 +246,9 @@ const unitSnapshot = (counts = {}, cooling = {}) => ({
 })
 const atWeight = { "unit/a": 3, "unit/b": 2, "unit/c": 1, "unit/d": 1 }
 const atCap = { "unit/a": 6, "unit/b": 4, "unit/c": 2, "unit/d": 2 }
+const allCooling = Object.fromEntries(
+  unitSlots.map((slot) => [slot.model, { model: slot.model, until: Infinity, strikes: 1, reason: "test", last: 0 }]),
+)
 
 test("[US-5] pickSlot fills in declaration order, skips cooling, and overflows to the least-loaded slot", () => {
   // The lowest-index slot still below its weight.
@@ -275,6 +278,9 @@ test("[US-5] pickSlot fills in declaration order, skips cooling, and overflows t
   // than piling onto the first one.
   const overflow = { "unit/a": 6, "unit/b": 4, "unit/c": 3, "unit/d": 2 }
   assert.equal(pool.pickSlot(unitState, unitSnapshot(overflow)).index, 4)
+
+  // No usable slot at all is an explicit refusal, not a dead-slot pick.
+  assert.equal(pool.pickSlot(unitState, unitSnapshot({}, allCooling)), undefined, "an all-cooling pool must not hand out a slot")
 })
 
 test("[US-5] poolPass reports fill, then overflow", () => {
@@ -286,6 +292,7 @@ test("[US-5] poolPass reports fill, then overflow", () => {
   )
   assert.equal(pool.poolPass(unitState, unitSnapshot(atWeight)), "overflow")
   assert.equal(pool.poolPass(unitState, unitSnapshot(atCap)), "overflow")
+  assert.equal(pool.poolPass(unitState, unitSnapshot({}, allCooling)), "none", "an all-cooling pool reports no routable slot")
 })
 
 test("[US-5] every pick leaves all earlier usable slots at or above their weight", () => {

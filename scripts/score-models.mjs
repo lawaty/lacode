@@ -40,7 +40,16 @@ import { execFileSync, spawn } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import { MIN_CONTEXT, MIN_SCORE, retryAfterMs, selectPool } from "./pool-selection.mjs"
+import {
+  MIN_CONTEXT,
+  MIN_SCORE,
+  classifyFailure,
+  isTransientFailure,
+  isTransientKind,
+  providerRank,
+  retryAfterMs,
+  selectPool,
+} from "./pool-selection.mjs"
 
 const AUTH = join(homedir(), ".local", "share", "opencode", "auth.json")
 const OUT = join(homedir(), ".config", "lacode", "model-scores.json")
@@ -59,8 +68,20 @@ const SLOW_MS = 8_000 // at or above this, speed scores 0
 const PROMPT = "Reply with the single word: ok"
 const MAX_TOKENS = 8
 const PROBE_ATTEMPTS = 2 // one retry for a timeout or a dropped connection
-const isTransientProbe = (reason) =>
-  /timeout|timed out|ECONNRESET|ETIMEDOUT|fetch failed|socket hang up|no answer/i.test(String(reason ?? ""))
+/**
+ * Retry the same probe only when the next attempt has a chance. A known
+ * exhausted balance or a permanent 401/403/404 will not recover in 300ms; the
+ * selector schedules those with retryAfter instead. A bare gateway 402 is
+ * retried once, because that is often a transient edge, not a real balance.
+ */
+const retryableProbe = (outcome) => {
+  if (!outcome || outcome.ok) return false
+  const kind = outcome.kind ?? classifyFailure({ status: outcome.status, reason: outcome.reason })
+  if (kind === "credit") {
+    return !/insufficient credits|out of credits|payment required|billing|purchase/i.test(String(outcome.reason ?? ""))
+  }
+  return isTransientKind(kind)
+}
 
 // ── args ────────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2)
@@ -81,6 +102,9 @@ const value = (flag, fallback) => {
   --free-only        only probe catalogue cost 0/0 models on every provider
   --timeout MS      per-request deadline in ms (default: 45000)
   --delay MS        pause between requests in ms (default: 300)
+  --budget-min N    stop starting new probes after N minutes and write what was
+                    measured; providers not scanned keep their previous rows
+                    (default: 30)
   --no-write        do not write ~/.config/lacode/model-scores.json
   -h, --help        this message
 
@@ -103,6 +127,8 @@ const minContext = Math.max(0, Number(value("--min-context", String(MIN_CONTEXT)
 const minScore = Math.max(0, Number(value("--min-score", String(MIN_SCORE))) || MIN_SCORE)
 const timeoutMs = Math.max(1_000, Number(value("--timeout", "45000")) || 45_000)
 const delayMs = Math.max(0, Number(value("--delay", "300")) || 300)
+const budgetMin = Math.max(1, Number(value("--budget-min", "30")) || 30)
+const budgetMs = budgetMin * 60_000
 const writeResults = !has("--no-write")
 const freeOnlyFlag = has("--free-only")
 
@@ -159,9 +185,10 @@ function isChatModel(model) {
 
 function buildProviderEntry(provider, rows) {
   const freeOnly = freeOnlyFlag || FREE_ONLY_PROVIDERS.has(provider)
+  const isFree = (model) => (model?.cost?.input ?? 1) === 0 && (model?.cost?.output ?? 1) === 0
   const models = rows
     .filter(({ model }) => model?.api?.id)
-    .filter(({ model }) => !freeOnly || ((model.cost?.input ?? 1) === 0 && (model.cost?.output ?? 1) === 0))
+    .filter(({ model }) => !freeOnly || isFree(model))
     .filter(({ model }) => !model.status || model.status === "active")
     .filter(({ model }) => isChatModel(model))
     .map(({ id, model }) => ({
@@ -171,6 +198,10 @@ function buildProviderEntry(provider, rows) {
       context: model.limit?.context ?? null,
       output: model.limit?.output ?? null,
       name: model.name ?? id,
+      // Ordering only: a zero-cost model is probed before a paid one, so a scan
+      // budget is spent on the models the pool is most likely to keep. It never
+      // excludes a paid model.
+      free: isFree(model),
     }))
   const excluded = models
     .filter((m) => m.context != null && m.context < minContext)
@@ -183,7 +214,9 @@ function buildProviderEntry(provider, rows) {
   return {
     provider,
     error: null,
-    models: models.filter((m) => m.context == null || m.context >= minContext),
+    models: models
+      .filter((m) => m.context == null || m.context >= minContext)
+      .sort((a, b) => Number(b.free) - Number(a.free)),
     excluded,
   }
 }
@@ -375,33 +408,25 @@ async function probeDirect(candidate, provider) {
 
     if (!response.ok) {
       const detail = parsed?.error?.message ?? body.slice(0, 160)
-      const kind =
-        response.status === 429
-          ? "rate-limited"
-          : response.status === 401 || response.status === 403
-            ? "credential"
-            : response.status === 404
-              ? "not served"
-              : `http ${response.status}`
+      const kind = classifyFailure({ status: response.status, reason: detail })
       const retryAfter =
-        kind === "rate-limited" || /credit|402/i.test(detail)
-          ? retryAfterMs(body, response.headers.get("retry-after"))
-          : undefined
-      return { ok: false, ms, reason: `${kind}: ${detail}`, retryAfter }
+        kind === "rate-limited" || kind === "credit" ? retryAfterMs(body, response.headers.get("retry-after")) : undefined
+      return { ok: false, ms, reason: `${kind}: ${detail}`, status: response.status, kind, retryAfter }
     }
     // A 200 can still carry an error object (OpenRouter does this).
     if (parsed?.error) {
       const reason = `${parsed.error.message ?? "error"} `.trim()
-      return { ok: false, ms, reason, retryAfter: retryAfterMs(reason) }
+      const kind = classifyFailure({ status: response.status, reason })
+      return { ok: false, ms, reason, status: response.status, kind, retryAfter: retryAfterMs(reason) }
     }
     if (!Array.isArray(parsed?.choices) || parsed.choices.length === 0) {
-      return { ok: false, ms, reason: "no choices in response" }
+      return { ok: false, ms, reason: "no choices in response", status: response.status, kind: "unknown" }
     }
-    return { ok: true, ms, reason: "answered" }
+    return { ok: true, ms, reason: "answered", status: response.status, kind: null }
   } catch (error) {
     const ms = Math.round(performance.now() - started)
     const name = error?.name === "TimeoutError" ? "timeout" : String(error?.message ?? error)
-    return { ok: false, ms, reason: name }
+    return { ok: false, ms, reason: name, kind: classifyFailure({ reason: name }) }
   }
 }
 
@@ -427,12 +452,20 @@ async function probeViaSession(candidate, provider) {
     if (!createRes.ok) {
       const detail = createdJson?.error?.message ?? createdJson?.message ?? createText.slice(0, 160)
       const ms = Math.round(performance.now() - started)
-      return { ok: false, ms, reason: `session create http ${createRes.status}: ${detail}`, retryAfter: retryAfterMs(detail) }
+      const kind = classifyFailure({ status: createRes.status, reason: detail })
+      return {
+        ok: false,
+        ms,
+        reason: `session create http ${createRes.status}: ${detail}`,
+        status: createRes.status,
+        kind,
+        retryAfter: retryAfterMs(detail),
+      }
     }
     id = createdJson?.id ?? createdJson?.data?.id ?? null
     if (!id) {
       const ms = Math.round(performance.now() - started)
-      return { ok: false, ms, reason: `no session id: ${createText.slice(0, 160)}` }
+      return { ok: false, ms, reason: `no session id: ${createText.slice(0, 160)}`, status: createRes.status, kind: "unknown" }
     }
     promptStarted = performance.now()
     const msgRes = await fetch(`${server.url}/session/${id}/message?directory=${directory}`, {
@@ -453,24 +486,33 @@ async function probeViaSession(candidate, provider) {
     const ms = Math.round(performance.now() - (promptStarted ?? started))
     if (!msgRes.ok) {
       const detail = parsed?.error?.message ?? parsed?.message ?? msgText.slice(0, 160)
-      return { ok: false, ms, reason: `http ${msgRes.status}: ${detail}`, retryAfter: retryAfterMs(detail) }
+      const kind = classifyFailure({ status: msgRes.status, reason: detail })
+      return {
+        ok: false,
+        ms,
+        reason: `http ${msgRes.status}: ${detail}`,
+        status: msgRes.status,
+        kind,
+        retryAfter: retryAfterMs(detail),
+      }
     }
     const failure = parsed?.error ?? parsed?.info?.error
     if (failure) {
       const reason = failureText(failure).slice(0, 240)
-      return { ok: false, ms, reason, retryAfter: retryAfterMs(reason) }
+      const kind = classifyFailure({ status: msgRes.status, reason })
+      return { ok: false, ms, reason, status: msgRes.status, kind, retryAfter: retryAfterMs(reason) }
     }
     if (!parsed?.info) {
-      return { ok: false, ms, reason: "no response" }
+      return { ok: false, ms, reason: "no response", status: msgRes.status, kind: "unknown" }
     }
-    return { ok: true, ms, reason: "answered" }
+    return { ok: true, ms, reason: "answered", status: msgRes.status, kind: null }
   } catch (error) {
     const ms = Math.round(performance.now() - (promptStarted ?? started))
     if (error?.name === "TimeoutError") {
-      return { ok: false, ms, reason: `timeout after ${timeoutMs}ms` }
+      return { ok: false, ms, reason: `timeout after ${timeoutMs}ms`, kind: "timeout" }
     }
     const reason = failureText(error).slice(0, 240)
-    return { ok: false, ms, reason, retryAfter: retryAfterMs(reason) }
+    return { ok: false, ms, reason, kind: classifyFailure({ reason }), retryAfter: retryAfterMs(reason) }
   } finally {
     if (id && server) {
       try {
@@ -491,8 +533,13 @@ async function probe(candidate, provider) {
   const outcome = await probeDirect(candidate, provider)
   if (outcome.ok) return outcome
   // A provider whose direct URL is misconfigured can still be reachable
-  // through opencode's own provider resolution.
-  if (/credential|no credential|not served|invalid request path|could not route/i.test(String(outcome.reason ?? ""))) {
+  // through opencode's own provider resolution. A real 401/404 is worth the
+  // second path; a permanent agreement/credit refusal is not retried here.
+  if (
+    outcome.kind === "credential" ||
+    outcome.kind === "not-served" ||
+    /invalid request path|could not route/i.test(String(outcome.reason ?? ""))
+  ) {
     return probeViaSession(candidate, provider)
   }
   return outcome
@@ -520,9 +567,23 @@ const padL = (s, n) => String(s).padStart(n)
 
 async function main() {
   const scanned = providers ? providers.map((provider) => freeModels(provider)) : freeModelsAll()
+  // Core providers first, then the free-only middle tier, then the slow paid
+  // catalogues. Ordering only; every provider is still probed if time allows.
+  scanned.sort(
+    (a, b) => providerRank(a.provider) - providerRank(b.provider) || String(a.provider).localeCompare(String(b.provider)),
+  )
   const results = []
+  const deadline = Date.now() + budgetMs
+  const skippedProviders = []
+  let budgetHit = false
 
   for (const entry of scanned) {
+    if (Date.now() >= deadline) {
+      budgetHit = true
+      skippedProviders.push(entry.provider)
+      console.log(`\n${entry.provider}: skipped (scan budget of ${budgetMin}m reached)`)
+      continue
+    }
     if (entry.error) {
       console.log(`\n${entry.provider}: ${entry.error}`)
       results.push({ provider: entry.provider, error: entry.error, rows: [], excluded: [] })
@@ -541,8 +602,14 @@ async function main() {
     }
     const rows = []
     for (const candidate of candidates) {
+      if (Date.now() >= deadline) {
+        budgetHit = true
+        entry.truncated = true
+        console.log(`  scan budget reached; stopped ${entry.provider} after ${rows.length}/${candidates.length}`)
+        break
+      }
       let outcome = await probe(candidate, entry.provider)
-      for (let attempt = 1; attempt < PROBE_ATTEMPTS && !outcome.ok && isTransientProbe(outcome.reason); attempt++) {
+      for (let attempt = 1; attempt < PROBE_ATTEMPTS && !outcome.ok && retryableProbe(outcome); attempt++) {
         console.log(`  retrying ${candidate.model.replace(`${entry.provider}/`, "")} after ${String(outcome.reason).slice(0, 60)}`)
         await sleep(delayMs)
         outcome = await probe(candidate, entry.provider)
@@ -563,7 +630,12 @@ async function main() {
       console.log(`  ${pad(candidate.model.replace(`${entry.provider}/`, ""), 52)} ${padL(verdict, 16)}`)
       await sleep(delayMs)
     }
-    results.push({ provider: entry.provider, error: null, rows, excluded: entry.excluded })
+    results.push({ provider: entry.provider, error: null, rows, excluded: entry.excluded, truncated: !!entry.truncated })
+  }
+  if (budgetHit) {
+    console.log(
+      `\nscan budget of ${budgetMin}m reached; ${skippedProviders.length} provider(s) skipped and any truncated provider keeps its previous rows.`,
+    )
   }
   stopSessionServer()
 
@@ -612,6 +684,7 @@ async function main() {
     providers: results.map((entry) => ({
       provider: entry.provider,
       error: entry.error,
+      truncated: entry.truncated,
       rows: entry.rows.map((row) => ({ ...row, score: row.score?.value ?? null })),
       excluded: entry.excluded,
     })),
@@ -619,6 +692,9 @@ async function main() {
     minContext,
     minScore,
   })
+  if (budgetHit) {
+    warnings.push(`scan budget of ${budgetMin}m reached; providers not fully scanned keep their previous scores`)
+  }
 
   if (selection.length) {
     console.log(`\nsuggested pool.txt (paste if it matches your judgement — nothing was changed)`)
@@ -633,6 +709,17 @@ async function main() {
   if (writeResults) {
     try {
       mkdirSync(dirname(OUT), { recursive: true })
+      // A provider the budget skipped has no current rows. Carry its previous
+      // entry forward verbatim so the next run still sees it and selectPool can
+      // keep its rankable models.
+      const scannedNames = new Set(results.map((e) => e.provider))
+      const carried = (previousScores?.providers ?? []).filter((p) => !scannedNames.has(String(p?.provider ?? "")))
+      const previousByModel = new Map()
+      for (const provider of previousScores?.providers ?? []) {
+        for (const row of provider?.rows ?? []) {
+          if (row?.model) previousByModel.set(row.model, row)
+        }
+      }
       const payload = {
         generatedAt: new Date().toISOString(),
         weights: W,
@@ -641,21 +728,38 @@ async function main() {
         selection,
         warnings,
         retry,
-        providers: results.map((e) => ({
-          provider: e.provider,
-          error: e.error,
-          excluded: e.excluded ?? [],
-          rows: e.rows.map((r) => ({
-            model: r.model,
-            context: r.context,
-            output: r.output,
-            ok: r.ok,
-            ms: r.ms,
-            reason: r.reason,
-            score: r.score?.value ?? null,
-            retryAfter: r.retryAfter ?? null,
+        providers: [
+          ...results.map((e) => ({
+            provider: e.provider,
+            error: e.error,
+            truncated: !!e.truncated,
+            excluded: e.excluded ?? [],
+            rows: e.rows.flatMap((r) => {
+              const current = {
+                model: r.model,
+                context: r.context,
+                output: r.output,
+                ok: r.ok,
+                ms: r.ms,
+                reason: r.reason,
+                status: r.status ?? null,
+                kind: r.kind ?? null,
+                score: r.score?.value ?? null,
+                retryAfter: r.retryAfter ?? null,
+              }
+              // A transient failure must not erase the last measured ranking:
+              // the next run needs it to keep a previously-good model while a
+              // gateway is down. Keep both rows; the selector prefers the
+              // rankable one and still schedules the failed one for retry.
+              if (r.ok === false && isTransientFailure(r)) {
+                const prior = previousByModel.get(r.model)
+                if (prior?.ok === true && typeof prior.score === "number") return [current, prior]
+              }
+              return [current]
+            }),
           })),
-        })),
+          ...carried,
+        ],
       }
       writeFileSync(OUT, JSON.stringify(payload, null, 2) + "\n")
       console.log(`\nwrote ${OUT}`)

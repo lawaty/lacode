@@ -176,7 +176,7 @@ test("scheduleRetry reports an exec failure", () => {
   assert.deepEqual(result, { scheduled: false, reason: "unit already exists" })
 })
 
-test("renderTimerUnits returns user systemd service and daily timer", () => {
+test("renderTimerUnits returns user systemd service and a 6-hourly timer", () => {
   const units = renderTimerUnits({
     nodePath: "/usr/bin/node",
     scriptPath: "/repo/scripts/refresh-pool.mjs",
@@ -190,12 +190,14 @@ test("renderTimerUnits returns user systemd service and daily timer", () => {
   assert.match(units.service, /After=network-online\.target/)
   assert.match(units.service, /Wants=network-online\.target/)
   assert.match(units.service, /Type=oneshot/)
+  assert.match(units.service, /TimeoutStartSec=infinity/)
   assert.match(units.service, /ExecStart=\/usr\/bin\/node \/repo\/scripts\/refresh-pool\.mjs/)
   assert.match(units.service, /Environment=PATH=\/home\/tester\/\.opencode\/bin:\/usr\/local\/bin:\/usr\/bin:\/bin/)
   assert.match(units.service, /Nice=10/)
 
-  assert.match(units.timer, /Description=Daily LaCode model pool refresh/)
-  assert.match(units.timer, /OnCalendar=\*-\*-\* 01:00:00/)
+  assert.match(units.timer, /Description=LaCode model pool refresh every 6 hours/)
+  assert.match(units.timer, /OnCalendar=\*-\*-\* 00\/6:00:00/)
+  assert.match(units.timer, /OnStartupSec=5min/)
   assert.ok(!units.timer.includes("RandomizedDelaySec"))
   assert.match(units.timer, /Persistent=true/)
   assert.match(units.timer, /Unit=lacode-refresh-pool\.service/)
@@ -224,7 +226,41 @@ test("--install-timer --stable copies all three modules and points ExecStart at 
   const service = readFileSync(join(home, ".config", "systemd", "user", "lacode-refresh-pool.service"), "utf8")
   assert.ok(service.includes(`ExecStart=${process.execPath} ${stable}`), service)
   const timer = readFileSync(join(home, ".config", "systemd", "user", "lacode-refresh-pool.timer"), "utf8")
-  assert.match(timer, /OnCalendar=\*-\*-\* 01:00:00/)
+  assert.match(timer, /OnCalendar=\*-\*-\* 00\/6:00:00/)
+
+  rmSync(home, { recursive: true, force: true })
+})
+
+test("a second refresh skips while one holds the lock, and a dead PID's lock is reclaimed", () => {
+  const home = mkdtempSync(join(tmpdir(), "refresh-pool-lock-"))
+  const conf = join(home, ".config", "lacode")
+  mkdirSync(conf, { recursive: true })
+  const scores = join(conf, "model-scores.json")
+  const pool = join(conf, "pool.txt")
+  const lock = join(conf, "refresh.lock")
+  writeFileSync(scores, JSON.stringify(makeScores()))
+  writeFileSync(pool, CURRENT_POOL)
+  mkdirSync(lock)
+  writeFileSync(join(lock, "pid"), String(process.pid)) // alive: the test runner
+
+  const script = fileURLToPath(new URL("../scripts/refresh-pool.mjs", import.meta.url))
+  const run = () =>
+    spawnSync(process.execPath, [script, "--from-scores", "--scores", scores, "--pool", pool], {
+      env: { ...process.env, HOME: home },
+      encoding: "utf8",
+    })
+
+  const blocked = run()
+  assert.equal(blocked.status, 0, blocked.stderr)
+  assert.match(blocked.stdout, /already running; skipping/)
+  assert.equal(readFileSync(pool, "utf8"), CURRENT_POOL, "a skipped run must not touch the pool")
+
+  // A lock left by a killed run must not block forever: the PID is dead.
+  writeFileSync(join(lock, "pid"), "2147483647")
+  const reclaimed = run()
+  assert.equal(reclaimed.status, 0, reclaimed.stderr)
+  assert.ok(readFileSync(pool, "utf8").includes("opencode-go/beam-free"), "the reclaimed run must write the pool")
+  assert.equal(existsSync(lock), false, "a completed run must release the lock")
 
   rmSync(home, { recursive: true, force: true })
 })

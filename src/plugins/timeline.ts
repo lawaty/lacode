@@ -386,6 +386,10 @@ export function timelineHooks(input: PluginInput, options?: PluginOptions): Hook
       pool.init(poolState, (m) => log("warn", m))
       const snap = pool.snapshot(poolState)
       slot = pool.pickSlot(poolState, snap)
+      if (!slot) {
+        log("warn", "timeline: no routable pool slot")
+        return { ok: false, bullets: [], error: "no routable pool slot" }
+      }
     } catch (error) {
       log("warn", String(error))
       return { ok: false, bullets: [], error: String(error) }

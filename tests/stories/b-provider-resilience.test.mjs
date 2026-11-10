@@ -147,7 +147,32 @@ test("[US-4] with model A cooling, the next spawn goes elsewhere and is never re
   await hooks.dispose()
 })
 
-test("[US-4] when every model is cooling the pool still routes instead of refusing", async () => {
+test("[US-4] an empty task result benches the model and the next spawn goes elsewhere", async () => {
+  const { hooks, cfg, dir, models } = await bootPool(
+    [
+      { model: "empty/a", weight: 1 },
+      { model: "empty/b", weight: 1 },
+    ],
+    "us4-empty",
+  )
+
+  const first = await spawn(hooks, cfg, { subagent: "explore", callID: "c1", sessionID: "s1" })
+  assert.equal(first.routed, "explore-1", `control: the first spawn must take slot 1, got ${first.routed}`)
+  await emit(hooks, "session.created", { info: { id: "child-1", parentID: "s1" } })
+
+  const out = { output: "" }
+  await hooks["tool.execute.after"]({ tool: "task", sessionID: "s1", callID: "c1", args: {} }, out)
+  assert.match(out.output, /empty response.*empty\/a.*benched/i, `the result must explain the bench, got ${out.output}`)
+  assert.ok(existsSync(limitFile(dir, "empty/a")), "the empty model must be benched")
+
+  const second = await spawn(hooks, cfg, { subagent: "explore", callID: "c2", sessionID: "s2" })
+  assert.equal(second.routed, "explore-2", `the next spawn must leave the empty model, got ${second.routed}`)
+  assert.equal(second.model, "empty/b", `the next spawn must use the other model, got ${second.model}`)
+  assert.equal(models.length, 2)
+  await hooks.dispose()
+})
+
+test("[US-4] when every model is cooling the spawn fails with the reason instead of routing", async () => {
   const { hooks, cfg, models } = await bootPool(
     [
       { model: "prov/a", weight: 1 },
@@ -163,21 +188,21 @@ test("[US-4] when every model is cooling the pool still routes instead of refusi
     })
   }
 
-  // The whole point: a refused spawn would fail the task. A degraded one does not.
-  // WHICH slot the degraded pick takes is the next test's business.
-  const routed = await burst(hooks, cfg, 2)
-  for (const variant of routed) {
-    assert.match(variant, /^explore-[1-9]$/, `the pool must degrade, not refuse: got ${variant}`)
-  }
+  // There is no healthy slot to degrade to: routing into a cooling model only
+  // produces a cancellation with no reason. The spawn must be refused, and the
+  // refusal must say why.
+  await assert.rejects(
+    () => spawn(hooks, cfg, { callID: "c0", sessionID: "s0" }),
+    (error) => {
+      assert.match(String(error?.message), /no slots to route to/i)
+      assert.match(String(error?.message), /cooling|rate-limit|quota/i)
+      return true
+    },
+  )
   await hooks.dispose()
 })
 
-test("[US-4] when every model is cooling the spawn lands on the least-loaded slot, not on the busier one", async () => {
-  // The degraded pick is a LEAST-LOADED pick, not an arbitrary one. Two slots
-  // carrying different load make the difference visible: the emptier one has to
-  // take the spawn. "Some slot" and "the first slot in declaration order" both
-  // satisfy a check that only asks whether the spawn went anywhere -- so the load
-  // has to be made unequal first, or the choice is invisible.
+test("[US-4] when every model is cooling the refusal names the slots, never a least-loaded fallback", async () => {
   const slots = [
     { model: "prov/busy", weight: 3 },
     { model: "prov/light", weight: 1 },
@@ -196,7 +221,9 @@ test("[US-4] when every model is cooling the spawn lands on the least-loaded slo
   assert.equal(await loadOf("prov/busy"), 3, "the heavy slot must hold three claims")
   assert.equal(await loadOf("prov/light"), 1, "the light slot must hold one claim")
 
-  // Now every model is cooling, so the ordered fill can pick nothing at all.
+  // Now every model is cooling, so there is no degraded pick: the spawn is
+  // refused and the message names the cooling slots instead of routing to the
+  // least-loaded one.
   for (const model of models) {
     const [provider, id] = [model.slice(0, model.indexOf("/")), model.slice(model.indexOf("/") + 1)]
     await emit(hooks, "message.updated", {
@@ -204,9 +231,16 @@ test("[US-4] when every model is cooling the spawn lands on the least-loaded slo
     })
   }
 
-  const degraded = await spawn(hooks, cfg, { callID: "degraded", sessionID: "degraded" })
-  assert.equal(degraded.routed, "explore-2", `the degraded pick must be the least-loaded slot, got ${degraded.routed}`)
-  assert.equal(degraded.model, "prov/light", `the least-loaded slot's model must be the one used, got ${degraded.model}`)
+  await assert.rejects(
+    () => spawn(hooks, cfg, { callID: "degraded", sessionID: "degraded" }),
+    (error) => {
+      const message = String(error?.message)
+      assert.match(message, /no slots to route to/i)
+      assert.match(message, /prov\/busy/)
+      assert.match(message, /prov\/light/)
+      return true
+    },
+  )
   await hooks.dispose()
 })
 
@@ -995,15 +1029,16 @@ test("[US-31] an error that says the limit was reached cools the model and abort
   await hooks.dispose()
 })
 
-test("[US-31] a context limit is not a quota, so nothing is cooled and nothing is aborted", async () => {
+test("[US-31] a context limit is not a quota, but it fails over: the model is kept out of routing and the session is aborted", async () => {
+  const clock = fakeClock()
   const net = stubFetch()
   const { dir, hooks, cfg } = await bootPool([{ model: "prov/one", weight: 2 }], "us31-context")
 
   await spawnChild(hooks, cfg, { callID: "c1", sessionID: "parent", childID: "child-context" })
 
-  // The prompt was too long. That is the user's own request, not the
-  // provider's allowance, so the model stays usable for routing and the task
-  // keeps running.
+  // The prompt was too long, so the model is not treated as a quota violation
+  // but is kept out of routing and the in-flight task is aborted so the caller
+  // re-routes to a larger slot.
   await emit(hooks, "message.updated", {
     info: {
       role: "assistant",
@@ -1014,13 +1049,14 @@ test("[US-31] a context limit is not a quota, so nothing is cooled and nothing i
     },
   })
 
-  assert.deepEqual(
-    readdirSync(dir).filter((f) => f.startsWith("limit.")),
-    [],
-    `a context limit must cool nothing, got ${readdirSync(dir).join(", ")}`,
-  )
-  assert.deepEqual(await coolingModels(hooks), [], `the model must not be cooling, got ${JSON.stringify(await coolingModels(hooks))}`)
-  assert.deepEqual(net.aborted, [], `a context limit must not abort the session, got ${JSON.stringify(net.aborted)}`)
+  const file = limitFile(dir, "prov/one")
+  assert.ok(existsSync(file), `a cooldown file must be written, got: ${readdirSync(dir).join(", ")}`)
+  const strike = JSON.parse(readFileSync(file, "utf8"))
+  assert.equal(strike.model, "prov/one", `the model must be the one cooled, got ${strike.model}`)
+  assert.ok(strike.until > clock.now(), `the cooldown must be in the future, got ${strike.until} vs ${clock.now()}`)
+  assert.equal(strike.reason, "context overflow", `a context limit must not be recorded as rate-limit/quota, got ${strike.reason}`)
+  assert.deepEqual(await coolingModels(hooks), ["prov/one"], `the model must be cooling, got ${JSON.stringify(await coolingModels(hooks))}`)
+  assert.deepEqual(net.aborted, ["child-context"], `the in-flight session must be aborted, got ${JSON.stringify(net.aborted)}`)
 
   net.restore()
   await hooks.dispose()

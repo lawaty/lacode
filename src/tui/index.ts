@@ -16,6 +16,7 @@ import type { ParsedQuestion } from "../voice/parse.ts"
 import { createVoiceClient } from "../voice/transport.ts"
 import { VOICE_PROTOCOL_VERSION } from "../voice/protocol.ts"
 import timelineMod from "./timeline.tsx"
+import { readModes, recommendedAnswer, toggleMode } from "../lib/modes.ts"
 
 export type VoiceOptions = {
   enabled?: boolean
@@ -100,6 +101,8 @@ type VoiceCommand = {
   title: string
   category: string
   namespace: "palette"
+  slashName?: string
+  slashAliases?: string[]
   run: (ctx: unknown) => Promise<void>
 }
 
@@ -626,6 +629,50 @@ const tui: TuiPlugin = async (api, options) => {
     }
   }
 
+  async function drainPendingMode(name: "yolo" | "ykb"): Promise<void> {
+    try {
+      const pending = await fetchPending(api)
+      for (const item of pending) {
+        if (name === "yolo" && item.kind === "permission") {
+          await api.client.permission.reply({ requestID: item.request.id, reply: "once" })
+        }
+        if (name === "ykb" && item.kind === "question") {
+          const answers = item.request.questions.map((question) => recommendedAnswer(question))
+          if (answers.some((answer) => answer.length > 0)) {
+            await api.client.question.reply({ requestID: item.request.id, answers })
+          }
+        }
+      }
+    } catch {
+      // Best effort: the server plugin re-checks the mode before the next prompt.
+    }
+  }
+
+  async function runToggleMode(name: "yolo" | "ykb"): Promise<void> {
+    try {
+      const next = toggleMode(name)
+      toast(api, {
+        variant: next[name] ? "success" : "info",
+        message: `${name.toUpperCase()} mode ${next[name] ? "on" : "off"}`,
+      })
+      if (next[name]) await drainPendingMode(name)
+    } catch (error) {
+      toast(api, { variant: "error", message: `Could not toggle ${name.toUpperCase()}: ${String(error)}` })
+    }
+  }
+
+  async function runModeStatus(): Promise<void> {
+    try {
+      const modes = readModes()
+      toast(api, {
+        variant: "info",
+        message: `YOLO ${modes.yolo ? "on" : "off"} · YKB ${modes.ykb ? "on" : "off"}`,
+      })
+    } catch (error) {
+      toast(api, { variant: "error", message: `Could not read mode state: ${String(error)}` })
+    }
+  }
+
   const commands: VoiceCommand[] = [
     {
       name: "lacode.voice.dictate",
@@ -648,6 +695,9 @@ const tui: TuiPlugin = async (api, options) => {
       namespace: "palette",
       run: async () => runCheck(),
     },
+    { name: "lacode.mode.yolo", title: "Mode: toggle YOLO (auto-approve permissions)", category: "Modes", namespace: "palette", slashName: "yolo", run: async () => runToggleMode("yolo") },
+    { name: "lacode.mode.ykb", title: "Mode: toggle YKB (no questions, decide itself)", category: "Modes", namespace: "palette", slashName: "ykb", run: async () => runToggleMode("ykb") },
+    { name: "lacode.mode.status", title: "Mode: show YOLO/YKB status", category: "Modes", namespace: "palette", slashName: "modes", run: async () => runModeStatus() },
   ]
 
   const bindings: Array<{ key: string; cmd: string; desc: string }> = []

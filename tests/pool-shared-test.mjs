@@ -253,9 +253,8 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
 
 // 8. pickSlot: a catalog-gated slot leaves the candidate set, so the first usable
 //    slot in declaration order takes the spawn. When EVERY slot is gated the pool
-//    still returns one -- it never refuses work (src/lib/pool.ts pickSlot): the
-//    usable set is empty, so the full slot list is used and, every load being equal,
-//    the first declared slot wins.
+//    must refuse explicitly: the usable set is empty, so pickSlot returns
+//    undefined and the caller fails the spawn instead of routing into a dead slot.
 {
   const state = pool.state({
     id: "gate",
@@ -275,15 +274,12 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   state.catalog.set("fixture/gate-a", "deprecated")
   const gated = pool.pickSlot(state, pool.snapshot(state))
   assert(gated.model === "fixture/gate-b", `a gated slot must fall through to the next usable slot, got ${gated.model}`)
-  // every slot retired: no usable slot, so the full list is the pool and -- every
-  // slot being at the same load -- the first declared slot (index 1) is returned.
+  // every slot retired: no usable slot, so pickSlot refuses and the caller can
+  // report the reason instead of being handed a slot that will cancel.
   state.catalog.set("fixture/gate-b", "deprecated")
   state.catalog.set("fixture/gate-c", "disabled")
   const fallback = pool.pickSlot(state, pool.snapshot(state))
-  assert(
-    fallback.model === "fixture/gate-a" && fallback.index === 1,
-    `when every slot is unusable pickSlot must still return a slot (first declared, index 1), got ${fallback.index}:${fallback.model}`,
-  )
+  assert(fallback === undefined, "when every slot is unusable pickSlot must return undefined, not a dead slot")
 }
 
 // 9. pickSlot declaration order: equal weights fill in declaration order. Pass 1
@@ -390,6 +386,46 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   assert(!gone("claims.dead.json"), "a non-numeric owner is not a pid; only its age may remove it")
   assert(Array.isArray(removed) && removed.includes("limit.stale.json"), "sweepStateDir must report what it removed")
   aliveChild.kill()
+}
+
+// 16. noteActivity updates hb in memory on every event but throttles on-disk publishes
+{
+  const dir = scratch()
+  const s = pool.state({ id: "hb-throttle", dir, modelsFile: PRESET })
+  pool.init(s)
+  pool.ensureSlots(s, () => {})
+  const slot = s.slots[0]
+  const claimKey = "hb-claim-1"
+  pool.acquire(s, "explore", slot, "sess-hb", claimKey, "sess-hb")
+  assert(s.own.get(claimKey), "acquire must record a claim for the heartbeat test")
+  const file = join(dir, pool.selfFile(s.id))
+
+  // acquire published once; record baseline and force the throttle window open
+  const first = JSON.parse(readFileSync(file, "utf8"))
+  const firstHb = first[claimKey]?.hb
+  assert(typeof firstHb === "number", "published claim must carry an hb timestamp")
+  s.lastHeartbeatPublish = 0
+
+  pool.noteActivity(s, "sess-hb")
+  const afterFirst = JSON.parse(readFileSync(file, "utf8"))
+  const hb1 = afterFirst[claimKey]?.hb
+  assert(typeof hb1 === "number" && hb1 >= firstHb, "noteActivity must publish and refresh hb on disk when throttle allows")
+  assert(s.own.get(claimKey)?.hb === hb1, "in-memory hb must stay exact after a throttled-allowed publish")
+
+  // Within the 30s window: in-memory hb advances, on-disk hb does not.
+  pool.noteActivity(s, "sess-hb")
+  const afterSecond = JSON.parse(readFileSync(file, "utf8"))
+  assert(afterSecond[claimKey]?.hb === hb1, "a second noteActivity within 30s must not publish again")
+  assert(s.own.get(claimKey)?.hb >= hb1, "in-memory hb must still advance within the throttle window")
+  assert(s.own.get(claimKey)?.hb > hb1 || s.lastHeartbeatPublish > 0, "throttle state must remain valid within the window")
+
+  // After the window passes (stamp reset), the next event publishes the fresh hb.
+  const memHb = s.own.get(claimKey).hb
+  s.lastHeartbeatPublish = 0
+  pool.noteActivity(s, "sess-hb")
+  const afterWindow = JSON.parse(readFileSync(file, "utf8"))
+  assert(afterWindow[claimKey]?.hb >= memHb, "noteActivity must publish again once the 30s window has passed")
+  pool.release(s, claimKey)
 }
 
 for (const d of made) rmSync(d, { recursive: true, force: true })

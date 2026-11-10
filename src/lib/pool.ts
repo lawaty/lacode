@@ -39,6 +39,13 @@ import { PACKAGE_ROOT } from "./package-root.ts"
 // range, repeats allowed, no slot cap.
 
 export const CLAIM_TTL_MS = 10 * 60 * 1000
+/**
+ * Streaming fires noteActivity per chunk; the on-disk heartbeat only needs to
+ * reach sibling processes well inside the 10-minute claim TTL, so heartbeat
+ * publishes are throttled to one per 30s. The in-memory hb stays exact on every
+ * event.
+ */
+export const HEARTBEAT_PUBLISH_MS = 30_000
 export const UNBOUND_CLAIM_MS = 2 * 60 * 1000
 export const DEAD_FILE_MS = 2 * CLAIM_TTL_MS
 export const ORPHAN_TMP_MS = 60 * 1000
@@ -69,6 +76,12 @@ export const UNAVAILABLE_REASON = "endpoint-unavailable"
 // silence load balancing entirely, which is a config error rather than a value to
 // honour.
 export const MAX_WEIGHT = 100
+// Minimum usable model context, matching the scorer's floor `MIN_CONTEXT` in
+// scripts/pool-selection.mjs. Slots whose recorded context is below this are
+// dropped when the slot table is parsed.
+export const MIN_SLOT_CONTEXT = 100_000
+// The pool's smallest possible request is the 20k context headroom, so a model that cannot accept a single request that size can never serve a pooled task.
+export const MIN_SLOT_TPM = 20_000
 /** How many active sessions a slot may hold at once: its weight. To give a
  * model more capacity, list it again on another line with its own weight. */
 export const slotCeiling = (slot: Slot) => slot.weight
@@ -172,7 +185,7 @@ export const isAuthFailureText = (text: string) => AUTH_FAILURE_PATTERN.test(tex
  * A pool slot. `notify` defaults to on for `opencode`/`opencode-go` models and
  * off for every other provider; an explicit value overrides.
  */
-export type Slot = { index: number; model: string; weight: number; bucket?: string; notify?: boolean; context?: number }
+export type Slot = { index: number; model: string; weight: number; bucket?: string; notify?: boolean; context?: number; tpm?: number }
 
 export type Claim = {
   v: string
@@ -203,6 +216,8 @@ export type Snapshot = {
 }
 
 export const BASES = ["explore", "implement", "context"]
+
+export const LEARNED_TPM_FILE = "learned-tpm.json"
 
 // ---------------------------------------------------------------------------
 // Preset resolution chain
@@ -301,7 +316,22 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
       if (Number.isFinite(parsedContext) && parsedContext > 0) context = parsedContext
       else problems.push(`${at} (${model}): context must be a positive number, got ${JSON.stringify(rawContext)}; ignoring it`)
     }
-    slots.push({ index: slots.length + 1, model, weight, ...(bucket ? { bucket } : {}), notify, ...(context === undefined ? {} : { context }) })
+    if (context !== undefined && context < MIN_SLOT_CONTEXT) {
+      problems.push(`${at} (${model}): context ${context} is below the ${MIN_SLOT_CONTEXT}-token minimum; dropping the slot`)
+      return
+    }
+    const rawTpm = (entry as { tpm?: unknown })?.tpm
+    let tpm: number | undefined
+    if (rawTpm !== undefined) {
+      const parsedTpm = typeof rawTpm === "number" ? rawTpm : Number(rawTpm)
+      if (Number.isFinite(parsedTpm) && parsedTpm > 0) tpm = parsedTpm
+      else problems.push(`${at} (${model}): tpm must be a positive number, got ${JSON.stringify(rawTpm)}; ignoring it`)
+    }
+    if (tpm !== undefined && tpm < MIN_SLOT_TPM) {
+      problems.push(`${at} (${model}): tpm ${tpm} is below the ${MIN_SLOT_TPM}-token/minute minimum; dropping the slot`)
+      return
+    }
+    slots.push({ index: slots.length + 1, model, weight, ...(bucket ? { bucket } : {}), notify, ...(context === undefined ? {} : { context }), ...(tpm === undefined ? {} : { tpm }) })
   })
   if (slots.length > SLOTS_WARN_AT) {
     problems.push(`${origin}: ${slots.length} slots is unusually large, but every entry is kept (the pool has no slot cap)`)
@@ -324,7 +354,7 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
  * are identical everywhere.
  */
 export function parseTextSlots(text: string, origin: string): SlotFile {
-  const entries: Array<{ model: string; weight?: string; bucket?: string; notify?: string; context?: number }> = []
+  const entries: Array<{ model: string; weight?: string; bucket?: string; notify?: string; context?: number; tpm?: number }> = []
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.split("#")[0].trim()
     if (!line) continue
@@ -333,6 +363,7 @@ export function parseTextSlots(text: string, origin: string): SlotFile {
     let bucket: string | undefined
     let notify: string | undefined
     let context: number | undefined
+    let tpm: number | undefined
     for (const token of rest) {
       if (token.startsWith("notify:")) {
         if (notify === undefined) notify = token.slice("notify:".length)
@@ -345,13 +376,20 @@ export function parseTextSlots(text: string, origin: string): SlotFile {
         }
         continue
       }
+      if (token.startsWith("tpm:")) {
+        if (tpm === undefined) {
+          const parsedTpm = Number(token.slice(4))
+          if (Number.isFinite(parsedTpm) && parsedTpm > 0) tpm = parsedTpm
+        }
+        continue
+      }
       if (token.startsWith("b:")) {
         if (bucket === undefined) bucket = token.slice(2)
       } else if (weight === undefined) {
         weight = token
       }
     }
-    entries.push({ model, ...(weight === undefined ? {} : { weight }), ...(bucket === undefined ? {} : { bucket }), ...(notify === undefined ? {} : { notify }), ...(context === undefined ? {} : { context }) })
+    entries.push({ model, ...(weight === undefined ? {} : { weight }), ...(bucket === undefined ? {} : { bucket }), ...(notify === undefined ? {} : { notify }), ...(context === undefined ? {} : { context }), ...(tpm === undefined ? {} : { tpm }) })
   }
   return parseSlots({ slots: entries }, origin)
 }
@@ -532,6 +570,62 @@ const LIMIT_PATTERNS = [
 const LIMIT_REACHED_PATTERN = /\blimits?[\s_-]?(?:reached|exceeded)\b|\breached\s+(?:your|the|its)\s+limit\b/i
 const CONTEXT_LIMIT_PATTERN = /(?:context|token|length|window|prompt|char|character|byte|size)\s*(?:limit|length|size|window)/i
 
+/**
+ * How long a model that reported a context overflow is kept out of routing so the
+ * retry lands on a larger slot; this is not a quota strike.
+ */
+export const CONTEXT_OVERFLOW_COOLDOWN_MS = 10 * 60 * 1000
+
+const CONTEXT_OVERFLOW_PATTERNS = [
+  /context[_\s-]*(?:length|window|limit|overflow|exceed)/i,
+  /input\s+too\s+long/i,
+  /prompt\s+is\s+too\s+long/i,
+  /maximum\s+(?:context|prompt|token)/i,
+  /reduce\s+the\s+length\s+of\s+(?:the\s+)?messages/i,
+]
+
+export const isContextOverflowText = (text: string): boolean =>
+  CONTEXT_OVERFLOW_PATTERNS.some((re) => re.test(text))
+
+/**
+ * When a provider's stated request limit is below `MIN_SLOT_CONTEXT`, the model
+ * is kept out of routing this long (effectively dropped, since LaCode's subagent
+ * prompts cannot fit it); not a quota strike.
+ */
+export const BELOW_MIN_CONTEXT_COOLDOWN_MS = 6 * 60 * 60 * 1000
+
+const REQUEST_TOO_LARGE_PATTERNS = [
+  /request\s+too\s+large/i,
+  /please\s+reduce\s+your\s+message\s+size/i,
+  /limit\s+\d+\s*,\s*requested\s+\d+/i,
+  /\(tpm\)/i,
+]
+
+export const isRequestTooLargeText = (text: string): boolean =>
+  REQUEST_TOO_LARGE_PATTERNS.some((re) => re.test(text))
+
+export const parseStatedTokenLimit = (text: string): number | undefined => {
+  for (const re of [/limit\s+(\d+)\s*,\s*requested\s+\d+/i, /limit\s+is\s+(\d+)/i]) {
+    const match = text.match(re)
+    if (match) {
+      const value = Number(match[1])
+      if (Number.isFinite(value) && value > 0) return value
+    }
+  }
+  return undefined
+}
+
+export function parseRateLimitHeaders(headers: unknown): number | undefined {
+  if (typeof headers !== "object" || headers === null || Array.isArray(headers)) return undefined
+  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+    if (key.toLowerCase() !== "x-ratelimit-limit-tokens") continue
+    const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value.trim()) : Number.NaN
+    if (Number.isFinite(parsed) && parsed > 0 && Number.isInteger(parsed)) return parsed
+    return undefined
+  }
+  return undefined
+}
+
 // The vocabulary a limit is NAMED by. The first alternative that matches
 // anywhere in the text wins, so "rate limit reached" is named "rate-limit" and
 // "daily limit reached" is named "limit-reached".
@@ -615,7 +709,7 @@ export const retryAfterMs = (headers?: Record<string, string>): number | undefin
   return undefined
 }
 
-type State = {
+export type State = {
   own: Map<string, Claim>
   models: Map<string, string>
   known: Set<string>
@@ -668,6 +762,8 @@ type State = {
   lastSweep: number
   /** When the shared state directory was last swept of stale files. */
   lastDirSweep: number
+  /** When the last heartbeat-driven publish happened; throttles noteActivity writes. */
+  lastHeartbeatPublish: number
   /** provider ids opencode reported as connected */
   connected: Set<string>
   /** when the list was last fetched (0 = never) */
@@ -720,6 +816,7 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
       reaping: false,
       lastSweep: 0,
       lastDirSweep: 0,
+      lastHeartbeatPublish: 0,
       connected: new Set(),
       connectedAt: 0,
       connectedReady: false,
@@ -741,7 +838,7 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
 export function ensureSlots(s: State, onWarn: (m: string) => void) {
   if (s.slots.length > 0) return s.slots
   const { slots, problems, origin } = resolveModels({ models: s.inlineModels, modelsFile: s.modelsFile })
-  s.slots = slots
+  s.slots = applyLearnedTpm(s, slots, onWarn)
   s.origin = origin
   for (const problem of problems) onWarn(problem)
   return slots
@@ -756,7 +853,7 @@ export function ensureSlots(s: State, onWarn: (m: string) => void) {
  * changes where the table came from, and the status line must say so.
  */
 const slotSignature = (origin: string, slots: Slot[]) =>
-  `${origin}\u0000${slots.map((slot) => `${slot.index}:${slot.model}:${slot.weight}:${slot.bucket ?? ""}:${slotNotify(slot) ? "1" : "0"}`).join("|")}`
+  `${origin}\u0000${slots.map((slot) => `${slot.index}:${slot.model}:${slot.weight}:${slot.bucket ?? ""}:${slotNotify(slot) ? "1" : "0"}:${slot.tpm ?? ""}`).join("|")}`
 
 export type SlotReload = { changed: boolean; slots: Slot[]; origin: string }
 
@@ -774,12 +871,13 @@ export type SlotReload = { changed: boolean; slots: Slot[]; origin: string }
  */
 export function reloadSlots(s: State, onWarn: (m: string) => void): SlotReload {
   const { slots, problems, origin } = resolveModels({ models: s.inlineModels, modelsFile: s.modelsFile })
-  const changed = slotSignature(origin, slots) !== slotSignature(s.origin, s.slots)
-  if (!changed) return { changed, slots, origin }
-  s.slots = slots
+  const effective = applyLearnedTpm(s, slots, onWarn)
+  const changed = slotSignature(origin, effective) !== slotSignature(s.origin, s.slots)
+  if (!changed) return { changed, slots: s.slots, origin: s.origin }
+  s.slots = effective
   s.origin = origin
   for (const problem of problems) onWarn(problem)
-  return { changed, slots, origin }
+  return { changed, slots: effective, origin }
 }
 
 /**
@@ -793,6 +891,59 @@ export function slotSources(input: { models?: unknown; modelsFile?: string } = {
   if (input.models !== undefined) return []
   if (input.modelsFile) return [input.modelsFile]
   return [USER_MODELS_TXT, USER_MODELS_PATH, DEFAULT_PRESET]
+}
+
+const learnedTpmPath = (s: State) => join(s.dir, LEARNED_TPM_FILE)
+
+export function readLearnedTpm(s: State): Record<string, number> {
+  try {
+    const raw = JSON.parse(readFileSync(learnedTpmPath(s), "utf8")) as unknown
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {}
+    const out: Record<string, number> = {}
+    for (const [model, value] of Object.entries(raw as Record<string, unknown>)) {
+      const n = typeof value === "number" ? value : Number(value)
+      if (Number.isFinite(n) && n > 0) out[model] = n
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+export function applyLearnedTpm(s: State, slots: Slot[], onWarn?: (m: string) => void): Slot[] {
+  const learned = readLearnedTpm(s)
+  const out: Slot[] = []
+  for (const slot of slots) {
+    const tpm = learned[slot.model]
+    if (tpm !== undefined && tpm < MIN_SLOT_TPM) {
+      onWarn?.(`learned-tpm: dropping ${slot.model} (tpm ${tpm} < ${MIN_SLOT_TPM})`)
+      continue
+    }
+    if (tpm !== undefined) out.push({ ...slot, tpm: Math.min(slot.tpm ?? tpm, tpm) })
+    else out.push(slot)
+  }
+  return out.map((slot, i) => ({ ...slot, index: i + 1 }))
+}
+
+export function noteTpm(s: State, model: string, tpm: number): boolean {
+  if (!Number.isFinite(tpm) || tpm <= 0) return false
+  const map = readLearnedTpm(s)
+  map[model] = tpm
+  if (s.dirReady) {
+    try {
+      const path = learnedTpmPath(s)
+      writeFileSync(`${path}.tmp`, JSON.stringify(map))
+      renameSync(`${path}.tmp`, path)
+    } catch {
+      /* learned TPM stays local to this process */
+    }
+  }
+  if (tpm < MIN_SLOT_TPM) {
+    s.slots = s.slots.filter((slot) => slot.model !== model).map((slot, i) => ({ ...slot, index: i + 1 }))
+    return true
+  }
+  s.slots = s.slots.map((slot) => (slot.model === model ? { ...slot, tpm: Math.min(slot.tpm ?? tpm, tpm) } : slot))
+  return false
 }
 
 export const claimKey = (sessionID: string, callID: string) => `${sessionID}:${callID}`
@@ -1287,14 +1438,16 @@ export function refreshCatalog(s: State, serverUrl?: URL) {
  *    entirely, and an absent entry would otherwise look exactly like a healthy
  *    one that simply has not been probed. Only an explicitly bad status
  *    disqualifies a model.
- * 2. THE POOL PREFERS A BAD MODEL TO NO MODEL. When every slot is cooling the
- *    caller re-admits them all (see pickSlot) rather than refusing the work,
- *    because a spawn that fails fast with a 429 is more useful than a spawn that
- *    never happens -- and the 429 is what produces the strike that cools it
- *    properly next time.
+ * 2. COOLING IS NOT ROUTABLE. A slot that is cooling (rate limit, quota,
+ *    outage, missing model, auth failure), catalog-retired, or on a provider
+ *    that is not configured is never handed a spawn. `pickSlot()` returns
+ *    `undefined` when no slot is usable so the caller can fail the spawn with
+ *    an explicit no-routable-slot message instead of routing into a model that
+ *    will only cancel -- a false "routed" line is worse than an honest refusal.
  *
- * The cost of both is that an unhealthy provider can take a turn it should not
- * have. That is the trade: prefer a wasted spawn over a stranded one.
+ * The remaining cost of point 1 is that an unprobed model can take a turn it
+ * should not have. That trade is kept: absence from the catalog is not a
+ * declaration of death.
  */
 export function isAvailable(s: State, model: string, cooling: Map<string, Strike>) {
   if (!providerReady(s, model)) return false
@@ -1322,7 +1475,8 @@ const loadOf = (counts: Map<number, number>, slot: number) => counts.get(slot) ?
 export const underCeiling = (slot: Slot, counts: Map<number, number>) => loadOf(counts, slot.index) < slotCeiling(slot)
 
 /**
- * The next slot the pool would hand a spawn.
+ * The next slot the pool would hand a spawn, or `undefined` when none is
+ * routable.
  *
  * ONE ordered pass over the usable slots, in declaration order: the first slot
  * still below its weight (its active-session budget) wins. There is no second
@@ -1330,16 +1484,18 @@ export const underCeiling = (slot: Slot, counts: Map<number, number>) => loadOf(
  * To give a model more of it, list that model on another line with its own weight.
  *
  * When every usable slot is at its weight, the overflow goes to the least-loaded
- * usable slot; if every slot is cooling, the least-loaded slot of all. The pool
- * never refuses work.
+ * usable slot. Cooling, catalog-retired, and provider-unconfigured slots are
+ * never in the usable set; when that set is empty this returns `undefined` and
+ * the caller must fail the spawn with an explicit no-routable-slot message
+ * rather than routing into a model that will only cancel.
  */
-export type PoolPass = 1 | "overflow"
+export type PoolPass = 1 | "overflow" | "none"
 
-export function pickSlot(s: State, snap: Snapshot, neededContext?: number): Slot {
+export function pickSlot(s: State, snap: Snapshot, neededContext?: number): Slot | undefined {
   const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
-  const configured = slots.filter((slot) => providerReady(s, slot.model))
-  const usable = configured.filter((slot) => isAvailable(s, slot.model, snap.cooling))
-  const pool = usable.length > 0 ? usable : configured.length > 0 ? configured : slots
+  const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
+  if (usable.length === 0) return undefined
+  const effective = (slot: Slot) => Math.min(slot.context ?? Number.POSITIVE_INFINITY, slot.tpm ?? Number.POSITIVE_INFINITY)
   if (neededContext === undefined) {
     for (const slot of usable) {
       if (loadOf(snap.counts, slot.index) < slot.weight) return slot
@@ -1348,21 +1504,20 @@ export function pickSlot(s: State, snap: Snapshot, neededContext?: number): Slot
     // spread the burst over the least-loaded usable slot rather than refusing the
     // work. The condition is not "every slot is full" -- a cooling slot frees the
     // others.
-    return pool.reduce((best, slot) => (loadOf(snap.counts, slot.index) < loadOf(snap.counts, best.index) ? slot : best), pool[0])
+    return usable.reduce((best, slot) => (loadOf(snap.counts, slot.index) < loadOf(snap.counts, best.index) ? slot : best), usable[0])
   }
-  const adequate = usable.filter((slot) => slot.context == null || slot.context >= neededContext)
-  const adequateKnown = adequate.filter((slot) => slot.context != null)
+  const adequate = usable.filter((slot) => effective(slot) >= neededContext)
+  const adequateKnown = adequate.filter((slot) => Number.isFinite(effective(slot)))
   const candidates = adequate.length > 0 ? adequate : usable
-  const fallbackPool = adequate.length > 0 ? adequate : pool
   if (adequateKnown.length === 0) {
-    // No known adequate slot: prefer the largest known context among the
+    // No known adequate slot: prefer the largest known effective capacity among the
     // candidates (best chance of fitting), then normal load rules. Unknown
     // slots are not preferred over known ones, so an adequate pool of only
     // unknown slots still lands here.
-    const known = usable.filter((slot) => slot.context != null)
+    const known = usable.filter((slot) => Number.isFinite(effective(slot)))
     if (known.length > 0) {
-      const largest = Math.max(...known.map((slot) => slot.context as number))
-      const largestSlots = known.filter((slot) => slot.context === largest)
+      const largest = Math.max(...known.map((slot) => effective(slot)))
+      const largestSlots = known.filter((slot) => effective(slot) === largest)
       for (const slot of largestSlots) {
         if (loadOf(snap.counts, slot.index) < slot.weight) return slot
       }
@@ -1371,13 +1526,13 @@ export function pickSlot(s: State, snap: Snapshot, neededContext?: number): Slot
     for (const slot of candidates) {
       if (loadOf(snap.counts, slot.index) < slot.weight) return slot
     }
-    return fallbackPool.reduce((best, slot) => (loadOf(snap.counts, slot.index) < loadOf(snap.counts, best.index) ? slot : best), fallbackPool[0])
+    return candidates.reduce((best, slot) => (loadOf(snap.counts, slot.index) < loadOf(snap.counts, best.index) ? slot : best), candidates[0])
   }
   const underWeight = candidates.filter((slot) => loadOf(snap.counts, slot.index) < slot.weight)
   if (underWeight.length > 0) {
-    const known = underWeight.filter((slot) => slot.context != null)
+    const known = underWeight.filter((slot) => Number.isFinite(effective(slot)))
     if (known.length === 0) return underWeight[0]
-    return known.reduce((best, slot) => ((slot.context as number) < (best.context as number) ? slot : best), known[0])
+    return known.reduce((best, slot) => (effective(slot) < effective(best) ? slot : best), known[0])
   }
   return candidates.reduce((best, slot) => (loadOf(snap.counts, slot.index) < loadOf(snap.counts, best.index) ? slot : best), candidates[0])
 }
@@ -1387,7 +1542,9 @@ export function pickSlot(s: State, snap: Snapshot, neededContext?: number): Slot
 export function poolPass(s: State, snap: Snapshot, neededContext?: number): PoolPass {
   const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
   const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
-  const candidates = neededContext === undefined ? usable : usable.filter((slot) => slot.context == null || slot.context >= neededContext)
+  if (usable.length === 0) return "none"
+  const effective = (slot: Slot) => Math.min(slot.context ?? Number.POSITIVE_INFINITY, slot.tpm ?? Number.POSITIVE_INFINITY)
+  const candidates = neededContext === undefined ? usable : usable.filter((slot) => effective(slot) >= neededContext)
   const pool = candidates.length > 0 ? candidates : usable
   if (pool.some((slot) => loadOf(snap.counts, slot.index) < slot.weight)) return 1
   return "overflow"
@@ -1483,7 +1640,10 @@ export function noteActivity(s: State, sessionID: string) {
   // counted while it keeps burning the provider, and the slot is handed out again.
   let touched = false
   for (const claim of s.own.values()) if (claim.g === sessionID) (claim.hb = now), (touched = true)
-  if (touched) publish(s)
+  if (touched && now - s.lastHeartbeatPublish >= HEARTBEAT_PUBLISH_MS) {
+    s.lastHeartbeatPublish = now
+    publish(s)
+  }
 }
 
 export function idleFor(s: State, claim: Claim, now: number) {

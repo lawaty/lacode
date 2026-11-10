@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { readFileSync } from "node:fs"
+import { closeSync, openSync, readSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
 
@@ -10,30 +10,8 @@ let registered = false
 const ENTRY_LINES = 14
 
 type TimelineLine = { content: string; requestRender?: () => void }
-
-/** Read and parse one session's timeline file. Missing/malformed is "no entries". */
-const readEntries = (id: string | undefined): string[] => {
-  if (typeof id !== "string" || !/^[A-Za-z0-9_.-]+$/.test(id)) return []
-  const rawDir = process.env.LACODE_TIMELINE_DIR
-  const dir = rawDir ? resolve(rawDir) : join(homedir(), ".local/share/opencode/lacode/timeline")
-  try {
-    const raw = readFileSync(join(dir, id + ".jsonl"), "utf8")
-    const parsed: string[] = []
-    for (const line of raw.split("\n")) {
-      const trimmed = line.trim()
-      if (!trimmed) continue
-      try {
-        const obj = JSON.parse(trimmed) as { ts?: unknown; text?: unknown }
-        if (obj && typeof obj.ts === "number" && typeof obj.text === "string") parsed.push(obj.text)
-      } catch {
-        // skip malformed lines
-      }
-    }
-    return parsed.slice(-ENTRY_LINES).reverse()
-  } catch {
-    return []
-  }
-}
+type TimelineEntry = { ts: number; text: string }
+type TimelineCache = { path: string | null; size: number; mtimeMs: number; ino: number; entries: TimelineEntry[]; rendered: string[] }
 
 const tui: TuiPlugin = async (api) => {
   if (registered) return
@@ -49,16 +27,87 @@ const tui: TuiPlugin = async (api) => {
       sidebar_content(ctx, props) {
         const rows: (TimelineLine | undefined)[] = []
         const muted = ctx.theme.current.textMuted
+        const cache: TimelineCache = { path: null, size: -1, mtimeMs: -1, ino: -1, entries: [], rendered: [] }
+
+        /** Read and parse one session's timeline file. Missing/malformed is "no entries". */
+        const readEntries = (id: string | undefined): TimelineEntry[] => {
+          if (typeof id !== "string" || !/^[A-Za-z0-9_.-]+$/.test(id)) return []
+          const rawDir = process.env.LACODE_TIMELINE_DIR
+          const dir = rawDir ? resolve(rawDir) : join(homedir(), ".local/share/opencode/lacode/timeline")
+          const path = join(dir, id + ".jsonl")
+          try {
+            const stat = statSync(path)
+            if (cache.path === path && cache.size === stat.size && cache.mtimeMs === stat.mtimeMs && cache.ino === stat.ino) {
+              return cache.entries
+            }
+            const maxRead = 64 * 1024
+            const start = Math.max(0, stat.size - maxRead)
+            const length = stat.size - start
+            const fd = openSync(path, "r")
+            try {
+              const buf = Buffer.alloc(length)
+              let total = 0
+              while (total < length) {
+                const n = readSync(fd, buf, total, length - total, start + total)
+                if (n <= 0) break
+                total += n
+              }
+              if (total < length) {
+                return []
+              }
+              let raw = buf.toString("utf8")
+              if (start > 0) {
+                const firstNl = raw.indexOf("\n")
+                raw = firstNl === -1 ? "" : raw.slice(firstNl + 1)
+              }
+              const parsed: TimelineEntry[] = []
+              for (const line of raw.split("\n")) {
+                const trimmed = line.trim()
+                if (!trimmed) continue
+                try {
+                  const obj = JSON.parse(trimmed) as { ts?: unknown; text?: unknown }
+                  if (obj && typeof obj.ts === "number" && typeof obj.text === "string") {
+                    parsed.push({ ts: obj.ts, text: obj.text })
+                  }
+                } catch {
+                  // skip malformed lines
+                }
+              }
+              const entries = parsed.slice(-ENTRY_LINES).reverse()
+              cache.path = path
+              cache.size = stat.size
+              cache.mtimeMs = stat.mtimeMs
+              cache.ino = stat.ino
+              cache.entries = entries
+              return entries
+            } finally {
+              closeSync(fd)
+            }
+          } catch {
+            return []
+          }
+        }
 
         const paint = () => {
           const entries = readEntries(props.session_id)
+          const next: string[] = []
+          for (let i = 0; i < ENTRY_LINES; i++) {
+            const text = entries[i]?.text
+            next.push(text ? `• ${text}` : i === 0 && entries.length === 0 ? "No timeline yet" : "")
+          }
+          if (
+            cache.rendered.length === ENTRY_LINES &&
+            next.every((value, i) => value === cache.rendered[i])
+          ) {
+            return
+          }
           for (let i = 0; i < ENTRY_LINES; i++) {
             const row = rows[i]
             if (!row) continue
-            const text = entries[i]
-            row.content = text ? `• ${text}` : i === 0 && entries.length === 0 ? "No timeline yet" : ""
+            row.content = next[i]
             row.requestRender?.()
           }
+          cache.rendered = next
         }
 
         const timer = setInterval(paint, 1000)

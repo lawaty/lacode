@@ -30,6 +30,7 @@ document; everything here is testable offline with a stub client and a
 | **E — Remote hosts** | Remote SSH notification. Work runs on remote hosts, so notifications raised there die on that host's nonexistent desktop instead of reaching the local one. |
 | **F — Adoption and safety** | Installability. A personal config cannot be adopted safely: it either clobbers what you already have, or needs manual surgery before it runs. |
 | **G — Context and cost** | Cold exploration. Every task starts by re-discovering the structure of the codebase from scratch, so the same layout is re-read — and re-paid for — on every single run. |
+| **K — Autonomy modes** | Stalls. A long run stops for every routine permission, or waits for a human to answer a question the agent could decide itself, even when its own recommendation is clear. |
 
 ---
 
@@ -88,8 +89,9 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 **Story ID(s) for tests:** US-4
 **Acceptance criteria:**
 - [ ] Given a spawn fails with a rate-limit-shaped error, When the error is serialized and matched, Then the offending model is marked cooling and a cooldown file is written for it.
-- [ ] Given model A is cooling, When the next spawn is routed, Then the pick is a different model and the spawn is never refused outright.
-- [ ] Given every model is cooling, When a spawn is routed, Then the least-loaded slot is chosen anyway (degrade, never block).
+- [ ] Given model A is cooling and another slot is usable, When the next spawn is routed, Then the pick is a different usable model, never the cooling one.
+- [ ] Given a pooled task completes with an empty result, When the task hook returns, Then that model is benched for `empty response`, the result explains the bench, and the next spawn routes to another slot.
+- [ ] Given every model is cooling, When a spawn is routed, Then the spawn is refused explicitly with a message naming the cooling slots and their reasons, and no model is routed to.
 - [ ] Given a limit error names a reset time, When the cooldown is recorded, Then the stated reset is used instead of a guessed backoff.
 
 ### US-5: Slots fill in declaration order in one pass, with repeats
@@ -101,7 +103,7 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given a model appears on more than one line, When the pool loads, Then each line is its own slot with its own weight, and the later line adds seats at its own position.
 - [ ] Given a slot is cooling or unavailable, When its position comes up, Then it is skipped and the pass continues to the next slot.
 - [ ] Given a claim is released, When the next spawn is routed, Then the slot that freed capacity is preferred again in declaration order; no stored position keeps it waiting.
-- [ ] Given every usable slot is at its weight, When another spawn is routed, Then it goes to the least-loaded usable slot as overflow, and the pool never refuses work.
+- [ ] Given every usable slot is at its weight, When another spawn is routed, Then it goes to the least-loaded usable slot as overflow, and the pool never refuses work while at least one slot is usable.
 - [ ] Given all slots carry equal weight, When spawns are routed, Then the same ordered one-pass fill applies.
 - [ ] Given per-slot load is read, When it is asserted, Then a slot's load never exceeds its weight except through overflow.
 
@@ -166,6 +168,20 @@ A limit does not always arrive as an error. Sometimes the provider accepts the r
 - [ ] Given a session stalls with no limit signal at all, When the reaper sweeps, Then the session is aborted, its model cooled, and the next spawn routes to a slot that is not on cooldown.
 - [ ] Given a provider reports a transient upstream outage rather than a limit, When the status is handled, Then the model is cooled for one short flat window instead of the quota window, and the session is still aborted, because an outage lifts on its own and must not bench a healthy model.
 - [ ] Given a transient outage was cooled, When the same model later fails with a real limit, Then the cooldown starts at the first strike rather than an escalated one, because an outage lifts on its own and must not make the next quota window longer.
+
+### US-39: The pool refresh completes, retries what failed, and never starves
+**As a** user relying on the scored pool, **I want** the refresh to finish even when the machine reboots, **so that** the pool is never stranded on stale scores and a transient provider failure does not erase a model I was using.
+
+A daily scan was killed by a reboot mid-run, and because systemd records a trigger when the service starts, `Persistent=true` did not retry it. The refresh now runs every 6 hours, gets a startup trigger, scans the core providers first under a wall-clock budget, keeps previous rows for providers it could not finish, and preserves the last measured score of a model that failed transiently. A PID lock keeps the 6-hour run and a retry timer from racing.
+
+**Story ID(s) for tests:** US-39
+**Acceptance criteria:**
+- [ ] Given the installed timer, When it is rendered, Then it has `OnCalendar=*-*-* 00/6:00:00`, `OnStartupSec=5min`, and `Persistent=true`, and the service has `TimeoutStartSec=infinity`.
+- [ ] Given a scan reaches its wall-clock budget, When the scores are written, Then unscanned and truncated providers keep their previous rows, so a partial run cannot shrink the pool.
+- [ ] Given a model failed transiently (timeout, rate limit, credit), When selection runs, Then its last measured score is retained and a retry is scheduled at the stated reset or 45 minutes later.
+- [ ] Given a permanent failure (401, 403 agreement, 404), When selection runs, Then the model is not retried and does not fall back to a previous score.
+- [ ] Given enough other providers to fill the pool, When selection runs, Then exactly one `opencode` slot is reserved last with weight 2.
+- [ ] Given two refreshes overlap, When the second starts, Then it skips while the lock is held, and a lock left by a dead PID is reclaimed.
 
 ---
 
@@ -531,6 +547,37 @@ A failed summarization used to clear the pending flag and never reschedule, so o
 - [ ] Given the sweep runs, When it completes, Then the `event_sequence` and `session` tables are never changed.
 - [ ] Given a run, When it completes, Then one JSON line is appended to `~/.local/share/opencode/lacode/event-prune.jsonl` carrying ts, days, graceHours, cutoff, rows, bytes, aggregates, dryRun and elapsedMs.
 
+## Epic K — Autonomy modes (YOLO and YKB)
+
+### US-37: YOLO mode approves permissions without stopping
+**As a** user running a long autonomous task, **I want** permission prompts to be approved automatically while YOLO is on, **so that** the agent keeps working instead of waiting for routine approvals, while an explicit `deny` still protects me.
+
+Permission prompts are the main thing that breaks a long autonomous run: every `ask` blocks the session until a human answers. YOLO flips that decision to `allow` at the permission hook, keeps an explicit `deny` authoritative, and answers any request that still reaches the event bus. The state is a small file the TUI writes and the server reads on the next decision, so enabling it also clears what is already pending.
+
+**Story ID(s) for tests:** US-37
+**Acceptance criteria:**
+- [ ] Given YOLO is on, When the runtime's permission decision is `ask`, Then it becomes `allow` without a prompt, while an existing `deny` or `allow` is left unchanged.
+- [ ] Given YOLO is off, When the runtime's permission decision is `ask`, Then it stays `ask` and still reaches the user.
+- [ ] Given a `permission.asked` event still reaches the event bus while YOLO is on and carries a request id and a session id, When the handler runs, Then the plugin replies `once` for that request; an event missing either id is ignored.
+- [ ] Given YOLO is toggled in the TUI, When the mode file changes, Then the next permission decision sees the new value without a restart, and requests already pending are answered.
+- [ ] Given `yolo: true` in the plugin options and no live mode file, When the plugin starts, Then the file is seeded; after a TUI toggle, the live file wins.
+- [ ] Given the README and configuration reference, Then the `yolo` option and the `/yolo` command are documented alongside `/modes`.
+
+### US-38: YKB mode chooses the recommendation instead of asking
+**As a** user who wants the agent to keep moving, **I want** YKB (You Know Better) mode to suppress questions and pick the recommended option itself, **so that** it finishes or blocks on a real dependency rather than waiting for me to choose.
+
+A question costs a full turn and a human decision, even when the agent has a clear recommendation. YKB adds a system instruction that tells the agent to choose and continue, and auto-answers any question that still reaches the runtime with its `(Recommended)` option (or the first option when none is marked). A free-text question with no options is left for the user, because there is nothing to choose.
+
+**Story ID(s) for tests:** US-38
+**Acceptance criteria:**
+- [ ] Given YKB is on, When a request is built, Then the system prompt carries the YKB instruction exactly once; when YKB is off, the instruction is absent.
+- [ ] Given a question offers options and YKB is on, When the plugin answers it, Then each question selects the option marked `(Recommended)` (case-insensitive, in the label or description), or the first option when none is marked.
+- [ ] Given a question has no options, When YKB sees it, Then it leaves the question for the user and records a warning rather than inventing an answer.
+- [ ] Given YKB is off, When a question is asked, Then the plugin sends no answer.
+- [ ] Given YKB is toggled on in the TUI, When questions are already pending, Then they are answered with the same recommendation rule.
+- [ ] Given YOLO and YKB are both on, When permission and question events arrive, Then each mode acts only on its own event and the other mode's behavior is unchanged.
+- [ ] Given the README and configuration reference, Then the `ykb` option and the `/ykb` and `/modes` commands are documented.
+
 ---
 
 ## Coverage
@@ -555,6 +602,7 @@ table was filled in.
 | US-7 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/pool-models-test.mjs` |
 | US-28 | B | `tests/stories/i-omniroute.test.mjs` |
 | US-31 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/stories/c-hang-recovery.test.mjs` |
+| US-39 | B | `tests/stories/l-pool-refresh.test.mjs` |
 | US-8 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs` |
 | US-9 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs`, `tests/pool-shared-test.mjs` |
 | US-10 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs`, `tests/pool-timer-test.mjs` |
@@ -581,13 +629,13 @@ table was filled in.
 | US-36 | G | `tests/stories/j-timeline-reliability.test.mjs` |
 | US-32 | H | `tests/retire-old-sessions-test.mjs` |
 | US-33 | H | `tests/prune-old-events-test.mjs` |
+| US-37 | K | `tests/stories/k-autonomy-modes.test.mjs` |
+| US-38 | K | `tests/stories/k-autonomy-modes.test.mjs` |
 
-The nine suites under `tests/` are unit-style; the `tests/stories/` suites are
+The root-level suites under `tests/` are unit-style; the `tests/stories/` suites are
 the behavioural layer, written one epic per file with every test name carrying
 its story id. Run everything with `npm test`.
 
-**No story is uncovered.** The guard reports 36 stories, 348 test cases, and
-36/36 stories with at least one behavioural test; US-1, US-2, US-3, US-6, and
-all of epic F have tests, and the coverage guard fails the build if any of them
-loses one. The scan covers the `tests/stories/` suites and the root-level
+39/39 stories covered by 370 test case(s); thinnest story has 1.
+No story is untested. The scan covers the `tests/stories/` suites and the root-level
 `tests/*-test.mjs` suites.

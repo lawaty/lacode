@@ -5,6 +5,36 @@ import * as probe from "../lib/probe.ts"
 import { claimDesktopNotice, notifyDesktop } from "../lib/desktop-notify.ts"
 import type { Claim } from "../lib/pool.ts"
 
+/**
+ * Raised when routing finds no usable slot. It is deliberately NOT swallowed by
+ * the task hook's routing catch: a spawn that cannot be routed must fail with
+ * the reason instead of silently running on a base agent or -- worse -- being
+ * rewritten onto a cooling slot that will only cancel.
+ */
+class NoRoutableSlotError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "NoRoutableSlotError"
+  }
+}
+
+function noRoutableSlotMessage(s: pool.State, snap: pool.Snapshot): string {
+  const slots = s.slots.length > 0 ? s.slots : pool.FALLBACK_SLOTS
+  const now = Date.now()
+  const reasons = slots.map((slot) => {
+    const strike = snap.cooling.get(slot.model)
+    if (strike && strike.until > now) {
+      return `${slot.model} (${strike.reason}, ${Math.ceil((strike.until - now) / 1000)}s left)`
+    }
+    if (!pool.providerReady(s, slot.model)) {
+      return `${slot.model} (provider ${pool.providerOf(slot.model)} not configured)`
+    }
+    const status = s.catalog.get(slot.model)
+    return `${slot.model} (${status ?? "unavailable"})`
+  })
+  return `no slots to route to: all ${slots.length} pool slot(s) are cooling or unavailable - ${reasons.join("; ")}. Nothing was spawned; wait for a cooldown to clear or run pool_recheck.`
+}
+
 // Task routing, limit detection and hang recovery for a shared set of models.
 //
 // This module is a HOOK FACTORY, not a plugin. opencode loads every export of
@@ -138,7 +168,7 @@ type AbortReport = {
   slot: number
   model: string
   elapsedMs: number
-  kind: "no-answer" | "rate-limit" | "empty response" | "permission" | "provider error"
+  kind: "no-answer" | "rate-limit" | "empty response" | "permission" | "provider error" | "context overflow"
   released: boolean
   message: string
 }
@@ -302,11 +332,16 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
   const spawns = new Map<string, { base: string; slot: number; model: string; t: number }>()
   const observedErrors = new Map<string, { reason: string; detail: string }>()
   const abortKind = (reason: string): AbortReport["kind"] =>
-    pool.isQuotaReason(reason) || pool.isLimitText(reason) ? "rate-limit" : "provider error"
+    pool.isContextOverflowText(reason) || pool.isRequestTooLargeText(reason) || reason === "context overflow"
+      ? "context overflow"
+      : pool.isQuotaReason(reason) || pool.isLimitText(reason)
+        ? "rate-limit"
+        : "provider error"
   const abortLabel = (kind: AbortReport["kind"], elapsedMs: number): string => {
     const seconds = Math.max(1, Math.round(elapsedMs / 1000))
     if (kind === "no-answer") return `no answer in ${seconds}s`
     if (kind === "rate-limit") return `rate limited after ${seconds}s`
+    if (kind === "context overflow") return `context window exceeded after ${seconds}s; model kept out of routing`
     if (kind === "empty response") return `empty response after ${seconds}s`
     if (kind === "permission") return `permission denied after ${seconds}s`
     return `provider error after ${seconds}s`
@@ -1192,6 +1227,31 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             }
             return
           }
+          const isTpm = pool.isRequestTooLargeText(haystack)
+          const statedLimit = isTpm ? pool.parseStatedTokenLimit(haystack) : undefined
+          const headers = (error as { data?: { responseHeaders?: unknown } })?.data?.responseHeaders
+          const observedTpm = isTpm ? (statedLimit ?? pool.parseRateLimitHeaders(headers)) : undefined
+          const belowMin = observedTpm !== undefined && observedTpm < pool.MIN_SLOT_TPM
+          const overflow = (pool.isContextOverflowText(haystack) || isTpm) && !auth && (!limited || isTpm)
+          if (overflow) {
+            const model = own?.claim.m
+            const cooldown = belowMin ? pool.BELOW_MIN_CONTEXT_COOLDOWN_MS : pool.CONTEXT_OVERFLOW_COOLDOWN_MS
+            if (model) {
+              pool.recordStrike(s, model, "context overflow", cooldown)
+              if (observedTpm !== undefined) pool.noteTpm(s, model, observedTpm)
+              const message = belowMin
+                ? `tpm below minimum on ${model}: stated ${observedTpm} < ${pool.MIN_SLOT_TPM}; dropping it for ${Math.round(cooldown / 1000)}s and failing over`
+                : `context overflow on ${model}; cooling it for ${Math.round(cooldown / 1000)}s and failing over`
+              await log("warn", message, {
+                model,
+                slot: own?.claim.k,
+                session: sessionID,
+                reason: haystack.slice(0, 400),
+              })
+            }
+            await failOver(sessionID, model ?? "?", "context overflow", { cool: false })
+            return
+          }
           if (!limited && !outage && !auth) {
             // session.error is terminal (see the comment above the branch), so any claim
             // bound to this session is finished even when the error is not a pool signal.
@@ -1374,8 +1434,33 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         const gateway5xx = status !== undefined && status >= 500 && status <= 599
         const transientGateway = gateway5xx || pool.isTransientGatewayText(haystack)
         const missing = pool.isModelMissingText(haystack)
+        const model = `${info.providerID ?? "?"}/${info.modelID ?? "?"}`
+        const ownMsg = claimFor(info.sessionID)
+        const isTpm = pool.isRequestTooLargeText(haystack)
+        const statedLimit = isTpm ? pool.parseStatedTokenLimit(haystack) : undefined
+        const headers = (info.error as { data?: { responseHeaders?: unknown } })?.data?.responseHeaders
+        const observedTpm = isTpm ? (statedLimit ?? pool.parseRateLimitHeaders(headers)) : undefined
+        const belowMin = observedTpm !== undefined && observedTpm < pool.MIN_SLOT_TPM
+        if ((pool.isContextOverflowText(haystack) || isTpm) && !auth && (!limited || isTpm)) {
+          const cooldown = belowMin ? pool.BELOW_MIN_CONTEXT_COOLDOWN_MS : pool.CONTEXT_OVERFLOW_COOLDOWN_MS
+          if (ownMsg) {
+            pool.recordStrike(s, model, "context overflow", cooldown)
+            if (observedTpm !== undefined) pool.noteTpm(s, model, observedTpm)
+            const message = belowMin
+              ? `tpm below minimum on ${model}: stated ${observedTpm} < ${pool.MIN_SLOT_TPM}; dropping it for ${Math.round(cooldown / 1000)}s and failing over`
+              : `context overflow on ${model}; cooling it for ${Math.round(cooldown / 1000)}s and failing over`
+            await log("warn", message, {
+              model,
+              slot: ownMsg.claim.k,
+              session: info.sessionID,
+              reason: haystack.slice(0, 400),
+            })
+          }
+          await failOver(info.sessionID, model, "context overflow", { cool: false })
+          return
+        }
         if (!limited && !transientGateway && !auth && !missing) {
-          const ownMsgUnclassified = claimFor(info.sessionID)
+          const ownMsgUnclassified = ownMsg
           if (ownMsgUnclassified) {
             pool.recordFailure(s, {
               ts: Date.now(),
@@ -1399,7 +1484,6 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           }
           return
         }
-        const model = `${info.providerID ?? "?"}/${info.modelID ?? "?"}`
         // A probe is a QUESTION about a model, not work on it. Counting its failure
         // would re-cool the model a little further on every check, until the window
         // sat at the six-hour cap and no probe could ever pass — the prober would
@@ -1415,7 +1499,6 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         // would escalate the cooldown past the outage -- see pool.coolUnavailable).
         // A gateway 5xx, a queue budget, or a timeout is the same kind of fault
         // and takes the same flat path; a real limit still escalates below.
-        const ownMsg = claimFor(info.sessionID)
         if (missing) {
           const ownMsgMissing = ownMsg
           const missingModel = ownMsgMissing?.claim.m ?? model
@@ -1502,6 +1585,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         if (pool.BASES.includes(requested)) {
           const neededContext = estimateContextTokens(output.args?.prompt)
           const slot = pool.pickSlot(s, snap, neededContext)
+          if (!slot) throw new NoRoutableSlotError(noRoutableSlotMessage(s, snap))
           const variant = pool.agentFor(requested, slot.index)
           if (s.known.size > 0 && !s.known.has(variant)) {
             await warnOnce(`variant ${variant} missing from config; spawn left unchanged`)
@@ -1547,6 +1631,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           )
         }
       } catch (error) {
+        if (error instanceof NoRoutableSlotError) throw error
         await log("error", `routing failed, spawn unchanged: ${String(error)}`)
       }
     },
@@ -1557,7 +1642,18 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       const spawn = spawns.get(key)
       pool.release(s, key)
       const text = typeof output.output === "string" ? output.output : ""
-      const failed = abortReports.has(key) || /task\s+cancel+ed/i.test(text)
+      const cancelled = abortReports.has(key) || /task\s+cancel+ed/i.test(text)
+      // A completed task with no text is a model failure, not a success. Without
+      // this the slot keeps winning every small task and every caller gets an
+      // empty result: the exact "routed only to slot N, and it returns nothing"
+      // symptom. Bench the model so the next spawn takes another slot; the
+      // strike backoff lengthens the window if it keeps happening.
+      if (!cancelled && spawn && typeof output.output === "string" && text.trim() === "") {
+        const strike = pool.recordStrike(s, spawn.model, "empty response")
+        const seconds = strike ? Math.max(1, Math.round((strike.until - Date.now()) / 1000)) : 0
+        await log("warn", `empty response from ${spawn.model} on slot ${spawn.slot}; benched ${seconds}s`)
+        output.output = `Task returned an empty response from ${spawn.model} (slot ${spawn.slot}); the model has been benched for ${seconds}s so the next spawn uses another slot.`
+      }
       spawns.delete(key)
       const report = abortReports.get(key)
       if (!report) return
@@ -1641,7 +1737,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
                 : "",
               status && status !== "active" && status !== "unknown" ? `catalog:${status}` : "",
             ].filter(Boolean)
-            const marker = slot.index === next.index ? " <- next" : ""
+            const marker = next && slot.index === next.index ? " <- next" : ""
             // load/ceiling: the ceiling is the slot's weight. A FULL slot is only
             // used again once no other slot is both available and under its weight.
             const load = entry?.total ?? 0
@@ -1674,6 +1770,9 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             title: `agent-pool: ${total} task(s) in flight, ${coolingNow.length} model(s) cooling`,
             output: [
               `shared pool over ${slots.length} slot(s) from ${s.origin}; state ${pass}; bases: ${pool.BASES.join(", ")}\none ordered pass in slot order: each slot fills to its weight, then overflow goes to the least-loaded slot. Capacity is the sum of the weights; repeat a model on another line to give it more (FULL = at weight).`,
+              ...(next
+                ? []
+                : ["next: none - no routable slot; every slot is cooling, catalog-retired, or provider-unconfigured. A spawn will fail explicitly instead of routing."]),
               ...(sharedBuckets.length
                 ? [`buckets: ${sharedBuckets.map(([name, entry]) => `${name} ${entry.seats} seat(s)${entry.cooling ? " COOLING" : ""}`).join("; ")}`]
                 : []),

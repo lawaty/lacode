@@ -6,7 +6,7 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { shippedConfig } from "./fixtures/config.mjs"
-import { UNBOUND_CLAIM_MS } from "../src/lib/pool.ts"
+import { MODEL_MISSING_COOLDOWN_MS, UNBOUND_CLAIM_MS } from "../src/lib/pool.ts"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PLUGIN = join(HERE, "..", "src", "plugins", "agent-pool.ts")
@@ -30,6 +30,12 @@ const scratch = () => {
 const REAL = Date.now()
 let clock = 0
 Date.now = () => REAL + clock
+
+// Step the fake clock past the cooldown a missing model is benched under, so a
+// scenario can test a later spawn without waiting for the 6h window.
+const clearCooldown = () => {
+  clock += MODEL_MISSING_COOLDOWN_MS + 1000
+}
 
 const { agentPoolHooks: AgentPool } = await import(PLUGIN)
 
@@ -124,8 +130,21 @@ const { agentPoolHooks: AgentPool } = await import(PLUGIN)
   assert(st.includes("COOLING"), `after model-not-found, slot must be COOLING, got:\n${st}`)
   assert(st.includes("model-missing"), `after model-not-found, reason must be model-missing, got:\n${st}`)
 
+  // The only slot is cooling: routing must refuse explicitly and name the
+  // reason, never degrade onto the missing model.
+  let refused
+  try {
+    await spawn("f2-refused", "parent")
+  } catch (error) {
+    refused = error
+  }
+  assert(refused && /no slots to route to/i.test(refused.message), `spawn on a cooling-only pool must refuse, got ${refused}`)
+  assert(refused && /model-missing/.test(refused.message), `the refusal must name the reason, got ${refused?.message}`)
+
+  // Once the cooldown lapses the slot is routable again.
+  clearCooldown()
   const f2 = await spawn("f2", "parent")
-  assert(f2 === "explore-1", `spawn after cooling should route to explore-1, got ${f2}`)
+  assert(f2 === "explore-1", `spawn after the cooldown should route to explore-1, got ${f2}`)
 
   await childCreated("parent", "child-2")
   await sessionError("child-2", { name: "UnknownError", data: { message: "boom" } })
@@ -155,16 +174,19 @@ const { agentPoolHooks: AgentPool } = await import(PLUGIN)
   assert(st.includes("load=0/2"), `after assistant-message model-not-found, load must be 0/2, got:\n${st}`)
   assert(st.includes("model-missing"), `after assistant-message model-not-found, status must still contain model-missing, got:\n${st}`)
 
-  // B. Unbound claim + model-not-found error on the parent
+  // B. Unbound claim + model-not-found error on the parent. Clear the cooldown
+  // the assistant-message error just wrote, so the spawn itself can be routed.
+  clearCooldown()
   await spawn("f-unbound", "parent")
   await sessionError("parent", { name: "UnknownError", data: { message: "Model not found: opencode/big-pickle" } })
   st = await status()
   assert(st.includes("load=0/2"), `after unbound claim + parent model-not-found, load must be 0/2, got:\n${st}`)
 
-  // Unbound-claim expiry
-  clock = 0
+  // Unbound-claim expiry. The parent error cooled the model again, so clear it
+  // before spawning; the claim written now must expire on its own.
+  clearCooldown()
   await spawn("f-expiry", "parent")
-  clock = UNBOUND_CLAIM_MS + 1000
+  clock += UNBOUND_CLAIM_MS + 1000
   st = await status()
   assert(st.includes("load=0/2"), `after unbound claim expiry, load must be 0/2, got:\n${st}`)
 }
