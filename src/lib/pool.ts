@@ -70,6 +70,23 @@ export const UNAVAILABLE_COOLDOWN_MS = 60 * 1000
  * long as the first one.
  */
 export const UNAVAILABLE_REASON = "endpoint-unavailable"
+/**
+ * A provider is degraded when several of its models fail with a transient,
+ * non-quota reason inside one short window. That is a provider-wide signal, not
+ * N independent model bugs, so the whole provider is benched for one flat window
+ * and every slot is re-probed together when it lapses. The window is longer than
+ * a single-model outage (60s) because a status-site degradation outlives a
+ * gateway hiccup, and short enough that a recovered provider returns without a
+ * restart. This is never a strike: waiting did not fail the model, the provider
+ * did.
+ */
+export const PROVIDER_DEGRADED_REASON = "provider-degraded"
+export const PROVIDER_DEGRADED_COOLDOWN_MS = 30 * 60 * 1000
+const PROVIDER_DEGRADED_WINDOW_MS = 10 * 60 * 1000
+const PROVIDER_DEGRADED_MIN_MODELS = 2
+const TRANSIENT_DEGRADATION_REASONS =
+  /^(?:no answer|no-answer|hang|timeout|timed out|endpoint-unavailable|provider-degraded|empty response|network|server)$/i
+const FLAT_OUTAGE_REASONS = new Set([UNAVAILABLE_REASON, PROVIDER_DEGRADED_REASON])
 // A weight is a slot's active-session budget. With no second pass the pool's
 // whole capacity is the sum of the slot weights, so this only bounds one line's
 // share. Past it the number stops describing concurrency and becomes a way to
@@ -1255,7 +1272,7 @@ export function recordStrike(s: State, model: string, reason: string, stated?: n
   // An outage is cooled flat and is never a strike, whatever window the caller
   // stated: one short window says "not right now", and the strike memory is
   // left alone so the next real failure on this model starts at strike 1.
-  if (reason === UNAVAILABLE_REASON) return coolUnavailable(s, model)
+  if (FLAT_OUTAGE_REASONS.has(reason)) return coolUnavailable(s, model, stated, reason)
   const now = Date.now()
   // A bucket is a shared quota: a limit on one line is evidence about every
   // line in it, so the whole group is benched with the same window. Without a
@@ -1307,13 +1324,14 @@ export function recordStrike(s: State, model: string, reason: string, stated?: n
  * answers, short enough to re-probe soon. A longer cooldown already in force (a
  * real rate limit) still wins.
  */
-export function coolUnavailable(s: State, model: string) {
+export function coolUnavailable(s: State, model: string, windowMs = UNAVAILABLE_COOLDOWN_MS, reason = UNAVAILABLE_REASON) {
   if (!s.dirReady) return
   const now = Date.now()
+  const requested = Number.isFinite(windowMs) && windowMs > 0 ? Math.min(windowMs, STATED_COOLDOWN_MAX_MS) : UNAVAILABLE_COOLDOWN_MS
   const prior = s.cooling.get(model)
-  const until = now + UNAVAILABLE_COOLDOWN_MS
+  const until = now + requested
   if (prior && prior.until > until) return prior
-  const strike: Strike = { model, until, strikes: 1, reason: UNAVAILABLE_REASON, last: now }
+  const strike: Strike = { model, until, strikes: 1, reason, last: now }
   s.cooling.set(model, strike)
   // The record goes into the COOLING map -- the model is benched -- and into the
   // file, so every process sees the window. It never enters the STRIKE memory:
@@ -1716,6 +1734,35 @@ export function coolProvider(s: State, provider: string, until: number, reason: 
     if (strike) affected.push(strike)
   }
   return affected
+}
+
+/**
+ * Turn repeated transient model failures on one provider into a provider-wide
+ * bench. A single timeout is evidence about one model; two distinct models on
+ * the same provider failing inside {@link PROVIDER_DEGRADED_WINDOW_MS} is
+ * evidence about the provider -- the exact shape of a status-site degradation.
+ *
+ * The window is FLAT (no strikes): the model did not misbehave, the provider did.
+ * A provider with only one slot keeps the ordinary per-model outage window;
+ * there is no second model to corroborate a provider-wide fault.
+ */
+export function noteProviderDegradation(s: State, model: string, reason: string): Strike[] {
+  if (!s.dirReady) return []
+  if (!TRANSIENT_DEGRADATION_REASONS.test(String(reason))) return []
+  const provider = providerOf(model)
+  const slots = (s.slots.length > 0 ? s.slots : FALLBACK_SLOTS).filter((slot) => providerOf(slot.model) === provider)
+  if (slots.length < PROVIDER_DEGRADED_MIN_MODELS) return []
+  const now = Date.now()
+  const failing = new Set<string>()
+  for (const slot of slots) {
+    const record = s.cooling.get(slot.model)
+    if (!record || record.until <= now) continue
+    if (now - record.last > PROVIDER_DEGRADED_WINDOW_MS) continue
+    if (!TRANSIENT_DEGRADATION_REASONS.test(String(record.reason))) continue
+    failing.add(slot.model)
+  }
+  if (failing.size < PROVIDER_DEGRADED_MIN_MODELS) return []
+  return coolProvider(s, provider, now + PROVIDER_DEGRADED_COOLDOWN_MS, PROVIDER_DEGRADED_REASON)
 }
 
 export type FailureRecord = {

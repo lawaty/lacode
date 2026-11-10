@@ -360,8 +360,8 @@ test("[US-4] a TimeoutError with no status code benches the model flat", async (
 test("[US-4] a gateway 502 or 504 benches the model flat", async () => {
   const clock = fakeClock()
   const slots = [
-    { model: "prov/bad502", weight: 1 },
-    { model: "prov/bad504", weight: 1 },
+    { model: "prov-a/bad502", weight: 1 },
+    { model: "prov-b/bad504", weight: 1 },
   ]
   const { dir, hooks, models } = await bootPool(slots, "us4-5xx")
 
@@ -1341,5 +1341,50 @@ test("[US-31] a terminal limit on an unbound pooled child is identified, cooled,
   assert.equal(net.aborted.length, before2)
 
   net.restore()
+  await hooks.dispose()
+})
+
+test("[US-4] two transient failures on one provider bench the whole provider", async () => {
+  const clock = fakeClock()
+  const { dir, hooks, cfg } = await bootPool(
+    [
+      { model: "deg/a", weight: 1 },
+      { model: "deg/b", weight: 1 },
+      { model: "other/c", weight: 1 },
+    ],
+    "us4-degraded",
+  )
+
+  const fail = (modelID) =>
+    emit(hooks, "message.updated", {
+      info: {
+        role: "assistant",
+        providerID: "deg",
+        modelID,
+        error: { name: "TimeoutError", message: "The operation was aborted due to timeout" },
+      },
+    })
+
+  // One timeout is about one model; the second is evidence about the provider.
+  await fail("a")
+  const first = JSON.parse(readFileSync(limitFile(dir, "deg/a"), "utf8"))
+  assert.equal(first.reason, "endpoint-unavailable", `one failure must stay a model outage, got ${first.reason}`)
+  assert.ok(!existsSync(limitFile(dir, "deg/b")), "one failure must not touch a sibling model")
+
+  await fail("b")
+
+  const a = JSON.parse(readFileSync(limitFile(dir, "deg/a"), "utf8"))
+  const b = JSON.parse(readFileSync(limitFile(dir, "deg/b"), "utf8"))
+  assert.equal(a.reason, "provider-degraded", `the first model must be upgraded to the provider window, got ${a.reason}`)
+  assert.equal(b.reason, "provider-degraded", `the second model must carry the provider window, got ${b.reason}`)
+  assert.equal(a.strikes, 1, `a provider degradation must not count as a strike, got ${a.strikes}`)
+  const windowSeconds = Math.round((a.until - clock.now()) / 1000)
+  assert.ok(windowSeconds >= 29 * 60 && windowSeconds <= 31 * 60, `the provider window must be ~30m, got ${windowSeconds}s`)
+
+  const { routed } = await spawn(hooks, cfg, { callID: "next", sessionID: "next" })
+  assert.equal(routed, "explore-3", `the next spawn must leave the degraded provider, got ${routed}`)
+
+  const status = await hooks.tool.pool_status.execute({}, {})
+  assert.match(status.output, /provider degraded: deg/, `the status must name the degraded provider:\n${status.output}`)
   await hooks.dispose()
 })

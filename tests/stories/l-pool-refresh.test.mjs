@@ -150,3 +150,19 @@ test("[US-39] overlapping refreshes serialize, and a dead PID's lock is reclaime
 
   rmSync(home, { recursive: true, force: true })
 })
+
+test("[US-39] a provider-degraded breaker keeps previous rows and is named in warnings", () => {
+  const previous = makeProviders()
+  const degraded = makeProviders().map((entry) =>
+    entry.provider === "google" ? { ...entry, degraded: true, truncated: true, rows: [] } : entry,
+  )
+  const { selection, warnings } = selectPool({ providers: degraded, previousProviders: previous, now: NOW })
+  assert.ok(
+    selection.some((row) => row.model.startsWith("google/")),
+    `a degraded provider must keep its previous rows, got ${selection.map((r) => r.model).join(", ")}`,
+  )
+  assert.ok(
+    warnings.some((w) => w.includes("google: degraded")),
+    `the degraded provider must be named in the warnings, got ${JSON.stringify(warnings)}`,
+  )
+})

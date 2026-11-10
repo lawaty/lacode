@@ -91,6 +91,8 @@ The reconciliation with US-7 is that **acceptance and endorsement are different 
 - [ ] Given a spawn fails with a rate-limit-shaped error, When the error is serialized and matched, Then the offending model is marked cooling and a cooldown file is written for it.
 - [ ] Given model A is cooling and another slot is usable, When the next spawn is routed, Then the pick is a different usable model, never the cooling one.
 - [ ] Given a pooled task completes with an empty result, When the task hook returns, Then that model is benched for `empty response`, the result explains the bench, and the next spawn routes to another slot.
+- [ ] Given two distinct models on one provider fail with transient, non-quota errors inside ten minutes, When the second failure is recorded, Then every slot on that provider is benched for one flat `provider-degraded` window and the next spawn routes to another provider.
+- [ ] Given a provider-degraded window lapses, When a probe answers on one of its models, Then that model is re-admitted without a restart, because the bench was evidence about the provider, not a strike against the model.
 - [ ] Given every model is cooling, When a spawn is routed, Then the spawn is refused explicitly with a message naming the cooling slots and their reasons, and no model is routed to.
 - [ ] Given a limit error names a reset time, When the cooldown is recorded, Then the stated reset is used instead of a guessed backoff.
 
@@ -180,6 +182,7 @@ A daily scan was killed by a reboot mid-run, and because systemd records a trigg
 - [ ] Given a scan reaches its wall-clock budget, When the scores are written, Then unscanned and truncated providers keep their previous rows, so a partial run cannot shrink the pool.
 - [ ] Given a model failed transiently (timeout, rate limit, credit), When selection runs, Then its last measured score is retained and a retry is scheduled at the stated reset or 45 minutes later.
 - [ ] Given a permanent failure (401, 403 agreement, 404), When selection runs, Then the model is not retried and does not fall back to a previous score.
+- [ ] Given three consecutive provider-level timeouts or network errors during a scan, When the breaker trips, Then the scan stops probing that provider, keeps its previous rows, and names the provider as degraded.
 - [ ] Given enough other providers to fill the pool, When selection runs, Then exactly one `opencode` slot is reserved last with weight 2.
 - [ ] Given two refreshes overlap, When the second starts, Then it skips while the lock is held, and a lock left by a dead PID is reclaimed.
 
@@ -636,6 +639,6 @@ The root-level suites under `tests/` are unit-style; the `tests/stories/` suites
 the behavioural layer, written one epic per file with every test name carrying
 its story id. Run everything with `npm test`.
 
-39/39 stories covered by 370 test case(s); thinnest story has 1.
+39/39 stories covered by 372 test case(s); thinnest story has 1.
 No story is untested. The scan covers the `tests/stories/` suites and the root-level
 `tests/*-test.mjs` suites.

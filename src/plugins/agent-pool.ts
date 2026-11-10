@@ -472,6 +472,27 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
   // lost to a session we can never reach. The give-up is logged loudly.
   const MAX_ABORT_ATTEMPTS = 3
 
+  // Repeated transient failures on one provider are a provider-wide signal, not
+  // N independent model bugs. Bench every slot on that provider under a flat
+  // `provider-degraded` window, and log it once rather than once per model.
+  const markProviderDegradation = async (log: LogFn, model: string, reason: string) => {
+    const provider = pool.providerOf(model)
+    const slots = s.slots.length > 0 ? s.slots : pool.FALLBACK_SLOTS
+    const already = slots.some(
+      (slot) =>
+        pool.providerOf(slot.model) === provider && s.cooling.get(slot.model)?.reason === pool.PROVIDER_DEGRADED_REASON,
+    )
+    const cooled = pool.noteProviderDegradation(s, model, reason)
+    if (!already && cooled.length > 0) {
+      const until = new Date(Date.now() + pool.PROVIDER_DEGRADED_COOLDOWN_MS).toISOString().slice(11, 19)
+      await log("warn", `provider ${provider} degraded; ${cooled.length} slot(s) benched until ${until}Z`, {
+        provider,
+        reason,
+        models: cooled.map((record) => record.model),
+      })
+    }
+  }
+
   // A usage limit HANGS rather than errors, so the model that wedged this task is
   // very often already cooling for that very limit. Re-striking it here only
   // relabelled a provider quota window as a "hang" and inflated its strike count.
@@ -481,7 +502,10 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     const prior = s.cooling.get(claim.m)
     if (prior && prior.until > now) return
     const strike = pool.recordStrike(s, claim.m, "hang", HANG_FALLBACK_MS)
-    if (strike) await log("warn", `cooling ${claim.m} for ${Math.round((strike.until - now) / 1000)}s (hang)`)
+    if (strike) {
+      await log("warn", `cooling ${claim.m} for ${Math.round((strike.until - now) / 1000)}s (hang)`)
+      await markProviderDegradation(log, claim.m, "hang")
+    }
   }
 
   // The claim this process owns that is running on `sessionID`, if any. A claim
@@ -1154,6 +1178,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
                 // What an outage changes is the WINDOW, not the wait.
                 const transient = pool.coolUnavailable(s, own.claim.m)
                 if (transient) await log("warn", `cooling ${own.claim.m} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason})`)
+                await markProviderDegradation(log, own.claim.m, "endpoint-unavailable")
               } else {
                 const stated = pool.statedCooldown(message)
                 const strike = pool.recordStrike(s, own.claim.m, named, stated)
@@ -1305,6 +1330,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
               if (transient) {
                 await log("warn", `cooling ${own.claim.m} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason}) after a terminal error`)
               }
+              await markProviderDegradation(log, own.claim.m, "endpoint-unavailable")
             } else {
               stated = pool.statedCooldown(haystack) ?? pool.retryAfterMs(error?.data?.responseHeaders)
               const strike = pool.recordStrike(s, own.claim.m, named, stated)
@@ -1526,6 +1552,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         if (pool.isUnavailableText(haystack) || (!limited && !auth && transientGateway)) {
           const transient = pool.coolUnavailable(s, model)
           if (transient) await log("warn", `cooling ${model} for ${Math.round((transient.until - Date.now()) / 1000)}s (${transient.reason})`)
+          await markProviderDegradation(log, model, "endpoint-unavailable")
           // The caller already cooled the model, so only the abort/release side
           // of failover applies; a stuck session must not keep retrying it.
           await failOver(info.sessionID, model, transient?.reason ?? pool.UNAVAILABLE_REASON, { cool: false })
@@ -1652,6 +1679,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         const strike = pool.recordStrike(s, spawn.model, "empty response")
         const seconds = strike ? Math.max(1, Math.round((strike.until - Date.now()) / 1000)) : 0
         await log("warn", `empty response from ${spawn.model} on slot ${spawn.slot}; benched ${seconds}s`)
+        await markProviderDegradation(log, spawn.model, "empty response")
         output.output = `Task returned an empty response from ${spawn.model} (slot ${spawn.slot}); the model has been benched for ${seconds}s so the next spawn uses another slot.`
       }
       spawns.delete(key)
@@ -1747,6 +1775,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
 
           const total = [...snap.counts.values()].reduce((sum, n) => sum + n, 0)
           const coolingNow = [...snap.cooling.entries()].filter(([, st]) => st.until > now)
+          const degradedProviders = [...new Set(coolingNow.filter(([, st]) => st.reason === pool.PROVIDER_DEGRADED_REASON).map(([model]) => pool.providerOf(model)))]
           // Effective capacity per shared quota group. A bucket with one slot is
           // just that model and is not repeated here.
           const buckets = new Map<string, { seats: number; slots: number; cooling: boolean }>()
@@ -1775,6 +1804,9 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
                 : ["next: none - no routable slot; every slot is cooling, catalog-retired, or provider-unconfigured. A spawn will fail explicitly instead of routing."]),
               ...(sharedBuckets.length
                 ? [`buckets: ${sharedBuckets.map(([name, entry]) => `${name} ${entry.seats} seat(s)${entry.cooling ? " COOLING" : ""}`).join("; ")}`]
+                : []),
+              ...(degradedProviders.length
+                ? [`provider degraded: ${degradedProviders.join(", ")} (flat window; a probe re-admits a model when it answers)`]
                 : []),
               ...slots.map(line),
               "",

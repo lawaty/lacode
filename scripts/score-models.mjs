@@ -68,6 +68,10 @@ const SLOW_MS = 8_000 // at or above this, speed scores 0
 const PROMPT = "Reply with the single word: ok"
 const MAX_TOKENS = 8
 const PROBE_ATTEMPTS = 2 // one retry for a timeout or a dropped connection
+// Three consecutive provider-level timeouts/network errors is enough evidence
+// that the provider is degraded. Stop spending the scan budget on the rest of
+// its catalogue; the previous rows are retained and a retry is scheduled.
+const PROVIDER_BREAKER_AFTER = 3
 /**
  * Retry the same probe only when the next attempt has a chance. A known
  * exhausted balance or a permanent 401/403/404 will not recover in 300ms; the
@@ -601,6 +605,7 @@ async function main() {
       continue
     }
     const rows = []
+    let consecutiveTransient = 0
     for (const candidate of candidates) {
       if (Date.now() >= deadline) {
         budgetHit = true
@@ -614,6 +619,9 @@ async function main() {
         await sleep(delayMs)
         outcome = await probe(candidate, entry.provider)
       }
+      const kind = outcome.kind ?? classifyFailure({ status: outcome.status, reason: outcome.reason })
+      const providerFault = !outcome.ok && ["timeout", "network", "server"].includes(kind)
+      consecutiveTransient = providerFault ? consecutiveTransient + 1 : 0
       const row = { provider: entry.provider, ...candidate, ...outcome, score: null }
       row.score = score(row)
       if (row.score && row.score.value < minScore) {
@@ -628,9 +636,17 @@ async function main() {
       rows.push(row)
       const verdict = outcome.ok ? `${outcome.ms}ms` : outcome.reason.slice(0, 60)
       console.log(`  ${pad(candidate.model.replace(`${entry.provider}/`, ""), 52)} ${padL(verdict, 16)}`)
+      if (consecutiveTransient >= PROVIDER_BREAKER_AFTER) {
+        entry.truncated = true
+        entry.degraded = true
+        console.log(
+          `  provider degraded: ${consecutiveTransient} consecutive ${kind} failures; stopped ${entry.provider} after ${rows.length}/${candidates.length}`,
+        )
+        break
+      }
       await sleep(delayMs)
     }
-    results.push({ provider: entry.provider, error: null, rows, excluded: entry.excluded, truncated: !!entry.truncated })
+    results.push({ provider: entry.provider, error: null, rows, excluded: entry.excluded, truncated: !!entry.truncated, degraded: !!entry.degraded })
   }
   if (budgetHit) {
     console.log(
@@ -733,6 +749,7 @@ async function main() {
             provider: e.provider,
             error: e.error,
             truncated: !!e.truncated,
+            degraded: !!e.degraded,
             excluded: e.excluded ?? [],
             rows: e.rows.flatMap((r) => {
               const current = {

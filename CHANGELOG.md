@@ -9,6 +9,22 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.3.0-beta.1] — provider degradation backoff
+
+### Added
+
+- Pool: a provider is now treated as degraded when two distinct models on it fail with transient, non-quota errors inside ten minutes. Every slot on that provider is benched for one flat 30-minute `provider-degraded` window (never a strike), `pool_status` names the provider, and a probe re-admits a model as soon as it answers. A single model failure keeps the existing 60-second flat outage window.
+- Pool: `npm run score` stops probing a provider after three consecutive provider-level timeouts or network errors, keeps its previous rows, and warns that the provider is degraded. The scan budget is reserved for healthy providers.
+- `oc-sync`: the local `file://.../lacode/dist/index.js` plugin entry is rewritten to the published `@lawaty/lacode@<version>` spec before syncing, so a remote host never receives a path that only exists on the development machine.
+
+### Changed
+
+- Pool: a flat outage window can now be longer than 60 seconds for a provider-wide degradation; it still never enters the strike memory, so recovery starts clean.
+
+### Fixed
+
+- Pool: repeated timeouts on a degraded provider no longer re-probe every model every few minutes or inflate each model's strike count.
+
 ## [2.3.0-beta.0] — reliable pool refresh, autonomy modes, and empty-response failover
 
 ### Added

@@ -251,6 +251,9 @@ export function selectPool({
       continue
     }
     const entryRows = Array.isArray(entry?.rows) ? entry.rows : []
+    if (entry?.degraded) {
+      warnings.push(`${entry.provider}: degraded — stopped after consecutive transient failures; previous rows kept`)
+    }
     if (entryRows.length === 0 || entryRows.some(rankable)) continue
     const kinds = new Map()
     for (const row of entryRows) {
