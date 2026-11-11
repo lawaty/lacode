@@ -9,7 +9,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
-import { buildPool, degradedRetryDelay, poolSlotCount, renderTimerUnits, scheduleRetry, scheduleRetrySoon, shouldKeepPool } from "../scripts/refresh-pool.mjs"
+import { buildPool, degradedRetryDelay, poolHasHead, poolHasTail, poolSlotCount, renderTimerUnits, scheduleRetry, scheduleRetrySoon, shouldKeepPool, shouldSkipScan } from "../scripts/refresh-pool.mjs"
 
 const NOW = new Date("2026-11-06T12:00:00.000Z")
 const GENERATED = "2026-11-06T03:41:14.089Z"
@@ -291,23 +291,73 @@ test("poolSlotCount ignores comments and blanks", () => {
 })
 
 test("shouldKeepPool refuses a degenerate selection against a healthy pool", () => {
-  const kept = shouldKeepPool({ currentPoolText: TEN_SLOT_POOL, newSlotCount: 2 })
+  const kept = shouldKeepPool({
+    currentPoolText: TEN_SLOT_POOL,
+    newSlots: ["google/gemini-3-flash-preview  1  c:1048576", "opencode/inkling-2-small-free  2  b:opencode  c:1048576"],
+  })
   assert.equal(kept.keep, true)
   assert.equal(kept.prev, 10)
   assert.equal(kept.threshold, 5)
-  assert.match(kept.reason, /refusing to shrink the pool/)
+  assert.match(kept.reason, /refusing to (shrink|behead) the pool/)
+})
+
+test("shouldKeepPool refuses a beheaded or docked pool even at full count", () => {
+  const headless = TEN_SLOT_POOL.split("\n").filter((line) => !line.startsWith("opencode-go/"))
+  assert.equal(
+    shouldKeepPool({ currentPoolText: TEN_SLOT_POOL, newSlots: [...headless.slice(0, 7), "opencode/zen  2  b:opencode"] }).keep,
+    true,
+  )
+  const tailless = TEN_SLOT_POOL.split("\n").filter((line) => !line.includes("b:opencode"))
+  assert.equal(
+    shouldKeepPool({ currentPoolText: TEN_SLOT_POOL, newSlots: [...tailless.slice(0, 7), "groq/a  2"] }).keep,
+    true,
+    "dropping the zen tail must keep the previous pool",
+  )
 })
 
 test("shouldKeepPool passes a healthy selection and a first-ever run", () => {
-  assert.equal(shouldKeepPool({ currentPoolText: TEN_SLOT_POOL, newSlotCount: 9 }).keep, false)
-  assert.equal(shouldKeepPool({ currentPoolText: TEN_SLOT_POOL, newSlotCount: 5 }).keep, false)
-  assert.equal(shouldKeepPool({ currentPoolText: "", newSlotCount: 2 }).keep, false)
-  assert.equal(shouldKeepPool({ currentPoolText: "# header only\n", newSlotCount: 1 }).keep, false)
+  const full = TEN_SLOT_POOL.split("\n").filter((line) => line && !line.startsWith("#"))
+  assert.equal(shouldKeepPool({ currentPoolText: TEN_SLOT_POOL, newSlots: full }).keep, false)
+  const minimal = [full[0], full[1], full[3], full[4], full[9]]
+  assert.equal(minimal.length, 5)
+  assert.equal(shouldKeepPool({ currentPoolText: TEN_SLOT_POOL, newSlots: minimal }).keep, false)
+  assert.equal(shouldKeepPool({ currentPoolText: "", newSlots: full.slice(0, 2) }).keep, false)
+  assert.equal(shouldKeepPool({ currentPoolText: "# header only\n", newSlots: full.slice(0, 1) }).keep, false)
+})
+
+test("poolHasHead and poolHasTail read the structural contract", () => {
+  assert.equal(poolHasHead(TEN_SLOT_POOL), true)
+  assert.equal(poolHasTail(TEN_SLOT_POOL), true)
+  assert.equal(poolHasHead("groq/a  2\nopencode/zen  2  b:opencode\n"), false)
+  assert.equal(poolHasTail("opencode-go/a  4\ngroq/a  2\n"), false)
+  assert.equal(poolHasHead(""), false)
+  assert.equal(poolHasTail(""), false)
+})
+
+test("shouldSkipScan only skips on a hard down with an intact pool", () => {
+  const down = { ok: true, stale: false, down: ["go"], providers: ["opencode-go"] }
+  assert.equal(shouldSkipScan({ providerStatus: down, currentPoolText: TEN_SLOT_POOL }).skip, true)
+
+  const degraded = { ok: true, stale: false, down: [], providers: ["opencode"] }
+  const scan = shouldSkipScan({ providerStatus: degraded, currentPoolText: TEN_SLOT_POOL })
+  assert.equal(scan.skip, false, "degraded must never skip a scan")
+  assert.match(scan.reason, /no hard outage/)
+
+  const headless = "groq/a  2\nopencode/zen  2  b:opencode\n"
+  assert.equal(
+    shouldSkipScan({ providerStatus: down, currentPoolText: headless }).skip,
+    false,
+    "a broken pool always gets its repair scan",
+  )
+
+  assert.equal(shouldSkipScan({ providerStatus: { ok: false, down: [] }, currentPoolText: TEN_SLOT_POOL }).skip, false)
+  assert.equal(shouldSkipScan({ providerStatus: { ok: true, stale: true, down: ["go"] }, currentPoolText: TEN_SLOT_POOL }).skip, false)
 })
 
 test("shouldKeepPool allows recovery from a previously clobbered pool", () => {
   const thin = "opencode-go/a  4  c:1048576\nopencode/b  2  b:opencode  c:1048576\n"
-  assert.equal(shouldKeepPool({ currentPoolText: thin, newSlotCount: 8 }).keep, false)
+  const full = TEN_SLOT_POOL.split("\n").filter((line) => line && !line.startsWith("#"))
+  assert.equal(shouldKeepPool({ currentPoolText: thin, newSlots: [...full.slice(0, 7), full[9]] }).keep, false)
 })
 
 test("degradedRetryDelay rechecks within 5 minutes while degraded", () => {
@@ -360,7 +410,7 @@ test("a degenerate scan never replaces a healthy pool file", () => {
   const result = run()
   assert.equal(readFileSync(join(conf, "pool.txt"), "utf8"), TEN_SLOT_POOL, "the healthy pool must survive a degenerate scan")
   assert.ok(
-    (result.status === 1 && /fail closed|refusing to shrink/.test(result.stderr)) ||
+    (result.status === 1 && /fail closed|refusing to (shrink|behead|dock)/.test(result.stderr)) ||
       (result.status === 0 && /status degraded/.test(result.stdout)),
     `either the write guard or the status early-out must keep the pool (status=${result.status} out=${result.stdout} err=${result.stderr})`,
   )

@@ -35,6 +35,14 @@ export const statusCachePath = (home = homedir()) => join(home, ".config", "laco
 /** Status components that carry model traffic. console/logs are irrelevant to routing. */
 const ROUTING_SERVICES = ["inference", "go", "free", "payg"]
 
+/**
+ * The only components allowed to gate a scan. `payg` is the paid tier and
+ * `inference` is a shared roll-up — neither may freeze the free pool.
+ * `go`/`free` outages still never bench anything; they only ever skip a scan,
+ * and only on a hard `down`.
+ */
+export const OPENCODE_GATING_SERVICES = ["go", "free"]
+
 const SERVICE_PROVIDERS = {
   inference: ["opencode-go", "opencode"],
   go: ["opencode-go"],
@@ -64,6 +72,20 @@ export function statusDegradedProviders(payload) {
   }
   const providers = [...new Set(services.flatMap((entry) => SERVICE_PROVIDERS[entry.service] ?? []))]
   return { services, providers }
+}
+
+/**
+ * Pure gating signal for the refresh. Only a hard `down` on a gating service
+ * may skip a scan — `degraded` (latency, elevated errors) explicitly never
+ * does, because models routinely answer while the page says degraded.
+ */
+export function statusGateSignal(payload) {
+  const { services } = statusDegradedProviders(payload)
+  const gating = services.filter((entry) => OPENCODE_GATING_SERVICES.includes(entry.service))
+  return {
+    degraded: gating.map((entry) => entry.service),
+    down: gating.filter((entry) => entry.status === "down").map((entry) => entry.service),
+  }
 }
 
 function readCache(cachePath, now) {
@@ -111,6 +133,7 @@ export async function fetchProviderStatus(options = {}) {
     if (!response || response.ok !== true) throw new Error(`status API responded HTTP ${response?.status ?? "unknown"}`)
     const payload = await response.json()
     const { services, providers } = statusDegradedProviders(payload)
+    const { down } = statusGateSignal(payload)
     const record = {
       checkedAt: now,
       ok: true,
@@ -119,6 +142,7 @@ export async function fetchProviderStatus(options = {}) {
       stale: payload?.stale === true,
       services,
       providers,
+      down,
     }
     writeCache(cachePath, record)
     return record
@@ -133,6 +157,7 @@ export async function fetchProviderStatus(options = {}) {
       stale: false,
       services: [],
       providers: [],
+      down: [],
       reason: String(error?.message ?? error),
     }
   }

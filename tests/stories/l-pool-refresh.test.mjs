@@ -19,7 +19,7 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { SYNTHETIC_RETRY_MS, selectPool } from "../../scripts/pool-selection.mjs"
-import { degradedRetryDelay, renderTimerUnits, shouldKeepPool } from "../../scripts/refresh-pool.mjs"
+import { degradedRetryDelay, renderTimerUnits, shouldKeepPool, shouldSkipScan } from "../../scripts/refresh-pool.mjs"
 import { statusDegradedProviders } from "../../scripts/provider-status.mjs"
 
 const NOW = Date.parse("2026-11-10T20:00:00.000Z")
@@ -170,9 +170,25 @@ test("[US-39] a provider-degraded breaker keeps previous rows and is named in wa
 
 test("[US-40] a two-slot scan never replaces a ten-slot pool", () => {
   const healthy = makeProviders().flatMap((entry) => entry.rows.map((row) => `${row.model}  2`)).join("\n") + "\n"
-  const kept = shouldKeepPool({ currentPoolText: `# pool\n${healthy}`, newSlotCount: 2 })
+  const kept = shouldKeepPool({ currentPoolText: `# pool\n${healthy}`, newSlots: ["google/g/a  1", "opencode/zen  2  b:opencode"] })
   assert.equal(kept.keep, true)
-  assert.match(kept.reason, /refusing to shrink the pool/)
+  assert.match(kept.reason, /refusing to (shrink|behead) the pool/)
+})
+
+test("[US-40] only a hard outage pauses scanning, and never for a broken pool", () => {
+  const intact = "# pool\nopencode-go/a  4\nopencode/zen  2  b:opencode\n"
+  assert.equal(shouldSkipScan({ providerStatus: { ok: true, stale: false, down: ["go"] }, currentPoolText: intact }).skip, true)
+  assert.equal(
+    shouldSkipScan({ providerStatus: { ok: true, stale: false, down: [], providers: ["opencode"] }, currentPoolText: intact }).skip,
+    false,
+    "a degraded page must not pause scanning while the models answer",
+  )
+  const headless = "# pool\ngroq/a  2\nopencode/zen  2  b:opencode\n"
+  assert.equal(
+    shouldSkipScan({ providerStatus: { ok: true, stale: false, down: ["go"] }, currentPoolText: headless }).skip,
+    false,
+    "a broken pool always gets its repair scan",
+  )
 })
 
 test("[US-40] an opencode outage keeps the pool and rechecks in five minutes", () => {
@@ -194,6 +210,7 @@ test("[US-40] an opencode outage keeps the pool and rechecks in five minutes", (
 
 test("[US-40] recovery is always allowed: a fuller scan replaces a thin pool", () => {
   const thin = "# pool\nopencode-go/a  4\nopencode/zen  2  b:opencode\n"
-  assert.equal(shouldKeepPool({ currentPoolText: thin, newSlotCount: 8 }).keep, false)
-  assert.equal(shouldKeepPool({ currentPoolText: "", newSlotCount: 2 }).keep, false)
+  const fuller = ["opencode-go/a  4", "opencode-go/b  4", "groq/a  2", "groq/b  2", "google/a  1", "opencode/zen  2  b:opencode"]
+  assert.equal(shouldKeepPool({ currentPoolText: thin, newSlots: fuller }).keep, false)
+  assert.equal(shouldKeepPool({ currentPoolText: "", newSlots: fuller.slice(0, 2) }).keep, false)
 })

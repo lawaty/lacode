@@ -24,6 +24,7 @@ import { homedir, userInfo } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { fetchProviderStatus } from "./provider-status.mjs"
+import { POOL_SIZE } from "./pool-selection.mjs"
 
 const HOME = homedir()
 export const DEFAULT_SCORES_PATH = join(HOME, ".config", "lacode", "model-scores.json")
@@ -209,23 +210,83 @@ export function poolSlotCount(text) {
   return splitHeaderAndSlots(text).slots.filter(isSlotLine).length
 }
 
+/** The pool's structural contract: an opencode-go head and an opencode tail. */
+export function poolHasHead(text) {
+  const slots = splitHeaderAndSlots(text).slots.filter(isSlotLine)
+  return slots.length > 0 && slots[0].split("#")[0].trim().startsWith("opencode-go/")
+}
+
+export function poolHasTail(text) {
+  const slots = splitHeaderAndSlots(text).slots.filter(isSlotLine)
+  if (slots.length === 0) return false
+  const last = slots[slots.length - 1].split("#")[0].trim()
+  return last.startsWith("opencode/") && /(^|\s)b:opencode(\s|$)/.test(last)
+}
+
 /**
- * Pure fail-closed guard. A refresh must never replace a working pool with a
- * degenerate selection: when the new slot count falls below half the previous
- * pool (floored at MIN_POOL_SLOTS), the previous pool is kept. There is no
- * previous pool on a first-ever run, so there is nothing to protect and the
- * guard passes.
+ * Pure scan-skip decision. Only a hard `down` on a gating opencode service may
+ * skip a scan — `degraded` never does, because models routinely answer while
+ * the page says degraded. A structurally broken pool is never skipped either:
+ * the scan is its repair path.
  */
-export function shouldKeepPool({ currentPoolText, newSlotCount }) {
+export function shouldSkipScan({ providerStatus, currentPoolText }) {
+  if (!providerStatus?.ok || providerStatus.stale) {
+    return { skip: false, reason: "no trustworthy live signal; scanning" }
+  }
+  const down = Array.isArray(providerStatus.down) ? providerStatus.down : []
+  if (down.length === 0) {
+    return { skip: false, reason: "no hard outage on the live status; scanning" }
+  }
+  if (!poolHasHead(currentPoolText) || !poolHasTail(currentPoolText)) {
+    return { skip: false, reason: "pool structure already broken; scanning to repair it" }
+  }
+  return {
+    skip: true,
+    reason: `opencode status reports down: ${down.join(", ")}; keeping the current pool and rechecking in ${DEGRADED_RETRY_S / 60} minutes`,
+  }
+}
+
+/**
+ * Pure fail-closed guard. A refresh must never break the pool's structure or
+ * replace a working pool with a degenerate selection: the new pool must keep
+ * the opencode-go head and the opencode tail the current pool has, and hold at
+ * least half of POOL_SIZE. The baseline is the contract size, never the
+ * current file — a previously shrunk pool can always grow back, but no write
+ * may shrink or behead it. There is no previous pool on a first-ever run, so
+ * there is nothing to protect and the guard passes. `--force-write` is the
+ * human override for a genuinely changed catalogue.
+ */
+export function shouldKeepPool({ currentPoolText, newSlots }) {
   const prev = poolSlotCount(currentPoolText ?? "")
   if (prev <= 0) return { keep: false, prev, threshold: 0, reason: "no previous pool to protect" }
-  const threshold = Math.max(MIN_POOL_SLOTS, Math.floor(prev / 2))
-  if (newSlotCount >= threshold) return { keep: false, prev, threshold, reason: "" }
+  const slots = Array.isArray(newSlots) ? newSlots : []
+  const threshold = Math.max(MIN_POOL_SLOTS, Math.floor(POOL_SIZE / 2))
+  if (poolHasHead(currentPoolText) && !slots.some((line) => String(line).split("#")[0].trim().startsWith("opencode-go/"))) {
+    return {
+      keep: true,
+      prev,
+      threshold,
+      reason: `new selection has no opencode-go head slot while the previous pool has one; refusing to behead the pool`,
+    }
+  }
+  const tailKept = slots.some((line) => {
+    const stripped = String(line).split("#")[0].trim()
+    return stripped.startsWith("opencode/") && /(^|\s)b:opencode(\s|$)/.test(stripped)
+  })
+  if (poolHasTail(currentPoolText) && !tailKept) {
+    return {
+      keep: true,
+      prev,
+      threshold,
+      reason: `new selection has no opencode tail slot while the previous pool has one; refusing to dock the tail`,
+    }
+  }
+  if (slots.length >= threshold) return { keep: false, prev, threshold, reason: "" }
   return {
     keep: true,
     prev,
     threshold,
-    reason: `new selection has ${newSlotCount} usable slot(s), below the keep threshold of ${threshold} (previous pool had ${prev}); refusing to shrink the pool`,
+    reason: `new selection has ${slots.length} usable slot(s), below the keep threshold of ${threshold} (contract pool size ${POOL_SIZE}); refusing to shrink the pool`,
   }
 }
 
@@ -383,15 +444,19 @@ function usage() {
   --max N           models per provider passed to the scorer (default: 50)
   --scores PATH     scores file (default: ${DEFAULT_SCORES_PATH})
   --pool PATH       pool file to read/compare/write (default: ${DEFAULT_POOL_PATH})
+  --force-write   write the new selection even when the fail-closed guard would
+                    keep the previous pool (human override for a changed catalogue)
   -h, --help        this message
 
 Degradation behaviour: before scanning, the refresh checks
-https://status.opencode.ai/api/status. When opencode's serving path reports
-degraded and the current pool is intact, the scan is skipped, the pool is kept,
-and a recheck is scheduled in 5 minutes. After a scan, a selection below half
-the previous pool (minimum ${MIN_POOL_SLOTS} slots) is never written; the previous pool
-is kept and a 5-minute recheck is scheduled. A retry is always rechecked
-within 5 minutes while anything failed, even when the stated reset is hours out.`)
+https://status.opencode.ai/api/status. Only a hard outage (a gating service
+reporting down) with a structurally intact pool skips the scan; a mere degraded
+never does, because models routinely answer while the page says degraded. After
+a scan, a selection that beheads the pool (no opencode-go head), docks the tail
+(no opencode slot), or falls below half the contract pool size (minimum ${MIN_POOL_SLOTS}
+slots) is never written; the previous pool is kept and a 5-minute recheck is
+scheduled. A retry is always rechecked within 5 minutes while anything failed,
+even when the stated reset is hours out.`)
 }
 
 async function main() {
@@ -404,6 +469,7 @@ async function main() {
   const fromScores = argv.includes("--from-scores")
   const printOnly = argv.includes("--print") || argv.includes("--dry-run")
   const noRetry = argv.includes("--no-retry")
+  const forceWrite = argv.includes("--force-write")
   const value = (flag, fallback) => {
     const hit = argv.find((a) => a === flag || a.startsWith(`${flag}=`))
     if (!hit) return fallback
@@ -423,23 +489,21 @@ async function main() {
 
   const currentPoolText = readTextFile(poolPath)
 
-  // Live degradation signal. When opencode's own serving path reports degraded
-  // and the current pool is intact, probing now can only shrink it: keep the
-  // pool untouched and recheck in 5 minutes. A thin pool is still scanned, so
-  // a first-ever run (or a previously clobbered one) can recover, and the
-  // write guard below protects it if the scan comes back degenerate.
-  let providerStatus = { ok: false, providers: [], services: [] }
+  // Live degradation signal. Only a hard `down` on opencode's serving path may
+  // skip the scan — and only when the current pool is structurally intact, so
+  // a broken pool always gets its repair scan. `degraded` never skips: models
+  // routinely answer while the page says degraded, and the write guard below
+  // protects the pool if the scan comes back degenerate.
+  let providerStatus = { ok: false, providers: [], services: [], down: [] }
   if (!printOnly) {
     try {
       providerStatus = await fetchProviderStatus()
     } catch (error) {
-      providerStatus = { ok: false, providers: [], services: [], reason: String(error?.message ?? error) }
+      providerStatus = { ok: false, providers: [], services: [], down: [], reason: String(error?.message ?? error) }
     }
-    if (providerStatus.ok && providerStatus.providers.length > 0 && poolSlotCount(currentPoolText) >= MIN_POOL_SLOTS) {
-      const detail = providerStatus.services.map((entry) => `${entry.service}=${entry.status}`).join(", ")
-      console.log(
-        `opencode status degraded (${detail}); keeping the current pool of ${poolSlotCount(currentPoolText)} slots and rechecking in ${DEGRADED_RETRY_S / 60} minutes`,
-      )
+    const skip = shouldSkipScan({ providerStatus, currentPoolText })
+    if (skip.skip) {
+      console.log(`${skip.reason}; keeping the current pool of ${poolSlotCount(currentPoolText)} slots`)
       if (!noRetry) {
         const scheduled = scheduleRetrySoon()
         console.log(
@@ -457,6 +521,14 @@ async function main() {
       runScorer(max)
     } catch (error) {
       console.error(`scorer failed; pool.txt not written: ${String(error?.message ?? error)}`)
+      if (!printOnly && !noRetry) {
+        const scheduled = scheduleRetrySoon()
+        console.log(
+          scheduled.scheduled
+            ? `scheduled degraded recheck in ${scheduled.seconds}s`
+            : `degraded recheck not scheduled: ${scheduled.reason}`,
+        )
+      }
       process.exitCode = 1
       return
     }
@@ -476,6 +548,14 @@ async function main() {
     built = buildPool({ scores, currentPoolText, now: new Date() })
   } catch (error) {
     console.error(`refresh refused (fail closed): ${String(error?.message ?? error)}`)
+    if (!printOnly && !noRetry) {
+      const scheduled = scheduleRetrySoon()
+      console.log(
+        scheduled.scheduled
+          ? `scheduled degraded recheck in ${scheduled.seconds}s`
+          : `degraded recheck not scheduled: ${scheduled.reason}`,
+      )
+    }
     process.exitCode = 1
     return
   }
@@ -491,8 +571,9 @@ async function main() {
 
   // Fail closed on a degenerate selection: keep the previous pool, say so
   // loudly, and recheck in 5 minutes instead of waiting out a long reset.
-  if (!printOnly) {
-    const kept = shouldKeepPool({ currentPoolText, newSlotCount })
+  // --force-write is the human override for a genuinely changed catalogue.
+  if (!printOnly && !forceWrite) {
+    const kept = shouldKeepPool({ currentPoolText, newSlots: built.slots })
     if (kept.keep) {
       console.error(`refresh refused (fail closed): ${kept.reason}`)
       if (!noRetry) {

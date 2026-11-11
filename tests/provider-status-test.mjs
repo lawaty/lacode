@@ -106,3 +106,24 @@ test("a non-200 status API response is treated as no signal", async () => {
   assert.deepEqual(result.providers, [])
   rmSync(dir, { recursive: true, force: true })
 })
+
+test("statusGateSignal only gates on a hard down of a gating service", async () => {
+  const { statusGateSignal } = await import("../scripts/provider-status.mjs")
+  const down = statusGateSignal(
+    payload([
+      component("go", "down", { reason: "outage" }),
+      component("free", "degraded", { reason: "latency" }),
+      component("payg", "down", { reason: "paid blip" }),
+    ]),
+  )
+  assert.deepEqual(down.down, ["go"], "only the gating hard-down gates a scan")
+  assert.deepEqual(down.degraded, ["go", "free"], "degraded stays annotation-only")
+
+  const degradedOnly = statusGateSignal(payload([component("free", "degraded", { reason: "latency" })]))
+  assert.deepEqual(degradedOnly.down, [])
+  assert.deepEqual(degradedOnly.degraded, ["free"])
+
+  const clean = statusGateSignal(payload([component("go", "operational"), component("free", "operational")]))
+  assert.deepEqual(clean.down, [])
+  assert.deepEqual(clean.degraded, [])
+})

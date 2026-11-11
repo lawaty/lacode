@@ -9,6 +9,15 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.3.0-beta.4] — status never benches, structure is the contract
+
+### Fixed
+
+- Pool: only a hard outage (a gating `go`/`free` service reporting `down`) with a structurally intact pool may skip a refresh scan. A mere `degraded` never skips, because models routinely answer while the status page says degraded. Paid-tier (`payg`) and roll-up (`inference`) components can no longer freeze the free pool.
+- Pool: the fail-closed guard now enforces structure, not just count. A selection that drops the opencode-go head or the opencode tail is refused even at full count, and the keep threshold is anchored to the contract pool size (10) instead of the current file, so repeated writes can no longer ratchet the pool down. `--force-write` overrides the guard for a genuinely changed catalogue.
+- Pool: per-request probe deadline is 12 seconds (was 45), so a flapping provider stretches a scan far less; `--timeout MS` still overrides it.
+- Pool: a failed scorer run or a refused write now schedules a 5-minute recheck like every other failed run, instead of waiting for the next 6-hour slot.
+
 ## [2.3.0-beta.3] — persist autonomy modes in global config
 
 ### Changed

@@ -194,7 +194,9 @@ A refresh once replaced a healthy ten-slot pool with a two-slot scan because not
 **Story ID(s) for tests:** US-40
 **Acceptance criteria:**
 - [ ] Given a healthy pool and a scan that returns fewer slots than half of it (minimum four), When the refresh finishes, Then the previous pool file is left untouched, the refusal is logged, and a recheck is scheduled in 5 minutes.
-- [ ] Given opencode's serving path reports degraded on the live status and the current pool is intact, When the refresh runs, Then no scan is started, the pool is kept, and a recheck is scheduled in 5 minutes.
+- [ ] Given a scan that drops the opencode-go head or the opencode tail the current pool has, When the refresh finishes, Then the previous pool is kept even at full count, because the structure is the contract.
+- [ ] Given opencode's serving path reports a hard outage on the live status and the current pool is structurally intact, When the refresh runs, Then no scan is started, the pool is kept, and a recheck is scheduled in 5 minutes.
+- [ ] Given the status reports degraded (latency, elevated errors) rather than down, When the refresh runs, Then the scan proceeds as normal, because models routinely answer while the page says degraded.
 - [ ] Given any failed run with a stated reset hours out, When the retry is scheduled, Then the recheck still happens within 5 minutes; a sooner provider reset is honoured.
 - [ ] Given the degradation lifts, When the next 5-minute recheck runs, Then a full scan restores the pool instead of waiting for the next 6-hour slot.
 - [ ] Given a thin or missing pool, When a fuller scan completes, Then it is always written — the guard only ever blocks shrinking, never recovery.
@@ -654,6 +656,6 @@ The root-level suites under `tests/` are unit-style; the `tests/stories/` suites
 the behavioural layer, written one epic per file with every test name carrying
 its story id. Run everything with `npm test`.
 
-40/40 stories covered by 376 test case(s); thinnest story has 1.
+40/40 stories covered by 377 test case(s); thinnest story has 1.
 No story is untested. The scan covers the `tests/stories/` suites and the root-level
 `tests/*-test.mjs` suites.

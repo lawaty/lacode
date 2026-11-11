@@ -104,7 +104,7 @@ const value = (flag, fallback) => {
   --min-context N   exclude models whose context limit is below N (default: ${MIN_CONTEXT})
   --min-score N     do not rank models scoring below N (default: ${MIN_SCORE})
   --free-only        only probe catalogue cost 0/0 models on every provider
-  --timeout MS      per-request deadline in ms (default: 45000)
+  --timeout MS      per-request deadline in ms (default: 12000)
   --delay MS        pause between requests in ms (default: 300)
   --budget-min N    stop starting new probes after N minutes and write what was
                     measured; providers not scanned keep their previous rows
@@ -129,7 +129,7 @@ const providers = providerArg ? String(providerArg).split(",").map((s) => s.trim
 const maxPerProvider = Math.max(1, Number(value("--max", "50")) || 50)
 const minContext = Math.max(0, Number(value("--min-context", String(MIN_CONTEXT))) || MIN_CONTEXT)
 const minScore = Math.max(0, Number(value("--min-score", String(MIN_SCORE))) || MIN_SCORE)
-const timeoutMs = Math.max(1_000, Number(value("--timeout", "45000")) || 45_000)
+const timeoutMs = Math.max(1_000, Number(value("--timeout", "12000")) || 12_000)
 const delayMs = Math.max(0, Number(value("--delay", "300")) || 300)
 const budgetMin = Math.max(1, Number(value("--budget-min", "30")) || 30)
 const budgetMs = budgetMin * 60_000
