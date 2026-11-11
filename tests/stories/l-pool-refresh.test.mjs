@@ -18,8 +18,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { SYNTHETIC_RETRY_MS, selectPool } from "../../scripts/pool-selection.mjs"
-import { degradedRetryDelay, renderTimerUnits, shouldKeepPool, shouldSkipScan } from "../../scripts/refresh-pool.mjs"
+import { SYNTHETIC_RETRY_MS, poolStructureValid, selectPool } from "../../scripts/pool-selection.mjs"
+import { degradedRetryDelay, renderTimerUnits, shouldKeepPool } from "../../scripts/refresh-pool.mjs"
 import { statusDegradedProviders } from "../../scripts/provider-status.mjs"
 
 const NOW = Date.parse("2026-11-10T20:00:00.000Z")
@@ -172,23 +172,73 @@ test("[US-40] a two-slot scan never replaces a ten-slot pool", () => {
   const healthy = makeProviders().flatMap((entry) => entry.rows.map((row) => `${row.model}  2`)).join("\n") + "\n"
   const kept = shouldKeepPool({ currentPoolText: `# pool\n${healthy}`, newSlots: ["google/g/a  1", "opencode/zen  2  b:opencode"] })
   assert.equal(kept.keep, true)
-  assert.match(kept.reason, /refusing to (shrink|behead) the pool/)
+  assert.match(kept.reason, /breaks the pool structure|refusing to shrink the pool/)
 })
 
-test("[US-40] only a hard outage pauses scanning, and never for a broken pool", () => {
-  const intact = "# pool\nopencode-go/a  4\nopencode/zen  2  b:opencode\n"
-  assert.equal(shouldSkipScan({ providerStatus: { ok: true, stale: false, down: ["go"] }, currentPoolText: intact }).skip, true)
-  assert.equal(
-    shouldSkipScan({ providerStatus: { ok: true, stale: false, down: [], providers: ["opencode"] }, currentPoolText: intact }).skip,
-    false,
-    "a degraded page must not pause scanning while the models answer",
-  )
-  const headless = "# pool\ngroq/a  2\nopencode/zen  2  b:opencode\n"
-  assert.equal(
-    shouldSkipScan({ providerStatus: { ok: true, stale: false, down: ["go"] }, currentPoolText: headless }).skip,
-    false,
-    "a broken pool always gets its repair scan",
-  )
+test("[US-41] a failed scan never vacates head or tail: members are retained", () => {
+  const current = [
+    { model: "opencode-go/a", weight: 4, context: 1048576 },
+    { model: "groq/a", weight: 2, context: 131072 },
+    { model: "opencode/zen", weight: 2, bucket: "opencode", context: 1048576 },
+  ]
+  const outage = makeProviders().map((entry) => ({
+    ...entry,
+    rows: entry.rows.map((row) => (row.model === "opencode-go/a" ? fail(row.model, "timeout after 12000ms") : row)),
+  }))
+  const { selection } = selectPool({ providers: outage, previousProviders: [], currentSlots: current, now: NOW })
+  const models = selection.map((row) => row.model)
+  assert.ok(models.includes("opencode-go/a"), `the failed head member must be retained, got ${models.join(", ")}`)
+  assert.equal(models[0], "opencode-go/a", "the retained head must stay first")
+  assert.equal(models[models.length - 1], "opencode/zen", "the tail must stay last")
+  assert.ok(selection.find((row) => row.model === "opencode-go/a")?.retained, "retention must be marked")
+})
+
+test("[US-41] a catalogue removal on a clean scan vacates the slot", () => {
+  const current = [
+    { model: "opencode-go/gone", weight: 4, context: 1048576 },
+    { model: "opencode/zen", weight: 2, bucket: "opencode", context: 1048576 },
+  ]
+  // opencode-go scanned cleanly (rankable rows, no sign of "gone"): the missing
+  // model was removed from the catalogue, so it is dropped, not retained.
+  const { selection } = selectPool({ providers: makeProviders(), previousProviders: [], currentSlots: current, now: NOW })
+  assert.ok(!selection.some((row) => row.model === "opencode-go/gone"), "a removed model must not be retained")
+  assert.ok(selection.some((row) => row.model.startsWith("opencode-go/")), "the head is refilled from rankable models")
+})
+
+test("[US-41] a hard-dead model is replaced, never retained", () => {
+  const current = [
+    { model: "opencode-go/a", weight: 4, context: 1048576 },
+    { model: "opencode/zen", weight: 2, bucket: "opencode", context: 1048576 },
+  ]
+  const dead = makeProviders().map((entry) => ({
+    ...entry,
+    rows: entry.rows.map((row) => (row.model === "opencode-go/a" ? fail(row.model, "not served: 404") : row)),
+  }))
+  const { selection } = selectPool({ providers: dead, previousProviders: [], currentSlots: current, now: NOW })
+  assert.ok(!selection.some((row) => row.model === "opencode-go/a"), "a 404 model must vacate its slot")
+})
+
+test("[US-41] the structural verdict names the violation", () => {
+  const goodText = [
+    "opencode-go/a  4  c:1048576",
+    "opencode-go/b  4  c:1048576",
+    "opencode-go/c  4  c:262144",
+    "google/small  2  c:131072",
+    "groq/a  2  c:131072",
+    "groq/b  2  c:131072",
+    "mistral/a  2  c:262144",
+    "console-openrouter/a  2  c:131072",
+    "openrouter/a  2  c:131072",
+    "opencode/zen  2  c:1048576  b:opencode",
+  ]
+  const good = poolStructureValid(goodText)
+  assert.equal(good.valid, true)
+  const headless = poolStructureValid(["groq/a  2", "opencode/zen  2  b:opencode"])
+  assert.equal(headless.valid, false)
+  assert.ok(headless.problems.some((p) => p.includes("head")), `head violation must be named, got ${headless.problems.join("; ")}`)
+  const tailless = poolStructureValid(["opencode-go/a  4", "groq/a  2"])
+  assert.equal(tailless.valid, false)
+  assert.ok(tailless.problems.some((p) => p.includes("tail")), `tail violation must be named, got ${tailless.problems.join("; ")}`)
 })
 
 test("[US-40] an opencode outage keeps the pool and rechecks in five minutes", () => {

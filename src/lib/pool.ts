@@ -82,6 +82,14 @@ export const UNAVAILABLE_REASON = "endpoint-unavailable"
  */
 export const PROVIDER_DEGRADED_REASON = "provider-degraded"
 export const PROVIDER_DEGRADED_COOLDOWN_MS = 30 * 60 * 1000
+/**
+ * The reason a refresh scan files under when it keeps a transiently failed
+ * pool member in place. Written by scripts/refresh-pool.mjs (which cannot call
+ * into this module), honoured exactly like a flat outage: the slot is benched,
+ * never strike-counted, and re-admitted by the first probe that watches it
+ * answer.
+ */
+export const SCAN_KEPT_REASON = "scan-kept"
 const PROVIDER_DEGRADED_WINDOW_MS = 10 * 60 * 1000
 const PROVIDER_DEGRADED_MIN_MODELS = 2
 const TRANSIENT_DEGRADATION_REASONS =
@@ -1227,7 +1235,7 @@ export function readLimits(s: State): Map<string, Strike> {
       // An outage is not a strike: it benches the model for one flat window and
       // must not count towards the streak, or the next real failure on this
       // model would start at strike 2 and get twice the first window.
-      const countsAsStrike = strike.reason !== UNAVAILABLE_REASON
+      const countsAsStrike = strike.reason !== UNAVAILABLE_REASON && strike.reason !== SCAN_KEPT_REASON
       if (strike.until > now) {
         cooling.set(strike.model, strike)
         if (countsAsStrike) memory.set(strike.model, strike)

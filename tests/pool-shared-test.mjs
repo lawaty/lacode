@@ -428,6 +428,33 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + 2 * s.weight, 0)
   pool.release(s, claimKey)
 }
 
+// 9. a scanner-kept bench shows in pool_status with its absolute expiry, names
+//    the pool structure, and never enters the strike memory
+{
+  const t = await mk("shared-scan-kept", scratch())
+  const dir = made[made.length - 1]
+  const model = SLOT_MODELS[0]
+  const file = `limit.${model.replace(/[^a-zA-Z0-9._-]/g, "__")}.json`
+  writeFileSync(
+    join(dir, file),
+    JSON.stringify({ model, until: Date.now() + 30 * 60_000, strikes: 1, reason: pool.SCAN_KEPT_REASON, last: Date.now() }),
+  )
+  const status = await t.status()
+  assert(/scan-kept/.test(status), `status must name a scanner-kept bench, got:\n${status}`)
+  assert(/until \d\d:\d\d:\d\dZ/.test(status), `status must show the absolute bench expiry, got:\n${status}`)
+  assert(/pool structure: (intact|BROKEN)/.test(status), `status must carry the structural verdict, got:\n${status}`)
+
+  const mem = pool.state({ id: "scan-kept-mem", dir: scratch(), modelsFile: PRESET })
+  pool.init(mem, () => {})
+  writeFileSync(
+    join(mem.dir, "limit.scan__probe-a.json"),
+    JSON.stringify({ model: "scan/probe-a", until: Date.now() + 60_000, strikes: 5, reason: pool.SCAN_KEPT_REASON, last: Date.now() }),
+  )
+  const cooling = pool.readLimits(mem)
+  assert(cooling.has("scan/probe-a"), "a scan-kept record must bench its model")
+  assert(!mem.strikes.has("scan/probe-a"), "a scan-kept record must never enter the strike memory")
+}
+
 for (const d of made) rmSync(d, { recursive: true, force: true })
 if (failures === 0) console.log("\nALL SHARED-POOL CHECKS PASSED")
 else {

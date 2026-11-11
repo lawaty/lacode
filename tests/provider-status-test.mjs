@@ -127,3 +127,19 @@ test("statusGateSignal only gates on a hard down of a gating service", async () 
   assert.deepEqual(clean.down, [])
   assert.deepEqual(clean.degraded, [])
 })
+
+test("statusDeprioritizedProviders orders sick gating providers last", async () => {
+  const { statusDeprioritizedProviders } = await import("../scripts/provider-status.mjs")
+  const live = {
+    ok: true,
+    services: [
+      { service: "inference", status: "operational" },
+      { service: "go", status: "degraded", reason: "latency" },
+      { service: "free", status: "operational" },
+      { service: "payg", status: "down", reason: "paid blip" },
+    ],
+  }
+  assert.deepEqual(statusDeprioritizedProviders(live), ["opencode-go"], "only the sick gating service orders last; payg is ignored")
+  assert.deepEqual(statusDeprioritizedProviders({ ok: true, services: [] }), [])
+  assert.deepEqual(statusDeprioritizedProviders({ ok: false }), [])
+})

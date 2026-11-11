@@ -202,6 +202,22 @@ A refresh once replaced a healthy ten-slot pool with a two-slot scan because not
 - [ ] Given a thin or missing pool, When a fuller scan completes, Then it is always written — the guard only ever blocks shrinking, never recovery.
 - [ ] Given the status endpoint is unreachable, When the refresh runs, Then the scan proceeds as before, because an unknown signal must never block a refresh and the write guard still protects the pool.
 
+### US-41: The pool keeps its structure through any outage and shows its state
+**As a** user relying on the pool, **I want** members to be benched in place instead of deleted, recovery to be cheap, and the slot states visible, **so that** no outage can shrink the pool, no recovery takes longer than minutes, and I can see what each slot is doing.
+
+Selection retains current members unless the run proved them hard-dead (gone, credential, agreement, credit); a healthy-but-capped model is still decided by the caps. The refresh writes a flat `scan-kept` cooling record for every kept-but-transiently-failed member — the runtime already honours it and re-admits the model on the first answering probe — and clears stale benches for members that answered. The status page is a hint only: sick providers probe last, nothing is ever skipped or benched because of it. Degraded retries run a canary over the current members first and scan fully only when one stops answering. `pool_status` shows each cooling slot's absolute expiry, the structural verdict, the last refresh age, and the status hint.
+
+**Story ID(s) for tests:** US-41
+**Acceptance criteria:**
+- [ ] Given a current member whose probe failed transiently, When selection runs, Then the member is retained in place (marked retained) with its pool weight, and head/tail positions are never vacated.
+- [ ] Given a current member that is healthy but capped out, When selection runs, Then it is not retained — the caps decide.
+- [ ] Given a model absent from a cleanly scanned catalogue, When selection runs, Then it is dropped as hard-dead, not retained.
+- [ ] Given a retained member, When the refresh finishes, Then a flat `scan-kept` cooling record benches it without entering the strike memory, and a member that answered has any stale bench cleared.
+- [ ] Given a scan-kept bench, When any probe watches the model answer, Then it is re-admitted without waiting out the window.
+- [ ] Given a degraded page, When the refresh runs, Then sick providers only probe last; nothing is skipped or benched because of the page.
+- [ ] Given a degraded retry, When it runs, Then it probes only the current members first and scans fully only when one stops answering.
+- [ ] Given cooling slots, When `pool_status` renders, Then each shows its absolute expiry, plus the structural verdict, last refresh age, and status hint.
+
 ---
 
 ## Epic C — Hang detection and auto-recovery
@@ -623,6 +639,7 @@ table was filled in.
 | US-31 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/stories/c-hang-recovery.test.mjs` |
 | US-39 | B | `tests/stories/l-pool-refresh.test.mjs` |
 | US-40 | B | `tests/stories/l-pool-refresh.test.mjs`, `tests/refresh-pool-test.mjs`, `tests/provider-status-test.mjs` |
+| US-41 | B | `tests/stories/l-pool-refresh.test.mjs`, `tests/pool-selection-test.mjs`, `tests/refresh-pool-test.mjs`, `tests/pool-shared-test.mjs`, `tests/provider-status-test.mjs` |
 | US-8 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs` |
 | US-9 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs`, `tests/pool-shared-test.mjs` |
 | US-10 | C | `tests/stories/c-hang-recovery.test.mjs`, `tests/pool-hang-test.mjs`, `tests/pool-timer-test.mjs` |
@@ -656,6 +673,6 @@ The root-level suites under `tests/` are unit-style; the `tests/stories/` suites
 the behavioural layer, written one epic per file with every test name carrying
 its story id. Run everything with `npm test`.
 
-40/40 stories covered by 377 test case(s); thinnest story has 1.
+41/41 stories covered by 380 test case(s); thinnest story has 1.
 No story is untested. The scan covers the `tests/stories/` suites and the root-level
 `tests/*-test.mjs` suites.

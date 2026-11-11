@@ -1,4 +1,6 @@
-import { unwatchFile, watchFile } from "node:fs"
+import { readFileSync, unwatchFile, watchFile } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { tool, type Hooks, type PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
 import * as probe from "../lib/probe.ts"
@@ -200,6 +202,54 @@ export type AgentPoolOptions = {
 
 // Typed as a factory returning hooks, NOT as a Plugin: only src/index.ts may
 // carry the Plugin type, because only it may be loaded as one.
+
+/**
+ * Per-pool health lines for pool_status: the structural verdict (head, tail,
+ * count vs the 10-slot contract), the last refresh age from the pool header,
+ * and the live status-page hint. Every source is best-effort — a missing file
+ * drops its line instead of failing the status.
+ */
+const poolHealthLines = (slots: pool.Slot[], now: number): string[] => {
+  const lines: string[] = []
+  const heads = slots.filter((slot) => slot.model.startsWith("opencode-go/"))
+  const headOk = heads.length > 0 && slots.slice(0, heads.length).every((slot) => slot.model.startsWith("opencode-go/"))
+  const tail = slots[slots.length - 1]
+  const tailOk = !!tail && tail.model.startsWith("opencode/") && tail.bucket === "opencode"
+  const verdict = headOk && tailOk ? "intact" : "BROKEN"
+  lines.push(
+    `pool structure: ${verdict} (${slots.length}/10 slots, head=${headOk ? `${heads.length} opencode-go` : "missing"}, tail=${tailOk ? tail.model : "missing"})`,
+  )
+  try {
+    const text = readFileSync(join(homedir(), ".config", "lacode", "pool.txt"), "utf8")
+    const stamp = /^#\s*Refreshed\s+(\S+)/m.exec(text)?.[1]
+    if (stamp) {
+      const ageMs = now - Date.parse(stamp)
+      if (Number.isFinite(ageMs) && ageMs >= 0) {
+        const mins = Math.floor(ageMs / 60000)
+        lines.push(`last refresh: ${mins < 60 ? `${mins}m ago` : `${Math.floor(mins / 60)}h${mins % 60}m ago`} (${stamp})`)
+      }
+    }
+  } catch {}
+  try {
+    const raw = readFileSync(join(homedir(), ".config", "lacode", "provider-status.json"), "utf8")
+    const status = JSON.parse(raw) as {
+      ok?: boolean
+      overall?: string
+      checkedAt?: number
+      services?: { service?: string; status?: string; reason?: string }[]
+    }
+    if (status && typeof status === "object") {
+      const ageS = typeof status.checkedAt === "number" ? Math.max(0, Math.round((now - status.checkedAt) / 1000)) : -1
+      const bad = (status.services ?? []).filter((entry) => String(entry?.status ?? "") !== "operational")
+      const detail = bad.length > 0 ? `: ${bad.map((entry) => `${entry.service}=${entry.status}`).join(", ")}` : ""
+      lines.push(
+        `status page: ${status.ok === false ? "unreachable" : (status.overall ?? "unknown")}${detail}${ageS >= 0 ? ` (checked ${ageS}s ago)` : ""}`,
+      )
+    }
+  } catch {}
+  return lines
+}
+
 export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?: PluginOptions): Promise<Hooks> => {
   const opts = (options ?? {}) as AgentPoolOptions
   const notify = opts.notify ?? ((title: string, message: string) => void notifyDesktop(title, message))
@@ -1758,8 +1808,9 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             const users = entry && entry.bases.size > 0 ? [...entry.bases].map(([b, n]) => `${b}x${n}`).join(" ") : "idle"
             const strike = snap.cooling.get(slot.model)
             const status = s.catalog.get(slot.model)
+            const untilClock = strike ? new Date(strike.until).toISOString().slice(11, 19) + "Z" : ""
             const notes = [
-              strike ? `UNAVAILABLE (COOLING ${Math.ceil((strike.until - now) / 1000)}s, ${strike.reason}, strike ${strike.strikes})` : "",
+              strike ? `UNAVAILABLE (COOLING ${Math.ceil((strike.until - now) / 1000)}s left, until ${untilClock}, ${strike.reason}, strike ${strike.strikes})` : "",
               !pool.providerReady(s, slot.model)
                 ? `UNAVAILABLE (provider-unconfigured: ${pool.providerOf(slot.model)}; run \`opencode auth login ${pool.providerOf(slot.model)}\`)`
                 : "",
@@ -1809,6 +1860,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
                 ? [`provider degraded: ${degradedProviders.join(", ")} (flat window; a probe re-admits a model when it answers)`]
                 : []),
               ...slots.map(line),
+              ...poolHealthLines(slots, now),
               "",
               "by process:",
               `  ${s.id} (this process): ${snap.own.size} claim(s)`,

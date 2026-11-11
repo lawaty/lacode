@@ -46,13 +46,14 @@ import {
   classifyFailure,
   isTransientFailure,
   isTransientKind,
+  parsePoolSlots,
   providerRank,
   retryAfterMs,
   selectPool,
 } from "./pool-selection.mjs"
 
 const AUTH = join(homedir(), ".local", "share", "opencode", "auth.json")
-const OUT = join(homedir(), ".config", "lacode", "model-scores.json")
+const DEFAULT_OUT = join(homedir(), ".config", "lacode", "model-scores.json")
 // No default provider list: `opencode models --verbose` with no argument returns
 // every provider opencode knows about, and that is what we scan by default.
 const SESSION_PROVIDERS = new Set(["opencode", "opencode-go"])
@@ -100,6 +101,13 @@ const value = (flag, fallback) => {
     console.log(`Usage: npm run score -- [options]
 
   --providers a,b   restrict the scan to these providers (default: all configured)
+  --probe-models a,b probe exactly these provider/model ids (canary: skips the
+                    catalogue scan for everything else; unscanned providers keep
+                    their previous rows)
+  --deprioritize-providers a,b probe these providers last (a live status hint;
+                    never excludes anything, ordering only)
+  --current-pool PATH feed pool.txt as the current pool so selection retains
+                    members this run could not reach (default: no retention)
   --max N           probe at most N candidate models per provider (default: 50)
   --min-context N   exclude models whose context limit is below N (default: ${MIN_CONTEXT})
   --min-score N     do not rank models scoring below N (default: ${MIN_SCORE})
@@ -126,6 +134,16 @@ Providers with no direct HTTP endpoint (or an unexpanded \${...} URL) are probed
 
 const providerArg = value("--providers", null)
 const providers = providerArg ? String(providerArg).split(",").map((s) => s.trim()).filter(Boolean) : null
+const probeModelsArg = value("--probe-models", null)
+const probeModels = probeModelsArg ? new Set(String(probeModelsArg).split(",").map((s) => s.trim()).filter(Boolean)) : null
+const deprioritizeArg = value("--deprioritize-providers", null)
+  const deprioritizedProviders = new Set(
+    deprioritizeArg ? String(deprioritizeArg).split(",").map((s) => s.trim()).filter(Boolean) : [],
+  )
+  // probe --probe-models ids absent from every catalogue. Filled during the
+  // catalogue filter above; emitted as synthetic not-served rows after probing.
+  const missingProbeModels = []
+const currentPoolPath = value("--current-pool", null)
 const maxPerProvider = Math.max(1, Number(value("--max", "50")) || 50)
 const minContext = Math.max(0, Number(value("--min-context", String(MIN_CONTEXT))) || MIN_CONTEXT)
 const minScore = Math.max(0, Number(value("--min-score", String(MIN_SCORE))) || MIN_SCORE)
@@ -133,6 +151,7 @@ const timeoutMs = Math.max(1_000, Number(value("--timeout", "12000")) || 12_000)
 const delayMs = Math.max(0, Number(value("--delay", "300")) || 300)
 const budgetMin = Math.max(1, Number(value("--budget-min", "30")) || 30)
 const budgetMs = budgetMin * 60_000
+const OUT = value("--out", DEFAULT_OUT)
 const writeResults = !has("--no-write")
 const freeOnlyFlag = has("--free-only")
 
@@ -570,12 +589,35 @@ const pad = (s, n) => String(s).padEnd(n)
 const padL = (s, n) => String(s).padStart(n)
 
 async function main() {
-  const scanned = providers ? providers.map((provider) => freeModels(provider)) : freeModelsAll()
+  let scanned = providers ? providers.map((provider) => freeModels(provider)) : freeModelsAll()
   // Core providers first, then the free-only middle tier, then the slow paid
-  // catalogues. Ordering only; every provider is still probed if time allows.
+  // catalogues — and explicitly deprioritized providers last. Ordering only;
+  // every provider is still probed if time allows.
   scanned.sort(
-    (a, b) => providerRank(a.provider) - providerRank(b.provider) || String(a.provider).localeCompare(String(b.provider)),
+    (a, b) =>
+      Number(deprioritizedProviders.has(a.provider)) - Number(deprioritizedProviders.has(b.provider)) ||
+      providerRank(a.provider) - providerRank(b.provider) ||
+      String(a.provider).localeCompare(String(b.provider)),
   )
+  const currentSlots = (() => {
+    if (!currentPoolPath) return []
+    try {
+      return parsePoolSlots(readFileSync(currentPoolPath, "utf8"))
+    } catch {
+      return []
+    }
+  })()
+  if (probeModels && probeModels.size > 0) {
+    const seen = new Set()
+    scanned = scanned.flatMap((entry) => {
+      if (entry.error) return []
+      const models = (entry.models ?? []).filter((candidate) => probeModels.has(candidate.model))
+      models.forEach((candidate) => seen.add(candidate.model))
+      if (models.length === 0) return []
+      return [{ ...entry, models }]
+    })
+    missingProbeModels.push(...[...probeModels].filter((model) => !seen.has(model)))
+  }
   const results = []
   const deadline = Date.now() + budgetMs
   const skippedProviders = []
@@ -655,6 +697,32 @@ async function main() {
   }
   stopSessionServer()
 
+  // A canary model absent from every catalogue is not "unscanned" — it is
+  // gone. A synthetic not-served row makes the selector drop it (hard-dead)
+  // instead of retaining it blindly.
+  for (const model of missingProbeModels) {
+    const slash = model.indexOf("/")
+    const provider = slash === -1 ? "unknown" : model.slice(0, slash)
+    const row = {
+      provider,
+      model,
+      url: "",
+      apiId: slash === -1 ? model : model.slice(slash + 1),
+      context: null,
+      output: null,
+      ok: false,
+      ms: null,
+      reason: "not in provider catalogue (model-missing)",
+      status: 404,
+      kind: "not-served",
+      score: null,
+      retryAfter: null,
+    }
+    const entry = results.find((candidate) => candidate.provider === provider)
+    if (entry) entry.rows.push(row)
+    else results.push({ provider, error: null, rows: [row], excluded: [], truncated: false, degraded: false })
+  }
+
   // Per-provider ranked tables.
   for (const entry of results) {
     if (entry.error || entry.rows.length === 0) continue
@@ -705,6 +773,7 @@ async function main() {
       excluded: entry.excluded,
     })),
     previousProviders: previousScores?.providers,
+    currentSlots,
     minContext,
     minScore,
   })

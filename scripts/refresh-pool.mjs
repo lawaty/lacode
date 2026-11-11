@@ -20,11 +20,11 @@
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { execFileSync } from "node:child_process"
-import { homedir, userInfo } from "node:os"
+import { homedir, tmpdir, userInfo } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { fetchProviderStatus } from "./provider-status.mjs"
-import { POOL_SIZE } from "./pool-selection.mjs"
+import { fetchProviderStatus, statusDeprioritizedProviders } from "./provider-status.mjs"
+import { POOL_SIZE, isTransientFailure, parsePoolSlots, poolStructureValid } from "./pool-selection.mjs"
 
 const HOME = homedir()
 export const DEFAULT_SCORES_PATH = join(HOME, ".config", "lacode", "model-scores.json")
@@ -195,12 +195,45 @@ function writeFileAtomic(path, text) {
   renameSync(tmp, path)
 }
 
-function runScorer(max) {
+function runScorer(max, extraArgs = []) {
   const here = dirname(fileURLToPath(import.meta.url))
   const scorer = resolve(here, "score-models.mjs")
   if (!existsSync(scorer)) throw new Error(`scorer not found: ${scorer}`)
-  const args = [scorer, "--max", String(max)]
+  const args = [scorer, "--max", String(max), ...extraArgs]
   execFileSync(process.execPath, args, { stdio: "inherit" })
+}
+
+/**
+ * Cheap health check: probe exactly the current pool members (no catalogue
+ * sweep). Every member answers → the pool stands as-is: no full scan, no
+ * retry, back to the 6-hour cadence. Anything else → false, and the caller
+ * runs a full scan to verify. Returns true when the pool stands.
+ */
+function runCanary({ currentPoolText, scorerArgs, max }) {
+  const members = parsePoolSlots(currentPoolText).map((slot) => slot.model)
+  if (members.length === 0) return false
+  const tmp = join(tmpdir(), `lacode-canary-${process.pid}.json`)
+  try {
+    runScorer(Math.max(max, members.length), [...scorerArgs, "--probe-models", members.join(","), "--out", tmp])
+    const payload = JSON.parse(readFileSync(tmp, "utf8"))
+    const answered = new Set()
+    for (const entry of payload?.providers ?? []) {
+      for (const row of entry?.rows ?? []) {
+        if (row?.model && row?.ok === true) answered.add(row.model)
+      }
+    }
+    const missing = members.filter((model) => !answered.has(model))
+    if (missing.length === 0) {
+      console.log(`canary healthy: all ${members.length} pool member(s) answered; pool stands, no full scan`)
+      return true
+    }
+    console.log(`canary: ${missing.length} member(s) not answering (${missing.join(", ")}); running a full scan`)
+    return false
+  } finally {
+    try {
+      rmSync(tmp, { force: true })
+    } catch {}
+  }
 }
 
 /**
@@ -210,40 +243,71 @@ export function poolSlotCount(text) {
   return splitHeaderAndSlots(text).slots.filter(isSlotLine).length
 }
 
-/** The pool's structural contract: an opencode-go head and an opencode tail. */
-export function poolHasHead(text) {
-  const slots = splitHeaderAndSlots(text).slots.filter(isSlotLine)
-  return slots.length > 0 && slots[0].split("#")[0].trim().startsWith("opencode-go/")
-}
-
-export function poolHasTail(text) {
-  const slots = splitHeaderAndSlots(text).slots.filter(isSlotLine)
-  if (slots.length === 0) return false
-  const last = slots[slots.length - 1].split("#")[0].trim()
-  return last.startsWith("opencode/") && /(^|\s)b:opencode(\s|$)/.test(last)
-}
+/**
+ * Bench-in-place file layout. Must match src/lib/pool.ts: the runtime treats
+ * these files as flat cooling records (never strikes) and re-admits a model
+ * the moment a probe watches it answer.
+ */
+export const SCAN_BENCH_REASON = "scan-kept"
+export const SCAN_BENCH_WINDOW_MS = 45 * 60 * 1000
+export const scanBenchDir = (home = HOME) => join(home, ".local", "share", "opencode", "agent-pool")
+export const scanBenchFile = (model) => `limit.${String(model).replace(/[^a-zA-Z0-9._-]/g, "__")}.json`
 
 /**
- * Pure scan-skip decision. Only a hard `down` on a gating opencode service may
- * skip a scan — `degraded` never does, because models routinely answer while
- * the page says degraded. A structurally broken pool is never skipped either:
- * the scan is its repair path.
+ * Pure bench plan for the current pool members. A member whose current row
+ * failed transiently is benched until its stated reset (else 45 minutes); a
+ * member that answered has any stale bench cleared; an unscanned member is
+ * left alone for lack of evidence. Only pool members are ever touched.
  */
-export function shouldSkipScan({ providerStatus, currentPoolText }) {
-  if (!providerStatus?.ok || providerStatus.stale) {
-    return { skip: false, reason: "no trustworthy live signal; scanning" }
+export function computeScanBench({ selectionModels, providers, now = Date.now() }) {
+  const currentByModel = new Map()
+  for (const entry of Array.isArray(providers) ? providers : []) {
+    for (const row of Array.isArray(entry?.rows) ? entry.rows : []) {
+      if (row?.model && !currentByModel.has(row.model)) currentByModel.set(row.model, row)
+    }
   }
-  const down = Array.isArray(providerStatus.down) ? providerStatus.down : []
-  if (down.length === 0) {
-    return { skip: false, reason: "no hard outage on the live status; scanning" }
+  const bench = []
+  const clear = []
+  for (const model of selectionModels ?? []) {
+    const row = currentByModel.get(model)
+    if (!row) continue
+    if (row.ok !== false) {
+      clear.push(model)
+      continue
+    }
+    if (!isTransientFailure(row)) continue
+    const at = Number(row.retryAfter)
+    bench.push({
+      model,
+      until: Number.isFinite(at) && at > now ? at : now + SCAN_BENCH_WINDOW_MS,
+      kind: String(row.kind ?? "unknown"),
+    })
   }
-  if (!poolHasHead(currentPoolText) || !poolHasTail(currentPoolText)) {
-    return { skip: false, reason: "pool structure already broken; scanning to repair it" }
+  return { bench, clear }
+}
+
+/** Apply a bench plan with atomic writes; every failure is best-effort. */
+export function applyScanBench({ dir, bench, clear }) {
+  const applied = { benched: [], cleared: [] }
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch {}
+  for (const { model, until } of bench ?? []) {
+    try {
+      const record = { model, until, strikes: 1, reason: SCAN_BENCH_REASON, last: Date.now() }
+      const tmp = join(dir, `${scanBenchFile(model)}.tmp-${process.pid}`)
+      writeFileSync(tmp, JSON.stringify(record))
+      renameSync(tmp, join(dir, scanBenchFile(model)))
+      applied.benched.push(model)
+    } catch {}
   }
-  return {
-    skip: true,
-    reason: `opencode status reports down: ${down.join(", ")}; keeping the current pool and rechecking in ${DEGRADED_RETRY_S / 60} minutes`,
+  for (const model of clear ?? []) {
+    try {
+      rmSync(join(dir, scanBenchFile(model)), { force: true })
+      applied.cleared.push(model)
+    } catch {}
   }
+  return applied
 }
 
 /**
@@ -261,32 +325,22 @@ export function shouldKeepPool({ currentPoolText, newSlots }) {
   if (prev <= 0) return { keep: false, prev, threshold: 0, reason: "no previous pool to protect" }
   const slots = Array.isArray(newSlots) ? newSlots : []
   const threshold = Math.max(MIN_POOL_SLOTS, Math.floor(POOL_SIZE / 2))
-  if (poolHasHead(currentPoolText) && !slots.some((line) => String(line).split("#")[0].trim().startsWith("opencode-go/"))) {
+  const currentCheck = poolStructureValid(currentPoolText)
+  const newCheck = poolStructureValid(slots)
+  if (currentCheck.valid && !newCheck.valid) {
     return {
       keep: true,
       prev,
       threshold,
-      reason: `new selection has no opencode-go head slot while the previous pool has one; refusing to behead the pool`,
+      reason: `new selection breaks the pool structure (${newCheck.problems.join("; ")}); keeping the previous pool`,
     }
   }
-  const tailKept = slots.some((line) => {
-    const stripped = String(line).split("#")[0].trim()
-    return stripped.startsWith("opencode/") && /(^|\s)b:opencode(\s|$)/.test(stripped)
-  })
-  if (poolHasTail(currentPoolText) && !tailKept) {
-    return {
-      keep: true,
-      prev,
-      threshold,
-      reason: `new selection has no opencode tail slot while the previous pool has one; refusing to dock the tail`,
-    }
-  }
-  if (slots.length >= threshold) return { keep: false, prev, threshold, reason: "" }
+  if (slots.filter(isSlotLine).length >= threshold) return { keep: false, prev, threshold, reason: "" }
   return {
     keep: true,
     prev,
     threshold,
-    reason: `new selection has ${slots.length} usable slot(s), below the keep threshold of ${threshold} (contract pool size ${POOL_SIZE}); refusing to shrink the pool`,
+    reason: `new selection has ${slots.filter(isSlotLine).length} usable slot(s), below the keep threshold of ${threshold} (contract pool size ${POOL_SIZE}); refusing to shrink the pool`,
   }
 }
 
@@ -312,6 +366,7 @@ export function scheduleRetryIn(seconds, options = {}) {
   const scriptPath = options.scriptPath ?? fileURLToPath(import.meta.url)
   const nodePath = options.nodePath ?? process.execPath
   const home = options.home ?? HOME
+  const extraArgs = Array.isArray(options.args) ? options.args : []
   const nowMs = (options.now ?? Date.now)()
   const path = `${home}/.opencode/bin:/usr/local/bin:/usr/bin:/bin`
   const unit = `lacode-refresh-pool-retry-${Math.floor(nowMs / 1000).toString(36)}`
@@ -327,6 +382,7 @@ export function scheduleRetryIn(seconds, options = {}) {
         `--setenv=PATH=${path}`,
         nodePath,
         scriptPath,
+        ...extraArgs,
       ],
       { stdio: "ignore" },
     )
@@ -348,9 +404,11 @@ export function scheduleRetry(retry, options = {}) {
   return scheduled
 }
 
-/** Schedule a recheck on the degraded cadence (default 5 minutes). */
+/** Schedule a recheck on the degraded cadence (default 5 minutes). Retries run
+ * a cheap canary first and only fall back to a full scan when a pool member
+ * stops answering. */
 export function scheduleRetrySoon(seconds = DEGRADED_RETRY_S, options = {}) {
-  return scheduleRetryIn(seconds, options)
+  return scheduleRetryIn(seconds, { ...options, args: [...(options.args ?? []), "--canary"] })
 }
 
 export function renderTimerUnits(input = {}) {
@@ -441,6 +499,8 @@ function usage() {
                     systemctl --user start lacode-refresh-pool.service
   --print           print the proposed pool.txt and make no changes (alias: --dry-run)
   --dry-run         same as --print
+  --canary          probe only the current pool members; run a full scan only
+                    when one stops answering (used by degraded rechecks)
   --max N           models per provider passed to the scorer (default: 50)
   --scores PATH     scores file (default: ${DEFAULT_SCORES_PATH})
   --pool PATH       pool file to read/compare/write (default: ${DEFAULT_POOL_PATH})
@@ -448,15 +508,16 @@ function usage() {
                     keep the previous pool (human override for a changed catalogue)
   -h, --help        this message
 
-Degradation behaviour: before scanning, the refresh checks
-https://status.opencode.ai/api/status. Only a hard outage (a gating service
-reporting down) with a structurally intact pool skips the scan; a mere degraded
-never does, because models routinely answer while the page says degraded. After
-a scan, a selection that beheads the pool (no opencode-go head), docks the tail
-(no opencode slot), or falls below half the contract pool size (minimum ${MIN_POOL_SLOTS}
-slots) is never written; the previous pool is kept and a 5-minute recheck is
-scheduled. A retry is always rechecked within 5 minutes while anything failed,
-even when the stated reset is hours out.`)
+Degradation behaviour: before scanning, the refresh reads
+https://status.opencode.ai/api/status. The page is a hint, never a verdict:
+sick providers are only probed last, and nothing is ever skipped or benched
+because of it. A canary (--canary, used by every degraded recheck) probes only
+the current pool members and runs a full scan solely when one stops answering.
+After a scan, a selection that breaks the pool structure or falls below half
+the contract pool size (minimum ${MIN_POOL_SLOTS} slots) is never written; the
+previous pool is kept, transiently failed members are still benched in place,
+and a 5-minute canary recheck is scheduled. A retry is always rechecked
+within 5 minutes while anything failed, even when the stated reset is hours out.`)
 }
 
 async function main() {
@@ -488,37 +549,36 @@ async function main() {
   }
 
   const currentPoolText = readTextFile(poolPath)
+  const canary = argv.includes("--canary")
 
-  // Live degradation signal. Only a hard `down` on opencode's serving path may
-  // skip the scan — and only when the current pool is structurally intact, so
-  // a broken pool always gets its repair scan. `degraded` never skips: models
-  // routinely answer while the page says degraded, and the write guard below
+  // Live status is a hint, never a verdict. Gating services that report down
+  // or degraded only reorder probes (sick providers last) so they cannot eat
+  // the scan budget. Nothing is ever skipped or benched because of the page —
+  // only real probe evidence benches a model, and the write guard below
   // protects the pool if the scan comes back degenerate.
-  let providerStatus = { ok: false, providers: [], services: [], down: [] }
-  if (!printOnly) {
+  let deprioritized = []
+  if (!printOnly && !fromScores) {
     try {
-      providerStatus = await fetchProviderStatus()
+      deprioritized = statusDeprioritizedProviders(await fetchProviderStatus())
     } catch (error) {
-      providerStatus = { ok: false, providers: [], services: [], down: [], reason: String(error?.message ?? error) }
+      console.log(`live status unreadable (${String(error?.message ?? error)}); scanning in default order`)
     }
-    const skip = shouldSkipScan({ providerStatus, currentPoolText })
-    if (skip.skip) {
-      console.log(`${skip.reason}; keeping the current pool of ${poolSlotCount(currentPoolText)} slots`)
-      if (!noRetry) {
-        const scheduled = scheduleRetrySoon()
-        console.log(
-          scheduled.scheduled
-            ? `scheduled degraded recheck in ${scheduled.seconds}s`
-            : `degraded recheck not scheduled: ${scheduled.reason}`,
-        )
-      }
-      return
+    if (deprioritized.length > 0) {
+      console.log(`status hint: probing ${deprioritized.join(", ")} last`)
     }
   }
+  const scorerArgs = [`--current-pool`, poolPath]
+  if (deprioritized.length > 0) scorerArgs.push(`--deprioritize-providers`, deprioritized.join(","))
+
+  const runFullScan = () => runScorer(max, scorerArgs)
 
   if (!fromScores) {
     try {
-      runScorer(max)
+      if (canary) {
+        runCanary({ poolPath, currentPoolText, scorerArgs, max })
+      } else {
+        runFullScan()
+      }
     } catch (error) {
       console.error(`scorer failed; pool.txt not written: ${String(error?.message ?? error)}`)
       if (!printOnly && !noRetry) {
@@ -562,6 +622,21 @@ async function main() {
 
   const oldSlotCount = poolSlotCount(currentPoolText)
   const newSlotCount = built.slots.filter(isSlotLine).length
+
+  // Bench-in-place: a pool member this run failed transiently keeps its slot
+  // and gets a flat cooling record the runtime already honours; a member that
+  // answered has any stale bench cleared. Unscanned members are left alone.
+  // Runs on the write path and the refusal path alike — a kept pool still
+  // learns what the scan found.
+  if (!printOnly) {
+    const plan = computeScanBench({ selectionModels: built.chosen.selected, providers: scores.providers })
+    const applied = applyScanBench({ dir: scanBenchDir(), bench: plan.bench, clear: plan.clear })
+    if (applied.benched.length > 0) {
+      const detail = plan.bench.map((entry) => `${entry.model} (${entry.kind})`).join(", ")
+      console.log(`scan benched in place: ${detail}`)
+    }
+    if (applied.cleared.length > 0) console.log(`scan cleared stale benches: ${applied.cleared.join(", ")}`)
+  }
   const dropped = scores.providers.flatMap((entry) => (Array.isArray(entry?.excluded) ? entry.excluded : []))
   const summary = [
     `selected [${built.chosen.selected.join(", ")}]`,

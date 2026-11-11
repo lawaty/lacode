@@ -9,6 +9,20 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.3.0-beta.5] — bench in place, cheap recovery, visible slots
+
+### Added
+
+- Pool: selection retains current pool members unless the run proved them hard-dead (gone, credential, agreement, credit). Head and tail are never vacated by a failed scan; a healthy-but-capped model is still decided by the caps, and a catalogue removal on a clean scan vacates the slot.
+- Pool: the refresh benches kept-but-transiently-failed members in place with a flat `scan-kept` cooling record (never a strike) and clears stale benches for members that answered. The runtime re-admits a benched model on the first answering probe.
+- Pool: degraded retries run a canary over the current members first (`--canary`) and scan fully only when one stops answering. The scorer learned `--probe-models`, `--deprioritize-providers`, `--current-pool`, and `--out` to support it.
+- Pool: the status page is now hint-only. Sick providers probe last; nothing is ever skipped or benched because of the page.
+- Pool: `pool_status` shows each cooling slot's absolute expiry, the structural verdict (head/tail/count vs the 10-slot contract), the last refresh age, and the live status hint.
+
+### Changed
+
+- Pool: per-request probe deadline is 12 seconds (was 45); `--timeout MS` still overrides it.
+
 ## [2.3.0-beta.4] — status never benches, structure is the contract
 
 ### Fixed

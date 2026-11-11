@@ -49,6 +49,13 @@ const FAILURE_KINDS = [
 // and not-served failures are permanent for this model until a human acts.
 const TRANSIENT_KINDS = new Set(["rate-limited", "credit", "timeout", "network", "server"])
 
+/**
+ * Failure kinds that vacate a pool slot for good: the model is gone, the
+ * credential is wrong, the terms are unsigned, or the balance is empty. Every
+ * other failure mode keeps the slot — benched, not deleted.
+ */
+export const HARD_DEAD_KINDS = new Set(["not-served", "credential", "agreement", "credit"])
+
 export const isTransientKind = (kind) => TRANSIENT_KINDS.has(String(kind ?? "").toLowerCase())
 
 export function classifyFailure({ status, reason, kind } = {}) {
@@ -127,9 +134,84 @@ const rowsOf = (providers) =>
 
 const providerOf = (model) => String(model ?? "").split("/")[0]
 
+/**
+ * Parse pool.txt slot lines into [{ model, weight, bucket?, context? }].
+ * Comments and blanks are ignored; weight defaults to 1.
+ */
+export function parsePoolSlots(text) {
+  const out = []
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const code = line.split("#")[0].trim()
+    if (!code || !code.includes("/")) continue
+    const [model, weight] = code.split(/\s+/)
+    if (!model || !model.includes("/")) continue
+    const bucket = /b:([^\s]+)/.exec(code)?.[1]
+    const context = /c:(\d+)/.exec(code)?.[1]
+    out.push({
+      model,
+      weight: Number(weight) > 0 ? Number(weight) : 1,
+      ...(bucket ? { bucket } : {}),
+      context: context ? Number(context) : null,
+    })
+  }
+  return out
+}
+
+/**
+ * Pure structural verdict for a pool slot list (formatted lines or selection
+ * entries). The contract: an opencode-go head (every go slot first, weight 4),
+ * exactly one opencode tail (last, weight 2, b:opencode), POOL_SIZE slots.
+ * Returns { valid, problems[] } — valid covers head+tail; count is reported
+ * separately so a short-but-structured pool reads as short, not broken.
+ */
+export function poolStructureValid(slots) {
+  const problems = []
+  const items = typeof slots === "string" ? String(slots).split(/\r?\n/) : Array.isArray(slots) ? slots : []
+  const lines = items.map((entry) => {
+    if (typeof entry === "string") {
+      const parts = entry.split("#")[0].trim().split(/\s+/)
+      const bucket = /b:([^\s]+)/.exec(entry)?.[1]
+      return { model: parts[0] ?? "", weight: Number(parts[1]) || 0, bucket }
+    }
+    return { model: entry?.model ?? "", weight: Number(entry?.weight) || 0, bucket: entry?.bucket }
+  }).filter((entry) => entry.model.includes("/"))
+  const go = lines.filter((entry) => providerOf(entry.model) === "opencode-go")
+  const tails = lines.filter((entry) => providerOf(entry.model) === "opencode")
+  if (go.length === 0) problems.push("missing opencode-go head")
+  for (let i = 0; i < go.length; i++) {
+    if (lines[i] !== go[i]) {
+      problems.push("opencode-go slots must all come first")
+      break
+    }
+    if (go[i].weight !== 4) {
+      problems.push("opencode-go head slots must have weight 4")
+      break
+    }
+  }
+  if (tails.length !== 1) problems.push(`expected exactly one opencode tail, found ${tails.length}`)
+  else {
+    const tail = tails[0]
+    if (lines[lines.length - 1] !== tail) problems.push("opencode tail slot must be last")
+    if (tail.weight !== 2 || tail.bucket !== "opencode") problems.push("opencode tail must be weight 2 with b:opencode")
+  }
+  if (lines.length !== POOL_SIZE) problems.push(`expected ${POOL_SIZE} slots, found ${lines.length}`)
+  const structural = problems.filter((p) => !p.startsWith(`expected ${POOL_SIZE}`))
+  return { valid: structural.length === 0, problems, count: lines.length }
+}
+
+/**
+ * Hard-dead check for retention: only these failure kinds vacate a slot.
+ */
+export const isHardDeadRow = (row) => {
+  if (!row || row.ok !== false) return false
+  const kind = String(row.kind ?? classifyFailure({ status: row.status, reason: row.reason }) ?? "").toLowerCase()
+  return HARD_DEAD_KINDS.has(kind)
+}
+
 export function selectPool({
   providers,
   previousProviders,
+  currentSlots = [],
   minContext = MIN_CONTEXT,
   minScore = MIN_SCORE,
   poolSize = POOL_SIZE,
@@ -237,14 +319,93 @@ export function selectPool({
 
   const pickedZen = zen.slice(0, zenReserve)
 
-  const selection = [
-    ...go.map((row) => ({ model: row.model, weight: 4, context: row.context ?? null })),
-    ...pickedSmall.map((row) => ({ model: row.model, weight: 2, context: row.context ?? null })),
-    ...pickedLarge.map((row) => ({ model: row.model, weight: 1, context: row.context ?? null })),
-    ...pickedZen.map((row) => ({ model: row.model, weight: 2, bucket: "opencode", context: row.context ?? null })),
-  ]
-
   const warnings = []
+
+  // Pool-level retention: a current member stays unless this run proved it
+  // hard-dead. A healthy-but-unselected model (caps, score floors) is NOT
+  // retained — the caps decided that. A transiently failed, unscanned, or
+  // budget-cut model is retained and benched in place by the writer; only a
+  // catalogue removal on a cleanly scanned provider vacates the slot. Head
+  // and tail are never vacated by a failed or partial scan.
+  const rowByModel = new Map(rows.map((row) => [row.model, row]))
+  const cleanlyScanned = (model) => {
+    const provider = providerOf(model)
+    return scannedProviders.has(provider) && !truncatedProviders.has(provider) && !erroredProviders.has(provider)
+  }
+  const placedModels = new Set([...go, ...cappedSmall, ...cappedLarge, ...pickedZen].map((row) => row.model))
+  const shouldRetain = (model) => {
+    if (!model.includes("/") || placedModels.has(model)) return false
+    const row = rowByModel.get(model)
+    if (row) return row.ok === false && !isHardDeadRow(row)
+    return !cleanlyScanned(model)
+  }
+  const retainedHead = []
+  const retainedMiddle = []
+  let retainedTail = null
+  for (const slot of Array.isArray(currentSlots) ? currentSlots : []) {
+    const model = String(slot?.model ?? "")
+    if (!shouldRetain(model)) continue
+    const weight = Number(slot?.weight)
+    if (providerOf(model) === "opencode-go") {
+      retainedHead.push({ model, weight: 4, context: slot?.context ?? null, retained: true })
+    } else if (providerOf(model) === "opencode") {
+      if (!retainedTail) retainedTail = { model, weight: 2, bucket: "opencode", context: slot?.context ?? null, retained: true }
+    } else {
+      retainedMiddle.push({
+        model,
+        weight: Number.isFinite(weight) && weight > 0 ? weight : 2,
+        ...(slot?.bucket ? { bucket: slot.bucket } : {}),
+        context: slot?.context ?? null,
+        retained: true,
+      })
+    }
+  }
+
+  const toSmall = (row) => ({ model: row.model, weight: 2, context: row.context ?? null })
+  const toLarge = (row) => ({ model: row.model, weight: 1, context: row.context ?? null })
+  const middle = [...pickedSmall.map(toSmall), ...pickedLarge.map(toLarge)]
+  for (const entry of retainedMiddle) {
+    if (!middle.some((existing) => existing.model === entry.model)) middle.push(entry)
+  }
+  if (retainedTail && !pickedZen.some((row) => providerOf(row.model) === "opencode")) {
+    middle.push({ ...retainedTail })
+    retainedTail = { ...retainedTail, placed: true }
+  }
+  const head = [
+    ...retainedHead,
+    ...go.filter((row) => !retainedHead.some((entry) => entry.model === row.model)).map((row) => ({ model: row.model, weight: 4, context: row.context ?? null })),
+  ]
+  const tail = pickedZen.map((row) => ({ model: row.model, weight: 2, bucket: "opencode", context: row.context ?? null }))
+  let selection = [...head, ...middle, ...tail]
+  // Fit the contract size without ever vacating head or tail: trim the middle
+  // from the back (lowest score first), skipping retained slots. If even that
+  // cannot fit, the head wins and a warning says so.
+  while (selection.length > poolSize) {
+    let index = -1
+    for (let i = selection.length - 1; i >= 0; i--) {
+      const entry = selection[i]
+      if (!entry.retained && providerOf(entry.model) !== "opencode-go" && providerOf(entry.model) !== "opencode") {
+        index = i
+        break
+      }
+    }
+    if (index === -1) {
+      warnings.push(`pool head exceeds the contract size ${poolSize}; keeping every head slot`)
+      break
+    }
+    selection.splice(index, 1)
+  }
+
+  const retainedCount = selection.filter((entry) => entry.retained).length
+  if (retainedCount > 0) {
+    warnings.push(
+      `retained ${retainedCount} current slot(s) benched in place: ${selection
+        .filter((entry) => entry.retained)
+        .map((entry) => entry.model)
+        .join(", ")}`,
+    )
+  }
+
   for (const entry of Array.isArray(providers) ? providers : []) {
     if (entry?.error) {
       warnings.push(`${entry.provider}: ${entry.error}`)

@@ -43,6 +43,19 @@ const ROUTING_SERVICES = ["inference", "go", "free", "payg"]
  */
 export const OPENCODE_GATING_SERVICES = ["go", "free"]
 
+/**
+ * Pool provider names whose probes run last while their status is not
+ * operational. Ordering only — a hint that keeps a sick provider from eating
+ * the scan budget, never an exclusion.
+ */
+export function statusDeprioritizedProviders(record) {
+  const services = Array.isArray(record?.services) ? record.services : []
+  const hit = services.filter(
+    (entry) => OPENCODE_GATING_SERVICES.includes(entry?.service) && String(entry?.status ?? "").toLowerCase() !== "operational",
+  )
+  return [...new Set(hit.flatMap((entry) => SERVICE_PROVIDERS[entry.service] ?? []))]
+}
+
 const SERVICE_PROVIDERS = {
   inference: ["opencode-go", "opencode"],
   go: ["opencode-go"],

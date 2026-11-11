@@ -6,7 +6,10 @@ import assert from "node:assert/strict"
 import {
   SYNTHETIC_RETRY_MS,
   classifyFailure,
+  isHardDeadRow,
   isTransientKind,
+  parsePoolSlots,
+  poolStructureValid,
   providerRank,
   retryAfterMs,
   selectPool,
@@ -270,4 +273,62 @@ test("providerRank scans the core providers before the paid catalogues", () => {
   assert.equal(providerRank("cloudflare-workers-ai"), 1)
   assert.equal(providerRank("console-openrouter"), 2)
   assert.equal(providerRank("openrouter"), 2)
+})
+
+test("parsePoolSlots reads weight, bucket and context from pool lines", () => {
+  const slots = parsePoolSlots("# comment\n\nopencode-go/a  4  c:1048576\ngroq/a  2  c:131072\nopencode/zen  2  c:1048576  b:opencode\n")
+  assert.deepEqual(slots, [
+    { model: "opencode-go/a", weight: 4, context: 1048576 },
+    { model: "groq/a", weight: 2, context: 131072 },
+    { model: "opencode/zen", weight: 2, bucket: "opencode", context: 1048576 },
+  ])
+  assert.deepEqual(parsePoolSlots(""), [])
+})
+
+test("poolStructureValid accepts a full contract pool and names violations", () => {
+  const good = parsePoolSlots("opencode-go/a  4\ngroq/a  2\nopencode/zen  2  b:opencode\n")
+  assert.equal(poolStructureValid(good).valid, true)
+  assert.equal(poolStructureValid("opencode-go/a  4\ngroq/a  2\nopencode/zen  2  b:opencode\n").valid, true)
+  const headless = poolStructureValid("groq/a  2\nopencode/zen  2  b:opencode\n")
+  assert.equal(headless.valid, false)
+  assert.ok(headless.problems.some((p) => p.includes("head")))
+  const tailless = poolStructureValid("opencode-go/a  4\ngroq/a  2\n")
+  assert.equal(tailless.valid, false)
+  assert.ok(tailless.problems.some((p) => p.includes("tail")))
+  const short = poolStructureValid("opencode-go/a  4\nopencode/zen  2  b:opencode\n")
+  assert.equal(short.valid, true, "a short-but-structured pool is short, not broken")
+  assert.ok(short.problems.some((p) => p.includes("expected 10 slots")))
+})
+
+test("isHardDeadRow only matches gone/credential/agreement/credit failures", () => {
+  assert.equal(isHardDeadRow({ ok: false, kind: "not-served" }), true)
+  assert.equal(isHardDeadRow({ ok: false, kind: "credential" }), true)
+  assert.equal(isHardDeadRow({ ok: false, reason: "model agreement required" }), true)
+  assert.equal(isHardDeadRow({ ok: false, kind: "credit" }), true)
+  assert.equal(isHardDeadRow({ ok: false, kind: "timeout" }), false)
+  assert.equal(isHardDeadRow({ ok: false, reason: "socket hang up" }), false)
+  assert.equal(isHardDeadRow({ ok: true, kind: "timeout" }), false)
+  assert.equal(isHardDeadRow(null), false)
+})
+
+test("current members survive an unscanned provider and are marked retained", () => {
+  const current = [
+    { model: "opencode-go/beam-free", weight: 4, context: 1048576 },
+    { model: "groq/kept-a", weight: 2, context: 131072 },
+    { model: "opencode/best-free", weight: 2, bucket: "opencode", context: 1048576 },
+  ]
+  // groq unscanned entirely: its current member must be retained from the pool file.
+  const providers = makeProviders().filter((entry) => entry.provider !== "groq")
+  const { selection } = selectPool({ providers, previousProviders: [], currentSlots: current, now: NOW })
+  const kept = selection.find((row) => row.model === "groq/kept-a")
+  assert.ok(kept, `an unscanned provider's member must be retained, got ${selection.map((r) => r.model).join(", ")}`)
+  assert.equal(kept.retained, true)
+  assert.equal(kept.weight, 2)
+})
+
+test("a healthy-but-capped member is not retained over the caps", () => {
+  // openrouter/small-3 is healthy but capped out (MAX_PER_PROVIDER=2 smalls rank higher).
+  const current = [{ model: "openrouter/small-3", weight: 2, context: 131000 }]
+  const { selection } = selectPool({ providers: makeProviders(), previousProviders: [], currentSlots: current, now: NOW })
+  assert.ok(!selection.some((row) => row.model === "openrouter/small-3"), "caps decide healthy members, not retention")
 })

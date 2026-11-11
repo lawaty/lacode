@@ -9,7 +9,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
-import { buildPool, degradedRetryDelay, poolHasHead, poolHasTail, poolSlotCount, renderTimerUnits, scheduleRetry, scheduleRetrySoon, shouldKeepPool, shouldSkipScan } from "../scripts/refresh-pool.mjs"
+import { applyScanBench, buildPool, computeScanBench, degradedRetryDelay, poolSlotCount, renderTimerUnits, scheduleRetry, scheduleRetrySoon, shouldKeepPool } from "../scripts/refresh-pool.mjs"
 
 const NOW = new Date("2026-11-06T12:00:00.000Z")
 const GENERATED = "2026-11-06T03:41:14.089Z"
@@ -298,7 +298,7 @@ test("shouldKeepPool refuses a degenerate selection against a healthy pool", () 
   assert.equal(kept.keep, true)
   assert.equal(kept.prev, 10)
   assert.equal(kept.threshold, 5)
-  assert.match(kept.reason, /refusing to (shrink|behead) the pool/)
+  assert.match(kept.reason, /breaks the pool structure|refusing to shrink the pool/)
 })
 
 test("shouldKeepPool refuses a beheaded or docked pool even at full count", () => {
@@ -325,33 +325,65 @@ test("shouldKeepPool passes a healthy selection and a first-ever run", () => {
   assert.equal(shouldKeepPool({ currentPoolText: "# header only\n", newSlots: full.slice(0, 1) }).keep, false)
 })
 
-test("poolHasHead and poolHasTail read the structural contract", () => {
-  assert.equal(poolHasHead(TEN_SLOT_POOL), true)
-  assert.equal(poolHasTail(TEN_SLOT_POOL), true)
-  assert.equal(poolHasHead("groq/a  2\nopencode/zen  2  b:opencode\n"), false)
-  assert.equal(poolHasTail("opencode-go/a  4\ngroq/a  2\n"), false)
-  assert.equal(poolHasHead(""), false)
-  assert.equal(poolHasTail(""), false)
+test("computeScanBench benches transient failures and clears answered members", () => {
+  const now = 1_000_000
+  const providers = [
+    {
+      provider: "opencode-go",
+      rows: [
+        { model: "opencode-go/a", ok: false, reason: "timeout after 12000ms", kind: "timeout", retryAfter: now + 300_000 },
+        { model: "opencode-go/b", ok: true, score: 90 },
+      ],
+    },
+    { provider: "groq", rows: [{ model: "groq/a", ok: false, reason: "not served: 404", kind: "not-served" }] },
+  ]
+  const { bench, clear } = computeScanBench({ selectionModels: ["opencode-go/a", "opencode-go/b", "groq/a", "unscanned/x"], providers, now })
+  assert.deepEqual(
+    bench,
+    [{ model: "opencode-go/a", until: now + 300_000, kind: "timeout" }],
+    "only the transiently failed member is benched, at its stated reset",
+  )
+  assert.deepEqual(clear, ["opencode-go/b"], "an answered member has its stale bench cleared")
 })
 
-test("shouldSkipScan only skips on a hard down with an intact pool", () => {
-  const down = { ok: true, stale: false, down: ["go"], providers: ["opencode-go"] }
-  assert.equal(shouldSkipScan({ providerStatus: down, currentPoolText: TEN_SLOT_POOL }).skip, true)
+test("computeScanBench falls back to a 45-minute window without a stated reset", () => {
+  const now = 1_000_000
+  const providers = [{ provider: "mistral", rows: [{ model: "mistral/a", ok: false, reason: "socket hang up", kind: "network" }] }]
+  const { bench } = computeScanBench({ selectionModels: ["mistral/a"], providers, now })
+  assert.equal(bench[0].until, now + 45 * 60 * 1000)
+})
 
-  const degraded = { ok: true, stale: false, down: [], providers: ["opencode"] }
-  const scan = shouldSkipScan({ providerStatus: degraded, currentPoolText: TEN_SLOT_POOL })
-  assert.equal(scan.skip, false, "degraded must never skip a scan")
-  assert.match(scan.reason, /no hard outage/)
+test("applyScanBench writes atomic limit files and clears answered ones", () => {
+  const home = mkdtempSync(join(tmpdir(), "refresh-pool-bench-"))
+  const dir = join(home, ".local", "share", "opencode", "agent-pool")
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, "limit.opencode-go__b.json"), JSON.stringify({ model: "opencode-go/b", until: 1, reason: "x", strikes: 1, last: 0 }))
+  const applied = applyScanBench({
+    dir,
+    bench: [{ model: "opencode-go/a", until: 2_000_000, kind: "timeout" }],
+    clear: ["opencode-go/b", "never/existed"],
+  })
+  assert.deepEqual(applied.benched, ["opencode-go/a"])
+  const record = JSON.parse(readFileSync(join(dir, "limit.opencode-go__a.json"), "utf8"))
+  assert.equal(record.reason, "scan-kept")
+  assert.equal(record.until, 2_000_000)
+  assert.ok(!existsSync(join(dir, "limit.opencode-go__b.json")), "an answered member's bench must be removed")
+  rmSync(home, { recursive: true, force: true })
+})
 
-  const headless = "groq/a  2\nopencode/zen  2  b:opencode\n"
-  assert.equal(
-    shouldSkipScan({ providerStatus: down, currentPoolText: headless }).skip,
-    false,
-    "a broken pool always gets its repair scan",
-  )
-
-  assert.equal(shouldSkipScan({ providerStatus: { ok: false, down: [] }, currentPoolText: TEN_SLOT_POOL }).skip, false)
-  assert.equal(shouldSkipScan({ providerStatus: { ok: true, stale: true, down: ["go"] }, currentPoolText: TEN_SLOT_POOL }).skip, false)
+test("scheduleRetrySoon runs a canary recheck", () => {
+  const calls = []
+  const exec = (file, args) => calls.push([file, ...args])
+  const result = scheduleRetrySoon(300, {
+    now: () => 1_000_000,
+    exec,
+    scriptPath: "/repo/scripts/refresh-pool.mjs",
+    nodePath: "/usr/bin/node",
+    home: "/home/tester",
+  })
+  assert.deepEqual(result, { scheduled: true, seconds: 300 })
+  assert.ok(calls[0].includes("--canary"), "degraded retries must run the cheap canary first")
+  assert.ok(calls[0].includes("/repo/scripts/refresh-pool.mjs"))
 })
 
 test("shouldKeepPool allows recovery from a previously clobbered pool", () => {
@@ -410,7 +442,7 @@ test("a degenerate scan never replaces a healthy pool file", () => {
   const result = run()
   assert.equal(readFileSync(join(conf, "pool.txt"), "utf8"), TEN_SLOT_POOL, "the healthy pool must survive a degenerate scan")
   assert.ok(
-    (result.status === 1 && /fail closed|refusing to (shrink|behead|dock)/.test(result.stderr)) ||
+    (result.status === 1 && /fail closed|breaks the pool structure|refusing to shrink/.test(result.stderr)) ||
       (result.status === 0 && /status degraded/.test(result.stdout)),
     `either the write guard or the status early-out must keep the pool (status=${result.status} out=${result.stdout} err=${result.stderr})`,
   )
