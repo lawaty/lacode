@@ -9,6 +9,20 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.3.0-beta.3] — persist autonomy modes in global config
+
+### Changed
+
+- Modes: YOLO/YKB modes now persist in the lacode plugin options inside the global `opencode.jsonc` (single config file, comment-preserving edits).
+
+### Removed
+
+- Modes: removed `~/.config/lacode/modes.json` and `LACODE_MODES_FILE` seeding.
+
+### Fixed
+
+- Build: externalized the `jsonc-parser` runtime dependency.
+
 ## [2.3.0-beta.2] — degenerate refreshes never shrink the pool
 
 ### Added
@@ -1226,6 +1240,10 @@ experimental; `latest` remains 0.4.2.
 [Unreleased]: https://github.com/lawaty/lacode/compare/v2.1.0-beta.0...HEAD
 [2.1.0-beta.0]: https://github.com/lawaty/lacode/compare/v2.0.0-beta.0...v2.1.0-beta.0
 [2.0.0-beta.0]: https://github.com/lawaty/lacode/compare/v1.3.1...v2.0.0-beta.0
+[2.3.0-beta.3]: https://github.com/lawaty/lacode/compare/v2.3.0-beta.2...v2.3.0-beta.3
+[2.3.0-beta.2]: https://github.com/lawaty/lacode/compare/v2.3.0-beta.1...v2.3.0-beta.2
+[2.3.0-beta.1]: https://github.com/lawaty/lacode/compare/v2.3.0-beta.0...v2.3.0-beta.1
+[2.3.0-beta.0]: https://github.com/lawaty/lacode/releases/tag/v2.3.0-beta.0
 [1.3.1]: https://github.com/lawaty/lacode/releases/tag/v1.3.1
 [1.3.0-beta.9]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.9
 [1.3.0-beta.8]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.8

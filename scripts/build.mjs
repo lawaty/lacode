@@ -54,6 +54,7 @@ export const ENTRY_POINTS = [
 /** Never inlined: the peer SDK the host provides, and everything node ships. */
 export const EXTERNAL = [
   "@opencode-ai/plugin",
+  "jsonc-parser",
   "solid-js",
   "@opentui/solid",
   "@picovoice/porcupine-node",

@@ -1,27 +1,32 @@
 import { strict as assert } from "node:assert"
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { after, test } from "node:test"
 
 const DIR = mkdtempSync(join(tmpdir(), "lacode-modes-"))
-const FILE = join(DIR, "modes.json")
-process.env.LACODE_MODES_FILE = FILE
+const CONFIG = join(DIR, "opencode", "opencode.jsonc")
+const LACODE = "file:///home/lawaty/Projects/lacode/dist/index.js"
+process.env.XDG_CONFIG_HOME = DIR
+
+const writeConfig = (text) => {
+  mkdirSync(dirname(CONFIG), { recursive: true })
+  writeFileSync(CONFIG, text)
+}
+const baseConfig = (options = { yolo: false, ykb: false }, name = LACODE) =>
+  `{\n  "plugin": [\n    ["${name}", ${JSON.stringify(options)}]\n  ]\n}\n`
+const reset = () => writeConfig(baseConfig())
 
 const {
-  MODES_FILE,
   YKB_INSTRUCTION,
   readModes,
   recommendedAnswer,
-  seedModes,
   toggleMode,
   writeModes,
 } = await import("../src/lib/modes.ts")
 const { modesHooks } = await import("../src/plugins/modes.ts")
 
-const reset = () => rmSync(FILE, { force: true })
-
-function fakeClient() {
+const fakeClient = () => {
   const calls = { permissions: [], questions: [], logs: [] }
   return {
     calls,
@@ -38,36 +43,19 @@ after(() => rmSync(DIR, { recursive: true, force: true }))
 
 test("modes store defaults to off, writes atomically, and toggles independently", () => {
   reset()
-  assert.equal(MODES_FILE, FILE)
   assert.deepEqual(readModes(), { yolo: false, ykb: false })
-  assert.deepEqual(readModes({ yolo: true }), { yolo: true, ykb: false })
-
-  assert.deepEqual(toggleMode("yolo"), { yolo: true, ykb: false })
-  assert.equal(existsSync(FILE), true)
-  assert.deepEqual(JSON.parse(readFileSync(FILE, "utf8")), { yolo: true, ykb: false })
-  assert.equal(existsSync(`${FILE}.tmp`), false)
-
-  assert.deepEqual(toggleMode("ykb"), { yolo: true, ykb: true })
-  assert.deepEqual(toggleMode("yolo"), { yolo: false, ykb: true })
-})
-
-test("seedModes only writes config defaults when no live state exists", () => {
-  reset()
-  seedModes({})
-  assert.equal(existsSync(FILE), false)
-
-  seedModes({ yolo: true })
+  writeModes({ yolo: true, ykb: false })
   assert.deepEqual(readModes(), { yolo: true, ykb: false })
-
-  writeModes({ yolo: false, ykb: false })
-  seedModes({ yolo: true })
-  assert.deepEqual(readModes(), { yolo: false, ykb: false })
+  assert.deepEqual(toggleMode("ykb"), { yolo: true, ykb: true })
+  assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")).plugin[0], [LACODE, { yolo: true, ykb: true }])
+  assert.equal(readdirSync(dirname(CONFIG)).some((name) => name.endsWith(".tmp")), false)
 })
 
 test("invalid live state falls back to the configured defaults", () => {
   reset()
-  writeFileSync(FILE, "{ not json")
-  assert.deepEqual(readModes({ yolo: true, ykb: true }), { yolo: true, ykb: true })
+  writeConfig("{ nope")
+  assert.deepEqual(readModes({ yolo: true }), { yolo: true, ykb: false })
+  assert.throws(() => toggleMode("yolo", { yolo: true }), /Failed to parse/)
 })
 
 test("recommendedAnswer prefers the (Recommended) option, then the first option", () => {
@@ -190,39 +178,42 @@ test("YKB appends its instruction once and removes it when disabled", async () =
   assert.deepEqual(off.system, ["base"])
 })
 
-test("plugin options seed the live file on first run", async () => {
+test("plugin options apply only when the live config omits a key", () => {
   reset()
-  const { client } = fakeClient()
-  await modesHooks({ client }, { yolo: true, ykb: true })
-  assert.deepEqual(readModes(), { yolo: true, ykb: true })
+  writeConfig(`{\n  "plugin": [\n    ["${LACODE}", { "yolo": true }]\n  ]\n}\n`)
+  assert.deepEqual(readModes({ yolo: false, ykb: true }), { yolo: true, ykb: true })
 })
 
 test("readModes fills a missing key from defaults and ignores unknown or non-boolean values", () => {
   reset()
-  writeFileSync(FILE, JSON.stringify({ yolo: true, extra: "ignored" }))
+  writeConfig(`{\n  "plugin": [\n    ["${LACODE}", { "yolo": true, "extra": "ignored" }]\n  ]\n}\n`)
   assert.deepEqual(readModes({ ykb: true }), { yolo: true, ykb: true })
 
-  writeFileSync(FILE, JSON.stringify({ yolo: "yes", ykb: 1 }))
+  writeConfig(`{\n  "plugin": [\n    ["${LACODE}", { "yolo": "yes", "ykb": 1 }]\n  ]\n}\n`)
   assert.deepEqual(readModes({ yolo: true, ykb: true }), { yolo: true, ykb: true })
 })
 
 test("toggleMode preserves the other mode and uses defaults for a missing key", () => {
   reset()
-  writeFileSync(FILE, JSON.stringify({ yolo: true }))
+  writeConfig(`{\n  "plugin": [\n    ["${LACODE}", { "yolo": true }]\n  ]\n}\n`)
   assert.deepEqual(toggleMode("ykb", { ykb: false }), { yolo: true, ykb: true })
 
-  writeFileSync(FILE, JSON.stringify({ yolo: true }))
+  reset()
+  writeConfig(`{\n  "plugin": [\n    ["${LACODE}", { "yolo": true }]\n  ]\n}\n`)
   assert.deepEqual(toggleMode("ykb", { ykb: true }), { yolo: true, ykb: false })
 })
 
-test("seedModes writes ykb when only ykb is configured and never overwrites live state", () => {
-  reset()
-  seedModes({ ykb: true })
-  assert.deepEqual(readModes(), { yolo: false, ykb: true })
+test("writeModes requires the lacode plugin entry", () => {
+  writeConfig(`{ "plugin": ["other-plugin"] }\n`)
+  assert.throws(() => writeModes({ yolo: true, ykb: false }), /lacode plugin entry not found/)
+})
 
-  writeModes({ yolo: false, ykb: false })
-  seedModes({ yolo: true, ykb: true })
-  assert.deepEqual(readModes(), { yolo: false, ykb: false })
+test("writeModes preserves JSONC comments and converts a string entry to a tuple", () => {
+  writeConfig(`{\n  // keep this\n  "plugin": ["${LACODE}"]\n}\n`)
+  writeModes({ yolo: true, ykb: false })
+  const text = readFileSync(CONFIG, "utf8")
+  assert.match(text, /\/\/ keep this/)
+  assert.deepEqual(JSON.parse(text.replace(/\n\s*\/\/ keep this/, "")).plugin[0], [LACODE, { yolo: true, ykb: false }])
 })
 
 test("recommendedAnswer handles case, description markers, non-string labels and malformed input", () => {

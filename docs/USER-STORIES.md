@@ -569,15 +569,15 @@ A failed summarization used to clear the pending flag and never reschedule, so o
 ### US-37: YOLO mode approves permissions without stopping
 **As a** user running a long autonomous task, **I want** permission prompts to be approved automatically while YOLO is on, **so that** the agent keeps working instead of waiting for routine approvals, while an explicit `deny` still protects me.
 
-Permission prompts are the main thing that breaks a long autonomous run: every `ask` blocks the session until a human answers. YOLO flips that decision to `allow` at the permission hook, keeps an explicit `deny` authoritative, and answers any request that still reaches the event bus. The state is a small file the TUI writes and the server reads on the next decision, so enabling it also clears what is already pending.
+Permission prompts are the main thing that breaks a long autonomous run: every `ask` blocks the session until a human answers. YOLO flips that decision to `allow` at the permission hook, keeps an explicit `deny` authoritative, and answers any request that still reaches the event bus. The state lives in the `yolo` option on the lacode plugin entry in the global `opencode.jsonc`; the TUI writes it and the server reads it on the next decision, so enabling it also clears what is already pending.
 
 **Story ID(s) for tests:** US-37
 **Acceptance criteria:**
 - [ ] Given YOLO is on, When the runtime's permission decision is `ask`, Then it becomes `allow` without a prompt, while an existing `deny` or `allow` is left unchanged.
 - [ ] Given YOLO is off, When the runtime's permission decision is `ask`, Then it stays `ask` and still reaches the user.
 - [ ] Given a `permission.asked` event still reaches the event bus while YOLO is on and carries a request id and a session id, When the handler runs, Then the plugin replies `once` for that request; an event missing either id is ignored.
-- [ ] Given YOLO is toggled in the TUI, When the mode file changes, Then the next permission decision sees the new value without a restart, and requests already pending are answered.
-- [ ] Given `yolo: true` in the plugin options and no live mode file, When the plugin starts, Then the file is seeded; after a TUI toggle, the live file wins.
+- [ ] Given YOLO is toggled in the TUI, When the global `opencode.jsonc` changes, Then the next permission decision sees the new value without a restart, and requests already pending are answered.
+- [ ] Given the TUI toggles a mode, When it writes the global `opencode.jsonc`, Then only the `yolo` / `ykb` options on the lacode plugin entry change, comments and formatting are preserved, and the config remains the single source of truth.
 - [ ] Given the README and configuration reference, Then the `yolo` option and the `/yolo` command are documented alongside `/modes`.
 
 ### US-38: YKB mode chooses the recommendation instead of asking
@@ -654,6 +654,6 @@ The root-level suites under `tests/` are unit-style; the `tests/stories/` suites
 the behavioural layer, written one epic per file with every test name carrying
 its story id. Run everything with `npm test`.
 
-40/40 stories covered by 375 test case(s); thinnest story has 1.
+40/40 stories covered by 376 test case(s); thinnest story has 1.
 No story is untested. The scan covers the `tests/stories/` suites and the root-level
 `tests/*-test.mjs` suites.

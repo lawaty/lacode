@@ -1,21 +1,30 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { readFileSync, rmSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { dirname, join } from "node:path"
 import { ROOT, bootLaCode, cleanupAll, scratch, stubInput } from "./_harness.mjs"
 
 test.after(cleanupAll)
 
-const MODES_FILE = join(scratch("lacode-modes-story-"), "modes.json")
-process.env.LACODE_MODES_FILE = MODES_FILE
+const DIR = scratch("lacode-modes-story-")
+const CONFIG = join(DIR, "opencode", "opencode.jsonc")
+const LACODE = "file:///home/lawaty/Projects/lacode/dist/index.js"
+process.env.XDG_CONFIG_HOME = DIR
 process.env.LACODE_SOUND = "0"
 process.env.LACODE_NO_SELFUPDATE = "1"
 const HELPER = join(scratch("lacode-notify-helper-"), "oc-notify")
 writeFileSync(HELPER, "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 })
 process.env.OC_NOTIFY_HELPER = HELPER
 
+const writeConfig = (text) => {
+  mkdirSync(dirname(CONFIG), { recursive: true })
+  writeFileSync(CONFIG, text)
+}
+const baseConfig = (options = { yolo: false, ykb: false }) =>
+  `{\n  "plugin": [\n    ["${LACODE}", ${JSON.stringify(options)}]\n  ]\n}\n`
+const reset = () => writeConfig(baseConfig())
+
 const {
-  MODES_FILE: LIVE_MODES_FILE,
   YKB_INSTRUCTION,
   readModes,
   recommendedAnswer,
@@ -23,8 +32,6 @@ const {
   writeModes,
 } = await import("../../src/lib/modes.ts")
 const { modesHooks } = await import("../../src/plugins/modes.ts")
-
-const reset = () => rmSync(MODES_FILE, { force: true })
 const stop = async (hooks) => {
   try {
     await hooks.dispose?.()
@@ -35,6 +42,9 @@ const docs = () => `${source("README.md")}\n${source("docs/CONFIGURATION.md")}`
 const emit = (hooks, type, properties) => hooks.event({ event: { type, properties } })
 
 const boot = async (options = {}) => {
+  if (typeof options.yolo === "boolean" || typeof options.ykb === "boolean") {
+    writeModes({ yolo: options.yolo === true, ykb: options.ykb === true })
+  }
   const stub = stubInput()
   const replies = { permissions: [], questions: [] }
   stub.client.question = {
@@ -120,10 +130,8 @@ test("[US-37] a live toggle changes the next decision without a restart", async 
   await stop(hooks)
 })
 
-test("[US-37] plugin options seed the live state, and a later TUI toggle wins", async () => {
+test("[US-37] the live config is the source of truth and a TUI toggle wins", async () => {
   reset()
-  assert.equal(LIVE_MODES_FILE, MODES_FILE)
-
   const first = await boot({ yolo: true })
   assert.deepEqual(readModes(), { yolo: true, ykb: false })
   await stop(first.hooks)
@@ -131,9 +139,16 @@ test("[US-37] plugin options seed the live state, and a later TUI toggle wins", 
   toggleMode("yolo")
   assert.deepEqual(readModes(), { yolo: false, ykb: false })
 
-  const second = await boot({ yolo: true })
+  const second = await boot({})
   assert.deepEqual(readModes(), { yolo: false, ykb: false })
   await stop(second.hooks)
+})
+
+test("[US-37] toggling edits the lacode plugin options in the global config", () => {
+  reset()
+  toggleMode("yolo")
+  const config = JSON.parse(readFileSync(CONFIG, "utf8"))
+  assert.deepEqual(config.plugin[0], [LACODE, { yolo: true, ykb: false }])
 })
 
 test("[US-37] a permission event is answered once while YOLO is on, and malformed events are ignored", async () => {
@@ -190,8 +205,10 @@ test("[US-37] the TUI registers /yolo and drains pending permissions; docs name 
   assert.match(text, /`yolo`/)
   assert.match(text, /\/yolo/)
   assert.match(text, /\/modes/)
-  assert.match(text, /modes\.json/)
-  assert.match(text, /LACODE_MODES_FILE/)
+  assert.match(text, /opencode\.jsonc/)
+  assert.match(text, /plugin entry/)
+  assert.doesNotMatch(text, /modes\.json/)
+  assert.doesNotMatch(text, /LACODE_MODES_FILE/)
 })
 
 // ---------------------------------------------------------------------------

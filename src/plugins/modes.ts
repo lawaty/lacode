@@ -1,5 +1,5 @@
 import type { Hooks, PluginInput, PluginOptions } from "@opencode-ai/plugin"
-import { readModes, recommendedAnswer, seedModes, YKB_INSTRUCTION, type ModeDefaults } from "../lib/modes.ts"
+import { readModes, recommendedAnswer, YKB_INSTRUCTION, type ModeDefaults } from "../lib/modes.ts"
 
 type ModesOptions = { yolo?: boolean; ykb?: boolean }
 
@@ -8,7 +8,6 @@ export async function modesHooks(input: PluginInput, options?: PluginOptions): P
   const defaults: ModeDefaults = {}
   if (typeof opts.yolo === "boolean") defaults.yolo = opts.yolo
   if (typeof opts.ykb === "boolean") defaults.ykb = opts.ykb
-  seedModes(defaults)
 
   const state = () => readModes(defaults)
   const warn = (message: string) => {

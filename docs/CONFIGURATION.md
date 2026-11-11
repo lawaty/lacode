@@ -52,7 +52,7 @@ restart.
 
 ## Modes
 
-Two runtime modes can be seeded from plugin options and toggled from the TUI:
+Two runtime modes live on the lacode plugin entry and can be toggled from the TUI:
 
 | Command | Effect |
 | --- | --- |
@@ -60,7 +60,15 @@ Two runtime modes can be seeded from plugin options and toggled from the TUI:
 | `/ykb` | Toggle YKB (You Know Better). The agent is told not to ask questions and to continue with its recommendation. A question that still appears is answered with its `(Recommended)` option, or its first option when none is marked. |
 | `/modes` | Show both switches. |
 
-The toggles write `~/.config/lacode/modes.json` (override with `LACODE_MODES_FILE`) and the server picks the change up on the next decision — no restart. Turning a mode on also answers requests that are already pending. The `yolo` / `ykb` plugin options only seed the file on first run; after that, the file wins. A free-text question with no options is left for the user, since there is no option to choose.
+```jsonc
+{
+  "plugin": [
+    ["@lawaty/lacode", { "yolo": true, "ykb": false }]
+  ]
+}
+```
+
+The toggles edit the `yolo` / `ykb` options on the lacode plugin entry in your global opencode config (`~/.config/opencode/opencode.jsonc`, or `$XDG_CONFIG_HOME/opencode/opencode.jsonc`), preserving comments. The server reads that file on the next decision — no restart. Turning a mode on also answers requests that are already pending. The lacode plugin entry must already exist in the global config; a project-only entry cannot be toggled. A free-text question with no options is left for the user, since there is no option to choose.
 
 
 ## Which models run which agent

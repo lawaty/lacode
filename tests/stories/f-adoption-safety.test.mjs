@@ -64,11 +64,12 @@ const installedPackage = async () => {
   await ensureBuilt()
   const dir = scratch("installed-")
   copyPublishedFiles(dir)
-  // The peer dependency is supplied by the HOST, never shipped: linking the
-  // repo's copy into node_modules is exactly what `npm install @lawaty/lacode`
-  // produces, and it is what proves the package resolves without vendoring.
+  // Runtime deps and peers are supplied by the host install, never shipped:
+  // linking the repo's copies into node_modules mirrors what an install
+  // produces and proves the package resolves without vendoring.
   mkdirSync(join(dir, "node_modules"), { recursive: true })
   symlinkSync(join(ROOT, "node_modules", "@opencode-ai"), join(dir, "node_modules", "@opencode-ai"), "dir")
+  symlinkSync(join(ROOT, "node_modules", "jsonc-parser"), join(dir, "node_modules", "jsonc-parser"), "dir")
   return dir
 }
 
@@ -157,7 +158,10 @@ test("[US-15] with no configuration at all, the installed package falls back to 
 test("[US-15] the peer dependency is declared, not duplicated inside the package", async () => {
   const pkg = manifest()
   assert.equal(pkg.peerDependencies?.["@opencode-ai/plugin"], "1.18.34", "the SDK must be declared as a peer")
-  assert.equal(pkg.dependencies, undefined, "the peer must not also be a hard dependency: that is duplication")
+  assert.ok(
+    !Object.keys(pkg.dependencies ?? {}).includes("@opencode-ai/plugin"),
+    "the peer must not also be a hard dependency: that is duplication",
+  )
   assert.ok(!pkg.files.includes("node_modules"), "node_modules must not be published")
 
   // And the source imports it as a peer, never vendored: there is exactly one
@@ -220,6 +224,7 @@ test("[US-15] the published package loads and runs from inside node_modules, whe
   copyPublishedFiles(pkgDir)
   mkdirSync(join(dir, "node_modules", "@opencode-ai"), { recursive: true })
   symlinkSync(join(ROOT, "node_modules", "@opencode-ai", "plugin"), join(dir, "node_modules", "@opencode-ai", "plugin"), "dir")
+  symlinkSync(join(ROOT, "node_modules", "jsonc-parser"), join(dir, "node_modules", "jsonc-parser"), "dir")
 
   // A consumer importing the package BY NAME, the way a plugin host does.
   const consumer = join(dir, "consumer.mjs")
