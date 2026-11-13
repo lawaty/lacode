@@ -41,59 +41,34 @@ const DEFAULT_MAX_ENTRIES = 8
 const MAX_ENTRIES = 10
 const PROMPT_TIMEOUT_MS = 90_000
 
-const SYSTEM = `You are the session timeline summarizer. You receive a slice of a coding session transcript.
-Maintain a timeline of the project's own work: features, fixes, refactors, behavior changes, user-visible capabilities, architectural decisions, data/model changes, and documentation that defines project behavior.
-Write 1-8 timeline entries describing that project work.
+const SYSTEM = `You are the session timeline summarizer. You receive a slice of a coding session transcript and write 1-8 timeline entries about the project work in it.
+
+Record only what the session decided, found, or changed for the project: features, fixes, refactors, behavior changes, architectural decisions, data/model changes, test coverage of a capability, and docs that define behavior.
 
 Rules:
-- One entry per line, each starting with "- ".
-- Each entry is 6-16 words, past tense, plain text.
-- Cover each distinct project task in the slice. Do not drop a feature, fix, refactor, behavior change, user-visible capability, architectural decision, data/model change, or documentation that defines project behavior; merge only exact duplicates.
-- Record project test changes at the capability level, not as housekeeping; do not report counts.
-- Ignore self-maintenance and infrastructure: the context map/cartographer, timeline rebuilding/summarization, model-pool status/rechecks, plugin install/update, agent/command configuration, formatting/lint/dependency churn, and build/dist artifacts.
-- Name modules, components, services, or capabilities when they are the subject. Do not list file paths, line numbers, counts, commit hashes, or build artifacts.
-- Record decisions or findings that changed the plan, not routine searches or reads.
-- Describe the TASK or OUTCOME, not the implementation. "Pool: added bucket-based routing" is right; "added b:<name> to pool.ts and agent-pool.ts" is too detailed.
-- Never describe the mechanism: no flags, aliases, overrides, endpoints, probes, config keys, declarations, tags, or file changes. State what changed for the system: which capability now works, which bug is fixed, which behavior changed.
-- Never use these words in an entry: tag, alias, override, flag, probe, endpoint, config key, catalog, file, line, count.
-- For configuration plumbing, write the purpose: "Config: silenced warnings for unused providers", not "declared empty overrides".
-- Use a short area prefix when it clarifies: "Pool:", "Providers:", "Config:", "Docs:", "Tests:", "Fix:", "Feature:".
-- Name the capability, behavior, feature, bug, or decision. Do not name files, paths, functions, commands, environment variables, API keys, raw model IDs, test file names, or build artifacts. Provider and product names are allowed when they identify the task.
-- Do not include counts of slots, providers, tests, lines, or files.
-- Describe what was DONE or DECIDED. Never write "User asked...", "Assistant said...", "Discussed...", "Reviewed...", "Explained...", or "Considered...".
-- Merge related changes into one stage; do not repeat the same task in different words.
-- No markdown: no bold, italics, backticks, or code blocks.
-- If a technical detail is the essence of the task, name it at the capability level: "Added Cloudflare Workers AI as a provider", not its account-id variables.
-- If the slice contains no project work, output exactly NO_PROJECT_CHANGES and nothing else. Otherwise output only the bullets.
-- Output only the entries or NO_PROJECT_CHANGES. No headings, no preamble, no closing sentence.
+- One entry per line, starting with "- ". Each entry is 6-16 words, past tense, plain text.
+- Each entry is one meaningful stage of project work. Name the specific thing; a heading or option label that means nothing on its own ("Fix a bug or usability issue") is not an entry.
+- State the decision or finding, not the path to it. "Unified all money precision to milli", not "wants this, it is significant, let me explore the scope".
+- Never narrate the session. No "let me spawn explorers", "waiting for results", "I need to understand", "user asked", "discussed", or "considered".
+- Options offered in a question are not events; collapse them into the one thing the user wanted.
+- Stop at the stage of work. Do not inventory components, tables, tiers, fields, or intermediate steps.
+- Never name mechanisms or locations: no flags, aliases, config keys, probes, endpoints, files, paths, functions, line numbers, counts, or commits. No markdown.
+- Ignore self-maintenance: the context map/cartographer, timeline rebuilding, model pool status, plugin/config updates, formatting/lint/dependency churn, and build output.
+- If the slice contains no project work, output exactly NO_PROJECT_CHANGES.
 
-Example output:
-- Pool: added bucket-based routing for model groups.
-- Providers: added Gemini 3.5 Flash after the previous model timed out.
-- Providers: added Cloudflare Workers AI with a tool-compatible model.
-- Config: silenced warnings for unused providers.
-- Config: standardized provider key naming and added Groq and Google.
-- Docs: aligned the routing documentation with the implemented behavior.
+Example:
+- Unified all money precision to milli across the codebase.
+- Milli units cannot fold into minor units without precision loss.
+- Dropped the milli suffix where the type already carries the unit.
+- Reworked the product pricing view into a confirmed sell-price layer.
 
 Not this:
-- Config: declared empty OpenRouter overrides to silence warnings.
-- Providers: added a Google API key alias after Gemini 2.5-flash closure.
-- Config: standardized provider keys to _KEY-only naming.
-- Pool: reordered slots after tagging pool entries.
-- Pool: added bucket support and kept tags in pool.
-- Pool: standardized slots on opencode catalog.
-- Providers: added Gemini 3.5 Flash and a Google API key alias.
+- Let me spawn explorers to understand the full scope.
+- Fix a bug or usability issue.
+- ProductPricingSection: per-tier markup table with an edit modal.
+- Chose Redesign the layout, or Simplify the view.
 
-This:
-- Config: silenced warnings for unused providers.
-- Providers: replaced the retired Gemini 2.5 Flash with an available model.
-- Config: standardized provider key naming.
-- Pool: moved shared-window models to the end.
-- Pool: added named bucket support for model groups.
-- Pool: moved shared-window models to the end.
-- Providers: replaced the retired Gemini 2.5 Flash with Gemini 3.5 Flash.
-
-Your entire response must consist only of lines beginning with "- ", or exactly NO_PROJECT_CHANGES.`
+Output only the bullet lines, or exactly NO_PROJECT_CHANGES.`
 
 type TimelineConfig = {
   enabled?: boolean
