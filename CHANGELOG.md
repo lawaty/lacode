@@ -9,6 +9,14 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.3.0-beta.7] — transient upstream faults and leaner timeline entries
+
+### Changed
+
+- Pool: flaky upstream and infrastructure failures (5xx, streaming and internal server errors, DNS and socket failures) are classified as transient upstream faults and cooled briefly, instead of being benched for hours as a capability mismatch.
+- Timeline: the summarizer instruction is shorter and records only decisions, findings, and stages of project work. Session narration, question options, and component-level detail are excluded.
+- Docs: the README documents the secondary pool, autonomy modes, and the pool options that already shipped.
+
 ## [2.3.0-beta.6] — fallback capacity and honest failure benching
 
 ### Added
