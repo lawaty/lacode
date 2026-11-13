@@ -23,10 +23,21 @@ allowlist anywhere in the package, and no cost check of any kind: only the
 structure is validated. The bundled preset is built from free models because
 that is a sensible default, not because the pool requires it.
 
-A slot's `weight` (default 1) is both its concurrency budget and its cap. The
-pool fills slots in declaration order in one pass; there is no slot cap, and a
-model may appear on more than one line — each line is its own slot with its own
-weight. A `tier` key is the deprecated spelling of `weight`.
+A slot's `weight` (default 1) is its per-pass concurrency budget. Its hard cap is
+its `ceiling` (max parallel sessions), which defaults to the weight and can be
+raised with a `ceiling` field (flat form `ceil:<n>`; it must be at least the
+weight). The pool fills slots in declaration order; when every usable slot has
+reached its weight, later passes deepen a slot toward its ceiling. There is no
+slot cap, and a model may appear on more than one line — each line is its own
+slot with its own weight and ceiling. A `tier` key is the deprecated spelling of
+`weight`.
+
+A slot table may also declare a **fallback pool**: a `fallbackSlots` array in
+JSON, or a line that is exactly `# --- fallback ---` (or `[fallback]`) followed
+by more slots in `pool.txt`. Fallback slots are used only when no primary slot is
+usable — they are not overflow capacity. A fallback slot that shares a quota
+bucket (or model) with any primary slot is dropped with a warning, because the
+same limit would bench both.
 
 A slot may also declare a shared quota bucket with `b:<name>` on the line (or a
 `bucket` field in JSON). A limit on any member benches the whole bucket, because

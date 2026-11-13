@@ -19,6 +19,13 @@ export const STATED_COOLDOWN_MAX_MS = 6 * 60 * 60 * 1000
 // for a gateway hiccup or a short provider outage to clear, short enough that a
 // recovered model is back well before the 6-hour timer.
 export const SYNTHETIC_RETRY_MS = 45 * 60 * 1000
+// A model that fails transiently scan after scan is not having a bad moment; it
+// is a bad slot. Keep it (benched in place) for this many consecutive scans, then
+// let it vacate the pool. A successful scan resets the streak, so a model that
+// genuinely recovers returns on the next run. This is what stops a model that
+// times out on every single request from being retained forever because the
+// failure kind is nominally "transient".
+export const MAX_TRANSIENT_STREAK = 3
 
 // Scan order, not selection order: the pool's core providers are probed first so
 // a wall-clock budget can never starve them behind a slow paid catalogue. This is
@@ -35,7 +42,7 @@ export const providerRank = (provider) => {
 // classifier existed or by a provider that gives only prose.
 const FAILURE_KINDS = [
   ["agreement", /model\s+agreement|terms\s+of\s+(?:service|use)|\btos\b/i],
-  ["credit", /out\s+of\s+credits|insufficient\s+credits|credit\s+balance|requires\s+more\s+credits|payment\s+required|billing|purchase|\b402\b/i],
+  ["credit", /out\s+of\s+credits|insufficient\s+credits|credit\s+balance|requires\s+more\s+credits|payment\s+required|billing|purchase|budget\s+exhausted|api\s+budget|quota\s+exhausted|\b402\b/i],
   ["rate-limited", /rate[\s_-]?limit|usage\s+limit|too\s+many\s+requests|overloaded|limits?[\s_-]?(?:reached|exceeded)|free[-\s]?tier|freelimiterror|quota|\b429\b/i],
   ["credential", /\b401\b|unauthori[sz]ed|not\s+authori[sz]ed|invalid[\s_-]+(?:api[\s_-]?(?:key|token)|token|credential|bearer)|api[\s_-]?key\s+(?:is\s+)?(?:invalid|missing|expired|not\s+valid)|authentication\s+(?:failed|error|required)|incorrect[\s_-]?api[\s_-]?key/i],
   ["not-served", /\b404\b|no\s+such\s+model|model\s+not\s+found|does\s+not\s+exist|is\s+not\s+available|not\s+served|not\s+found/i],
@@ -44,10 +51,12 @@ const FAILURE_KINDS = [
   ["server", /\b5\d\d\b|internal\s+server|bad\s+gateway|service\s+unavailable|gateway\s+timeout/i],
 ]
 
-// A credit exhaustion is transient over hours, not permanent: the balance can be
-// topped up, and the retry schedule is what carries it. Agreement, credential
-// and not-served failures are permanent for this model until a human acts.
-const TRANSIENT_KINDS = new Set(["rate-limited", "credit", "timeout", "network", "server"])
+// An empty balance is not a bad moment: the provider has said it will not serve
+// this account until someone tops it up (or the reset date arrives). Retaining
+// the slot only benches a seat forever, so credit exhaustion vacates it like a
+// missing model. A later scan that answers re-admits it automatically. Rate
+// limits and outages are the kinds that stay retained.
+const TRANSIENT_KINDS = new Set(["rate-limited", "timeout", "network", "server"])
 
 /**
  * Failure kinds that vacate a pool slot for good: the model is gone, the
@@ -134,24 +143,89 @@ const rowsOf = (providers) =>
 
 const providerOf = (model) => String(model ?? "").split("/")[0]
 
+// Which providers spend ONE shared quota window across their free models.
+// `opencode` (Zen) is the known case: every free model draws from the same free
+// bucket, which is why the primary selector tags it `b:opencode`. `opencode-go`
+// is known to publish a per-model window. For any other provider the scorer
+// cannot claim two models are independent, so fallback disjointness treats the
+// provider as one shared window (the safe direction). The primary selection is
+// unchanged unless a bucket is explicit or the provider is a known shared one.
+export const SHARED_PROVIDER_BUCKETS = { opencode: "opencode" }
+const PER_MODEL_PROVIDERS = new Set(["opencode-go"])
+
+/** The quota group a candidate actually spends: declared, known-shared, or its own model. */
+export function effectiveBucketFor(model, declared) {
+  if (declared) return declared
+  const provider = providerOf(model)
+  if (PER_MODEL_PROVIDERS.has(provider)) return model
+  return SHARED_PROVIDER_BUCKETS[provider] ?? provider
+}
+
+/** The bucket that must be written into pool.txt for a slot, when it is a known shared one. */
+export function bucketToWriteFor(model, declared) {
+  return declared ?? SHARED_PROVIDER_BUCKETS[providerOf(model)]
+}
+
+/** How many disjoint models the secondary pool keeps. */
+export const FALLBACK_POOL_SIZE = 5
+// Fallback seats are real capacity, not a token gesture: give each enough weight
+// to run work, and allow up to two models from one fallback provider so a
+// provider with several distinct models is not reduced to a single w1 seat.
+export const FALLBACK_WEIGHT = 2
+const MAX_FALLBACK_PER_PROVIDER = 2
+
+// The fallback-section marker inside pool.txt, shared with the runtime parser.
+const FALLBACK_MARKER = /^(?:#\s*-*\s*fallback(?:\s+slots)?\s*-*|\[fallback\])$/i
+
 /**
- * Parse pool.txt slot lines into [{ model, weight, bucket?, context? }].
- * Comments and blanks are ignored; weight defaults to 1.
+ * Read `# exclude-provider: name[,name]` directives from a pool.txt header.
+ *
+ * A listed provider is not probed at all and is removed from the primary pool,
+ * the fallback pool, and the retention source. The directive lives in the
+ * header, which refresh preserves, so a provider whose account is out of budget
+ * (or otherwise unwanted) stays out across regenerations without hand-editing
+ * a generated file. Removing the line is all it takes to bring it back.
+ */
+export function parsePoolDirectives(text) {
+  const excluded = new Set()
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const match = /^#\s*exclude-provider\s*:\s*(.+)$/i.exec(line.trim())
+    if (!match) continue
+    for (const name of match[1].split(/[,\s]+/)) {
+      const provider = name.trim()
+      if (provider) excluded.add(provider)
+    }
+  }
+  return excluded
+}
+
+/**
+ * Parse pool.txt slot lines into [{ model, weight, bucket?, context?, ceiling?, fallback? }].
+ * Comments and blanks are ignored; weight defaults to 1. A line that is exactly
+ * `# --- fallback ---` (or `[fallback]`) starts the fallback section.
  */
 export function parsePoolSlots(text) {
   const out = []
+  let section = "primary"
   for (const line of String(text ?? "").split(/\r?\n/)) {
+    if (FALLBACK_MARKER.test(line.trim())) {
+      section = "fallback"
+      continue
+    }
     const code = line.split("#")[0].trim()
     if (!code || !code.includes("/")) continue
     const [model, weight] = code.split(/\s+/)
     if (!model || !model.includes("/")) continue
     const bucket = /b:([^\s]+)/.exec(code)?.[1]
     const context = /c:(\d+)/.exec(code)?.[1]
+    const ceiling = /ceil:(\d+)/.exec(code)?.[1]
     out.push({
       model,
       weight: Number(weight) > 0 ? Number(weight) : 1,
+      ...(ceiling ? { ceiling: Number(ceiling) } : {}),
       ...(bucket ? { bucket } : {}),
       context: context ? Number(context) : null,
+      ...(section === "fallback" ? { fallback: true } : {}),
     })
   }
   return out
@@ -166,15 +240,18 @@ export function parsePoolSlots(text) {
  */
 export function poolStructureValid(slots) {
   const problems = []
-  const items = typeof slots === "string" ? String(slots).split(/\r?\n/) : Array.isArray(slots) ? slots : []
-  const lines = items.map((entry) => {
-    if (typeof entry === "string") {
-      const parts = entry.split("#")[0].trim().split(/\s+/)
-      const bucket = /b:([^\s]+)/.exec(entry)?.[1]
-      return { model: parts[0] ?? "", weight: Number(parts[1]) || 0, bucket }
-    }
-    return { model: entry?.model ?? "", weight: Number(entry?.weight) || 0, bucket: entry?.bucket }
-  }).filter((entry) => entry.model.includes("/"))
+  const parsed =
+    typeof slots === "string"
+      ? parsePoolSlots(slots)
+      : Array.isArray(slots)
+        ? slots.flatMap((entry) => (typeof entry === "string" ? parsePoolSlots(entry) : [entry]))
+        : []
+  const lines = parsed.map((entry) => ({
+    model: entry?.model ?? "",
+    weight: Number(entry?.weight) || 0,
+    bucket: entry?.bucket,
+    fallback: entry?.fallback === true,
+  })).filter((entry) => entry.model.includes("/") && !entry.fallback)
   const go = lines.filter((entry) => providerOf(entry.model) === "opencode-go")
   const tails = lines.filter((entry) => providerOf(entry.model) === "opencode")
   if (go.length === 0) problems.push("missing opencode-go head")
@@ -223,7 +300,11 @@ export function selectPool({
     typeof row.score === "number" &&
     Number.isFinite(row.score) &&
     row.score >= minScore &&
-    (row.context == null || row.context >= minContext)
+    (row.context == null || row.context >= minContext) &&
+    // A stale success carried beside a current failure is rankable only while the
+    // failure streak is short. Once the model has failed MAX_TRANSIENT_STREAK
+    // scans in a row, the old score stops being evidence about the present.
+    Number(row?.failStreak ?? 0) < MAX_TRANSIENT_STREAK
   const byScore = (a, b) => b.score - a.score || String(a.model).localeCompare(String(b.model))
   const nowMs = typeof now === "function" ? Number(now()) : Number(now)
   const normalize = (row) => {
@@ -236,6 +317,14 @@ export function selectPool({
   const rows = rowsOf(providers).map(normalize)
   const previousRows = rowsOf(previousProviders)
   const currentByModel = new Map(rows.map((row) => [row.model, row]))
+  // A ceiling is the slot's hard concurrency cap (max parallel sessions). It is
+  // carried from the current pool through the report so a refresh never silently
+  // drops it; only a ceiling that still fits the slot's weight is kept.
+  const ceilingByModel = new Map(
+    (Array.isArray(currentSlots) ? currentSlots : [])
+      .filter((slot) => slot && typeof slot.model === "string" && Number.isFinite(Number(slot.ceiling)))
+      .map((slot) => [slot.model, Number(slot.ceiling)]),
+  )
   const scannedProviders = new Set(
     (Array.isArray(providers) ? providers : []).map((entry) => String(entry?.provider ?? "")),
   )
@@ -336,7 +425,10 @@ export function selectPool({
   const shouldRetain = (model) => {
     if (!model.includes("/") || placedModels.has(model)) return false
     const row = rowByModel.get(model)
-    if (row) return row.ok === false && !isHardDeadRow(row)
+    // Retain a failed member only while its consecutive-failure streak is short.
+    // Past the cap the slot has proved it cannot serve; leaving it in the pool
+    // just benches a seat every refresh and hands work to it between refreshes.
+    if (row) return row.ok === false && !isHardDeadRow(row) && Number(row.failStreak ?? 0) < MAX_TRANSIENT_STREAK
     return !cleanlyScanned(model)
   }
   const retainedHead = []
@@ -377,6 +469,34 @@ export function selectPool({
   ]
   const tail = pickedZen.map((row) => ({ model: row.model, weight: 2, bucket: "opencode", context: row.context ?? null }))
   let selection = [...head, ...middle, ...tail]
+  // The report carries each slot's ceiling as a fact: a configured ceiling from
+  // the current pool survives regeneration, and a slot with none stays weight-only.
+  selection = selection.map((entry) => {
+    const ceiling = ceilingByModel.get(entry.model)
+    return ceiling !== undefined && ceiling >= Number(entry.weight) ? { ...entry, ceiling } : entry
+  })
+  // Two provider ids can front the same upstream model (an `openrouter` and a
+  // `console-openrouter` alias, for example). They draw on one quota window, so
+  // giving both a slot burns capacity twice and both fall over together. When
+  // the provider names are aliases (one is a suffix of the other) and the model
+  // id past the provider prefix is identical, keep only the first, score-ranked
+  // occurrence. A plain `provider/model` id is never collapsed, so different
+  // providers serving the same model name keep their independent slots.
+  const upstreamOf = (model) => {
+    const slash = String(model).indexOf("/")
+    const upstream = slash < 0 ? "" : String(model).slice(slash + 1)
+    return upstream.includes("/") ? upstream : ""
+  }
+  const seenUpstream = new Map()
+  selection = selection.filter((entry) => {
+    const upstream = upstreamOf(entry.model)
+    if (!upstream) return true
+    const provider = providerOf(entry.model)
+    const prior = seenUpstream.get(upstream)
+    if (prior && (provider.endsWith(prior) || prior.endsWith(provider))) return false
+    seenUpstream.set(upstream, provider)
+    return true
+  })
   // Fit the contract size without ever vacating head or tail: trim the middle
   // from the back (lowest score first), skipping retained slots. If even that
   // cannot fit, the head wins and a warning says so.
@@ -404,6 +524,28 @@ export function selectPool({
         .map((entry) => entry.model)
         .join(", ")}`,
     )
+  }
+
+  // A fallback pool for the case where every primary slot is cooling at once.
+  // Candidates are score-ranked and must spend a different quota window from
+  // every primary slot: a same-bucket model would be benched by the same limit,
+  // so it cannot serve as a fallback. A provider may contribute up to
+  // MAX_FALLBACK_PER_PROVIDER distinct models; a shared bucket is written only
+  // when it is a known fact (Zen).
+  const selectedModels = new Set(selection.map((entry) => entry.model))
+  const primaryBuckets = new Set(selection.map((entry) => effectiveBucketFor(entry.model, entry.bucket)))
+  const fallbackSelection = []
+  const fallbackCounts = new Map()
+  for (const row of merge(() => true)) {
+    if (fallbackSelection.length >= FALLBACK_POOL_SIZE) break
+    if (!rankable(row) || selectedModels.has(row.model)) continue
+    if (primaryBuckets.has(effectiveBucketFor(row.model, undefined))) continue
+    const provider = providerOf(row.model)
+    const count = fallbackCounts.get(provider) ?? 0
+    if (count >= MAX_FALLBACK_PER_PROVIDER) continue
+    fallbackCounts.set(provider, count + 1)
+    const bucket = bucketToWriteFor(row.model, undefined)
+    fallbackSelection.push({ model: row.model, weight: FALLBACK_WEIGHT, ...(bucket ? { bucket } : {}), context: row.context ?? null })
   }
 
   for (const entry of Array.isArray(providers) ? providers : []) {
@@ -441,5 +583,5 @@ export function selectPool({
         }
       : undefined
 
-  return { selection, warnings, retry }
+  return { selection, fallback: fallbackSelection, warnings, retry }
 }

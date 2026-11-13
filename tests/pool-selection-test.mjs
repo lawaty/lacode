@@ -4,10 +4,13 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 
 import {
+  FALLBACK_WEIGHT,
+  MAX_TRANSIENT_STREAK,
   SYNTHETIC_RETRY_MS,
   classifyFailure,
   isHardDeadRow,
   isTransientKind,
+  parsePoolDirectives,
   parsePoolSlots,
   poolStructureValid,
   providerRank,
@@ -110,15 +113,100 @@ test("zen is reserved exactly one slot, even when the other providers fill the p
   assert.deepEqual(secondZen, [{ model: "opencode/best-free", weight: 2, bucket: "opencode", context: 1048576 }])
 })
 
-test("transient credit fallback keeps the previous selection", () => {
+test("budget exhaustion vacates the model instead of retaining a dead seat", () => {
   const previousProviders = makeProviders()
   const providers = makeProviders().map((entry) => ({
     ...entry,
-    rows: entry.rows.map((row) => ({ ...row, ok: false, score: null, reason: "http 402: out of credits", retryAfter: CREDIT_RETRY })),
+    rows: entry.rows.map((row) => ({
+      ...row,
+      ok: false,
+      score: null,
+      reason: "API budget exhausted.",
+      kind: "credit",
+      retryAfter: CREDIT_RETRY,
+    })),
   }))
-  const { selection, retry } = selectPool({ providers, previousProviders, now: NOW })
-  assert.deepEqual(selection, EXPECTED_SELECTION)
-  assert.equal(retry.after, new Date(CREDIT_RETRY).toISOString())
+  const { selection } = selectPool({ providers, previousProviders, now: NOW })
+  assert.ok(!selection.some((row) => row.model === "opencode-go/beam-free"), "a budget-exhausted model must vacate")
+  assert.ok(
+    !selection.some((row) => row.model === "openrouter/small-1"),
+    "no credit-failed model may be retained from the previous scan",
+  )
+})
+
+test("a member that fails transiently for MAX_TRANSIENT_STREAK scans vacates the pool", () => {
+  const currentSlots = [
+    { model: "opencode-go/beam-free", weight: 4 },
+    { model: "openrouter/small-1", weight: 2 },
+  ]
+  const providers = [
+    {
+      provider: "openrouter",
+      error: null,
+      rows: [
+        {
+          model: "openrouter/small-1",
+          ok: false,
+          score: null,
+          kind: "timeout",
+          reason: "timeout after 12000ms",
+          failStreak: MAX_TRANSIENT_STREAK,
+          context: 131072,
+        },
+      ],
+    },
+  ]
+  const { selection } = selectPool({ providers, currentSlots, now: NOW })
+  assert.ok(
+    !selection.some((row) => row.model === "openrouter/small-1"),
+    `a model failing ${MAX_TRANSIENT_STREAK} scans in a row must not be retained`,
+  )
+})
+
+test("a member inside the transient-streak budget is still retained and benched", () => {
+  const currentSlots = [
+    { model: "opencode-go/beam-free", weight: 4 },
+    { model: "openrouter/small-1", weight: 2 },
+  ]
+  const providers = [
+    {
+      provider: "openrouter",
+      error: null,
+      rows: [
+        {
+          model: "openrouter/small-1",
+          ok: false,
+          score: null,
+          kind: "timeout",
+          reason: "timeout after 12000ms",
+          failStreak: MAX_TRANSIENT_STREAK - 1,
+          context: 131072,
+        },
+      ],
+    },
+  ]
+  const { selection } = selectPool({ providers, currentSlots, now: NOW })
+  const kept = selection.find((row) => row.model === "openrouter/small-1")
+  assert.ok(kept, "a member inside the streak budget must be retained")
+  assert.equal(kept.retained, true)
+})
+
+test("the same upstream model behind two provider aliases occupies one slot", () => {
+  const providers = [
+    { provider: "openrouter", error: null, rows: [
+      { model: "openrouter/nvidia/vl:free", ok: true, score: 99, context: 1048576 },
+    ]},
+    { provider: "console-openrouter", error: null, rows: [
+      { model: "console-openrouter/nvidia/vl:free", ok: true, score: 98, context: 1048576 },
+    ]},
+  ]
+  const { selection } = selectPool({ providers })
+  assert.equal(
+    selection.filter((row) => row.model.endsWith("/nvidia/vl:free")).length,
+    1,
+    `one upstream model must not occupy two slots: ${selection.map((r) => r.model).join(", ")}`,
+  )
+  assert.ok(selection.some((row) => row.model === "openrouter/nvidia/vl:free"), "the higher-scored alias wins")
 })
 
 test("hard failure drops that model from fallback", () => {
@@ -128,7 +216,7 @@ test("hard failure drops that model from fallback", () => {
     rows: entry.rows.map((row) =>
       row.model === "opencode-go/beam-free"
         ? { ...row, ok: false, score: null, reason: "not served: 404" }
-        : { ...row, ok: false, score: null, reason: "http 402: out of credits", retryAfter: CREDIT_RETRY },
+        : { ...row, ok: false, score: null, reason: "timeout after 12000ms", kind: "timeout", retryAfter: CREDIT_RETRY },
     ),
   }))
   const { selection } = selectPool({ providers, previousProviders, now: NOW })
@@ -157,18 +245,25 @@ test("classifyFailure names the fault from the status, with prose as the fallbac
   assert.equal(classifyFailure({ reason: "timeout after 45000ms" }), "timeout")
   assert.equal(classifyFailure({ reason: "fetch failed" }), "network")
   assert.equal(classifyFailure({ reason: "Payment required" }), "credit")
+  assert.equal(classifyFailure({ reason: "API budget exhausted." }), "credit")
   assert.equal(classifyFailure({ reason: "free-tier quota exceeded" }), "rate-limited")
   assert.equal(classifyFailure({ reason: "something else" }), "unknown")
   assert.equal(classifyFailure({ kind: "Credit" }), "credit")
 })
 
-test("only transient kinds are retried; agreement, credential and not-served are permanent", () => {
-  for (const kind of ["credit", "rate-limited", "timeout", "network", "server"]) {
+test("only transient kinds are retried; credit, agreement, credential and not-served are permanent", () => {
+  for (const kind of ["rate-limited", "timeout", "network", "server"]) {
     assert.equal(isTransientKind(kind), true, `${kind} must be transient`)
   }
-  for (const kind of ["agreement", "credential", "not-served", "unknown"]) {
+  for (const kind of ["credit", "agreement", "credential", "not-served", "unknown"]) {
     assert.equal(isTransientKind(kind), false, `${kind} must be permanent`)
   }
+})
+
+test("pool.txt exclude-provider directives are parsed and survive as a set", () => {
+  const excluded = parsePoolDirectives("# exclude-provider: mistral\n# exclude-provider: cerebras, sambanova\nopencode-go/a 4\n")
+  assert.deepEqual([...excluded].sort(), ["cerebras", "mistral", "sambanova"])
+  assert.equal(parsePoolDirectives("opencode-go/a 4\n").size, 0)
 })
 
 test("a transient timeout with no reset gets a synthetic retry, a permanent 404 does not", () => {
@@ -283,6 +378,75 @@ test("parsePoolSlots reads weight, bucket and context from pool lines", () => {
     { model: "opencode/zen", weight: 2, bucket: "opencode", context: 1048576 },
   ])
   assert.deepEqual(parsePoolSlots(""), [])
+})
+
+test("parsePoolSlots reads an explicit ceiling", () => {
+  const slots = parsePoolSlots("opencode-go/a  4  ceil:8\ngroq/b  2\n")
+  assert.deepEqual(slots, [
+    { model: "opencode-go/a", weight: 4, ceiling: 8, context: null },
+    { model: "groq/b", weight: 2, context: null },
+  ])
+})
+
+test("selectPool carries a configured ceiling into the selection report", () => {
+  const base = selectPool({ providers: makeProviders() }).selection
+  assert.equal(base.length, 10)
+  const target = base[0]
+  const carried = selectPool({
+    providers: makeProviders(),
+    currentSlots: [{ model: target.model, weight: target.weight, ceiling: target.weight + 2 }],
+  }).selection
+  assert.equal(carried.find((row) => row.model === target.model)?.ceiling, target.weight + 2)
+
+  const below = selectPool({
+    providers: makeProviders(),
+    currentSlots: [{ model: target.model, weight: target.weight, ceiling: 1 }],
+  }).selection
+  assert.equal(
+    below.find((row) => row.model === target.model)?.ceiling,
+    undefined,
+    "a ceiling below the weight must not be carried",
+  )
+})
+
+test("parsePoolSlots marks the fallback section", () => {
+  const slots = parsePoolSlots("opencode-go/a  4\n# --- fallback ---\ngroq/x  1\n")
+  assert.deepEqual(slots, [
+    { model: "opencode-go/a", weight: 4, context: null },
+    { model: "groq/x", weight: 1, context: null, fallback: true },
+  ])
+})
+
+test("selectPool builds a score-ranked fallback from a disjoint provider", () => {
+  const row = (model, score) => ({ model, ok: true, score, context: 1048576 })
+  const providers = [
+    { provider: "opencode-go", rows: Array.from({ length: 9 }, (_, i) => row(`opencode-go/m${i}`, 90 - i)) },
+    { provider: "opencode", rows: [row("opencode/zen", 80), row("opencode/other", 79)] },
+    { provider: "mistral", rows: [row("mistral/x", 70)] },
+  ]
+  const { selection, fallback } = selectPool({ providers })
+  assert.equal(selection.length, 10)
+  assert.ok(!selection.some((entry) => entry.model === "mistral/x"), "the primary pool is already full")
+  assert.deepEqual(
+    fallback,
+    [{ model: "mistral/x", weight: FALLBACK_WEIGHT, context: 1048576 }],
+    "the fallback is the rankable model on a provider the primary does not use",
+  )
+  // A second model on the same unknown provider is not eligible either: an
+  // unknown provider is treated as one shared window for fallback disjointness.
+  assert.ok(!fallback.some((entry) => entry.model === "opencode/other"), "a Zen sibling shares the primary's bucket")
+})
+
+test("fallback takes up to two models from one provider at full weight", () => {
+  const row = (model, score) => ({ model, ok: true, score, context: 1048576 })
+  const providers = [
+    { provider: "opencode-go", rows: Array.from({ length: 10 }, (_, i) => row(`opencode-go/m${i}`, 90 - i)) },
+    { provider: "cloudflare-workers-ai", rows: [row("cloudflare-workers-ai/a", 80), row("cloudflare-workers-ai/b", 79), row("cloudflare-workers-ai/c", 78)] },
+  ]
+  const { fallback } = selectPool({ providers })
+  const cf = fallback.filter((entry) => entry.model.startsWith("cloudflare-workers-ai/"))
+  assert.equal(cf.length, 2, "a provider with several models must contribute more than one fallback seat")
+  for (const entry of cf) assert.equal(entry.weight, FALLBACK_WEIGHT)
 })
 
 test("poolStructureValid accepts a full contract pool and names violations", () => {

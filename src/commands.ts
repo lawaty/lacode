@@ -140,7 +140,7 @@ Follow the rules for the file in your system prompt, then report what you change
 Print one PASS/FAIL line per check below, with the exact fix for any FAIL.
 
 1. Pool status — call the \`pool_status\` tool. Report the slot list, each
-   slot's load against its budget (its weight), and which models
+   slot's load against its ceiling, and which models
    are cooling.
 
 2. OmniRoute configured — inspect the \`@lawaty/lacode\` plugin options in the
@@ -178,9 +178,11 @@ The pool is ONE global slot table shared by every pooled base (explore, implemen
 1. Establish the baseline. Read \`${USER_MODELS_TXT}\`. If it is absent, the pool is resolving from the bundled preset \`presets/free-tier.json\`; read that file to learn what is in effect. Call the \`pool_status\` tool only if you need live load or cooldown state.
 
 2. Resolve the instruction above into a target slot table. These are the rules the loader enforces — never write a file that breaks one:
-   - one slot per line: \`<provider>/<model-id>  [weight]\`
+   - one slot per line: \`<provider>/<model-id>  [weight]  [ceil:<max-parallel>]  [c:<context>]  [b:<bucket>]\`
    - any number of slots; a model may appear on more than one line, and each line is its own slot with its own budget
-   - weight is optional (default 1) and must be a number in (0, ${MAX_WEIGHT}]. It is the slot's active-session budget — how many concurrent sessions it may hold. The pool's total capacity is the sum of the weights. NOT a priority; pick order follows line order.
+   - weight is optional (default 1) and must be a number in (0, ${MAX_WEIGHT}]. It is the slot's per-pass budget — how many concurrent sessions one pass may add. The pool's total capacity is the sum of the ceilings (which equals the sum of the weights when no ceiling is set). NOT a priority; pick order follows line order.
+   - \`ceil:<max-parallel>\` is optional and is the slot's hard concurrency cap (its max parallel sessions). It must be at least the weight; later passes deepen a slot toward it after every slot has had its weight. Absent means the ceiling equals the weight (one pass).
+   - a line that is exactly \`# --- fallback ---\` starts the fallback section. Keep it and the slots below it when rewriting the file: those slots are used only when no primary slot is usable, and each must not share a bucket or model with the primary.
    - \`#\` starts a comment (whole-line or trailing); blank lines are ignored.
    If the instruction names a model ambiguously, stop and ask rather than guessing.
 

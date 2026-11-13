@@ -16,9 +16,14 @@ import assert from "node:assert/strict"
 import {
   createChunkNormalizer,
   installProviderCompat,
+  isOpencodeInferenceChat,
+  isReplayableInit,
+  isTransientUpstreamResponse,
   normalizeChunk,
   normalizeSseLine,
   reasoningText,
+  requestUrl,
+  UPSTREAM_ATTEMPTS,
   wrapFetch,
 } from "../src/lib/provider-compat.ts"
 
@@ -243,4 +248,141 @@ test("installing is idempotent and the undo restores the exact original", async 
   } finally {
     globalThis.fetch = original
   }
+})
+
+// ---------------------------------------------------------------------------
+// Request side: bounded retry for the flaky upstream `reasoning_display` 400
+// ---------------------------------------------------------------------------
+
+const GO_CHAT = "https://opencode.ai/inference/go/openai/v1/chat/completions"
+const ZEN_CHAT = "https://opencode.ai/inference/openai/v1/chat/completions"
+
+const transient400 = () =>
+  new Response(
+    JSON.stringify({
+      error: {
+        type: "invalid_request_error",
+        message: "Upstream request failed: [invalid_request_error] `summary` is not a supported value for `reasoning_display`.",
+      },
+    }),
+    { status: 400, headers: { "content-type": "application/json" } },
+  )
+
+const okJson = () =>
+  new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })
+
+test("requestUrl reads a string, a URL and a Request-like object", () => {
+  assert.equal(requestUrl(GO_CHAT), GO_CHAT)
+  assert.equal(requestUrl(new URL(GO_CHAT)), GO_CHAT)
+  assert.equal(requestUrl({ url: GO_CHAT }), GO_CHAT)
+  assert.equal(requestUrl(42), "")
+})
+
+test("only opencode inference chat-completions URLs are matched", () => {
+  assert.equal(isOpencodeInferenceChat(GO_CHAT), true)
+  assert.equal(isOpencodeInferenceChat(ZEN_CHAT), true)
+  assert.equal(isOpencodeInferenceChat("https://opencode.ai/inference/go/openai/v1/models"), false)
+  assert.equal(isOpencodeInferenceChat("https://api.groq.com/openai/v1/chat/completions"), false)
+  assert.equal(isOpencodeInferenceChat("http://example.invalid/v1/chat/completions"), false)
+  assert.equal(isOpencodeInferenceChat("not a url"), false)
+})
+
+test("a string body is replayable; a stream, FormData or no init is not", () => {
+  assert.equal(isReplayableInit({ body: "{}" }), true)
+  assert.equal(isReplayableInit({ body: new Uint8Array([1, 2]) }), true)
+  assert.equal(isReplayableInit({ body: new ArrayBuffer(4) }), true)
+  assert.equal(isReplayableInit({ body: new ReadableStream() }), false)
+  assert.equal(isReplayableInit({ body: new FormData() }), false)
+  assert.equal(isReplayableInit({}), false)
+  assert.equal(isReplayableInit(undefined), false)
+})
+
+test("the known transient 400 is recognised by status and body", async () => {
+  assert.equal(await isTransientUpstreamResponse(transient400()), true)
+  assert.equal(await isTransientUpstreamResponse(okJson()), false)
+  assert.equal(await isTransientUpstreamResponse(new Response(JSON.stringify({ error: "invalid request" }), { status: 400 })), false)
+})
+
+test("the response stays usable after the transient check", async () => {
+  const response = transient400()
+  assert.equal(await isTransientUpstreamResponse(response), true)
+  // clone(), not read(): the caller can still read the original body.
+  assert.match(await response.text(), /reasoning_display/)
+})
+
+test("a flaky opencode request is retried and the good response returned", async () => {
+  let calls = 0
+  const original = async () => {
+    calls++
+    return calls < 3 ? transient400() : okJson()
+  }
+  const wrapped = wrapFetch(original, { delayMs: 0 })
+  const out = await wrapped(GO_CHAT, { method: "POST", body: "{}" })
+  assert.equal(out.status, 200)
+  assert.equal(calls, 3)
+})
+
+test("retries stop at the bounded attempt count and return the last 400", async () => {
+  let calls = 0
+  const original = async () => {
+    calls++
+    return transient400()
+  }
+  const wrapped = wrapFetch(original, { delayMs: 0 })
+  const out = await wrapped(GO_CHAT, { method: "POST", body: "{}" })
+  assert.equal(out.status, 400)
+  assert.equal(calls, UPSTREAM_ATTEMPTS)
+  assert.match(await out.text(), /reasoning_display/)
+})
+
+test("a different 400 is not retried", async () => {
+  let calls = 0
+  const original = async () => {
+    calls++
+    return new Response(JSON.stringify({ error: { message: "context length exceeded" } }), { status: 400 })
+  }
+  const out = await wrapFetch(original, { delayMs: 0 })(GO_CHAT, { method: "POST", body: "{}" })
+  assert.equal(out.status, 400)
+  assert.equal(calls, 1)
+})
+
+test("a non-opencode host is not retried, even for the same body", async () => {
+  let calls = 0
+  const original = async () => {
+    calls++
+    return transient400()
+  }
+  const out = await wrapFetch(original, { delayMs: 0 })("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    body: "{}",
+  })
+  assert.equal(out.status, 400)
+  assert.equal(calls, 1)
+})
+
+test("a non-replayable body is not retried", async () => {
+  let calls = 0
+  const original = async () => {
+    calls++
+    return transient400()
+  }
+  const out = await wrapFetch(original, { delayMs: 0 })(GO_CHAT, { method: "POST", body: new ReadableStream() })
+  assert.equal(out.status, 400)
+  assert.equal(calls, 1)
+})
+
+test("a successful SSE stream is returned without retry and still normalized", async () => {
+  let calls = 0
+  const original = async () => {
+    calls++
+    const body = streamOf([sse(chunk({ reasoning: { summary: { text: "**" } } }))])
+    return new Response(body, { headers: { "content-type": "text/event-stream" } })
+  }
+  const wrapped = wrapFetch(original, { delayMs: 0 })
+  const out = await wrapped(GO_CHAT, { method: "POST", body: "{}" })
+  assert.equal(calls, 1)
+  assert.equal(JSON.parse((await out.text()).slice("data: ".length)).choices[0].delta.reasoning, "**")
 })

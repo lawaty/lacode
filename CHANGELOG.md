@@ -9,6 +9,31 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.3.0-beta.6] — fallback capacity and honest failure benching
+
+### Added
+
+- Pool: `pool.txt` now supports a fallback section (`# --- fallback ---`) used only when no primary slot is usable. Fallback candidates are score-ranked and must spend a different quota window from every primary slot; a seat carries weight 2 (was 1), a provider may contribute up to two models, and up to five fallback seats are kept.
+- Pool: `pool.txt` supports `# exclude-provider: name[,name]` in its header. A listed provider is never probed and is removed from the primary selection, the fallback selection, and the retention source. The header survives refresh, so the exclusion persists; deleting the line re-admits the provider.
+- Pool: slots accept `ceil:<max-parallel>` as a hard concurrency cap (the pool's capacity is the sum of ceilings) and `c:<context>` as a context fact. The status output shows the ceiling when it differs from the weight and tags the fallback section.
+- Pool: consecutive-failure streaks are carried in `model-scores.json`, so a model that keeps failing can be retired instead of retained indefinitely.
+- Provider compatibility: the transport retries the identical replayable request up to three times when `opencode.ai/inference` answers HTTP 400 "`summary` is not a supported value for `reasoning_display`". It is a flaky upstream, no client field changes the rate, and the model is never disabled or dropped.
+
+### Changed
+
+- Pool: a model whose current probe is a transient failure is retired after three consecutive failing scans (`MAX_TRANSIENT_STREAK`); a successful scan resets the streak.
+- Pool: the refresh's `scan-kept` bench now spans the six-hour refresh interval instead of 45 minutes. A successful probe clears only a `scan-kept` record; runtime strikes (`rate-limited`, `no answer`, `provider error`, ...) keep their escalation count.
+- Pool: `API budget exhausted`, `quota exhausted`, and bare credit/billing failures are classified as credit, and credit exhaustion now vacates the slot instead of retaining a dead seat. A later answering scan re-admits the model.
+- Pool: a terminal session error that is not a recognised model signal now benches the model on the ordinary strike curve instead of only being logged. `MessageAbortedError` (a user interrupt or the pool's own failover) is never counted as a model failure.
+- Pool: `budget exhausted` is recognised as a quota reason, so it takes the longer quota cooldown curve.
+- Pool: the scorer deliberately does not include `rate-limited` in the provider breaker. A 429 answers in milliseconds, and truncating on it leaves the provider's pool members unscanned, so their failure streak could never advance.
+
+### Fixed
+
+- Pool: an upstream model served by two provider aliases (`openrouter/...` and `console-openrouter/...`) no longer occupies two primary slots when the model id past the provider prefix is identical.
+- Pool: the `reasoning_display` 400 is classified as a transient upstream fault (`upstream-transient`) and cooled for one short minute instead of being misread as a capability mismatch and benched for six hours. A genuinely unsupported parameter is still benched as `invalid-request`.
+- Pool: `pool_status` judges structure on the primary pool and tags the fallback section, so a fallback line no longer looks like a broken tail.
+
 ## [2.3.0-beta.5] — bench in place, cheap recovery, visible slots
 
 ### Added

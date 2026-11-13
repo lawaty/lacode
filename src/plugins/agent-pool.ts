@@ -1258,7 +1258,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           // opencode reports a terminal API error as `session.error` plus an idle
           // status, not as a retry status, so the branch above never sees it.
           const error = props.error as
-            | { data?: { statusCode?: number; responseHeaders?: Record<string, string> } }
+            | { data?: { statusCode?: number; isRetryable?: boolean; responseHeaders?: Record<string, string> } }
             | undefined
           const haystack = JSON.stringify(error) ?? ""
           if (sessionID && pool.isProbe(s, sessionID)) {
@@ -1271,6 +1271,22 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           const auth = pool.isAuthFailureText(haystack) || status === 401 || status === 403
           const limited = pool.isLimitText(haystack) || status === 429
           const outage = pool.isUnavailableText(haystack)
+          // The `reasoning_display` 400 is an upstream flake: it clears on a
+          // retry, so it must never be benched like a capability mismatch.
+          const transientUpstream =
+            status === 400 && pool.isTransientUpstreamText(haystack) && !auth && !limited && !outage
+          // A non-retryable 400 that names an unsupported parameter is a model
+          // capability mismatch, not a bad moment: the same request would fail
+          // forever. Bench the model instead of filing it as a generic error the
+          // pool will route to again on the very next spawn.
+          const unsupported =
+            status === 400 &&
+            error?.data?.isRetryable === false &&
+            pool.isUnsupportedParameterText(haystack) &&
+            !transientUpstream &&
+            !auth &&
+            !limited &&
+            !outage
           if (missing) {
             // A model id the provider does not serve is terminal and will not fix itself.
             // Bench it for the cap like the probe does, and release the claim at once:
@@ -1299,6 +1315,32 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
                 slot: target.claim.k,
                 session: sessionID,
               })
+            }
+            return
+          }
+          if (transientUpstream) {
+            if (own) {
+              const transient = pool.coolUnavailable(s, own.claim.m, pool.TRANSIENT_UPSTREAM_COOLDOWN_MS, pool.TRANSIENT_UPSTREAM_REASON)
+              pool.recordFailure(s, {
+                ts: Date.now(),
+                source: "observed",
+                base: own.claim.v,
+                slot: own.claim.k,
+                model: own.claim.m,
+                session: sessionID,
+                reason: pool.TRANSIENT_UPSTREAM_REASON,
+                elapsedMs: Date.now() - own.claim.t,
+                released: true,
+                detail: haystack.slice(0, 400),
+              })
+              pool.release(s, own.key)
+              await log(
+                "warn",
+                transient
+                  ? `cooling ${own.claim.m} for ${Math.round((transient.until - Date.now()) / 1000)}s (${pool.TRANSIENT_UPSTREAM_REASON}) after a flaky upstream error`
+                  : `released ${own.claim.v} claim on ${own.claim.m} after a flaky upstream error`,
+                { base: own.claim.v, model: own.claim.m, slot: own.claim.k, session: sessionID },
+              )
             }
             return
           }
@@ -1333,23 +1375,45 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
             // Release it here rather than leaving the slot FULL until the reaper.
             if (own) {
               const detail = haystack.slice(0, 400)
-              pool.recordFailure(s, {
-                ts: Date.now(),
-                source: "observed",
-                base: own.claim.v,
-                slot: own.claim.k,
-                model: own.claim.m,
-                session: sessionID,
-                reason: "provider error",
-                elapsedMs: Date.now() - own.claim.t,
-                released: true,
-                detail,
-              })
-              if (!observedErrors.has(own.key)) {
-                observedErrors.set(own.key, { reason: "provider error", detail })
-                if (observedErrors.size > 32) {
-                  const oldest = observedErrors.keys().next().value
-                  if (oldest !== undefined) observedErrors.delete(oldest)
+              const aborted = pool.isAbortText(haystack)
+              const reason = unsupported ? pool.INVALID_REQUEST_REASON : "provider error"
+              if (!aborted) {
+                pool.recordFailure(s, {
+                  ts: Date.now(),
+                  source: "observed",
+                  base: own.claim.v,
+                  slot: own.claim.k,
+                  model: own.claim.m,
+                  session: sessionID,
+                  reason,
+                  elapsedMs: Date.now() - own.claim.t,
+                  released: true,
+                  detail,
+                })
+                if (!observedErrors.has(own.key)) {
+                  observedErrors.set(own.key, { reason, detail })
+                  if (observedErrors.size > 32) {
+                    const oldest = observedErrors.keys().next().value
+                    if (oldest !== undefined) observedErrors.delete(oldest)
+                  }
+                }
+                // A terminal failure the model itself produced is evidence about the
+                // model. Bench it on the ordinary strike curve so a slot that fails on
+                // every spawn stops being handed work; the next probe that sees it
+                // answer re-admits it. An unsupported-parameter error is deterministic
+                // and gets the long capability-mismatch window instead.
+                const strike = pool.recordStrike(
+                  s,
+                  own.claim.m,
+                  reason,
+                  unsupported ? pool.INVALID_REQUEST_COOLDOWN_MS : undefined,
+                )
+                if (strike) {
+                  await log(
+                    "warn",
+                    `bench ${own.claim.m} (${reason}, strike ${strike.strikes}, ${Math.round((strike.until - Date.now()) / 1000)}s) after a terminal session error`,
+                    { model: own.claim.m, slot: own.claim.k, session: sessionID, reason: detail },
+                  )
                 }
               }
               pool.release(s, own.key)
@@ -1510,6 +1574,21 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         const gateway5xx = status !== undefined && status >= 500 && status <= 599
         const transientGateway = gateway5xx || pool.isTransientGatewayText(haystack)
         const missing = pool.isModelMissingText(haystack)
+        // The `reasoning_display` 400 is an upstream flake: a retry clears it, so
+        // it takes the short flat cooling path, never the capability-mismatch bench.
+        const transientUpstream =
+          status === 400 && pool.isTransientUpstreamText(haystack) && !auth && !limited && !transientGateway
+        // A non-retryable 400 naming an unsupported parameter is a capability
+        // mismatch, not a transient fault. Bench the model so the next spawn
+        // routes elsewhere instead of repeating a request that cannot succeed.
+        const unsupported =
+          status === 400 &&
+          (info.error as { data?: { isRetryable?: boolean } }).data?.isRetryable === false &&
+          pool.isUnsupportedParameterText(haystack) &&
+          !transientUpstream &&
+          !auth &&
+          !limited &&
+          !transientGateway
         const model = `${info.providerID ?? "?"}/${info.modelID ?? "?"}`
         const ownMsg = claimFor(info.sessionID)
         const isTpm = pool.isRequestTooLargeText(haystack)
@@ -1538,24 +1617,40 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         if (!limited && !transientGateway && !auth && !missing) {
           const ownMsgUnclassified = ownMsg
           if (ownMsgUnclassified) {
-            pool.recordFailure(s, {
-              ts: Date.now(),
-              source: "observed",
-              base: ownMsgUnclassified.claim.v,
-              slot: ownMsgUnclassified.claim.k,
-              model: ownMsgUnclassified.claim.m,
-              session: info.sessionID,
-              reason: "provider error",
-              elapsedMs: Date.now() - ownMsgUnclassified.claim.t,
-              released: false,
-              detail: haystack.slice(0, 400),
-            })
-            if (!observedErrors.has(ownMsgUnclassified.key)) {
-              observedErrors.set(ownMsgUnclassified.key, { reason: "provider error", detail: haystack.slice(0, 400) })
-              if (observedErrors.size > 32) {
-                const oldest = observedErrors.keys().next().value
-                if (oldest !== undefined) observedErrors.delete(oldest)
+            const aborted = pool.isAbortText(haystack)
+            if (!aborted) {
+              pool.recordFailure(s, {
+                ts: Date.now(),
+                source: "observed",
+                base: ownMsgUnclassified.claim.v,
+                slot: ownMsgUnclassified.claim.k,
+                model: ownMsgUnclassified.claim.m,
+                session: info.sessionID,
+                reason: "provider error",
+                elapsedMs: Date.now() - ownMsgUnclassified.claim.t,
+                released: true,
+                detail: haystack.slice(0, 400),
+              })
+              if (!observedErrors.has(ownMsgUnclassified.key)) {
+                observedErrors.set(ownMsgUnclassified.key, { reason: "provider error", detail: haystack.slice(0, 400) })
+                if (observedErrors.size > 32) {
+                  const oldest = observedErrors.keys().next().value
+                  if (oldest !== undefined) observedErrors.delete(oldest)
+                }
               }
+              // An unclassified terminal error is still evidence about the model.
+              // Bench it rather than logging it and routing to the same slot again;
+              // release the claim so `session.error` cannot count the same failure
+              // a second time.
+              const strike = pool.recordStrike(s, ownMsgUnclassified.claim.m, "provider error")
+              if (strike) {
+                await log(
+                  "warn",
+                  `bench ${ownMsgUnclassified.claim.m} (provider error, strike ${strike.strikes}) after an unclassified terminal error`,
+                  { model: ownMsgUnclassified.claim.m, slot: ownMsgUnclassified.claim.k, session: info.sessionID, reason: haystack.slice(0, 400) },
+                )
+              }
+              pool.release(s, ownMsgUnclassified.key)
             }
           }
           return
@@ -1594,6 +1689,43 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
               base: ownMsgMissing.claim.v,
               model: ownMsgMissing.claim.m,
               slot: ownMsgMissing.claim.k,
+              session: info.sessionID,
+            })
+          }
+          return
+        }
+        if (unsupported) {
+          // Bench only while the claim is still held. opencode can report the
+          // same terminal failure through both `session.error` and
+          // `message.updated`; whichever runs first releases the claim, so the
+          // other sees no claim and must not count a second strike.
+          const ownUnsupported = ownMsg
+          if (ownUnsupported) {
+            const strike = pool.recordStrike(s, ownUnsupported.claim.m, pool.INVALID_REQUEST_REASON, pool.INVALID_REQUEST_COOLDOWN_MS)
+            if (strike) {
+              await log(
+                "warn",
+                `bench ${ownUnsupported.claim.m} (${pool.INVALID_REQUEST_REASON}, ${Math.round((strike.until - Date.now()) / 1000)}s) after a non-retryable unsupported-parameter error`,
+                { model: ownUnsupported.claim.m, slot: ownUnsupported.claim.k, session: info.sessionID, reason: haystack.slice(0, 400) },
+              )
+            }
+            pool.recordFailure(s, {
+              ts: Date.now(),
+              source: "observed",
+              base: ownUnsupported.claim.v,
+              slot: ownUnsupported.claim.k,
+              model: ownUnsupported.claim.m,
+              session: info.sessionID,
+              reason: pool.INVALID_REQUEST_REASON,
+              elapsedMs: Date.now() - ownUnsupported.claim.t,
+              released: true,
+              detail: haystack.slice(0, 400),
+            })
+            pool.release(s, ownUnsupported.key)
+            await log("warn", `released ${ownUnsupported.claim.v} claim on ${ownUnsupported.claim.m} after an unsupported-parameter error`, {
+              base: ownUnsupported.claim.v,
+              model: ownUnsupported.claim.m,
+              slot: ownUnsupported.claim.k,
               session: info.sessionID,
             })
           }
@@ -1817,11 +1949,15 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
               status && status !== "active" && status !== "unknown" ? `catalog:${status}` : "",
             ].filter(Boolean)
             const marker = next && slot.index === next.index ? " <- next" : ""
-            // load/ceiling: the ceiling is the slot's weight. A FULL slot is only
-            // used again once no other slot is both available and under its weight.
+            // load/ceiling: the ceiling is the slot's max parallel sessions (its
+            // weight unless a larger ceiling is configured). A FULL slot is only
+            // used again once no other slot is both available and under its ceiling.
             const load = entry?.total ?? 0
+            const ceiling = pool.slotCeiling(slot)
             const atCeiling = !pool.underCeiling(slot, snap.counts)
-            return `  slot ${slot.index} w${slot.weight}  ${slot.model}  load=${load}/${pool.slotCeiling(slot)}${atCeiling ? " FULL" : ""}${marker}  [${users}${notes.length ? "; " + notes.join("; ") : ""}]`
+            const cap = ceiling === slot.weight ? `w${slot.weight}` : `w${slot.weight} c${ceiling}`
+            const tier = slot.fallback ? " [fallback]" : ""
+            return `  slot ${slot.index} ${cap}  ${slot.model}${tier}  load=${load}/${ceiling}${atCeiling ? " FULL" : ""}${marker}  [${users}${notes.length ? "; " + notes.join("; ") : ""}]`
           }
 
           const total = [...snap.counts.values()].reduce((sum, n) => sum + n, 0)
@@ -1833,7 +1969,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           for (const slot of slots) {
             const name = pool.slotBucket(slot)
             const entry = buckets.get(name) ?? { seats: 0, slots: 0, cooling: false }
-            entry.seats += slot.weight
+            entry.seats += pool.slotCeiling(slot)
             entry.slots++
             if (snap.cooling.has(slot.model)) entry.cooling = true
             buckets.set(name, entry)
@@ -1849,7 +1985,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           return {
             title: `agent-pool: ${total} task(s) in flight, ${coolingNow.length} model(s) cooling`,
             output: [
-              `shared pool over ${slots.length} slot(s) from ${s.origin}; state ${pass}; bases: ${pool.BASES.join(", ")}\none ordered pass in slot order: each slot fills to its weight, then overflow goes to the least-loaded slot. Capacity is the sum of the weights; repeat a model on another line to give it more (FULL = at weight).`,
+              `shared pool over ${slots.filter((slot) => !slot.fallback).length} primary slot(s) + ${slots.filter((slot) => slot.fallback).length} fallback slot(s) from ${s.origin}; state ${pass}; bases: ${pool.BASES.join(", ")}\nordered fill in declaration order: each pass fills every usable slot to its weight, then the next pass deepens a slot toward its ceiling (max parallel sessions). The fallback section is used only when no primary slot is usable. Capacity is the sum of the ceilings; weight alone is the per-pass budget (FULL = at ceiling).`,
               ...(next
                 ? []
                 : ["next: none - no routable slot; every slot is cooling, catalog-retired, or provider-unconfigured. A spawn will fail explicitly instead of routing."]),
@@ -1860,7 +1996,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
                 ? [`provider degraded: ${degradedProviders.join(", ")} (flat window; a probe re-admits a model when it answers)`]
                 : []),
               ...slots.map(line),
-              ...poolHealthLines(slots, now),
+              ...poolHealthLines(slots.filter((slot) => !slot.fallback), now),
               "",
               "by process:",
               `  ${s.id} (this process): ${snap.own.size} claim(s)`,

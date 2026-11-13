@@ -601,6 +601,61 @@ const dirB = scratch()
   assert(pool.isLimitText(groq) === false, "Groq request-too-large must not be classified as a quota/rate limit")
 }
 
+// 22. a non-retryable unsupported-parameter 400 is its own class, so the plugin
+//     can bench the model instead of filing a generic error the pool re-routes
+//     to. The matcher must stay narrow: a bare "invalid request" may be our own
+//     payload and would fail on every model, so it must not match.
+{
+  const unsupported = [
+    "unsupported field `foo`",
+    "invalid value for `temperature`",
+    "response_format is not supported by this model",
+  ]
+  const generic = [
+    "invalid request",
+    "400 Bad Request",
+    "invalid_request_error",
+    "context_length_exceeded",
+    "rate limit reached",
+    "model not found",
+  ]
+  for (const text of unsupported) {
+    assert(pool.isUnsupportedParameterText(text) === true, `must detect unsupported parameter: ${text}`)
+  }
+  for (const text of generic) {
+    assert(pool.isUnsupportedParameterText(text) === false, `must NOT detect unsupported parameter: ${text}`)
+  }
+  assert(pool.INVALID_REQUEST_REASON === "invalid-request", "invalid-request reason must be stable")
+  assert(
+    pool.INVALID_REQUEST_COOLDOWN_MS === pool.MODEL_MISSING_COOLDOWN_MS,
+    "an invalid-request bench must use the same long re-probe window as model-missing",
+  )
+}
+
+// 23. the `reasoning_display` 400 is an UPSTREAM FLAKE, not a capability
+//     mismatch: measured against the live gateway the same request succeeds on
+//     retry and no client field changes the rate. It must take the short flat
+//     cooling path, so it never benches the model for six hours.
+{
+  const flaky = [
+    "Upstream request failed: [invalid_request_error] `summary` is not a supported value for `reasoning_display`.",
+    "unsupported parameter: reasoning_display",
+  ]
+  for (const text of flaky) {
+    assert(pool.isTransientUpstreamText(text) === true, `must classify as transient upstream: ${text}`)
+    // The generic matcher still matches it; the plugin excludes it explicitly
+    // via isTransientUpstreamText, which is why both predicates are asserted.
+    assert(pool.isUnsupportedParameterText(text) === true, `still matches the unsupported matcher: ${text}`)
+  }
+  assert(pool.isTransientUpstreamText("invalid value for `temperature`") === false, "a real capability mismatch is not transient")
+  assert(pool.isTransientUpstreamText("rate limit reached") === false, "a limit is not the flaky upstream fault")
+  assert(pool.TRANSIENT_UPSTREAM_REASON === "upstream-transient", "transient reason must be stable")
+  assert(
+    pool.TRANSIENT_UPSTREAM_COOLDOWN_MS === 60_000,
+    "the flaky upstream must cool for one short minute, never the six-hour capability cap",
+  )
+}
+
 globalThis.fetch = realFetch
 for (const dir of made) rmSync(dir, { recursive: true, force: true })
 if (failures === 0) console.log("\nALL LIMIT CHECKS PASSED")

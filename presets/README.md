@@ -32,30 +32,42 @@ change here takes effect without a restart. Plugin CODE still needs one.
 
 ## The flat pool file (recommended)
 
-`~/.config/lacode/pool.txt` is one model per line — edit a model id or a weight
-in place, no JSON and no objects:
+`~/.config/lacode/pool.txt` is one model per line — edit a model id, a weight or
+a ceiling in place, no JSON and no objects:
 
 ```text
-# provider/model-id                       weight  c:<context>
-opencode/big-pickle                       3       c:200000
+# provider/model-id                       weight  ceil:<max-parallel>  c:<context>
+opencode/big-pickle                       3       ceil:6                c:200000
 opencode-go/beam-free       2       c:200000
 opencode/deepseek-v4.1-flash-free         1       c:200000
 opencode/glm-5.3-flash-free               1       c:200000
 ```
 
 `#` starts a comment (whole-line or trailing), blank lines are ignored, and the
-weight is optional (default 1). `c:<context>` is the model's context window in tokens; the router uses it to prefer the smallest model that fits the task, and it is optional for hand-written lines. The rules are exactly the same as the JSON form
+weight is optional (default 1). `ceil:<max-parallel>` is optional and is the
+slot's hard concurrency cap (max parallel sessions); it must be at least the
+weight, and absent means the ceiling is the weight. `c:<context>` is the model's context window in tokens; the router uses it to prefer the smallest model that fits the task, and it is optional for hand-written lines. The rules are exactly the same as the JSON form
 below: any number of slots, a model may repeat on another line, split on the
 first slash only. The loader accepts either shape in the same file, so a leading
 `{` means JSON and anything else means the flat form.
+
+A line that is exactly `# --- fallback ---` (or `[fallback]`) starts the
+**fallback section**. Those slots are used only when no primary slot is usable;
+they are not extra overflow capacity. A fallback slot that shares a quota bucket
+(or model) with any primary slot is dropped with a warning, because a limit that
+benches the primary would bench it too. The JSON form is `"fallbackSlots": [...]`
+beside `"slots"`.
 
 ## Schema
 
 ```jsonc
 {
   "slots": [
-    { "model": "provider/model-id", "weight": 3 },
-    { "model": "provider/another-id" }        // weight defaults to 1
+    { "model": "provider/model-id", "weight": 3, "ceiling": 6 },
+    { "model": "provider/another-id" }        // weight defaults to 1, ceiling to the weight
+  ],
+  "fallbackSlots": [
+    { "model": "other-provider/reserve-id", "weight": 1 }
   ]
 }
 ```
@@ -63,7 +75,9 @@ first slash only. The loader accepts either shape in the same file, so a leading
 | Field | Required | Meaning |
 |-------|----------|---------|
 | `model` | yes | `provider/model-id`, split on the **first** slash only |
-| `weight` | no | active-session budget; the pool's capacity is the sum of the weights. Absent = 1 |
+| `weight` | no | per-pass concurrency budget; absent = 1 |
+| `ceiling` | no | hard concurrency cap (max parallel sessions); must be >= `weight`. Absent = the weight |
+| `fallbackSlots` | no | slots used only when no primary slot is usable; each must be disjoint from the primary's buckets |
 
 `$comment` is a JSON-legal array of strings and is ignored by the loader; the
 bundled preset uses it to explain itself in place.
@@ -92,18 +106,23 @@ because the pool requires it.
 
 ## Weight, precisely
 
-A weight is a slot's active-session budget: the number of concurrent claims it
-may hold before the next slot is preferred. The pool's capacity is the **sum of
-the weights**, so a weight-3 slot may hold 3 concurrent sessions and listing a
-model on two lines gives it two independent budgets.
+A weight is a slot's per-pass budget: the number of concurrent claims one pass
+may add to it before the next slot is preferred. Its hard cap is the `ceiling`
+(max parallel sessions), which defaults to the weight and can be raised per slot
+with a `ceiling` field (flat form `ceil:<n>`). The pool's capacity is the **sum
+of the ceilings**, so a weight-3 slot with ceiling 6 may hold 6 concurrent
+sessions, and listing a model on two lines gives it two independent budgets.
 
-Routing is one pass:
+Routing repeats the pass:
 
 1. fill each usable slot up to its weight, in declaration order
+2. once every usable slot has reached its weight, the next pass deepens each
+   usable slot toward its ceiling
 
-A slot is skipped when it is cooling or unavailable. When every usable slot is
-at its weight, the pool is at capacity and overflow goes to the least loaded
-usable slot; the pool never refuses work.
+A slot is skipped when it is cooling, unavailable, or at its ceiling. When every
+usable slot is at its ceiling, the pool is at capacity and overflow goes to the
+least loaded usable slot; the pool never refuses work. With no ceiling set the
+slot stops at its weight, so the historical one-pass behaviour is unchanged.
 
 Live claims decide the next slot: a released claim immediately reopens its
 slot, and there is no stored position.

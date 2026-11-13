@@ -3,11 +3,13 @@
 //   US-5  ordered fill gives every slot its pass target in declaration order
 //   US-6  live pool visibility (the pool_status tool)
 //
-// Slots fill in declaration order. A slot's weight is its active-session budget
-// and the pool's capacity is the sum of the weights. Routing walks the usable
-// slots and fills each to its weight, in order; once every usable slot is at its
-// weight, overflow goes to the least-loaded slot. Preference is order, never
-// weight, so a light slot declared before a heavy one is filled first.
+// Slots fill in declaration order. A slot's weight is its per-pass budget and,
+// unless a larger ceiling is configured, its hard cap. Routing walks the usable
+// slots and fills each to its weight in one pass; when every usable slot is at
+// its weight, later passes deepen a slot toward its ceiling (max parallel
+// sessions). A slot with no ceiling therefore stops at its weight exactly as
+// before. Preference is order, never weight, so a light slot declared before a
+// heavy one is filled first.
 //
 // A released claim immediately reopens its slot, because live claims are the only
 // state routing consults and there is no stored position. The serial release test
@@ -37,6 +39,16 @@ const bootPool = async (slots, id, options = {}) => {
   const cfg = configFor(slots.map((s) => s.model))
   await hooks.config(cfg)
   return { stub, dir, hooks, cfg, models: slots.map((s) => s.model) }
+}
+
+/** Boot a pool with a primary table and a fallback section. */
+const bootPoolWithFallback = async (slots, fallbackSlots, id) => {
+  const stub = stubInput()
+  const dir = scratch()
+  const hooks = await bootLaCode(stub, { id, dir, models: { slots, fallbackSlots } })
+  const cfg = configFor([...slots, ...fallbackSlots].map((s) => s.model))
+  await hooks.config(cfg)
+  return { hooks }
 }
 
 /** Route one spawn and report the variant sent to it. */
@@ -180,6 +192,80 @@ test("[US-5] a cooling slot is skipped and a recovered earlier slot is preferred
 
   clock.restore()
   await hooks.dispose()
+})
+
+// ---------------------------------------------------------------------------
+// US-5 (continued) — a ceiling above the weight deepens a slot on later passes
+// ---------------------------------------------------------------------------
+
+test("[US-5] a ceiling above the weight deepens a slot across passes", async () => {
+  const slots = [
+    { model: "slot/a", weight: 1, ceiling: 3 },
+    { model: "slot/b", weight: 1 },
+  ]
+  const { hooks } = await bootPool(slots, "slot-fill-ceiling")
+
+  const routed = await burst(hooks, 4)
+  assert.deepEqual(
+    routed,
+    ["explore-1", "explore-2", "explore-1", "explore-1"],
+    `pass 1 fills every slot to its weight, then later passes deepen an under-ceiling slot, got ${routed}`,
+  )
+
+  const status = (await hooks.tool.pool_status.execute({}, {})).output
+  assert.match(status, /slot 1 w1 c3/, `the status must show the explicit ceiling:\n${status}`)
+  assert.match(status, /load=3\/3/, `slot 1 must reach its ceiling:\n${status}`)
+  await hooks.dispose()
+})
+
+test("[US-5] the flat slot format parses ceil: and rejects a ceiling below the weight", () => {
+  const { slots } = pool.parseTextSlots("slot/a 2 ceil:6 c:200000\nslot/b 4 ceil:2", "test")
+  assert.equal(slots[0].weight, 2)
+  assert.equal(slots[0].ceiling, 6)
+  assert.equal(pool.slotCeiling(slots[0]), 6)
+  assert.equal(slots[1].ceiling, undefined, "a ceiling below the weight is ignored")
+  assert.equal(pool.slotCeiling(slots[1]), 4, "an ignored ceiling falls back to the weight")
+})
+
+test("[US-5] the fallback section is used only when every primary slot is unavailable", async () => {
+  const primary = [{ model: "primary/a", weight: 1 }]
+  const fallbackSlots = [{ model: "fallback/x", weight: 1 }]
+  const { hooks } = await bootPoolWithFallback(primary, fallbackSlots, "slot-fill-fallback")
+
+  // Primary is usable: overflow stays in the primary, it never reaches the fallback.
+  assert.equal(await spawnExplore(hooks, "fb-0"), "explore-1")
+  assert.equal(await spawnExplore(hooks, "fb-1"), "explore-1", "overflow must not use the fallback while the primary is usable")
+
+  // Cool the only primary slot: now the fallback is the only routable model.
+  await emit(hooks, "message.updated", {
+    info: { role: "assistant", providerID: "primary", modelID: "a", error: { message: "Endpoint is unavailable" } },
+  })
+  assert.equal(await spawnExplore(hooks, "fb-2"), "explore-2", "the fallback must route when no primary slot is usable")
+  await hooks.dispose()
+})
+
+test("[US-5] a fallback slot sharing a limit window with the primary is dropped", () => {
+  const { slots, problems } = pool.parseSlots(
+    {
+      slots: [{ model: "opencode/a", weight: 1, bucket: "opencode" }],
+      fallbackSlots: [
+        { model: "opencode/b", weight: 1, bucket: "opencode" },
+        { model: "other/c", weight: 1 },
+      ],
+    },
+    "test",
+  )
+  assert.deepEqual(slots.map((slot) => slot.model), ["opencode/a", "other/c"])
+  assert.equal(slots[1].fallback, true)
+  assert.ok(problems.some((problem) => /shares a limit window/.test(problem)), `expected a warning, got ${problems}`)
+})
+
+test("[US-5] the flat pool file switches to fallback slots at the marker", () => {
+  const { slots } = pool.parseTextSlots("primary/a  1\n# --- fallback ---\nother/x  1  ceil:2\n", "test")
+  assert.deepEqual(slots.map((slot) => slot.model), ["primary/a", "other/x"])
+  assert.equal(slots[0].fallback, undefined)
+  assert.equal(slots[1].fallback, true)
+  assert.equal(slots[1].ceiling, 2)
 })
 
 // ---------------------------------------------------------------------------

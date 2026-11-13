@@ -151,6 +151,17 @@ const { agentPoolHooks: AgentPool } = await import(PLUGIN)
 
   st = await status()
   assert(st.includes("load=0/2"), `after generic error, load must be 0/2, got:\n${st}`)
+  assert(st.includes("COOLING"), `a generic terminal error must bench the model, got:\n${st}`)
+
+  // An abort is not evidence about the model: it must not bench it. Clear the
+  // generic error's bench, then abort a fresh spawn and check it stays routable.
+  clearCooldown()
+  const fAbort = await spawn("f-abort", "parent")
+  assert(fAbort === "explore-1", `spawn f-abort should route to explore-1, got ${fAbort}`)
+  await childCreated("parent", "child-abort")
+  await sessionError("child-abort", { name: "MessageAbortedError", data: { message: "Aborted" } })
+  st = await status()
+  assert(!st.includes("COOLING"), `an aborted request must not bench the model, got:\n${st}`)
 
   // A. Assistant-message model-not-found
   const fMsg = await spawn("f-msg", "parent")

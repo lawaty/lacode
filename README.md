@@ -244,11 +244,19 @@ bare name is the only thing that works: a hand-named variant such as `explore-1`
 is coerced to its base and routed by the pool, so naming one cannot pin a
 provider or skip ordered slot filling.
 
-A slot's `weight` is both its concurrency budget and its cap: the pool fills
-slots in declaration order in one pass, then overflows to the least-loaded slot.
-There is no slot cap, and a model may appear on more than one line — each line
-is a separate slot with its own weight — so to give a model more capacity, list
-it again.
+A slot's `weight` is its per-pass concurrency budget, and its default cap. A
+larger optional `ceiling` (max parallel sessions; flat form `ceil:<n>`) lets a
+later pass deepen the slot past its weight. The pool fills slots in declaration
+order; when every usable slot has reached its weight, later passes fill toward
+each slot's ceiling, then overflow goes to the least-loaded slot. There is no
+slot cap, and a model may appear on more than one line — each line is a separate
+slot with its own weight and ceiling — so to give a model more capacity, raise
+its ceiling or list it again.
+
+A pool file may carry a fallback section (`# --- fallback ---` in `pool.txt`, or
+`fallbackSlots` in JSON). Those slots are used only when every primary slot is
+unavailable; a fallback slot that shares a quota bucket with the primary is
+rejected so the same provider limit cannot bench both pools.
 
 A model that rate-limits or runs out of quota is benched until its window ends,
 so one sick provider does not take the pool with it.

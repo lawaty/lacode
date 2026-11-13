@@ -9,7 +9,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
-import { applyScanBench, buildPool, computeScanBench, degradedRetryDelay, poolSlotCount, renderTimerUnits, scheduleRetry, scheduleRetrySoon, shouldKeepPool } from "../scripts/refresh-pool.mjs"
+import { applyScanBench, buildPool, computeScanBench, degradedRetryDelay, FALLBACK_MARKER, poolSlotCount, renderTimerUnits, scheduleRetry, scheduleRetrySoon, shouldKeepPool } from "../scripts/refresh-pool.mjs"
 
 const NOW = new Date("2026-11-06T12:00:00.000Z")
 const GENERATED = "2026-11-06T03:41:14.089Z"
@@ -37,6 +37,68 @@ const makeScores = (overrides = {}) => ({
   selection: SELECTION,
   warnings: ["only 6 scorable model(s) available, wanted 10"],
   ...overrides,
+})
+
+test("buildPool writes ceil: when the selection raises a slot's ceiling", () => {
+  const { slots } = buildPool({
+    scores: makeScores({ selection: [{ model: "openrouter/x:free", weight: 2, ceiling: 5, context: null }] }),
+    currentPoolText: CURRENT_POOL,
+    now: NOW,
+  })
+  assert.deepEqual(slots, ["openrouter/x:free  2  ceil:5"])
+})
+
+test("buildPool omits ceil: when the ceiling equals the weight", () => {
+  const { slots } = buildPool({
+    scores: makeScores({ selection: [{ model: "openrouter/x:free", weight: 2, ceiling: 2, context: null }] }),
+    currentPoolText: CURRENT_POOL,
+    now: NOW,
+  })
+  assert.deepEqual(slots, ["openrouter/x:free  2"])
+})
+
+
+test("buildPool writes the fallback section after the primary slots", () => {
+  const { text, fallback } = buildPool({
+    scores: makeScores({ fallback: [{ model: "mistral/x", weight: 1, bucket: "mistral", context: null }] }),
+    currentPoolText: CURRENT_POOL,
+    now: NOW,
+  })
+  assert.deepEqual(fallback, ["mistral/x  1  b:mistral"])
+  assert.ok(text.includes("# --- fallback ---"), "the marker must be written")
+  assert.ok(
+    text.indexOf("# --- fallback ---") > text.indexOf("opencode-go/beam-free"),
+    "the fallback section must come after the primary slots",
+  )
+})
+
+
+test("a legacy score file keeps the configured ceiling and fallback section", () => {
+  const current = [
+    "# header",
+    "opencode-go/a  4  ceil:8  c:1048576",
+    FALLBACK_MARKER,
+    "mistral/x  1  c:131072",
+    "",
+  ].join("\n")
+  const legacy = makeScores({
+    selection: [{ model: "opencode-go/a", weight: 4, context: 1048576 }],
+    fallback: undefined,
+  })
+  const kept = buildPool({ scores: legacy, currentPoolText: current, now: NOW })
+  assert.deepEqual(kept.slots, ["opencode-go/a  4  ceil:8  c:1048576"])
+  assert.deepEqual(kept.fallback, ["mistral/x  1  c:131072"])
+  assert.ok(kept.text.includes(FALLBACK_MARKER))
+
+  // An explicit empty fallback is a decision, not a missing field: it removes
+  // the section.
+  const explicit = buildPool({
+    scores: makeScores({ selection: [{ model: "opencode-go/a", weight: 4, context: 1048576 }], fallback: [] }),
+    currentPoolText: current,
+    now: NOW,
+  })
+  assert.deepEqual(explicit.fallback, [])
+  assert.ok(!explicit.text.includes(FALLBACK_MARKER))
 })
 
 test("buildPool writes the scorer selection in order", () => {
@@ -79,6 +141,12 @@ test("consecutive runs do not duplicate the refresh comment", () => {
   const refreshLines = second.text.split("\n").filter((line) => /^#\s*Refreshed\b/.test(line))
   assert.equal(refreshLines.length, 1)
   assert.match(refreshLines[0], /2026-11-07T12:00:00\.000Z/)
+
+  // A chained run must not grow the blank-line run: the header keeps the
+  // previous blank separator, so without trimming every run adds one more.
+  const blankLines = (text) => text.replace(/\n$/, "").split("\n").filter((line) => line.trim() === "").length
+  assert.equal(blankLines(first.text), 1)
+  assert.equal(blankLines(second.text), 1)
 })
 
 test("fail-closed on missing or invalid scores shape", () => {
@@ -266,6 +334,30 @@ test("a second refresh skips while one holds the lock, and a dead PID's lock is 
   rmSync(home, { recursive: true, force: true })
 })
 
+test("a first refresh in a fresh HOME creates the config dir instead of claiming another run", () => {
+  const home = mkdtempSync(join(tmpdir(), "refresh-pool-fresh-"))
+  const conf = join(home, ".config", "lacode")
+  // Deliberately do NOT create conf: a first-ever run must not mistake the
+  // missing parent for a live lock.
+  const scores = join(home, "model-scores.json")
+  const pool = join(conf, "pool.txt")
+  writeFileSync(scores, JSON.stringify(makeScores()))
+
+  const script = fileURLToPath(new URL("../scripts/refresh-pool.mjs", import.meta.url))
+  const result = spawnSync(process.execPath, [script, "--from-scores", "--scores", scores, "--pool", pool], {
+    env: { ...process.env, HOME: home },
+    encoding: "utf8",
+  })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.doesNotMatch(result.stdout, /already running/)
+  assert.ok(existsSync(pool), "the first run must write the pool")
+  assert.ok(readFileSync(pool, "utf8").includes("opencode-go/beam-free"))
+  assert.equal(existsSync(join(conf, "refresh.lock")), false, "a completed run must release the lock")
+
+  rmSync(home, { recursive: true, force: true })
+})
+
 const TEN_SLOT_POOL = `# LaCode pool
 opencode-go/a  4  c:1048576
 opencode-go/b  4  c:1048576
@@ -346,28 +438,31 @@ test("computeScanBench benches transient failures and clears answered members", 
   assert.deepEqual(clear, ["opencode-go/b"], "an answered member has its stale bench cleared")
 })
 
-test("computeScanBench falls back to a 45-minute window without a stated reset", () => {
+test("computeScanBench falls back to the next-refresh window without a stated reset", () => {
   const now = 1_000_000
   const providers = [{ provider: "mistral", rows: [{ model: "mistral/a", ok: false, reason: "socket hang up", kind: "network" }] }]
   const { bench } = computeScanBench({ selectionModels: ["mistral/a"], providers, now })
-  assert.equal(bench[0].until, now + 45 * 60 * 1000)
+  assert.equal(bench[0].until, now + 6 * 60 * 60 * 1000)
 })
 
-test("applyScanBench writes atomic limit files and clears answered ones", () => {
+test("applyScanBench writes atomic limit files and clears only its own scan bench", () => {
   const home = mkdtempSync(join(tmpdir(), "refresh-pool-bench-"))
   const dir = join(home, ".local", "share", "opencode", "agent-pool")
   mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, "limit.opencode-go__b.json"), JSON.stringify({ model: "opencode-go/b", until: 1, reason: "x", strikes: 1, last: 0 }))
+  writeFileSync(join(dir, "limit.opencode-go__b.json"), JSON.stringify({ model: "opencode-go/b", until: 1, reason: "scan-kept", strikes: 1, last: 0 }))
+  writeFileSync(join(dir, "limit.opencode-go__c.json"), JSON.stringify({ model: "opencode-go/c", until: 9_000_000, reason: "rate-limited", strikes: 4, last: 0 }))
   const applied = applyScanBench({
     dir,
     bench: [{ model: "opencode-go/a", until: 2_000_000, kind: "timeout" }],
-    clear: ["opencode-go/b", "never/existed"],
+    clear: ["opencode-go/b", "opencode-go/c", "never/existed"],
   })
   assert.deepEqual(applied.benched, ["opencode-go/a"])
   const record = JSON.parse(readFileSync(join(dir, "limit.opencode-go__a.json"), "utf8"))
   assert.equal(record.reason, "scan-kept")
   assert.equal(record.until, 2_000_000)
-  assert.ok(!existsSync(join(dir, "limit.opencode-go__b.json")), "an answered member's bench must be removed")
+  assert.ok(!existsSync(join(dir, "limit.opencode-go__b.json")), "an answered member's scan bench must be removed")
+  assert.ok(existsSync(join(dir, "limit.opencode-go__c.json")), "a runtime strike must survive a successful probe")
+  assert.deepEqual(applied.cleared, ["opencode-go/b"], "only the scan bench is reported cleared")
   rmSync(home, { recursive: true, force: true })
 })
 

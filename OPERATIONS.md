@@ -71,30 +71,38 @@ At most **4 slots**: the plugin injects one hidden variant per base per slot fro
 `src/agents.ts`, so a fifth entry would route spawns at an agent that does not exist.
 Entries past the fourth are dropped with a warning, not silently ignored.
 
-`weight` is a slot's active-session budget for one pass: the number of concurrent claims it
-may hold before the next slot is preferred. Its absolute cap is **twice that**. Slots are
-filled in declaration order; preference is order, never weight. Routing runs in two passes:
+`weight` is a slot's per-pass budget: the number of concurrent claims one pass may add
+before the next slot is preferred. Its hard cap is its `ceiling` (max parallel sessions),
+which defaults to the weight and can be raised per slot with `ceil:<n>` (or the JSON
+`ceiling` field); a ceiling below the weight is ignored. Slots are filled in declaration
+order; preference is order, never weight. Routing repeats the pass:
 
 1. pass 1 fills each usable slot up to its weight, in declaration order
-2. once every usable slot has reached its weight, pass 2 repeats the order, filling each
-   usable slot up to twice its weight
+2. once every usable slot has reached its weight, the next pass fills each usable slot
+   toward its ceiling
 
-A slot is skipped when it is cooling, unavailable, or at its absolute cap. When every
-usable slot is at its absolute cap, overflow goes to the least loaded usable slot; the
+A slot is skipped when it is cooling, unavailable, or at its ceiling. When every
+usable slot is at its ceiling, overflow goes to the least loaded usable slot; the
 pool never refuses work.
 
 Live claims decide the next slot: a released claim immediately reopens its slot, and there
 is no stored position.
 
-With shipped weights `3,2,1,1`: 7 active sessions in pass 1 and 14 total across both
-passes.
+With shipped weights `3,2,1,1` and no ceilings: 7 active sessions, all in pass 1.
 
-Raise a weight to let a model hold more concurrent sessions in a pass; lower it to make it
-more of a reserve. No weight means `1`; anything that is not a number in `(0, 100]` warns
-and means `1`.
+Raise a weight to let a model take more concurrent sessions in a pass; raise its
+`ceiling` to let later passes deepen it to its max parallel sessions. Lower either to make
+it more of a reserve. No weight means `1`; anything that is not a number in `(0, 100]`
+warns and means `1`.
 `tier` is an accepted alias for `weight` — `primary` is weight 2, `overflow` is
 weight 1 — read with a warning, so a host that has not picked up this file keeps two slots' worth
 of headroom.
+
+A pool file may also carry a fallback section: a line that is exactly
+`# --- fallback ---` (or `[fallback]`) followed by more slots, or a
+`fallbackSlots` array in JSON. Those slots are used only when no primary slot is
+usable. A fallback slot that shares a quota bucket or model with the primary is
+dropped with a warning, because the same limit would bench both.
 
 Do **not** add a `model` to a variant agent anywhere — they carry none on purpose. The
 plugin's config hook writes `<base>-<slot>` for `explore`, `implement` and

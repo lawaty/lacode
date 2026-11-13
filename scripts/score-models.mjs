@@ -46,6 +46,7 @@ import {
   classifyFailure,
   isTransientFailure,
   isTransientKind,
+  parsePoolDirectives,
   parsePoolSlots,
   providerRank,
   retryAfterMs,
@@ -589,7 +590,20 @@ const pad = (s, n) => String(s).padEnd(n)
 const padL = (s, n) => String(s).padStart(n)
 
 async function main() {
+  const currentPoolText = (() => {
+    if (!currentPoolPath) return ""
+    try {
+      return readFileSync(currentPoolPath, "utf8")
+    } catch {
+      return ""
+    }
+  })()
+  const excludedProviders = parsePoolDirectives(currentPoolText)
   let scanned = providers ? providers.map((provider) => freeModels(provider)) : freeModelsAll()
+  if (excludedProviders.size > 0) {
+    scanned = scanned.filter((entry) => !excludedProviders.has(entry.provider))
+    if (scanned.length === 0) console.log(`every provider was excluded by pool.txt directives; nothing to probe`)
+  }
   // Core providers first, then the free-only middle tier, then the slow paid
   // catalogues — and explicitly deprioritized providers last. Ordering only;
   // every provider is still probed if time allows.
@@ -599,14 +613,9 @@ async function main() {
       providerRank(a.provider) - providerRank(b.provider) ||
       String(a.provider).localeCompare(String(b.provider)),
   )
-  const currentSlots = (() => {
-    if (!currentPoolPath) return []
-    try {
-      return parsePoolSlots(readFileSync(currentPoolPath, "utf8"))
-    } catch {
-      return []
-    }
-  })()
+  const currentSlots = parsePoolSlots(currentPoolText).filter(
+    (slot) => !excludedProviders.has(String(slot.model).split("/")[0]),
+  )
   if (probeModels && probeModels.size > 0) {
     const seen = new Set()
     scanned = scanned.flatMap((entry) => {
@@ -662,6 +671,12 @@ async function main() {
         outcome = await probe(candidate, entry.provider)
       }
       const kind = outcome.kind ?? classifyFailure({ status: outcome.status, reason: outcome.reason })
+      // Only cheap-failure kinds that also stall the scan count toward the
+      // breaker. A rate limit is deliberately NOT included: a 429 answers in
+      // milliseconds, so truncating on it saves little, and it would leave the
+      // provider's pool members unscanned -- which means no current failure row,
+      // so their consecutive-failure streak could never advance and they could
+      // never retire. Probe every model and record the evidence instead.
       const providerFault = !outcome.ok && ["timeout", "network", "server"].includes(kind)
       consecutiveTransient = providerFault ? consecutiveTransient + 1 : 0
       const row = { provider: entry.provider, ...candidate, ...outcome, score: null }
@@ -764,15 +779,19 @@ async function main() {
       return null
     }
   })()
-  const { selection, warnings, retry } = selectPool({
-    providers: results.map((entry) => ({
-      provider: entry.provider,
-      error: entry.error,
-      truncated: entry.truncated,
-      rows: entry.rows.map((row) => ({ ...row, score: row.score?.value ?? null })),
-      excluded: entry.excluded,
-    })),
-    previousProviders: previousScores?.providers,
+  const { selection, fallback, warnings, retry } = selectPool({
+    providers: results
+      .filter((entry) => !excludedProviders.has(entry.provider))
+      .map((entry) => ({
+        provider: entry.provider,
+        error: entry.error,
+        truncated: entry.truncated,
+        rows: entry.rows.map((row) => ({ ...row, score: row.score?.value ?? null })),
+        excluded: entry.excluded,
+      })),
+    previousProviders: (previousScores?.providers ?? []).filter(
+      (entry) => !excludedProviders.has(String(entry?.provider ?? "")),
+    ),
     currentSlots,
     minContext,
     minScore,
@@ -785,6 +804,14 @@ async function main() {
     console.log(`\nsuggested pool.txt (paste if it matches your judgement — nothing was changed)`)
     console.log(`# scored ${new Date().toISOString()} — opencode-go first (weight 4), small-context providers (weight 2), large-context providers (weight 1), opencode last (max 1)`)
     for (const entry of selection) {
+      const ceiling = Number.isFinite(entry.ceiling) && entry.ceiling > entry.weight ? `  ceil:${entry.ceiling}` : ""
+      const bucket = entry.bucket ? `  b:${entry.bucket}` : ""
+      console.log(`${pad(entry.model, 60)}${entry.weight}${ceiling}${bucket}`)
+    }
+  }
+  if (fallback.length) {
+    console.log(`\nfallback section (used only when every primary slot is unavailable)`)
+    for (const entry of fallback) {
       const bucket = entry.bucket ? `  b:${entry.bucket}` : ""
       console.log(`${pad(entry.model, 60)}${entry.weight}${bucket}`)
     }
@@ -798,7 +825,9 @@ async function main() {
       // entry forward verbatim so the next run still sees it and selectPool can
       // keep its rankable models.
       const scannedNames = new Set(results.map((e) => e.provider))
-      const carried = (previousScores?.providers ?? []).filter((p) => !scannedNames.has(String(p?.provider ?? "")))
+      const carried = (previousScores?.providers ?? []).filter(
+        (p) => !scannedNames.has(String(p?.provider ?? "")) && !excludedProviders.has(String(p?.provider ?? "")),
+      )
       const previousByModel = new Map()
       for (const provider of previousScores?.providers ?? []) {
         for (const row of provider?.rows ?? []) {
@@ -811,6 +840,7 @@ async function main() {
         minContext,
         minScore,
         selection,
+        fallback,
         warnings,
         retry,
         providers: [
@@ -832,14 +862,21 @@ async function main() {
                 kind: r.kind ?? null,
                 score: r.score?.value ?? null,
                 retryAfter: r.retryAfter ?? null,
+                failStreak: 0,
               }
               // A transient failure must not erase the last measured ranking:
               // the next run needs it to keep a previously-good model while a
-              // gateway is down. Keep both rows; the selector prefers the
-              // rankable one and still schedules the failed one for retry.
+              // gateway is down. But a model that keeps failing scan after scan
+              // is not having a bad moment, and the selector must be able to see
+              // that: carry a consecutive-failure count forward on both rows so
+              // it can retire the slot after MAX_TRANSIENT_STREAK scans. A
+              // successful scan emits a fresh row with a zero streak.
               if (r.ok === false && isTransientFailure(r)) {
                 const prior = previousByModel.get(r.model)
-                if (prior?.ok === true && typeof prior.score === "number") return [current, prior]
+                const failStreak = Number(prior?.failStreak ?? 0) + 1
+                const failed = { ...current, failStreak }
+                if (prior?.ok === true && typeof prior.score === "number") return [failed, { ...prior, failStreak }]
+                return [failed]
               }
               return [current]
             }),

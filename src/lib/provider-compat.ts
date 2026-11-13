@@ -1,14 +1,28 @@
-// Provider compatibility: make opencode's chunk parser tolerate the shapes
-// providers actually send, instead of the one shape its schema assumes.
+// Provider compatibility: make opencode's transport tolerate the request and
+// response shapes providers actually accept, instead of the one shape its
+// schema assumes.
 //
-// THE FAULT THIS EXISTS FOR. `@ai-sdk/openai-compatible` validates every SSE
-// chunk with a schema whose `choices[].delta.reasoning` is a `z.string()`. Some
-// free gateways stream the OpenAI reasoning ITEM instead -- an object such as
-// `{ encrypted_content, content, summary }` -- and the validator throws
-// `invalid_union` at `choices[0].delta.reasoning` ("expected string, received
-// object"). The provider never gets a chance to be tolerated: the whole spawn
-// dies on the first chunk that carries reasoning, every time, because the
-// mismatch is deterministic rather than transient.
+// THE FAULTS THIS EXISTS FOR.
+//
+// RESPONSE. `@ai-sdk/openai-compatible` validates every SSE chunk with a schema
+// whose `choices[].delta.reasoning` is a `z.string()`. Some free gateways stream
+// the OpenAI reasoning ITEM instead -- an object such as `{ encrypted_content,
+// content, summary }` -- and the validator throws `invalid_union` at
+// `choices[0].delta.reasoning` ("expected string, received object"). The
+// provider never gets a chance to be tolerated: the whole spawn dies on the
+// first chunk that carries reasoning, every time, because the mismatch is
+// deterministic rather than transient.
+//
+// REQUEST. The `opencode.ai/inference` gateway sometimes forwards a default
+// `reasoning_display: "summary"` to a model whose upstream rejects that value,
+// answering HTTP 400 `invalid_request_error` before any token streams. It is a
+// FLAKY UPSTREAM, not a client parameter problem: measured against
+// `opencode-go/iceman-contributor-free`, the same body fails or succeeds
+// nondeterministically across attempts, and NO client field (reasoning_effort,
+// reasoning_display, reasoning, include_reasoning, thinking) changes the rate.
+// The repair therefore retries the identical replayable request a bounded
+// number of times at the transport seam; a later attempt lands on a healthy
+// upstream and the spawn proceeds. Nothing is disabled and no field is invented.
 //
 // WHY A FETCH WRAPPER AND NOT A SCHEMA EDIT. The schema lives inside the
 // compiled opencode binary, not in this package and not in any node_modules tree
@@ -109,6 +123,85 @@ export function normalizeChunk(value: unknown): boolean {
   return changed
 }
 
+// ---------------------------------------------------------------------------
+// Request side: bounded retry for a flaky upstream 400
+// ---------------------------------------------------------------------------
+
+/** Total attempts for one replayable opencode inference request (1 try + 2 retries). */
+export const UPSTREAM_ATTEMPTS = 3
+
+/** Delay before each retry, in milliseconds. Exposed so tests run instantly. */
+export const UPSTREAM_RETRY_DELAY_MS = 250
+
+/**
+ * The request-side fault this recognises: a 400 body from `opencode.ai/inference`
+ * whose upstream rejected the gateway's default reasoning display. The client
+ * cannot influence it (see the module header); it only clears on a retry.
+ */
+const TRANSIENT_UPSTREAM_PATTERN = /reasoning_display/i
+
+/** The URL a fetch input names, or "" when it cannot be read without doing work. */
+export function requestUrl(input: unknown): string {
+  if (typeof input === "string") return input
+  if (input instanceof URL) return input.toString()
+  if (input && typeof input === "object") {
+    const url = (input as { url?: unknown }).url
+    if (typeof url === "string") return url
+  }
+  return ""
+}
+
+/**
+ * Whether a URL is an opencode inference chat-completions endpoint.
+ *
+ * Scoped on purpose: this is the only host observed to return the transient
+ * upstream 400, so no other provider's request is retried.
+ */
+export function isOpencodeInferenceChat(raw: string): boolean {
+  if (!raw) return false
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    return false
+  }
+  if (url.hostname !== "opencode.ai" && !url.hostname.endsWith(".opencode.ai")) return false
+  return url.pathname.includes("/inference/") && url.pathname.endsWith("/chat/completions")
+}
+
+/**
+ * Whether the request can be replayed byte-for-byte.
+ *
+ * A string or a materialised byte body is fully available, so retrying it sends
+ * the same bytes and cannot consume a stream. Anything else -- a
+ * `ReadableStream`, `FormData`, a `Request` object's implicit body, no `init` at
+ * all -- is NOT retried: a replay that cannot be proven identical is worse than
+ * the flake it would hide.
+ */
+export function isReplayableInit(init: unknown): boolean {
+  if (!init || typeof init !== "object") return false
+  const body = (init as Record<string, unknown>).body
+  return typeof body === "string" || body instanceof Uint8Array || body instanceof ArrayBuffer
+}
+
+/**
+ * Whether a response is the known transient upstream 400.
+ *
+ * Clones rather than reads, so the response is still usable by the caller when
+ * this returns false and on the final attempt. A body that cannot be read is
+ * treated as "not this fault" -- the wrapper never turns a read failure into a
+ * retry storm.
+ */
+export async function isTransientUpstreamResponse(response: Response): Promise<boolean> {
+  if (response.status !== 400) return false
+  try {
+    const text = await response.clone().text()
+    return TRANSIENT_UPSTREAM_PATTERN.test(text) && /not\s+a\s+supported\s+value|unsupported/i.test(text)
+  } catch {
+    return false
+  }
+}
+
 /**
  * Normalize one complete SSE frame line (including its trailing newline).
  *
@@ -172,9 +265,43 @@ export function createChunkNormalizer(): TransformStream<Uint8Array, Uint8Array>
  * cannot be piped) still returns the original response rather than throwing:
  * compatibility is a repair, not a gate.
  */
-export function wrapFetch(original: FetchLike): FetchLike {
+export type WrapFetchOptions = { attempts?: number; delayMs?: number }
+
+const sleep = (ms: number) => (ms > 0 ? new Promise<void>((resolve) => setTimeout(resolve, ms)) : Promise.resolve())
+
+/**
+ * Wrap a fetch so an opencode inference request survives the flaky upstream 400
+ * and an SSE response passes through `normalizeSseLine`.
+ *
+ * A request is retried only when all three hold: it targets an opencode
+ * inference chat-completions endpoint, its body is a replayable string, and the
+ * response is the known transient 400. Everything else -- a success, an SSE
+ * body, a different status, a non-replayable body, any other host -- is returned
+ * exactly as the original produced it. A failure inside the wrapper is still
+ * downgraded to the original response: compatibility is a repair, not a gate.
+ */
+export function wrapFetch(original: FetchLike, options: WrapFetchOptions = {}): FetchLike {
+  const attempts = Math.max(1, Math.trunc(options.attempts ?? UPSTREAM_ATTEMPTS))
+  const delayMs = Math.max(0, Math.trunc(options.delayMs ?? UPSTREAM_RETRY_DELAY_MS))
+
   const wrapped = async (input: unknown, init?: unknown): Promise<Response> => {
-    const response = await original(input, init)
+    const retryable =
+      attempts > 1 && isReplayableInit(init) && isOpencodeInferenceChat(requestUrl(input))
+
+    let response = await original(input, init)
+    for (let attempt = 1; retryable && attempt < attempts; attempt++) {
+      if (!(await isTransientUpstreamResponse(response))) break
+      // The discarded attempt's body is the small JSON 400; release it rather
+      // than leaving the clone's branch unread.
+      try {
+        await response.body?.cancel()
+      } catch {
+        /* nothing to release */
+      }
+      await sleep(delayMs)
+      response = await original(input, init)
+    }
+
     try {
       const contentType = response.headers.get("content-type") ?? ""
       if (!contentType.includes("text/event-stream") || !response.body) return response

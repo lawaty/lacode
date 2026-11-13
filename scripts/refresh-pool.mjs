@@ -60,6 +60,11 @@ const REFRESH_LOCK_STALE_MS = 60 * 60 * 1000
  */
 function acquireRefreshLock() {
   const take = () => {
+    // Ensure the parent exists (a fresh HOME, or the stable systemd copy before
+    // the plugin has ever started) but keep the lock directory's own creation
+    // non-recursive: mkdir with `recursive` succeeds on an existing directory,
+    // which would let two refreshes run at once.
+    mkdirSync(dirname(REFRESH_LOCK_DIR), { recursive: true })
     mkdirSync(REFRESH_LOCK_DIR)
     writeFileSync(join(REFRESH_LOCK_DIR, "pid"), String(process.pid))
     return true
@@ -99,6 +104,9 @@ const isSlotLine = (line) => {
   return stripped.length > 0 && stripped.includes("/")
 }
 
+/** The marker that starts the fallback section; shared with src/lib/pool.ts. */
+export const FALLBACK_MARKER = "# --- fallback ---"
+
 function splitHeaderAndSlots(text) {
   const lines = String(text ?? "").split(/\r?\n/)
   // Drop a single trailing empty element produced by a final newline so we can
@@ -120,11 +128,17 @@ function refreshComment(now, scoresGeneratedAt) {
 
 function withRefreshComment(headerLines, comment) {
   const kept = headerLines.filter((line) => !/^#\s*Refreshed\b/.test(String(line)))
+  // The header includes the blank separator before the slots, so trim trailing
+  // blanks or every run would prepend one more and the file would grow an
+  // unbounded run of empty lines.
+  while (kept.length > 0 && String(kept[kept.length - 1]).trim() === "") kept.pop()
   return [...kept, comment]
 }
 
-function formatGeneratedLine(model, weight, bucket, context) {
+function formatGeneratedLine(model, weight, bucket, context, ceiling) {
   const parts = [String(model), String(weight)]
+  // A ceiling equal to the weight is the default (one pass), so it is not printed.
+  if (Number.isFinite(Number(ceiling)) && Number(ceiling) > Number(weight)) parts.push(`ceil:${Math.round(Number(ceiling))}`)
   if (context != null && Number.isFinite(Number(context))) parts.push(`c:${Math.round(Number(context))}`)
   if (bucket) parts.push(`b:${bucket}`)
   return parts.join("  ")
@@ -141,29 +155,38 @@ export function buildPool(input) {
   if (!scores || typeof scores !== "object" || !Array.isArray(scores.providers) || !Array.isArray(scores.selection)) {
     throw new Error("score file is missing or invalid (expected { providers: [...], selection: [...] })")
   }
-  const selection = scores.selection.filter(
-    (entry) =>
-      entry &&
-      typeof entry.model === "string" &&
-      entry.model.includes("/") &&
-      typeof entry.weight === "number" &&
-      Number.isFinite(entry.weight) &&
-      entry.weight > 0,
-  )
+  const validSelection = (entry) =>
+    entry &&
+    typeof entry.model === "string" &&
+    entry.model.includes("/") &&
+    typeof entry.weight === "number" &&
+    Number.isFinite(entry.weight) &&
+    entry.weight > 0
+  const selection = scores.selection.filter(validSelection)
   if (selection.length === 0) {
     throw new Error("score file has no selected models; refusing to write pool.txt")
   }
+  // A score file written before fallback/ceiling support has no such fields.
+  // Treat "absent" as "no opinion" and carry the configured facts forward, so a
+  // refresh cannot silently delete a hand-written fallback or ceiling.
+  const currentSlots = parsePoolSlots(input?.currentPoolText ?? "")
+  const currentByModel = new Map(currentSlots.map((slot) => [slot.model, slot]))
+  const fallbackProvided = Array.isArray(scores.fallback)
+  const fallback = (fallbackProvided ? scores.fallback : currentSlots.filter((slot) => slot.fallback)).filter(validSelection)
+  const ceilingOf = (entry) => entry.ceiling ?? currentByModel.get(entry.model)?.ceiling
   const warnings = Array.isArray(scores.warnings) ? scores.warnings : []
   const { header } = splitHeaderAndSlots(input?.currentPoolText ?? "")
-  const outSlots = selection.map((entry) => formatGeneratedLine(entry.model, entry.weight, entry.bucket, entry.context))
+  const outSlots = selection.map((entry) => formatGeneratedLine(entry.model, entry.weight, entry.bucket, entry.context, ceilingOf(entry)))
+  const outFallback = fallback.map((entry) => formatGeneratedLine(entry.model, entry.weight, entry.bucket, entry.context, ceilingOf(entry)))
   const comment = refreshComment(input?.now ?? new Date(), scores.generatedAt)
   const outHeader = withRefreshComment(header, comment)
-  const text = [...outHeader, "", ...outSlots, ""].join("\n")
+  const text = [...outHeader, "", ...outSlots, ...(outFallback.length > 0 ? ["", FALLBACK_MARKER, ...outFallback] : []), ""].join("\n")
   return {
     text,
     slots: outSlots,
+    fallback: outFallback,
     warnings,
-    chosen: { selected: selection.map((entry) => entry.model) },
+    chosen: { selected: selection.map((entry) => entry.model), fallback: fallback.map((entry) => entry.model) },
   }
 }
 
@@ -240,7 +263,7 @@ function runCanary({ currentPoolText, scorerArgs, max }) {
  * Count the usable model slots in a pool.txt text (comments and blanks ignored).
  */
 export function poolSlotCount(text) {
-  return splitHeaderAndSlots(text).slots.filter(isSlotLine).length
+  return parsePoolSlots(text).filter((slot) => !slot.fallback).length
 }
 
 /**
@@ -249,15 +272,21 @@ export function poolSlotCount(text) {
  * the moment a probe watches it answer.
  */
 export const SCAN_BENCH_REASON = "scan-kept"
-export const SCAN_BENCH_WINDOW_MS = 45 * 60 * 1000
+// Bench a kept-but-failing member until the next scheduled refresh. The timer
+// runs every six hours; a 45-minute bench left the slot routable for most of the
+// cycle, so it kept failing spawns between refreshes. The cooldown probe still
+// re-admits the model as soon as it watches it answer, so a real recovery is not
+// made to wait for the timer.
+export const SCAN_BENCH_WINDOW_MS = 6 * 60 * 60 * 1000
 export const scanBenchDir = (home = HOME) => join(home, ".local", "share", "opencode", "agent-pool")
 export const scanBenchFile = (model) => `limit.${String(model).replace(/[^a-zA-Z0-9._-]/g, "__")}.json`
 
 /**
  * Pure bench plan for the current pool members. A member whose current row
- * failed transiently is benched until its stated reset (else 45 minutes); a
- * member that answered has any stale bench cleared; an unscanned member is
- * left alone for lack of evidence. Only pool members are ever touched.
+ * failed transiently is benched until its stated reset (else until the next
+ * scheduled refresh); a member that answered has any stale bench cleared; an
+ * unscanned member is left alone for lack of evidence. Only pool members are
+ * ever touched.
  */
 export function computeScanBench({ selectionModels, providers, now = Date.now() }) {
   const currentByModel = new Map()
@@ -302,8 +331,21 @@ export function applyScanBench({ dir, bench, clear }) {
     } catch {}
   }
   for (const model of clear ?? []) {
+    const path = join(dir, scanBenchFile(model))
     try {
-      rmSync(join(dir, scanBenchFile(model)), { force: true })
+      // Clear only the bench THIS scan wrote. A runtime strike
+      // (`rate-limited`, `no answer`, `provider error`, ...) is evidence from a
+      // real spawn and carries the escalation count; deleting it because a
+      // probe happened to answer would let a model that fails every real
+      // request be re-admitted every refresh. The runtime owns that record.
+      let reason
+      try {
+        reason = JSON.parse(readFileSync(path, "utf8"))?.reason
+      } catch {
+        continue // nothing on disk to clear
+      }
+      if (reason !== SCAN_BENCH_REASON) continue
+      rmSync(path, { force: true })
       applied.cleared.push(model)
     } catch {}
   }
@@ -335,7 +377,7 @@ export function shouldKeepPool({ currentPoolText, newSlots }) {
       reason: `new selection breaks the pool structure (${newCheck.problems.join("; ")}); keeping the previous pool`,
     }
   }
-  if (slots.filter(isSlotLine).length >= threshold) return { keep: false, prev, threshold, reason: "" }
+  if (parsePoolSlots(slots.join("\n")).filter((slot) => !slot.fallback).length >= threshold) return { keep: false, prev, threshold, reason: "" }
   return {
     keep: true,
     prev,
