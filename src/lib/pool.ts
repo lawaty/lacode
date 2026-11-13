@@ -247,17 +247,19 @@ const UNSUPPORTED_PARAMETER_PATTERN =
 export const isUnsupportedParameterText = (text: string) => UNSUPPORTED_PARAMETER_PATTERN.test(text)
 
 /**
- * A flaky upstream that rejects the gateway's default `reasoning_display`.
+ * A flaky upstream or transient infrastructure fault (5xx, DNS, socket).
  *
  * Measured against `opencode-go/iceman-contributor-free`, the SAME request
- * fails or succeeds nondeterministically and no client field changes the rate,
- * so this is a transient provider fault, not the model's contract. It is cooled
+ * can fail or succeed nondeterministically (e.g. `reasoning_display`) and no
+ * client field changes the rate; infrastructure faults such as 5xx/internal
+ * server errors, streaming failures, DNS, connection reset/refused, timeouts,
+ * socket hangups, and fetch failures are likewise transient. These are cooled
  * for one short flat window and re-probed -- never benched like a capability
- * mismatch and never strike-counted -- because retrying is what clears it.
+ * mismatch and never strike-counted -- because retrying is what clears them.
  */
 export const TRANSIENT_UPSTREAM_REASON = "upstream-transient"
 export const TRANSIENT_UPSTREAM_COOLDOWN_MS = 60 * 1000
-const TRANSIENT_UPSTREAM_PATTERN = /reasoning_display/i
+const TRANSIENT_UPSTREAM_PATTERN = /reasoning_display|internal[\s_-]?server[\s_-]?error|streaming response failed|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket hang up|fetch failed/i
 export const isTransientUpstreamText = (text: string) => TRANSIENT_UPSTREAM_PATTERN.test(text)
 
 /**

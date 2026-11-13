@@ -1271,10 +1271,11 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
           const auth = pool.isAuthFailureText(haystack) || status === 401 || status === 403
           const limited = pool.isLimitText(haystack) || status === 429
           const outage = pool.isUnavailableText(haystack)
-          // The `reasoning_display` 400 is an upstream flake: it clears on a
-          // retry, so it must never be benched like a capability mismatch.
+          // Transient upstream/infrastructure faults (e.g. `reasoning_display` 400s,
+          // 5xx, or absent status with infra text) clear on retry, so they must
+          // never be benched like a capability mismatch.
           const transientUpstream =
-            status === 400 && pool.isTransientUpstreamText(haystack) && !auth && !limited && !outage
+            (status === 400 || status === undefined || status >= 500) && pool.isTransientUpstreamText(haystack) && !auth && !limited && !outage
           // A non-retryable 400 that names an unsupported parameter is a model
           // capability mismatch, not a bad moment: the same request would fail
           // forever. Bench the model instead of filing it as a generic error the

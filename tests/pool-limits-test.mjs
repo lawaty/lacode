@@ -647,6 +647,13 @@ const dirB = scratch()
     // via isTransientUpstreamText, which is why both predicates are asserted.
     assert(pool.isUnsupportedParameterText(text) === true, `still matches the unsupported matcher: ${text}`)
   }
+  // Infrastructure/transient faults (5xx, DNS, socket, streaming failures) are
+  // also transient upstream issues, unlike deterministic capability faults such
+  // as "Type validation failed", which must remain benched.
+  assert(pool.isTransientUpstreamText("Streaming response failed: [internal_server_error] Internal server error") === true, "streaming/internal server error must be treated as transient upstream")
+  assert(pool.isTransientUpstreamText("getaddrinfo EAI_AGAIN api.example.com") === true, "DNS resolution failure must be treated as transient upstream")
+  assert(pool.isTransientUpstreamText("ECONNRESET") === true, "socket reset must be treated as transient upstream")
+  assert(pool.isTransientUpstreamText("Type validation failed") === false, "a deterministic capability fault must stay benched, not treated as transient upstream")
   assert(pool.isTransientUpstreamText("invalid value for `temperature`") === false, "a real capability mismatch is not transient")
   assert(pool.isTransientUpstreamText("rate limit reached") === false, "a limit is not the flaky upstream fault")
   assert(pool.TRANSIENT_UPSTREAM_REASON === "upstream-transient", "transient reason must be stable")
