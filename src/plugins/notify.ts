@@ -2,6 +2,7 @@ import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import type { Hooks } from "@opencode-ai/plugin"
 import { findNotifyHelper } from "../lib/desktop-notify.ts"
+import { readModes } from "../lib/modes.ts"
 import {
   NOTIFY_CLOSE_ENV,
   NOTIFY_OUTCOMES,
@@ -235,12 +236,17 @@ type LivePopup = { raisedAt: number; interacted: boolean; timer?: NodeJS.Timeout
 
 /**
  * The plugin options this factory reads, narrowed from the loose value opencode
- * hands it -- the same cast agent-pool.ts and selfupdate.ts make. One field, and
- * it is opt-out: an absent option means the full behaviour.
+ * hands it -- the same cast agent-pool.ts and selfupdate.ts make. Absent options
+ * mean the full behaviour.
  */
 export type NotifyOptions = {
   /** Notification sounds. Absent (or anything but `false`) plays them. */
   sound?: boolean
+  /**
+   * YOLO fallback default. Stored global config wins; this option is only the
+   * fallback default, mirroring how `ModesOptions` works.
+   */
+  yolo?: boolean
 }
 
 // A factory returning hooks, not a Plugin -- see the note in ./agent-pool.ts.
@@ -264,6 +270,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   const opts = (options ?? {}) as NotifyOptions
   const soundEnv = (process.env[SOUND_ENV] ?? "").trim().toLowerCase()
   const soundOn = !SOUND_OFF_VALUES.includes(soundEnv) && opts.sound !== false
+  const yoloOn = () => readModes({ yolo: opts.yolo }).yolo === true
 
   const notifier = new Notifier(COOLDOWN_MS)
   const instanceId = randomUUID()
@@ -733,6 +740,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       // A wait that was superseded never raises anything.
       if (pendingPermissionPopups.get(sessionID) !== timer) return
       pendingPermissionPopups.delete(sessionID)
+      if (yoloOn()) return
       const outstanding = permissions.get(sessionID)
       if (!outstanding || outstanding.size === 0) return
       // One request says WHAT is being asked for. Several say HOW MANY there
@@ -1014,6 +1022,11 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           // The request id is what a reply is addressed to, so it is carried on
           // the notification rather than shown to the user.
           const requestID = typeof properties?.id === "string" && properties.id ? properties.id : undefined
+          // A permission request is also proof of work, so it must not be
+          // suppressed by the never-went-busy rule -- and if it was never seen
+          // busy, treat it as busy.
+          rememberActive(sessionID)
+          if (yoloOn()) return
           const outstanding = permissions.get(sessionID) ?? new Set<string>()
           // The first request of this session: nothing was outstanding before.
           const first = outstanding.size === 0
@@ -1021,10 +1034,6 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           // outstanding request, so it is tracked under the placeholder.
           outstanding.add(requestID ?? UNANSWERABLE_REQUEST)
           rememberPermissions(sessionID, outstanding)
-          // A permission request is also proof of work, so it must not be
-          // suppressed by the never-went-busy rule -- and if it was never seen
-          // busy, treat it as busy.
-          rememberActive(sessionID)
           // The popup that is already up -- or already on its way -- covers
           // this request. The user is told once, and the click answers them
           // all.

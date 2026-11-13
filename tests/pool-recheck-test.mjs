@@ -387,7 +387,7 @@ const cooling = (id, dir, models, ms) => {
   }
 }
 
-// --- a re-admitted slot raises a permanent desktop notice --------------------
+// --- a probe re-admission of a quota-cooled model sends NO desktop notice -----
 {
   const dir = scratch()
   const model = SLOT_MODELS[0]
@@ -414,10 +414,7 @@ const cooling = (id, dir, models, ms) => {
   cooling("notify-seam", dir, [model], 60_000)
   const result = await hooks.tool.pool_recheck.execute({ models: [model] }, {})
   assert(/agent-pool:/.test(result.title), `the recheck tool must report: ${result.title}`)
-  assert(sent.length === 1, `a cleared slot must notify once, got ${sent.length}: ${sent.join(" | ")}`)
-  assert(sent[0].startsWith("LaCode: rate limit reset:"), `the notice must have a fixed title: ${sent[0]}`)
-  assert(sent[0].includes(model), `the notice must name the recovered model: ${sent[0]}`)
-  assert(/rate limit has reset/.test(sent[0]), `the notice must say the rate limit has reset: ${sent[0]}`)
+  assert(sent.length === 0, `probe re-admission must not notify, got ${sent.length}: ${sent.join(" | ")}`)
   assert(limitFiles(dir).length === 0, "the cooldown file must be gone")
   await hooks.dispose?.()
 }
@@ -543,36 +540,91 @@ const cooling = (id, dir, models, ms) => {
 
 
 
-// --- US-34: notify:false suppresses rate-limit reset notice -------------------
+// --- a cooldown removed BEFORE its until (early clear) produces NO notice -----
 {
   const dir = scratch()
-  const model = SLOT_MODELS[0]
+  const model = SLOT_MODELS[0 % SLOT_MODELS.length]
   const { provider, id: modelID } = pool.splitModel(model)
   const stub = stubClient({ [model]: async () => ({ role: "assistant", providerID: provider, modelID }) })
+  const sent = []
+  const hooks = await AgentPool(
+    { client: { ...client, ...stub }, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    {
+      id: "early-clear",
+      dir,
+      modelsFile: PRESET,
+      probeMs: 0,
+      watchMs: 0,
+      expiryMs: 50,
+      notify: (title, message) => sent.push(`${title}: ${message}`),
+    },
+  )
+  await hooks.config(shippedConfig())
+  // Let watcher observe a quota cooldown, then have a probe clear it early.
+  cooling("early-clear", dir, [model], 60_000)
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  await hooks.tool.pool_recheck.execute({ models: [model] }, {})
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert(sent.length === 0, `early probe/recheck clear must not notify, got ${sent.join(" | ")}`)
+  await hooks.dispose?.()
+}
+
+// --- throttle: a second natural expiry within 30 min is suppressed -------------
+{
+  const dir = scratch()
+  const model = SLOT_MODELS[1 % SLOT_MODELS.length]
+  const sent = []
+  const prevNotifyDir = process.env.LACODE_NOTIFY_DIR
+  process.env.LACODE_NOTIFY_DIR = scratch()
+  const hooks = await AgentPool(
+    { client, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    {
+      id: "throttle-expiry",
+      dir,
+      modelsFile: PRESET,
+      probeMs: 0,
+      watchMs: 0,
+      expiryMs: 50,
+      notify: (title, message) => sent.push(`${title}: ${message}`),
+    },
+  )
+  await hooks.config(shippedConfig())
+  cooling("throttle-expiry", dir, [model], 400)
+  await new Promise((resolve) => setTimeout(resolve, 900))
+  assert(sent.length === 1, `first natural expiry must notify once, got ${sent.length}: ${sent.join(" | ")}`)
+  // Cool the same model again and let it expire naturally within 30 minutes of first notice.
+  cooling("throttle-expiry", dir, [model], 400)
+  await new Promise((resolve) => setTimeout(resolve, 900))
+  assert(sent.length === 1, `second natural expiry within 30 minutes must be throttled, got ${sent.length}: ${sent.join(" | ")}`)
+  await hooks.dispose?.()
+  if (prevNotifyDir === undefined) delete process.env.LACODE_NOTIFY_DIR
+  else process.env.LACODE_NOTIFY_DIR = prevNotifyDir
+}
+
+// --- US-34: notify:false suppresses rate-limit reset notice -------------------
+{
+  const model = SLOT_MODELS[0]
   const sent = []
   const claimsDir = scratch()
   const modelsInline = { slots: [{ model, weight: 1, notify: false }] }
   const prevNotifyDir = process.env.LACODE_NOTIFY_DIR
   process.env.LACODE_NOTIFY_DIR = scratch()
   const hooks = await AgentPool(
-
-    { client: { ...client, ...stub }, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    { client, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
     {
       id: "notify-off",
       dir: claimsDir,
       models: modelsInline,
       probeMs: 0,
       watchMs: 0,
+      expiryMs: 50,
       notify: (title, message) => sent.push(`${title}: ${message}`),
     },
   )
   await hooks.config(shippedConfig())
-  const sOff = pool.state({ id: "notify-off", dir: claimsDir, models: modelsInline })
-  pool.init(sOff, () => {})
-  pool.ensureSlots(sOff, () => {})
-  pool.recordStrike(sOff, model, "quota", 60_000)
-  const result = await hooks.tool.pool_recheck.execute({ models: [model] }, {})
-  assert(result && result.title, `[US-34] result must exist: ${JSON.stringify(result)}`)
+  // Natural expiry path (probe/recheck must not announce).
+  cooling("notify-off", claimsDir, [model], 400)
+  await new Promise((resolve) => setTimeout(resolve, 900))
   assert(sent.length === 0, `[US-34] Recovering slot configured notify:false -> NO reset notice is raised, got ${sent.join(" | ")}`)
   await hooks.dispose?.()
   if (prevNotifyDir === undefined) delete process.env.LACODE_NOTIFY_DIR
@@ -581,34 +633,27 @@ const cooling = (id, dir, models, ms) => {
 
 // --- US-34 control: notify on -> exactly one reset notice ---------------------
 {
-  const dir = scratch()
   const model = SLOT_MODELS[1]
-  const { provider, id: modelID } = pool.splitModel(model)
-  const stub = stubClient({ [model]: async () => ({ role: "assistant", providerID: provider, modelID }) })
   const sent = []
   const claimsDir = scratch()
   const modelsInline = { slots: [{ model, weight: 1, notify: true }] }
   const prevNotifyDir = process.env.LACODE_NOTIFY_DIR
   process.env.LACODE_NOTIFY_DIR = scratch()
   const hooks = await AgentPool(
-
-    { client: { ...client, ...stub }, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    { client, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
     {
       id: "notify-on-x",
       dir: claimsDir,
       models: modelsInline,
       probeMs: 0,
       watchMs: 0,
+      expiryMs: 50,
       notify: (title, message) => sent.push(`${title}: ${message}`),
     },
   )
   await hooks.config(shippedConfig())
-  const sOnx = pool.state({ id: "notify-on-x", dir: claimsDir, models: modelsInline })
-  pool.init(sOnx, () => {})
-  pool.ensureSlots(sOnx, () => {})
-  pool.recordStrike(sOnx, model, "quota", 60_000)
-  const result = await hooks.tool.pool_recheck.execute({ models: [model] }, {})
-  assert(result && result.title, `[US-34] result must exist: ${JSON.stringify(result)}`)
+  cooling("notify-on-x", claimsDir, [model], 400)
+  await new Promise((resolve) => setTimeout(resolve, 900))
   assert(sent.length === 1, `[US-34] Control: notify on -> exactly one reset notice, got ${sent.length}: ${sent.join(" | ")}`)
   await hooks.dispose?.()
   if (prevNotifyDir === undefined) delete process.env.LACODE_NOTIFY_DIR
@@ -618,31 +663,26 @@ const cooling = (id, dir, models, ms) => {
 // --- US-34: non-opencode default-off suppresses reset notice ------------------
 {
   const model = "groq/openai/gpt-oss-120b"
-  const { provider, id: modelID } = pool.splitModel(model)
-  const stub = stubClient({ [model]: async () => ({ role: "assistant", providerID: provider, modelID }) })
   const sent = []
   const claimsDir = scratch()
   const modelsInline = { slots: [{ model, weight: 1 }] }
   const prevNotifyDir = process.env.LACODE_NOTIFY_DIR
   process.env.LACODE_NOTIFY_DIR = scratch()
   const hooks = await AgentPool(
-    { client: { ...client, ...stub }, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
+    { client, serverUrl: new URL("http://127.0.0.1:59999"), directory: "/tmp" },
     {
       id: "notify-default-off",
       dir: claimsDir,
       models: modelsInline,
       probeMs: 0,
       watchMs: 0,
+      expiryMs: 50,
       notify: (title, message) => sent.push(`${title}: ${message}`),
     },
   )
   await hooks.config(shippedConfig())
-  const sOff = pool.state({ id: "notify-default-off", dir: claimsDir, models: modelsInline })
-  pool.init(sOff, () => {})
-  pool.ensureSlots(sOff, () => {})
-  pool.recordStrike(sOff, model, "quota", 60_000)
-  const result = await hooks.tool.pool_recheck.execute({ models: [model] }, {})
-  assert(result && result.title, `[US-34] result must exist: ${JSON.stringify(result)}`)
+  cooling("notify-default-off", claimsDir, [model], 400)
+  await new Promise((resolve) => setTimeout(resolve, 900))
   assert(sent.length === 0, `[US-34] a non-opencode slot with no explicit opt-in is silent by default, got ${sent.join(" | ")}`)
   await hooks.dispose?.()
   if (prevNotifyDir === undefined) delete process.env.LACODE_NOTIFY_DIR

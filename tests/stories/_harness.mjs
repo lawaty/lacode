@@ -58,6 +58,14 @@ export const cleanupAll = () => {
 // state directory would fight over the same session ids, and one of them would
 // lose a notification it was supposed to raise.
 process.env.LACODE_NOTIFY_DIR = scratch("lacode-notify-")
+// Isolate from the developer's real global opencode config (e.g. yolo: true)
+// so notify hooks do not suppress permission popups unexpectedly. One temp
+// config dir per test process; tests that already set XDG_CONFIG_HOME keep it.
+if (!process.env.XDG_CONFIG_HOME) {
+  const xdg = scratch("lacode-xdg-")
+  mkdirSync(join(xdg, "opencode"), { recursive: true })
+  process.env.XDG_CONFIG_HOME = xdg
+}
 // Story tests must never install real systemd timers.
 process.env.LACODE_NO_TIMER_MIGRATION = "1"
 
@@ -165,7 +173,19 @@ export const bootLaCode = async (stub, options = {}) => {
   // so a developer's own slot list silently changes what these tests assert.
   // An inline `models` (which resolveModels prefers) still wins; a caller's own
   // `modelsFile` still wins via the spread.
-  const hooks = await LaCode(stub.input, { modelsFile: PRESET, expiryMs: 0, ...options })
+  //
+  // The state directory is isolated for the same reason: the developer's live
+  // cooldowns must not decide whether a story can spawn. Preflight is off by
+  // default here — these suites assert routing, and a probe would add session
+  // calls to the very recorders they count. The dedicated preflight suite owns
+  // that behaviour.
+  const hooks = await LaCode(stub.input, {
+    modelsFile: PRESET,
+    expiryMs: 0,
+    dir: scratch("pool-state-"),
+    preflightMs: 0,
+    ...options,
+  })
   return hooks
 }
 

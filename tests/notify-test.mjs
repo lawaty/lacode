@@ -7,6 +7,13 @@ import { test } from "node:test"
 import nodeAssert from "node:assert/strict"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
+
+// Isolate from the developer's real global opencode config (e.g. yolo: true),
+// so permission-popups expectations are deterministic in the default env.
+// The YOLO check below saves/restores XDG_CONFIG_HOME around its own runs.
+const TEST_XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "lacode-notify-xdg-"))
+mkdirSync(join(TEST_XDG_CONFIG_HOME, "opencode"), { recursive: true })
+process.env.XDG_CONFIG_HOME = TEST_XDG_CONFIG_HOME
 // The source of truth. plugins/notify.ts is a dev-only re-export shim so
 // opencode's directory auto-discovery still finds this code in the working tree;
 // the published package has one plugin, src/index.ts, and the suites test the
@@ -321,6 +328,46 @@ await check("an unanswered question suppresses the redundant 'finished'", () => 
     !decision.notify && decision.reason === "awaiting your response",
     `the idle after a question must not claim the task finished, got ${JSON.stringify(decision)}`,
   )
+})
+
+// ---------------------------------------------------------------------------
+// YOLO: permission popups suppressed while YOLO is on
+// ---------------------------------------------------------------------------
+
+await check("permission popup suppressed when YOLO is enabled, delivered when off", async () => {
+  const root = mkdtempSync(join(tmpdir(), "notify-yolo-"))
+  const prev = process.env.XDG_CONFIG_HOME
+  try {
+    const cfgDir = join(root, "opencode")
+    mkdirSync(cfgDir, { recursive: true })
+    const cfg = join(cfgDir, "opencode.jsonc")
+    writeFileSync(cfg, '{\n  "plugin": [["@lawaty/lacode", {}]]\n}\n')
+
+    const run = async (yolo) => {
+      process.env.XDG_CONFIG_HOME = root
+      const sent = []
+      const hooks = await Notify(
+        { client: { app: { log: async () => {} }, session: { get: async () => ({ data: { id: "y", title: "YOLO check" } }) } }, directory: root },
+        { yolo },
+        { deliver: async (title, message, urgency, sound, requestID) => { sent.push({ title, message, urgency, sound, requestID }); return { ok: true } } },
+      )
+      await hooks.event({ event: { type: "permission.asked", properties: { id: "p1", sessionID: "y", permission: "bash", patterns: ["*"], metadata: { command: "ls" } } } })
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      return sent
+    }
+
+    const off = await run(false)
+    assert(off.length === 1, `yolo off should notify once, got ${off.length}: ${JSON.stringify(off)}`)
+    assert(off[0].urgency === "normal", `permission should be normal urgency: ${JSON.stringify(off[0])}`)
+
+    resetNotificationState()
+    const on = await run(true)
+    assert(on.length === 0, `yolo on must not emit permission popup, got ${JSON.stringify(on)}`)
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = prev
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------------------

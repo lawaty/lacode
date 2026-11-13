@@ -23,18 +23,27 @@ class NoRoutableSlotError extends Error {
 function noRoutableSlotMessage(s: pool.State, snap: pool.Snapshot): string {
   const slots = s.slots.length > 0 ? s.slots : pool.FALLBACK_SLOTS
   const now = Date.now()
-  const reasons = slots.map((slot) => {
-    const strike = snap.cooling.get(slot.model)
-    if (strike && strike.until > now) {
-      return `${slot.model} (${strike.reason}, ${Math.ceil((strike.until - now) / 1000)}s left)`
-    }
-    if (!pool.providerReady(s, slot.model)) {
-      return `${slot.model} (provider ${pool.providerOf(slot.model)} not configured)`
-    }
-    const status = s.catalog.get(slot.model)
-    return `${slot.model} (${status ?? "unavailable"})`
-  })
-  return `no slots to route to: all ${slots.length} pool slot(s) are cooling or unavailable - ${reasons.join("; ")}. Nothing was spawned; wait for a cooldown to clear or run pool_recheck.`
+  const cooling = slots
+    .map((slot) => ({ slot, strike: snap.cooling.get(slot.model) }))
+    .filter((entry): entry is { slot: pool.Slot; strike: pool.Strike } => !!entry.strike && entry.strike.until > now)
+    .sort((a, b) => a.strike.until - b.strike.until)
+  const parts: string[] = []
+  if (cooling.length > 0) {
+    // Lead with the one answer the caller can act on: which slot comes back
+    // first and how long it is. A list of eight cooldowns hides that.
+    const [nearest, next] = cooling
+    parts.push(
+      `${cooling.length} slot(s) cooling; nearest is ${nearest.slot.model} in ${Math.ceil((nearest.strike.until - now) / 1000)}s (${nearest.strike.reason})`,
+    )
+    if (next) parts.push(`next ${next.slot.model} in ${Math.ceil((next.strike.until - now) / 1000)}s`)
+  }
+  const unavailable = slots.length - cooling.length
+  if (unavailable > 0) parts.push(`${unavailable} slot(s) unavailable (provider not configured or model retired)`)
+  const next =
+    cooling.length > 0
+      ? "Wait for the nearest cooldown, then retry once — or run pool_recheck to test them now."
+      : "Configure the provider or add a slot, then retry."
+  return `no slots to route to: ${parts.join("; ")}. ${next}`
 }
 
 // Task routing, limit detection and hang recovery for a shared set of models.
@@ -119,6 +128,30 @@ const SLOT_WATCH_DEBOUNCE_MS = 250
 // reaper is the thing that must never wedge: an unbounded fetch would leave
 // s.reaping true and silently disarm the watchdog for the rest of the process.
 const ABORT_TIMEOUT_MS = 10_000
+/**
+ * How long route preflight may spend on one candidate.
+ *
+ * A provider that still has quota answers a one-word question in seconds; one
+ * that is out of quota refuses it in well under a second. The deadline exists
+ * for the third case — a provider that accepts the request and says nothing —
+ * where waiting out the 45s cooling-probe deadline would stall the spawn the
+ * user is already waiting on.
+ */
+const PREFLIGHT_TIMEOUT_MS = 6_000
+/** The whole preflight, however many candidates it asks, fits inside this. */
+const PREFLIGHT_BUDGET_MS = 12_000
+/** Never ask more than this many candidates before letting the normal pick run. */
+const PREFLIGHT_MAX_PROBES = 3
+/**
+ * How long a successful answer is trusted without asking again.
+ *
+ * One probe per model per window is the cost of catching a free tier that died
+ * since the last spawn; without the TTL every spawn would pay it, turning an
+ * optimisation into a slowdown. A failed task or a recorded strike clears the
+ * entry immediately, so the TTL only ever suppresses probes for models that
+ * genuinely answered.
+ */
+const PREFLIGHT_TTL_MS = 2 * 60 * 1000
 
 /**
  * A cooldown window as a person would say it out loud.
@@ -198,6 +231,12 @@ export type AgentPoolOptions = {
   notify?: (title: string, message: string) => void
   /** How often to watch for cooldowns that simply expire; 15s default, 0 disables. */
   expiryMs?: number
+  /**
+   * Per-candidate deadline for route preflight: ask a slot one tiny question
+   * before committing a spawn to it, and skip it if it refuses. 6s default;
+   * 0 disables preflight and restores blind routing.
+   */
+  preflightMs?: number
 }
 
 // Typed as a factory returning hooks, NOT as a Plugin: only src/index.ts may
@@ -265,6 +304,70 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     if (s.warned.has(message)) return
     s.warned.add(message)
     await log("warn", message)
+  }
+
+  // Route preflight (see PREFLIGHT_* above). A slot that refuses a one-word
+  // question would have refused the spawn too, and it refuses the question in
+  // under a second without creating a child session, aborting it, or returning
+  // an error to the caller. The savings are a primary-agent turn per dead slot.
+  //
+  // It is deliberately optional and self-limiting: disabled by option or env,
+  // skipped while a background probe runs (a spawn must not queue behind the
+  // 15-minute pass), skipped for a client with no session API (tests, tools),
+  // and skipped for a model that answered inside PREFLIGHT_TTL_MS.
+  const preflightMs = opts.preflightMs ?? PREFLIGHT_TIMEOUT_MS
+  const preflightEnabled = preflightMs > 0 && process.env.LACODE_POOL_PREFLIGHT !== "0"
+  const canProbe = typeof (client as unknown as { session?: { create?: unknown } })?.session?.create === "function"
+  const probeDirectory = directory ?? process.cwd()
+
+  const pickWorkingSlot = async (snap: pool.Snapshot, neededContext?: number): Promise<pool.Slot | undefined> => {
+    const candidates = pool.pickSlots(s, snap, neededContext)
+    if (candidates.length === 0) return undefined
+    // Fast exits before any request: the ordinary pick is the same first entry,
+    // so a skipped preflight changes only speed, never the chosen slot.
+    if (!preflightEnabled || s.probing || !canProbe) return candidates[0]
+
+    const now = Date.now()
+    const fresh = (model: string) => now - (s.verifiedAt.get(model) ?? 0) < PREFLIGHT_TTL_MS
+    const firstFresh = candidates.findIndex((slot) => fresh(slot.model))
+    // Only the slots ahead of the first trusted one can win; probing past it would
+    // spend requests on a slot the order would not choose anyway.
+    const toProbe = (firstFresh === -1 ? candidates : candidates.slice(0, firstFresh)).slice(0, PREFLIGHT_MAX_PROBES)
+
+    if (toProbe.length > 0) {
+      let outcomes: probe.ProbeOutcome[] = []
+      try {
+        outcomes = await probe.probeFirst(client as probe.ProbeClient, {
+          state: s,
+          directory: probeDirectory,
+          models: toProbe.map((slot) => slot.model),
+          timeoutMs: preflightMs,
+          budgetMs: PREFLIGHT_BUDGET_MS,
+          benchFailures: true,
+        })
+      } catch (error) {
+        // A probe must never cost a spawn. Fall through to the ordered list.
+        await log("debug", `route preflight failed: ${String(error)}`)
+      }
+      const answered = outcomes.find((outcome) => outcome.ok)
+      if (answered) {
+        const slot = candidates.find((candidate) => candidate.model === answered.model)
+        if (slot) return slot
+      }
+      const skipped = outcomes.filter((outcome) => !outcome.ok)
+      if (skipped.length > 0) {
+        await log(
+          "info",
+          `preflight skipped ${skipped.map((outcome) => `${outcome.model} (${outcome.reason})`).join(", ")}`,
+        )
+      }
+    }
+
+    if (firstFresh >= 0) return candidates[firstFresh]
+    // Every preferred slot refused and none was already trusted. The probes wrote
+    // cooldowns, so a fresh snapshot routes around them — the ordinary pick is
+    // still the decider, it just sees better evidence now.
+    return pool.pickSlot(s, pool.snapshot(s), neededContext)
   }
 
   const refreshProviders = async (force = false) => {
@@ -873,7 +976,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
    * toast is best-effort: there is no TUI on a server-only run, and a prober that
    * cannot report is still a prober.
    */
-  const announce = async (report: probe.ProbeReport, prior: ReturnType<typeof pool.readLimits>) => {
+  const announce = async (report: probe.ProbeReport) => {
     if (!report.changed) return
     const message =
       report.cleared.length > 0
@@ -889,17 +992,9 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
     } catch {
       /* no TUI attached; the log line above is the record */
     }
-    const resets = report.cleared.filter((model) => pool.isQuotaReason(prior.get(model)?.reason ?? ""))
-    if (resets.length > 0) announceReady(resets)
   }
 
   const runProbe = async (models?: string[]): Promise<probe.ProbeReport> => {
-    let prior: ReturnType<typeof pool.readLimits> = new Map()
-    try {
-      prior = pool.readLimits(s)
-    } catch {
-      /* no state dir yet; nothing was cooling */
-    }
     let report = EMPTY_REPORT
     try {
       report = await probe.probeCooling(client as probe.ProbeClient, { state: s, directory, models })
@@ -907,7 +1002,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       await log("error", `pool probe failed: ${String(error)}`)
       return EMPTY_REPORT
     }
-    await announce(report, prior)
+    await announce(report)
     return report
   }
 
@@ -925,35 +1020,38 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
   // the cooling map on the next look, and routing uses it again. Watch that
   // transition so a slot the user is waiting for says so.
   const expiryMs = opts.expiryMs ?? EXPIRY_INTERVAL_MS
-  let coolingSeen = new Map<string, string>()
+  let coolingSeen = new Map<string, { reason?: string; until: number }>()
   try {
-    for (const [model, strike] of pool.readLimits(s)) coolingSeen.set(model, strike.reason ?? "")
+    for (const [model, strike] of pool.readLimits(s)) coolingSeen.set(model, { reason: strike.reason, until: strike.until })
   } catch {
     /* no state dir yet; the first tick will populate it */
   }
   const expiryTimer =
     expiryMs > 0
       ? setInterval(() => {
-          // A probe clears cooldowns itself and announces them; do not race it.
+          // A probe clears cooldowns itself; the watcher ignores a cooldown that vanished before its own `until`, so do not race it.
           if (s.probing) return
+          const now = Date.now()
           let current: ReturnType<typeof pool.readLimits>
           try {
             current = pool.readLimits(s)
           } catch {
             return
           }
-          const still = new Map<string, string>()
-          for (const [model, strike] of current) still.set(model, strike.reason ?? "")
+          const still = new Set<string>()
+          for (const [model] of current) still.add(model)
           const back: string[] = []
-          for (const [model, reason] of coolingSeen) {
+          for (const [model, seen] of coolingSeen) {
             if (still.has(model)) continue
             // Only a rate-limit window is a reset. Auth, missing-model and
             // outage windows are not, and time does not fix them.
-            if (!pool.isQuotaReason(reason)) continue
+            if (!pool.isQuotaReason(seen.reason ?? "")) continue
+            if (now < seen.until) continue // vanished before its own until = early re-admission, NOT a reset
             if (!pool.providerReady(s, model)) continue
             back.push(model)
           }
-          coolingSeen = still
+          coolingSeen = new Map<string, { reason?: string; until: number }>()
+          for (const [model, strike] of current) coolingSeen.set(model, { reason: strike.reason, until: strike.until })
           if (back.length > 0) {
             void log("info", `pool: ${resetMessage(back)}`, { cleared: back })
             announceReady(back)
@@ -1794,8 +1892,8 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
 
         if (pool.BASES.includes(requested)) {
           const neededContext = estimateContextTokens(output.args?.prompt)
-          const slot = pool.pickSlot(s, snap, neededContext)
-          if (!slot) throw new NoRoutableSlotError(noRoutableSlotMessage(s, snap))
+          const slot = await pickWorkingSlot(snap, neededContext)
+          if (!slot) throw new NoRoutableSlotError(noRoutableSlotMessage(s, pool.snapshot(s)))
           const variant = pool.agentFor(requested, slot.index)
           if (s.known.size > 0 && !s.known.has(variant)) {
             await warnOnce(`variant ${variant} missing from config; spawn left unchanged`)
@@ -1865,6 +1963,10 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
         await markProviderDegradation(log, spawn.model, "empty response")
         output.output = `Task returned an empty response from ${spawn.model} (slot ${spawn.slot}); the model has been benched for ${seconds}s so the next spawn uses another slot.`
       }
+      // Real text is the strongest proof a slot works: trust it for the preflight
+      // TTL so the next spawn need not ask the same model again. A recorded
+      // failure deletes the entry, so this can only ever suppress a probe.
+      if (!cancelled && spawn && text.trim() !== "") s.verifiedAt.set(spawn.model, Date.now())
       spawns.delete(key)
       const report = abortReports.get(key)
       if (!report) return

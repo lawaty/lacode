@@ -107,7 +107,10 @@ test("[US-15] one config line is enough: a bare config boots and delivers the wh
   // agents, no hand-written commands, no manual preset.
   const stub = stubInput()
   const { default: LaCode } = await import(join(ROOT, "src", "index.ts"))
-  const hooks = await LaCode(stub.input)
+  // The pool's STATE directory is isolated (not its config): a developer's live
+  // cooldowns must not decide whether a bare config can route. Preflight is off
+  // so the session recorder sees only the spawn this test is about.
+  const hooks = await LaCode(stub.input, { dir: scratch("pool-state-"), preflightMs: 0 })
   const cfg = { plugin: ["@lawaty/lacode"] }
   await hooks.config(cfg)
 

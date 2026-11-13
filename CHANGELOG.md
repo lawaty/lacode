@@ -9,6 +9,24 @@ commit as the changelog entry it describes.
 
 ## [Unreleased]
 
+## [2.3.0-beta.8] — route preflight and quieter reset notices
+
+### Added
+
+- Pool: route preflight. Before a spawn is committed to a slot, the plugin asks that slot one tiny probe request; a slot that refuses (quota, auth, capability, or no answer) is benched at once and the next candidate is tried, so the caller sees one working slot instead of a trail of cancelled spawns and retries. At most three candidates and 12 seconds are spent per spawn, and a model that answered within the last two minutes is trusted without a probe. Disable with `preflightMs: 0` or `LACODE_POOL_PREFLIGHT=0`.
+- Pool: `pickSlots()` exposes the ordered candidate list behind a routing decision. The ordinary pick is always its first entry, so a skipped preflight changes only speed, never the chosen slot.
+- Pool: when no slot can be routed, the refusal now leads with the nearest cooldown and its remaining seconds instead of a list of every slot.
+
+### Changed
+
+- Notify: a rate-limit-reset notice is raised only when a cooldown expires naturally. A probe or `pool_recheck` re-admission is silent, and repeat notices for the same model are throttled to one per 30 minutes.
+- Notify: permission popups are suppressed while YOLO is enabled. Stored global config wins; the `yolo` plugin option is only the fallback default.
+
+### Fixed
+
+- Tests: the story suites isolate the pool state directory, so a developer's live cooldowns cannot decide whether a story can spawn; the notify suite isolates `XDG_CONFIG_HOME` for the same reason.
+- Tests: the remote-SSH fixture links the package's only runtime dependency (`jsonc-parser`) so the installed-shape check works from an otherwise-empty fixture.
+
 ## [2.3.0-beta.7] — transient upstream faults and leaner timeline entries
 
 ### Changed

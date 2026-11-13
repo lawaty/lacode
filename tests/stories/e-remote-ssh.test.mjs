@@ -18,7 +18,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { execFile } from "node:child_process"
-import { chmodSync, cpSync, existsSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { promisify } from "node:util"
 import { ROOT, cleanupAll, scratch, settle } from "./_harness.mjs"
@@ -646,6 +646,8 @@ test("[US-14] a missing notify helper warns once and the plugin keeps working", 
   cpSync(join(ROOT, "src"), join(installed, "src"), { recursive: true })
   cpSync(join(ROOT, "presets"), join(installed, "presets"), { recursive: true })
   cpSync(join(ROOT, "package.json"), join(installed, "package.json"))
+  mkdirSync(join(installed, "node_modules"))
+  symlinkSync(join(ROOT, "node_modules", "jsonc-parser"), join(installed, "node_modules", "jsonc-parser"), "dir")
   assert.ok(!existsSync(join(installed, "bin", "oc-notify")), "control: the published files list has no oc-notify")
   assert.ok(!existsSync(join(installed, "dist", "lacode.js")), "control: this fixture has no built CLI either")
 

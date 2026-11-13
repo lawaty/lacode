@@ -911,6 +911,14 @@ export type State = {
   /** When a probe run last did anything, so the status can say when it last checked. */
   lastProbe: number
   /**
+   * When a model last proved it answers (a successful probe, or a task that
+   * returned real text). Route preflight trusts a model inside a short TTL, so a
+   * healthy pool pays for one tiny probe per model per window instead of one on
+   * every spawn. A recorded strike deletes the entry, so a failure is never
+   * second-hand proof of health.
+   */
+  verifiedAt: Map<string, number>
+  /**
    * Recently seen `session.created` children, newest last, per parent session.
    * `bindChild` only matches a claim that already exists, so a child that is
    * created before its claim is taken is never bound and the claim can never be
@@ -973,6 +981,7 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
       probes: new Set(),
       probing: false,
       lastProbe: 0,
+      verifiedAt: new Map(),
       children: new Map(),
       reaped: 0,
       reaping: false,
@@ -1449,6 +1458,7 @@ export function recordStrike(s: State, model: string, reason: string, stated?: n
     const record: Strike = { model: target, until, strikes, reason, last: now }
     s.cooling.set(target, record)
     s.strikes.set(target, record)
+    s.verifiedAt.delete(target)
     const path = join(s.dir, limitFile(target))
     try {
       writeFileSync(`${path}.tmp`, JSON.stringify(record))
@@ -1548,6 +1558,7 @@ export function clearCooldowns(s: State, models?: string[]): ClearedCooldown[] {
     }
     s.cooling.delete(strike.model)
     s.strikes.delete(strike.model)
+    s.verifiedAt.set(strike.model, now)
     cleared.push({
       model: strike.model,
       reason: typeof strike.reason === "string" ? strike.reason : "unknown",
@@ -1716,6 +1727,38 @@ export function pickSlot(s: State, snap: Snapshot, neededContext?: number): Slot
     return pickByPass(candidates, snap.counts) ?? candidates.reduce(leastLoaded, candidates[0])
   }
   return pickByPass(candidates, snap.counts, smallest) ?? candidates.reduce(leastLoaded, candidates[0])
+}
+
+/**
+ * Every usable slot in the order the router would try them, with `pickSlot`'s
+ * choice first.
+ *
+ * `pickSlot` answers "which slot should this spawn use"; route preflight needs
+ * the next question, "and if that one refuses the request, what next?". The
+ * first entry is exactly `pickSlot`'s answer, so a caller that does not probe
+ * (or whose probe is skipped) keeps byte-identical routing. The rest are ordered
+ * by the same rules the pick uses: context-adequate first, then least-loaded,
+ * then declaration order. Cooling, catalog-retired and provider-unconfigured
+ * slots are absent because `pickSlot` would never choose them.
+ */
+export function pickSlots(s: State, snap: Snapshot, neededContext?: number): Slot[] {
+  const first = pickSlot(s, snap, neededContext)
+  if (!first) return []
+  const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
+  const primary = slots.filter((slot) => !slot.fallback)
+  const fallback = slots.filter((slot) => slot.fallback)
+  const usablePrimary = primary.filter((slot) => isAvailable(s, slot.model, snap.cooling))
+  const usable = usablePrimary.length > 0 ? usablePrimary : fallback.filter((slot) => isAvailable(s, slot.model, snap.cooling))
+  const effective = (slot: Slot) => Math.min(slot.context ?? Number.POSITIVE_INFINITY, slot.tpm ?? Number.POSITIVE_INFINITY)
+  const fits = (slot: Slot) =>
+    neededContext === undefined || !Number.isFinite(effective(slot)) || effective(slot) >= neededContext
+  const rest = usable.filter((slot) => slot.index !== first.index)
+  rest.sort((a, b) => {
+    const fit = Number(!fits(a)) - Number(!fits(b))
+    if (fit !== 0) return fit
+    return loadOf(snap.counts, a.index) - loadOf(snap.counts, b.index) || a.index - b.index
+  })
+  return [first, ...rest]
 }
 
 /** Which fill pass routing is in: the next pass number while any usable slot is

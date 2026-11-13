@@ -19,8 +19,8 @@ import { PACKAGE_ROOT } from "./package-root.ts"
 // recovery is seen by every process that watches it. A claim file makes exactly
 // one of them speak. It is a TTL, not a lock: after the window another recovery
 // for the same model may speak again, and a crashed process cannot silence the
-// model forever.
-const NOTICE_CLAIM_MS = 60_000
+// model forever. Throttle repeat rate-limit-reset notices per model to 30 minutes.
+const NOTICE_CLAIM_MS = 30 * 60_000
 
 /**
  * Whether this process should be the one to announce `key`.

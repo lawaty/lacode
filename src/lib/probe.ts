@@ -130,6 +130,15 @@ export type ProbeOptions = {
   /** Narrow the run to these models. Omit to probe every model that is cooling. */
   models?: string[]
   timeoutMs?: number
+  /** Total wall-clock the run may spend, across every model it asks. */
+  budgetMs?: number
+  /**
+   * Record ANY failure as a short cooldown, not just the ones the provider
+   * states. The cooling probe leaves an unknown failure alone (a probe must not
+   * lengthen a cooldown); route preflight is the opposite question — "may this
+   * slot take a spawn right now?" — so a refusal of any kind must bench it.
+   */
+  benchFailures?: boolean
   /** Injected clock, so a test can age a cooldown without waiting for it. */
   now?: () => number
 }
@@ -232,6 +241,7 @@ const probeOne = async (client: ProbeClient, opts: ProbeOptions, model: string, 
     if (!timedOut && failure === undefined && result?.data?.info !== undefined) {
       // It answered. This is the fact the whole module exists to obtain.
       clearCooldowns(s, [model])
+      s.verifiedAt.set(model, clock())
       return settle(true, "answered", 0, "answered")
     }
 
@@ -268,6 +278,14 @@ const probeOne = async (client: ProbeClient, opts: ProbeOptions, model: string, 
       if (stated !== undefined) {
         const recorded = recordStrike(s, model, shortReason(text), stated)
         strikes = recorded?.strikes
+      } else if (opts.benchFailures) {
+        // Route preflight: this slot refused a spawn-shaped request, so bench it
+        // on the ordinary short curve. The cooling probe keeps the old window;
+        // there is no window to keep here, and re-asking on the next spawn would
+        // reintroduce the round trip preflight exists to remove.
+        const recorded = recordStrike(s, model, shortReason(text), 0)
+        strikes = recorded?.strikes
+        kind = "benched"
       }
     }
     const still = readLimits(s).get(model)
@@ -347,6 +365,56 @@ export async function probeModels(client: ProbeClient, opts: ProbeOptions & { mo
     missing,
     changed: reAdmitted.length > 0 || missing.length > 0 || stillLimited.some((o) => o.leftSeconds !== o.hadSeconds),
   }
+}
+
+/**
+ * Ask the given models in order until one answers: the ROUTE PREFLIGHT path.
+ *
+ * This is the same question a routing decision needs and the same request the
+ * cooling probe sends, with two differences. It stops at the first answer,
+ * because the caller only needs one usable slot, and it is bounded by a total
+ * budget as well as a per-request deadline, because this run sits inside a
+ * spawn the caller is waiting on rather than on a background timer.
+ *
+ * Failures bench the model (`benchFailures`) so the next spawn skips it without
+ * asking again. On success the model is marked verified, which is what lets a
+ * healthy pool skip preflight for the next TTL window.
+ *
+ * Returns an empty list when a background probe is already in flight: a spawn
+ * must not queue behind the fifteen-minute pass.
+ */
+export async function probeFirst(
+  client: ProbeClient,
+  opts: ProbeOptions & { models: string[] },
+): Promise<ProbeOutcome[]> {
+  const s = opts.state
+  const now = opts.now ?? Date.now
+  if (s.probing) return []
+  const models = [...new Set(opts.models)]
+  if (models.length === 0) return []
+  const cooling = readLimits(s)
+  const at = now()
+  const perProbe = opts.timeoutMs ?? PROBE_TIMEOUT_MS
+  const deadline =
+    typeof opts.budgetMs === "number" && Number.isFinite(opts.budgetMs) && opts.budgetMs > 0 ? at + opts.budgetMs : undefined
+  const outcomes: ProbeOutcome[] = []
+  s.probing = true
+  try {
+    for (const model of models) {
+      const remaining = deadline === undefined ? undefined : deadline - now()
+      if (remaining !== undefined && remaining <= 0) break
+      const strike = cooling.get(model)
+      const left = strike && strike.until > at ? Math.ceil((strike.until - at) / 1000) : 0
+      const timeoutMs = remaining === undefined ? perProbe : Math.max(1, Math.min(perProbe, remaining))
+      const outcome = await probeOne(client, { ...opts, timeoutMs }, model, left)
+      outcomes.push(outcome)
+      if (outcome.ok) break
+    }
+  } finally {
+    s.probing = false
+    s.lastProbe = Date.now()
+  }
+  return outcomes
 }
 
 /**
