@@ -464,6 +464,25 @@ test("poolStructureValid accepts a full contract pool and names violations", () 
   assert.ok(short.problems.some((p) => p.includes("expected 10 slots")))
 })
 
+test("poolStructureValid validates generically when opencode-go is unavailable", () => {
+  const generic = parsePoolSlots("anthropic/a  2\nopenai/b  1\ngoogle/c  3\n")
+  const genericResult = poolStructureValid(generic, { go: false })
+  assert.equal(genericResult.valid, true)
+  assert.deepEqual(genericResult.problems, [])
+
+  const goResult = poolStructureValid(generic)
+  assert.equal(goResult.valid, false)
+  assert.ok(goResult.problems.includes("missing opencode-go head"))
+
+  assert.deepEqual(poolStructureValid("", { go: false }), { valid: false, problems: ["no slots"], count: 0 })
+  assert.deepEqual(poolStructureValid([], { go: false }), { valid: false, problems: ["no slots"], count: 0 })
+
+  const odd = parsePoolSlots("opencode-go/x  1\nopencode/y  1  b:foo\n")
+  const oddResult = poolStructureValid(odd, { go: false })
+  assert.equal(oddResult.valid, true)
+  assert.deepEqual(oddResult.problems, [])
+})
+
 test("isHardDeadRow only matches gone/credential/agreement/credit failures", () => {
   assert.equal(isHardDeadRow({ ok: false, kind: "not-served" }), true)
   assert.equal(isHardDeadRow({ ok: false, kind: "credential" }), true)
@@ -495,4 +514,56 @@ test("a healthy-but-capped member is not retained over the caps", () => {
   const current = [{ model: "openrouter/small-3", weight: 2, context: 131000 }]
   const { selection } = selectPool({ providers: makeProviders(), previousProviders: [], currentSlots: current, now: NOW })
   assert.ok(!selection.some((row) => row.model === "openrouter/small-3"), "caps decide healthy members, not retention")
+})
+
+const genericProviders = () => [
+  { provider: "anthropic", error: null, rows: [
+    { model: "anthropic/small", ok: true, score: 90, context: 131072 },
+    { model: "anthropic/large", ok: true, score: 89, context: 262144 },
+  ]},
+  { provider: "openai", error: null, rows: [
+    { model: "openai/small", ok: true, score: 88, context: 131072 },
+    { model: "openai/large", ok: true, score: 87, context: 262144 },
+  ]},
+  { provider: "google", error: null, rows: [
+    { model: "google/small", ok: true, score: 86, context: 131072 },
+    { model: "google/large", ok: true, score: 85, context: 262144 },
+  ]},
+]
+
+test("generic pool without opencode-go selects uniformly without go head/tail or unmet-size warning", () => {
+  const { selection, warnings } = selectPool({ providers: genericProviders(), now: NOW })
+  assert.ok(selection.length > 0 && selection.length <= 10)
+  assert.ok(selection.every((row) => row.weight !== 4), "no go head weights in generic mode")
+  assert.ok(selection.every((row) => row.bucket !== "opencode"), "no opencode tail bucket in generic mode")
+  assert.ok(!warnings.some((w) => w.includes(`wanted ${10}`)), `generic mode must not warn about wanted 10: ${JSON.stringify(warnings)}`)
+})
+
+test("goStructure: false treats a rankable opencode-go row as a normal middle slot", () => {
+  const providers = [...genericProviders(), { provider: "opencode-go", error: null, rows: [{ model: "opencode-go/free", ok: true, score: 99, context: 1048576 }] }]
+  const { selection } = selectPool({ providers, goStructure: false, now: NOW })
+  assert.ok(selection.every((row) => row.weight !== 4), "goStructure false must not create go head")
+  assert.ok(selection.every((row) => row.bucket !== "opencode"), "goStructure false must not create opencode tail")
+  const go = selection.find((row) => row.model === "opencode-go/free")
+  assert.ok(go, "rankable go model may appear as a normal selected slot")
+  assert.ok(go.weight !== 4)
+})
+
+test("goStructure: true keeps opencode-go head at weight 4", () => {
+  const providers = [...genericProviders(), { provider: "opencode-go", error: null, rows: [{ model: "opencode-go/free", ok: true, score: 99, context: 1048576 }] }]
+  const { selection } = selectPool({ providers, goStructure: true, now: NOW })
+  const go = selection.find((row) => row.model === "opencode-go/free")
+  assert.ok(go, "go model must be selected")
+  assert.equal(go.weight, 4)
+  assert.equal(selection[0].model, "opencode-go/free")
+})
+
+test("current opencode-go slots keep useGoStructure true when providers lack go", () => {
+  const currentSlots = [{ model: "opencode-go/x", weight: 4, context: 1048576 }]
+  const { selection } = selectPool({ providers: genericProviders(), currentSlots, now: NOW })
+  const retained = selection.find((row) => row.model === "opencode-go/x")
+  assert.ok(retained, "retained go slot must remain")
+  assert.equal(retained.weight, 4)
+  assert.equal(retained.retained, true)
+  assert.equal(selection[0].model, "opencode-go/x", "retained go head must stay first")
 })

@@ -448,8 +448,10 @@ For each host the script:
   JSONC, so comments and trailing commas are accepted;
 - syncs the allowlisted providers from the local
   `~/.local/share/opencode/auth.json` to each host's auth store
-  (`OC_AUTH_PROVIDERS`, default `opencode-go opencode`), keeps host-only
-  providers, and writes the remote file atomically with a timestamped backup;
+  (`OC_AUTH_PROVIDERS`; no default — only listed providers are touched, and
+  unset/empty skips credential sync entirely), keeps host-only providers, and
+  writes the remote file atomically with a timestamped backup. `opencode` and
+  `opencode-go` are normally omitted when hosts hold per-host keys;
 - checks that the helper can run: an executable `~/bin/lacode`, or a system node at
   version 22 or newer. A host that fails only that check is reported
   `warn (helper cannot run: <detail>; install node>=22 or a ~/bin/lacode wrapper)` and

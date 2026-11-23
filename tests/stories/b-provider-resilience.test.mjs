@@ -160,7 +160,9 @@ test("[US-4] an empty task result benches the model and the next spawn goes else
   assert.equal(first.routed, "explore-1", `control: the first spawn must take slot 1, got ${first.routed}`)
   await emit(hooks, "session.created", { info: { id: "child-1", parentID: "s1" } })
 
-  const out = { output: "" }
+  // The real task tool wraps the subagent answer, so an empty completion is a
+  // full `<task …><task_result></task_result></task>` block -- never "".
+  const out = { output: '<task id="child-1" state="completed">\n<task_result>\n\n</task_result>\n</task>' }
   await hooks["tool.execute.after"]({ tool: "task", sessionID: "s1", callID: "c1", args: {} }, out)
   assert.match(out.output, /empty response.*empty\/a.*benched/i, `the result must explain the bench, got ${out.output}`)
   assert.ok(existsSync(limitFile(dir, "empty/a")), "the empty model must be benched")
@@ -169,6 +171,45 @@ test("[US-4] an empty task result benches the model and the next spawn goes else
   assert.equal(second.routed, "explore-2", `the next spawn must leave the empty model, got ${second.routed}`)
   assert.equal(second.model, "empty/b", `the next spawn must use the other model, got ${second.model}`)
   assert.equal(models.length, 2)
+  await hooks.dispose()
+})
+
+test("[US-4] a completed task with a real result is trusted, not benched", async () => {
+  const { hooks, cfg, dir } = await bootPool(
+    [
+      { model: "empty/a", weight: 1 },
+      { model: "empty/b", weight: 1 },
+    ],
+    "us4-empty-ok",
+  )
+
+  await spawn(hooks, cfg, { subagent: "explore", callID: "c1", sessionID: "s1" })
+  await emit(hooks, "session.created", { info: { id: "child-1", parentID: "s1" } })
+
+  const out = { output: '<task id="child-1" state="completed">\n<task_result>\nfound the answer\n</task_result>\n</task>' }
+  await hooks["tool.execute.after"]({ tool: "task", sessionID: "s1", callID: "c1", args: {} }, out)
+  assert.doesNotMatch(out.output, /empty response/i, `a real answer must not be rewritten, got ${out.output}`)
+  assert.ok(!existsSync(limitFile(dir, "empty/a")), "a model that answered must not be benched")
+  await hooks.dispose()
+})
+
+test("[US-4] an errored task does not bench the model", async () => {
+  const { hooks, cfg, dir } = await bootPool(
+    [
+      { model: "empty/a", weight: 1 },
+      { model: "empty/b", weight: 1 },
+    ],
+    "us4-empty-error",
+  )
+
+  await spawn(hooks, cfg, { subagent: "explore", callID: "c1", sessionID: "s1" })
+  await emit(hooks, "session.created", { info: { id: "child-1", parentID: "s1" } })
+
+  // `state="error"` is opencode's own failure (e.g. a DB fault), not a model
+  // that answered with nothing; benching the model for it would be wrong.
+  const out = { output: '<task id="child-1" state="error">\n<task_result>\n\n</task_result>\n</task>' }
+  await hooks["tool.execute.after"]({ tool: "task", sessionID: "s1", callID: "c1", args: {} }, out)
+  assert.ok(!existsSync(limitFile(dir, "empty/a")), "an opencode error must not bench the model")
   await hooks.dispose()
 })
 

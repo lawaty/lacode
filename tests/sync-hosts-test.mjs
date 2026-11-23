@@ -465,31 +465,85 @@ test("sync-hosts dry run with a local auth store contacts no host", (t) => {
 
   assert.equal(result.status, 0, result.stderr)
   assert.match(result.stdout, /dry run: 2 hosts, nothing was run/)
-  assert.match(result.stdout, /auth: would sync 1 provider \(opencode\); dry run contacts no host/)
+  assert.match(result.stdout, /auth: OC_AUTH_PROVIDERS is empty; skipping credential sync/)
   assert.equal(calls(log).length, 0, "dry run must not invoke ssh, even with a local auth store")
   assert.equal(existsSync(join(env.FAKE_SSH_STATE, "auth.log")), false, "no auth envelope is sent")
 })
 
-test("sync-hosts syncs credentials when the run is real", (t) => {
+test("sync-hosts has no default opencode-go/opencode sync when OC_AUTH_PROVIDERS is unset or empty", (t) => {
+  const { log, env } = setup(t, {
+    auth: {
+      opencode: { key: "sk-test-do-not-log" },
+      "opencode-go": { key: "sk-other-do-not-log" },
+    },
+    authOutput: "UPDATED:opencode",
+  })
+
+  for (const providers of [undefined, ""]) {
+    const runEnv = { ...env, OC_HOSTS: "host-a", LACODE_SYNC_NO_WAIT: "1" }
+    if (providers === undefined) delete runEnv.OC_AUTH_PROVIDERS
+    else runEnv.OC_AUTH_PROVIDERS = providers
+    const result = run(runEnv)
+
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /host-a: ok/)
+    assert.match(result.stdout, /host-a: auth: OC_AUTH_PROVIDERS is empty; skipping credential sync/)
+
+    const authCalls = calls(log).filter((args) => String(args[args.length - 1]).includes("python3 -c"))
+    assert.equal(authCalls.length, 0, "auth helper must not be invoked when OC_AUTH_PROVIDERS is empty")
+    assert.equal(existsSync(env.FAKE_SSH_AUTH_LOG), false, "no auth envelope is sent")
+  }
+})
+
+test("sync-hosts syncs an allowlisted provider and skips non-allowlisted ones", (t) => {
   const { log, env } = setup(t, {
     auth: {
       opencode: { key: "sk-test-do-not-log" },
       openrouter: { key: "sk-other-do-not-log" },
     },
-    authOutput: "UPDATED:opencode",
+    authOutput: "ADDED:opencode",
+    env: { OC_AUTH_PROVIDERS: "opencode" },
   })
   const result = run({ ...env, OC_HOSTS: "host-a", LACODE_SYNC_NO_WAIT: "1" })
 
   assert.equal(result.status, 0, result.stderr)
   assert.match(result.stdout, /host-a: ok/)
-  assert.match(result.stdout, /host-a: auth: updated opencode/)
+  assert.match(result.stdout, /host-a: auth: added opencode/)
 
   const authCalls = calls(log).filter((args) => String(args[args.length - 1]).includes("python3 -c"))
   assert.equal(authCalls.length, 1, "the auth helper is invoked once for the host")
   const envelope = JSON.parse(readFileSync(env.FAKE_SSH_AUTH_LOG, "utf8"))
   assert.deepEqual(Object.keys(envelope.providers).sort(), ["opencode", "openrouter"])
-  assert.deepEqual(envelope.replace, ["opencode-go", "opencode"])
+  assert.deepEqual(envelope.replace, ["opencode"])
   assert.equal(envelope.dryRun, false)
+
+  // A non-allowlisted local provider missing on the remote is NOT added,
+  // and a non-allowlisted differing provider is NOT overwritten.
+  const localAuth = JSON.parse(readFileSync(env.OC_AUTH_FILE, "utf8"))
+  const remoteAuth = {
+    openrouter: { key: "sk-remote-different" },
+    other: { key: "sk-remote-only" },
+  }
+  const helperHome = join(env.FAKE_SSH_STATE, "helper-home")
+  mkdirSync(join(helperHome, ".local", "share", "opencode"), { recursive: true })
+  writeFileSync(
+    join(helperHome, ".local", "share", "opencode", "auth.json"),
+    JSON.stringify(remoteAuth, null, 2) + "\n",
+  )
+  const helperScript = readFileSync(SCRIPT, "utf8").match(/const AUTH_HELPER = `([\s\S]*?)`\n\n\/\*\* Read the local auth store/)[1]
+  const helperRun = spawnSync("python3", ["-c", helperScript], {
+    env: { ...process.env, HOME: helperHome },
+    input: JSON.stringify({ replace: ["opencode"], providers: localAuth, dryRun: false }),
+    encoding: "utf8",
+  })
+  assert.equal(helperRun.status, 0, helperRun.stderr)
+  assert.match(helperRun.stdout, /ADDED:opencode/)
+  const merged = JSON.parse(
+    readFileSync(join(helperHome, ".local", "share", "opencode", "auth.json"), "utf8"),
+  )
+  assert.deepEqual(merged.opencode, localAuth.opencode, "allowlisted missing provider is added")
+  assert.deepEqual(merged.openrouter, remoteAuth.openrouter, "non-allowlisted differing provider is not overwritten")
+  assert.deepEqual(merged.other, remoteAuth.other, "non-allowlisted remote-only provider is preserved")
 })
 
 test("sync-hosts accepts a real opencode.jsonc with comments and trailing commas", (t) => {

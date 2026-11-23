@@ -119,18 +119,45 @@ export const slotCeiling = (slot: Slot) => slot.ceiling ?? slot.weight
 /** The quota group a slot belongs to. Default: the model is its own bucket. */
 export const slotBucket = (slot: Slot) => slot.bucket ?? slot.model
 
-const NOTIFY_DEFAULT_ON_PROVIDERS = new Set(["opencode", "opencode-go"])
+export type NotifyPolicy = { mode: "all" | "none" | "set"; providers: Set<string> }
+export const DEFAULT_NOTIFY_PROVIDERS = ["opencode", "opencode-go"]
+const BUILTIN_NOTIFY_POLICY: NotifyPolicy = { mode: "set", providers: new Set(DEFAULT_NOTIFY_PROVIDERS) }
+
+export const notifySignature = (raw: unknown): string => {
+  if (raw === undefined) return ""
+  if (raw === "all") return "all"
+  if (raw === "none") return "none"
+  if (Array.isArray(raw)) {
+    const ids = [...new Set(raw.filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim()))].sort()
+    return `set:${ids.join(",")}`
+  }
+  return "invalid"
+}
+
+export const notifyPolicy = (raw: unknown, problems?: string[]): NotifyPolicy => {
+  if (raw === undefined) return BUILTIN_NOTIFY_POLICY
+  if (raw === "all") return { mode: "all", providers: new Set() }
+  if (raw === "none") return { mode: "none", providers: new Set() }
+  if (Array.isArray(raw)) {
+    const ids = raw.filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim())
+    if (raw.length > 0 && ids.length === raw.length) return { mode: "set", providers: new Set(ids) }
+  }
+  problems?.push('notifyProviders must be "all", "none", or an array of provider ids; using the built-in default')
+  return BUILTIN_NOTIFY_POLICY
+}
 
 /** opencode and opencode-go slots announce the reset notice by default; every other provider is quiet. */
-export const notifyDefault = (model: string): boolean => {
+export const notifyDefault = (model: string, policy: NotifyPolicy = BUILTIN_NOTIFY_POLICY): boolean => {
+  if (policy.mode === "all") return true
+  if (policy.mode === "none") return false
   const slash = model.indexOf("/")
   const provider = slash < 0 ? model : model.slice(0, slash)
-  return NOTIFY_DEFAULT_ON_PROVIDERS.has(provider)
+  return policy.providers.has(provider)
 }
 
 /** The effective setting for one slot: an explicit boolean wins, otherwise the provider default. */
-const slotNotify = (slot: Slot): boolean =>
-  typeof slot.notify === "boolean" ? slot.notify : notifyDefault(slot.model)
+const slotNotify = (slot: Slot, policy: NotifyPolicy = BUILTIN_NOTIFY_POLICY): boolean =>
+  typeof slot.notify === "boolean" ? slot.notify : notifyDefault(slot.model, policy)
 
 /**
  * Whether a recovered model should raise the rate-limit-reset notice.
@@ -139,9 +166,9 @@ const slotNotify = (slot: Slot): boolean =>
  * `notify` overrides. A model on several lines is announced if any of its slots
  * is effectively on; a model not in the table follows its provider default.
  */
-export const announcesReset = (slots: Slot[], model: string): boolean => {
+export const announcesReset = (slots: Slot[], model: string, policy: NotifyPolicy = BUILTIN_NOTIFY_POLICY): boolean => {
   const matching = slots.filter((slot) => slot.model === model)
-  return matching.length > 0 ? matching.some((slot) => slotNotify(slot)) : notifyDefault(model)
+  return matching.length > 0 ? matching.some((slot) => slotNotify(slot, policy)) : notifyDefault(model, policy)
 }
 // The pool has no fixed slot count: src/agents.ts generates exactly one hidden
 // variant per base per resolved slot, and the watcher creates a variant when the
@@ -334,6 +361,9 @@ export const USER_MODELS_PATH = join(USER_CONFIG_DIR, "pool.json")
 /** The flat, hand-edited pool file: `model [weight]` per line. Preferred over pool.json. */
 export const USER_MODELS_TXT = join(USER_CONFIG_DIR, "pool.txt")
 
+export const isDefaultPoolOrigin = (origin: string): boolean =>
+  origin === "presets/free-tier.json" || origin === "built-in defaults"
+
 export const FALLBACK_SLOTS: Slot[] = [
   { index: 1, model: "opencode/big-pickle", weight: 3 },
   { index: 2, model: "opencode-go/beam-free", weight: 2 },
@@ -344,20 +374,20 @@ export const FALLBACK_SLOTS: Slot[] = [
 export type SlotFile = { slots: Slot[]; problems: string[] }
 
 /** Human-readable origin of a slot list, used in log lines and warnings. */
-export type ModelsSource = { slots: Slot[]; problems: string[]; origin: string }
+export type ModelsSource = { slots: Slot[]; problems: string[]; origin: string; policy: NotifyPolicy }
 
-const coerceNotify = (raw: unknown, at: string, model: string, problems: string[]): boolean => {
-  if (raw === undefined) return notifyDefault(model)
+const coerceNotify = (raw: unknown, at: string, model: string, problems: string[], policy: NotifyPolicy = BUILTIN_NOTIFY_POLICY): boolean => {
+  if (raw === undefined) return notifyDefault(model, policy)
   if (typeof raw === "boolean") return raw
   if (typeof raw === "string") {
     const s = raw.trim().toLowerCase()
     if (s === "true" || s === "1" || s === "on" || s === "yes") return true
     if (s === "false" || s === "0" || s === "off" || s === "no") return false
     problems.push(`${at} (${model}): notify must be a boolean or one of on/off, got ${JSON.stringify(raw)}; keeping the provider default`)
-    return notifyDefault(model)
+    return notifyDefault(model, policy)
   }
   problems.push(`${at} (${model}): notify must be a boolean or one of on/off, got ${JSON.stringify(raw)}; keeping the provider default`)
-  return notifyDefault(model)
+  return notifyDefault(model, policy)
 }
 
 // Slot indices are the array position, so the source is the only place a slot
@@ -377,7 +407,7 @@ const FALLBACK_MARKER = /^(?:#\s*-*\s*fallback(?:\s+slots)?\s*-*|\[fallback\])$/
 /** Whether a raw `pool.txt` line is the fallback-section marker. */
 export const isFallbackMarker = (line: string): boolean => FALLBACK_MARKER.test(String(line).trim())
 
-function parseSlotEntry(entry: unknown, at: string, problems: string[]): Slot | undefined {
+function parseSlotEntry(entry: unknown, at: string, problems: string[], policy: NotifyPolicy = BUILTIN_NOTIFY_POLICY): Slot | undefined {
   const model = typeof (entry as { model?: unknown })?.model === "string" ? ((entry as { model: string }).model).trim() : ""
   // The only per-model rule there is: a slot must be addressable. Whether it
   // costs money is never inspected (US-7), and a model may appear on more than
@@ -393,7 +423,7 @@ function parseSlotEntry(entry: unknown, at: string, problems: string[]): Slot | 
   if (rawBucket !== undefined && !bucket) {
     problems.push(`${at} (${model}): bucket must be a non-empty name; using the model id`)
   }
-  const notify = coerceNotify((entry as { notify?: unknown }).notify, at, model, problems)
+  const notify = coerceNotify((entry as { notify?: unknown }).notify, at, model, problems, policy)
   const rawContext = (entry as { context?: unknown })?.context
   let context: number | undefined
   if (rawContext !== undefined) {
@@ -419,7 +449,7 @@ function parseSlotEntry(entry: unknown, at: string, problems: string[]): Slot | 
   return { index: 0, model, weight, ...(ceiling === undefined ? {} : { ceiling }), ...(bucket ? { bucket } : {}), notify, ...(context === undefined ? {} : { context }), ...(tpm === undefined ? {} : { tpm }) }
 }
 
-export function parseSlots(parsed: unknown, origin: string): SlotFile {
+export function parseSlots(parsed: unknown, origin: string, policy: NotifyPolicy = BUILTIN_NOTIFY_POLICY): SlotFile {
   const problems: string[] = []
   const primaryEntries = (parsed as { slots?: unknown })?.slots
   const fallbackEntries = (parsed as { fallbackSlots?: unknown })?.fallbackSlots
@@ -430,7 +460,7 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
     if (!Array.isArray(list)) return []
     const out: Slot[] = []
     list.forEach((entry, i) => {
-      const slot = parseSlotEntry(entry, `${fallback ? "fallback slot" : "slot"} ${i + 1}`, problems)
+      const slot = parseSlotEntry(entry, `${fallback ? "fallback slot" : "slot"} ${i + 1}`, problems, policy)
       if (slot) out.push({ ...slot, ...(fallback ? { fallback: true } : {}) })
     })
     return out
@@ -479,7 +509,7 @@ export function parseSlots(parsed: unknown, origin: string): SlotFile {
  * other source, so the rules (first-slash split, weight in range, repeats
  * allowed, no slot cap) are identical everywhere.
  */
-export function parseTextSlots(text: string, origin: string): SlotFile {
+export function parseTextSlots(text: string, origin: string, policy: NotifyPolicy = BUILTIN_NOTIFY_POLICY): SlotFile {
   const entries: Array<{ model: string; weight?: string; ceiling?: number; bucket?: string; notify?: string; context?: number; tpm?: number }> = []
   const fallbackEntries: typeof entries = []
   let section: "primary" | "fallback" = "primary"
@@ -533,22 +563,22 @@ export function parseTextSlots(text: string, origin: string): SlotFile {
     if (section === "fallback") fallbackEntries.push(entry)
     else entries.push(entry)
   }
-  return parseSlots({ slots: entries, ...(fallbackEntries.length > 0 ? { fallbackSlots: fallbackEntries } : {}) }, origin)
+  return parseSlots({ slots: entries, ...(fallbackEntries.length > 0 ? { fallbackSlots: fallbackEntries } : {}) }, origin, policy)
 }
 
 /**
  * Parse a slot file that may be JSON (a leading `{`) or the flat line format, so a
  * user can keep either shape in the same file without the loader caring which.
  */
-export function parseSlotText(text: string, origin: string): SlotFile {
+export function parseSlotText(text: string, origin: string, policy: NotifyPolicy = BUILTIN_NOTIFY_POLICY): SlotFile {
   if (text.trimStart().startsWith("{")) {
     try {
-      return parseSlots(JSON.parse(text), origin)
+      return parseSlots(JSON.parse(text), origin, policy)
     } catch (error) {
       return { slots: FALLBACK_SLOTS, problems: [`${origin} is not valid JSON (${String(error)}); using built-in defaults`] }
     }
   }
-  return parseTextSlots(text, origin)
+  return parseTextSlots(text, origin, policy)
 }
 
 const readJSON = (path: string): { ok: true; value: unknown } | { ok: false; error: string } => {
@@ -587,61 +617,63 @@ function readTextOptional(path: string, origin: string, problems: string[]): str
  *
  * @param input.models     inline `{ slots: [...] }` from plugin options (highest priority)
  * @param input.modelsFile an explicit file, which short-circuits the chain
+ * @param input.notifyProviders per-slot reset-notification provider policy
  */
-export function resolveModels(input: { models?: unknown; modelsFile?: string } = {}): ModelsSource {
+export function resolveModels(input: { models?: unknown; modelsFile?: string; notifyProviders?: unknown } = {}): ModelsSource {
   const problems: string[] = []
+  const policy = notifyPolicy(input.notifyProviders, problems)
 
   if (input.models !== undefined) {
     const origin = "plugin options"
     if (typeof input.models !== "object" || input.models === null || Array.isArray(input.models)) {
-      return { slots: FALLBACK_SLOTS, problems: [`${origin}: "models" must be an object like {"slots":[...]}`], origin }
+      return { slots: FALLBACK_SLOTS, problems: [...problems, `${origin}: "models" must be an object like {"slots":[...]}`], origin, policy }
     }
-    const parsed = parseSlots(input.models, origin)
-    return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin }
+    const parsed = parseSlots(input.models, origin, policy)
+    return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin, policy }
   }
 
   if (input.modelsFile) {
-    const parsed = readSlotFile(input.modelsFile)
-    return { slots: parsed.slots, problems: parsed.problems, origin: input.modelsFile }
+    const parsed = readSlotFile(input.modelsFile, policy)
+    return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin: input.modelsFile, policy }
   }
 
   // 2. the user's own file — the flat pool.txt first, then the JSON pool.json —
   //    then 3. the bundled preset.
   const text = readTextOptional(USER_MODELS_TXT, USER_MODELS_TXT, problems)
   if (text !== undefined) {
-    const parsed = parseSlotText(text, USER_MODELS_TXT)
-    if (parsed.slots !== FALLBACK_SLOTS) return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin: USER_MODELS_TXT }
+    const parsed = parseSlotText(text, USER_MODELS_TXT, policy)
+    if (parsed.slots !== FALLBACK_SLOTS) return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin: USER_MODELS_TXT, policy }
     problems.push(...parsed.problems)
   }
 
   const user = readOptional(USER_MODELS_PATH, USER_MODELS_PATH, problems)
   if (user !== undefined) {
-    const parsed = parseSlots(user, USER_MODELS_PATH)
+    const parsed = parseSlots(user, USER_MODELS_PATH, policy)
     // parseSlots returns the FALLBACK_SLOTS array itself when it had to give up,
     // which is the honest signal that the user's file was structurally broken:
     // fall through to the bundled preset rather than leaving the pool on the
     // generic fallback while a real preset is sitting right there.
-    if (parsed.slots !== FALLBACK_SLOTS) return { slots: parsed.slots, problems, origin: USER_MODELS_PATH }
+    if (parsed.slots !== FALLBACK_SLOTS) return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin: USER_MODELS_PATH, policy }
     problems.push(...parsed.problems)
   }
 
   const preset = readOptional(DEFAULT_PRESET, DEFAULT_PRESET, problems)
   if (preset !== undefined) {
-    const parsed = parseSlots(preset, "presets/free-tier.json")
-    return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin: "presets/free-tier.json" }
+    const parsed = parseSlots(preset, "presets/free-tier.json", policy)
+    return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin: "presets/free-tier.json", policy }
   }
 
-  return { slots: FALLBACK_SLOTS, problems: [...problems, `no pool source found (${USER_MODELS_TXT}, ${USER_MODELS_PATH}, ${DEFAULT_PRESET}); using built-in defaults`], origin: "built-in defaults" }
+  return { slots: FALLBACK_SLOTS, problems: [...problems, `no pool source found (${USER_MODELS_TXT}, ${USER_MODELS_PATH}, ${DEFAULT_PRESET}); using built-in defaults`], origin: "built-in defaults", policy }
 }
 
-export function readSlotFile(path: string): SlotFile {
+export function readSlotFile(path: string, policy: NotifyPolicy = BUILTIN_NOTIFY_POLICY): SlotFile {
   let text: string
   try {
     text = readFileSync(path, "utf8")
   } catch (error) {
     return { slots: FALLBACK_SLOTS, problems: [`${path} unreadable (${String(error)}); using built-in defaults`] }
   }
-  return parseSlotText(text, path)
+  return parseSlotText(text, path, policy)
 }
 
 /**
@@ -949,21 +981,24 @@ export type State = {
   modelsFile?: string
   /** Inline `{ slots: [...] }` from plugin options, if the caller passed one. */
   inlineModels?: unknown
+  notifyProviders?: unknown
+  notifyPolicy: NotifyPolicy
   origin: string
   slots: Slot[]
 }
 
-export function state(opts: { id?: string; dir?: string; modelsFile?: string; models?: unknown } = {}): State {
+export function state(opts: { id?: string; dir?: string; modelsFile?: string; models?: unknown; notifyProviders?: unknown } = {}): State {
   const id = opts.id ?? String(process.pid)
   const dir = opts.dir ?? join(homedir(), ".local", "share", "opencode", "agent-pool")
   const modelsFile = opts.modelsFile
   const models = opts.models
+  const notifyProviders = opts.notifyProviders
   // Keyed by identity so every hook in one process shares one state (same id +
   // dir + models source), while separate ids stay independent. Inline plugin
   // options are keyed by presence, not by value: two calls with the same models
   // object still share, which is what lets the router and the cartographer agree
   // on which slot each other are holding.
-  const key = Symbol.for(`agent-pool:state:${id}:${dir}:${modelsFile ?? ""}:${models === undefined ? "" : "inline"}`)
+  const key = Symbol.for(`agent-pool:state:${id}:${dir}:${modelsFile ?? ""}:${models === undefined ? "" : "inline"}:${notifySignature(notifyProviders)}`)
   const g = globalThis as Record<symbol, State | undefined>
   if (!g[key]) {
     g[key] = {
@@ -997,6 +1032,8 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
       dir,
       modelsFile,
       inlineModels: models,
+      notifyProviders,
+      notifyPolicy: BUILTIN_NOTIFY_POLICY,
       origin: "unresolved",
       slots: [],
     }
@@ -1008,11 +1045,12 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string; mo
 // through reloadSlots() below rather than through this cache.
 export function ensureSlots(s: State, onWarn: (m: string) => void) {
   if (s.slots.length > 0) return s.slots
-  const { slots, problems, origin } = resolveModels({ models: s.inlineModels, modelsFile: s.modelsFile })
+  const { slots, problems, origin, policy } = resolveModels({ models: s.inlineModels, modelsFile: s.modelsFile, notifyProviders: s.notifyProviders })
   s.slots = applyLearnedTpm(s, slots, onWarn)
   s.origin = origin
+  s.notifyPolicy = policy
   for (const problem of problems) onWarn(problem)
-  return slots
+  return s.slots
 }
 
 /**
@@ -1041,12 +1079,16 @@ export type SlotReload = { changed: boolean; slots: Slot[]; origin: string }
  * `changed: false`, so it neither re-binds an agent nor spends a probe.
  */
 export function reloadSlots(s: State, onWarn: (m: string) => void): SlotReload {
-  const { slots, problems, origin } = resolveModels({ models: s.inlineModels, modelsFile: s.modelsFile })
+  const { slots, problems, origin, policy } = resolveModels({ models: s.inlineModels, modelsFile: s.modelsFile, notifyProviders: s.notifyProviders })
   const effective = applyLearnedTpm(s, slots, onWarn)
   const changed = slotSignature(origin, effective) !== slotSignature(s.origin, s.slots)
-  if (!changed) return { changed, slots: s.slots, origin: s.origin }
+  if (!changed) {
+    s.notifyPolicy = policy
+    return { changed, slots: s.slots, origin: s.origin }
+  }
   s.slots = effective
   s.origin = origin
+  s.notifyPolicy = policy
   for (const problem of problems) onWarn(problem)
   return { changed, slots: effective, origin }
 }
@@ -1577,11 +1619,14 @@ export const unmarkProbe = (s: State, sessionID: string) => s.probes.delete(sess
 /** True for a session this process opened to probe a cooled model. */
 export const isProbe = (s: State, sessionID: string) => s.probes.has(sessionID)
 
-export function providerReady(s: State, model: string) {
+export function providerAvailable(s: State, provider: string): boolean {
   if (!s.connectedReady) return true
-  const provider = providerOf(model)
   if (!s.connected.has(provider)) return false
   return s.credentialed.has(provider) || s.configCreds.has(provider) || provider === "opencode"
+}
+
+export function providerReady(s: State, model: string) {
+  return providerAvailable(s, providerOf(model))
 }
 
 export function refreshCatalog(s: State, serverUrl?: URL) {

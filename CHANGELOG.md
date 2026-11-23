@@ -7,7 +7,22 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
-## [Unreleased]
+## [2.3.0] — provider-neutral pools and wrapper-aware empty responses
+
+### Added
+
+- Pool: `notifyProviders` plugin option configures the default rate-limit-reset notice per provider. Absent keeps `["opencode", "opencode-go"]`; `"all"` enables every provider; `"none"` disables all; a `string[]` names provider ids. Per-slot `notify:on|off` (or JSON `notify: true/false`) still overrides the default, and invalid values warn and fall back to the built-in default without throwing.
+- Pool: `pool_status` reports a provider-neutral structure line (`pool structure: N slot(s) across M provider(s); head=..., tail=...`, no intact/BROKEN verdict) when opencode-go is not available; the existing Go contract verdict is unchanged when opencode-go is available. Refresh/selection tooling keeps the opencode-go head/tail/10-slot layout only while opencode-go is available, otherwise builds a provider-neutral, score-ranked pool (`score-ranked models, small-context providers (weight 2), large-context providers (weight 1)`).
+
+### Changed
+
+- Pool: resolving the bundled preset or built-in fallback when none of its providers is configured in opencode logs one warning (naming configured providers and pointing at `~/.config/lacode/pool.txt` or the `models` option) and never auto-selects or routes to unchosen models.
+- Credential sync: now strictly allowlist-scoped — non-allowlisted providers are never added to or overwritten on hosts, no longer defaults to `opencode-go opencode`, and an empty `OC_AUTH_PROVIDERS` skips credential sync.
+
+### Fixed
+
+- Pool: an empty task result is now read from the `<task_result>` body, not the raw tool output. opencode wraps every subagent answer in `<task …><task_result>…</task_result></task>`, so a blank completion arrived as a non-empty string and the empty-response failover never fired — the slot kept winning spawns while callers saw nothing. A `completed` task with no text now benches the model for `empty response` so the next spawn takes another slot; an `error` state (opencode's own DB or transport fault) is left alone and never benches a healthy model.
+- Provider compat: a request rejected by the gateway's `oneOf` schema (`oneOf at '/' not met`) is replayed once with text-only `messages[].content` arrays flattened to strings; a non-text part disables the retry.
 
 ## [2.3.0-beta.8] — route preflight and quieter reset notices
 

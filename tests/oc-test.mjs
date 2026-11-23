@@ -13,6 +13,7 @@ import { test as nodeTest } from "node:test"
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, chmodSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import * as path from "node:path"
+import { join } from "node:path"
 
 const REPO = path.resolve(import.meta.dirname, "..")
 const BIN = path.join(REPO, "bin")
@@ -211,10 +212,30 @@ check("oc-sync keeps --with-auth as an on switch", () => {
   assert(/--with-auth\)\s+WITH_AUTH=1/.test(src), "--with-auth must set WITH_AUTH=1")
 })
 
-check("oc-sync auth allowlist defaults to opencode-go and opencode", () => {
+check("oc-sync has no built-in auth provider allowlist", () => {
   const src = read("oc-sync")
-  assert(/AUTH_PROVIDERS="\$\{OC_AUTH_PROVIDERS:-opencode-go opencode\}"/.test(src),
-    "allowlist must default to opencode-go opencode")
+  assert(/AUTH_PROVIDERS="\$\{OC_AUTH_PROVIDERS:-\}"/.test(src),
+    "AUTH_PROVIDERS must have no built-in default")
+})
+
+check("oc-sync skips credential sync when OC_AUTH_PROVIDERS is empty", () => {
+  const src = read("oc-sync")
+  assert(/\[auth\] OC_AUTH_PROVIDERS is empty; skipping credential sync/.test(src),
+    "must print clear skip message when OC_AUTH_PROVIDERS is empty")
+  assert(/sync_auth\(\)\s*\{[\s\S]*?if \[\[ -z "\$\{AUTH_PROVIDERS\/\/\[[:space:\]\]\/\}" \]\]; then[\s\S]*?skipping credential sync[\s\S]*?return 0/.test(src),
+    "sync_auth must short-circuit before building/sending payload when allowlist is empty")
+})
+
+check("oc-sync remote auth merge is scoped to allowlist providers only", () => {
+  const src = read("oc-sync")
+  assert(/for pid, val in providers\.items\(\):\n\s+if pid not in replace_set:\n\s+continue/.test(src),
+    "merge loop must skip non-allowlisted providers")
+  assert(/if pid in cur:\n\s+if pid in replace_set and cur\[pid\] != val:\n\s+new_cur\[pid\] = val\n\s+updated\.append\(pid\)/.test(src),
+    "allowlisted differing provider must still be replaced")
+  assert(/else:\n\s+new_cur\[pid\] = val\n\s+added\.append\(pid\)/.test(src),
+    "allowlisted missing provider must still be added")
+  assert(!/new_cur\s*=\s*\{\}|del new_cur\[|prune/i.test(src),
+    "merge must not add removal/prune behavior")
 })
 
 check("oc-sync remote helper reports UPDATED/ADDED and uses os.replace", () => {
@@ -316,6 +337,40 @@ check("every synced item is read from the tree that owns it", () => {
   // .opencode/ carries a package.json, a lockfile and tens of megabytes of
   // node_modules in both trees, so only prompts/ may be pushed.
   assert(!/push "\.opencode\/" /.test(src), "the whole .opencode/ must not be pushed, only .opencode/prompts/")
+})
+
+check("prepare_config inlines project-relative prompt files", () => {
+  const src = read("oc-sync")
+  const block = /<<'PY'\n([\s\S]*?)\nPY\n/.exec(src)
+  assert(block, "prepare_config must embed a PY program")
+
+  const dir = mkdtempSync(join(tmpdir(), "oc-inline-"))
+  try {
+    const cfg = join(dir, "cfg")
+    mkdirSync(join(cfg, ".opencode", "prompts"), { recursive: true })
+    writeFileSync(join(cfg, ".opencode", "prompts", "build.txt"), 'hello "world"\nline2 caf\u00e9\n')
+    writeFileSync(
+      join(cfg, "opencode.jsonc"),
+      '{ "agent": { "build": { "prompt": "{file:./.opencode/prompts/build.txt}" } } }\n',
+    )
+
+    const prog = join(dir, "prog.py")
+    writeFileSync(prog, block[1] + "\n")
+    const dest = join(dir, "out.jsonc")
+    const stdout = execFileSync(
+      "python3",
+      [prog, join(cfg, "opencode.jsonc"), dest, REPO, cfg],
+      { encoding: "utf8" },
+    )
+
+    const text = readFileSync(dest, "utf8")
+    assert(!text.includes("{file:"), "no {file: reference may survive")
+    assert(text.includes('hello \\"world\\"'), "the prompt text must be inlined and JSON-escaped")
+    const fields = stdout.trim().split(/\s+/)
+    assert(fields[fields.length - 1] === "1", "one prompt file must be reported inlined")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 check("the host list still comes from .env, found in the config dir", () => {

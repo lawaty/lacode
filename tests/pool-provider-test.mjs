@@ -37,6 +37,8 @@ const clearCooldown = () => {
   clock += MODEL_MISSING_COOLDOWN_MS + 1000
 }
 
+import * as pool from "../src/lib/pool.ts"
+
 const { agentPoolHooks: AgentPool } = await import(PLUGIN)
 
 // Scenario 1
@@ -237,7 +239,132 @@ const { agentPoolHooks: AgentPool } = await import(PLUGIN)
   assert(s1 === "explore-1", `config-resolved credential should allow routing, got ${s1}`)
 }
 
-Date.now = REAL
+// Scenario 4: providerAvailable semantics (no routing/cooldown/probe changes)
+{
+  const dir = scratch()
+  const s = pool.state({ id: "provider-available-1", dir })
+  assert(pool.providerAvailable(s, "missing") === true, "providerAvailable must fail-open when connectedReady=false")
+
+  s.connectedReady = true
+  s.connected = new Set()
+  s.credentialed = new Set()
+  s.configCreds = new Set()
+  assert(pool.providerAvailable(s, "missing") === false, "providerAvailable must be false when connectedReady=true and provider absent from connected")
+
+  s.connected = new Set(["missing"])
+  s.credentialed = new Set(["missing"])
+  assert(pool.providerAvailable(s, "missing") === true, "providerAvailable must be true when connected+credentialed")
+
+  s.connected = new Set(["opencode"])
+  s.credentialed = new Set()
+  s.configCreds = new Set()
+  assert(pool.providerAvailable(s, "opencode") === true, "providerAvailable must treat opencode as available when connected")
+}
+
+// Scenario 5: default origin with all slot providers absent from cfg.provider warns once
+{
+  const dir = scratch()
+  const warns = []
+  const client = {
+    app: { log: async ({ body }) => { if (body.level === "warn") warns.push(body.message) } },
+    provider: { list: async () => ({ data: { connected: [], all: [] } }) },
+  }
+  const hooks = await AgentPool({ client, serverUrl: new URL("http://127.0.0.1:59999") }, { id: "provider-5", dir })
+  const st = pool.state({ id: "provider-5", dir })
+  st.origin = "presets/free-tier.json"
+  st.slots = [
+    { index: 1, model: "absenta/a", weight: 1 },
+    { index: 2, model: "absentb/b", weight: 1 },
+  ]
+  const cfg5 = shippedConfig()
+  cfg5.provider = { myprov: { options: { apiKey: "k" } } }
+  await hooks.config(cfg5)
+  await hooks.config(cfg5)
+  const bundled = warns.filter((m) => m.includes("the bundled pool (") && m.includes("pool.txt"))
+  assert(bundled.length === 1, `expected exactly one bundled-pool warning, got ${bundled.length}: ${JSON.stringify(warns)}`)
+  if (bundled.length === 1) {
+    assert(bundled[0].includes("presets/free-tier.json"), `warning must mention default origin, got: ${bundled[0]}`)
+    assert(bundled[0].includes("absenta, absentb"), `warning must mention slot providers in order, got: ${bundled[0]}`)
+    assert(bundled[0].includes("myprov"), `warning must mention configured provider id, got: ${bundled[0]}`)
+    assert(bundled[0].includes(pool.USER_MODELS_TXT), `warning must mention pool.txt path, got: ${bundled[0]}`)
+  }
+}
+
+// Scenario 5b: skip warning when providers is undefined or empty
+{
+  const dir = scratch()
+  const warns = []
+  const client = {
+    app: { log: async ({ body }) => { if (body.level === "warn") warns.push(body.message) } },
+    provider: { list: async () => ({ data: { connected: [], all: [] } }) },
+  }
+  const hooks = await AgentPool({ client, serverUrl: new URL("http://127.0.0.1:59999") }, { id: "provider-5b", dir })
+  const st = pool.state({ id: "provider-5b", dir })
+  st.origin = "built-in defaults"
+  st.slots = [{ index: 1, model: "absenta/a", weight: 1 }]
+  const cfgU = shippedConfig()
+  delete cfgU.provider
+  await hooks.config(cfgU)
+  const cfgE = shippedConfig()
+  cfgE.provider = {}
+  await hooks.config(cfgE)
+  const bundled = warns.filter((m) => m.includes("the bundled pool ("))
+  assert(bundled.length === 0, `must skip warning when providers undefined/empty, got: ${JSON.stringify(bundled)}`)
+}
+
+// Scenario 6: user origin (plugin options) with same mismatch -> no bundled-pool warning
+{
+  const dir = scratch()
+  const warns = []
+  const client = {
+    app: { log: async ({ body }) => { if (body.level === "warn") warns.push(body.message) } },
+    provider: { list: async () => ({ data: { connected: [], all: [] } }) },
+  }
+  const hooks = await AgentPool(
+    { client, serverUrl: new URL("http://127.0.0.1:59999") },
+    { id: "provider-6", dir, models: { slots: [{ model: "absent/x", weight: 1 }] } },
+  )
+  const cfg6 = shippedConfig()
+  cfg6.provider = { myprov: { options: { apiKey: "k" } } }
+  await hooks.config(cfg6)
+  await hooks.tool.pool_status.execute({}, {})
+  const bundled = warns.filter((m) => m.includes("the bundled pool ("))
+  assert(bundled.length === 0, `plugin-options origin must not emit bundled-pool warning, got: ${JSON.stringify(bundled)}`)
+}
+
+// Scenario 7: default origin + one slot provider present in cfg.provider -> no warning
+{
+  const dir = scratch()
+  const warns = []
+  const client = {
+    app: { log: async ({ body }) => { if (body.level === "warn") warns.push(body.message) } },
+    provider: { list: async () => ({ data: { connected: [], all: [] } }) },
+  }
+  const hooks = await AgentPool({ client, serverUrl: new URL("http://127.0.0.1:59999") }, { id: "provider-7", dir })
+  const st = pool.state({ id: "provider-7", dir })
+  st.origin = "built-in defaults"
+  st.slots = [
+    { index: 1, model: "absenta/a", weight: 1 },
+    { index: 2, model: "present/b", weight: 1 },
+  ]
+  const cfg7 = shippedConfig()
+  cfg7.provider = { present: { options: { apiKey: "k" } }, myprov: { options: { apiKey: "k" } } }
+  await hooks.config(cfg7)
+  const bundled = warns.filter((m) => m.includes("the bundled pool ("))
+  assert(bundled.length === 0, `must not warn when a slot provider is configured, got: ${JSON.stringify(bundled)}`)
+}
+
+// Scenario 8: isDefaultPoolOrigin classification
+{
+  assert(pool.isDefaultPoolOrigin("presets/free-tier.json") === true, "presets/free-tier.json must be default origin")
+  assert(pool.isDefaultPoolOrigin("built-in defaults") === true, "built-in defaults must be default origin")
+  assert(pool.isDefaultPoolOrigin("plugin options") === false, "plugin options must not be default origin")
+  assert(pool.isDefaultPoolOrigin(pool.USER_MODELS_TXT) === false, "USER_MODELS_TXT must not be default origin")
+  assert(pool.isDefaultPoolOrigin(pool.USER_MODELS_PATH) === false, "USER_MODELS_PATH must not be default origin")
+  assert(pool.isDefaultPoolOrigin("/tmp/custom-pool.txt") === false, "arbitrary path must not be default origin")
+}
+
+Date.now = () => REAL
 for (const dir of made) rmSync(dir, { recursive: true, force: true })
 if (failures === 0) {
   console.log("\nALL CHECKS PASSED")

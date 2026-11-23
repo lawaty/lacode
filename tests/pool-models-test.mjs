@@ -422,6 +422,38 @@ for (let i = 1; i <= shipped.slots.length; i++) {
   assert(pool.announcesReset([], "groq/z") === false, "[US-34] announcesReset empty groq/z -> false")
   const slotsGroqOn = [{ index: 1, model: "groq/z", weight: 1, notify: true }]
   assert(pool.announcesReset(slotsGroqOn, "groq/z") === true, "[US-34] announcesReset groq slot notify:true -> true")
+
+  // notifyProviders policy: default, all, none, set, explicit override, invalid, announcesReset not-in-table
+  const models = { slots: [{ model: "opencode/go", weight: 1 }, { model: "opencode-go/x", weight: 1 }, { model: "acme/y", weight: 1 }] }
+  const base = pool.resolveModels({ models })
+  assert(base.slots.find((s) => s.model === "opencode/go")?.notify === true, "[US-34] default opencode notify true")
+  assert(base.slots.find((s) => s.model === "opencode-go/x")?.notify === true, "[US-34] default opencode-go notify true")
+  assert(base.slots.find((s) => s.model === "acme/y")?.notify === false, "[US-34] default acme notify false")
+
+  const all = pool.resolveModels({ models: { slots: [{ model: "acme/y", weight: 1 }] }, notifyProviders: "all" })
+  assert(all.slots[0].notify === true, '[US-34] notifyProviders:"all" -> acme slot true')
+
+  const none = pool.resolveModels({ models: { slots: [{ model: "opencode/go", weight: 1 }] }, notifyProviders: "none" })
+  assert(none.slots[0].notify === false, '[US-34] notifyProviders:"none" -> opencode false')
+
+  const set = pool.resolveModels({ models: { slots: [{ model: "acme/y", weight: 1 }, { model: "opencode/go", weight: 1 }] }, notifyProviders: ["acme"] })
+  assert(set.slots.find((s) => s.model === "acme/y")?.notify === true, '[US-34] notifyProviders:["acme"] -> acme true')
+  assert(set.slots.find((s) => s.model === "opencode/go")?.notify === false, '[US-34] notifyProviders:["acme"] -> opencode false')
+
+  const explicit = pool.resolveModels({ models: { slots: [{ model: "opencode/go", weight: 1, notify: false }] }, notifyProviders: "all" })
+  assert(explicit.slots[0].notify === false, '[US-34] explicit notify:false stays false under "all"')
+
+  const invalid = pool.resolveModels({ models: { slots: [{ model: "opencode/go", weight: 1 }] }, notifyProviders: 42 })
+  assert(invalid.problems.some((p) => p.includes("notifyProviders")), "[US-34] invalid 42 -> problem mentioning notifyProviders")
+  assert(invalid.slots[0].notify === true, "[US-34] invalid 42 falls back to built-in (Go default)")
+
+  const polAll = pool.notifyPolicy("all")
+  const polNone = pool.notifyPolicy("none")
+  const polSet = pool.notifyPolicy(["acme"])
+  assert(pool.announcesReset([], "acme/z", polAll) === true, "[US-34] announcesReset policy all for not-in-table acme -> true")
+  assert(pool.announcesReset([], "opencode/z", polNone) === false, "[US-34] announcesReset policy none for not-in-table opencode -> false")
+  assert(pool.announcesReset([], "acme/z", polSet) === true, "[US-34] announcesReset policy [acme] for not-in-table acme -> true")
+  assert(pool.announcesReset([], "opencode/z", polSet) === false, "[US-34] announcesReset policy [acme] for not-in-table opencode -> false")
 }
 
 import { test } from "node:test"

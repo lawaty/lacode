@@ -24,7 +24,7 @@ import { homedir, tmpdir, userInfo } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { fetchProviderStatus, statusDeprioritizedProviders } from "./provider-status.mjs"
-import { POOL_SIZE, isTransientFailure, parsePoolSlots, poolStructureValid } from "./pool-selection.mjs"
+import { POOL_SIZE, isTransientFailure, parsePoolSlots, poolStructureValid, providerOf } from "./pool-selection.mjs"
 
 const HOME = homedir()
 export const DEFAULT_SCORES_PATH = join(HOME, ".config", "lacode", "model-scores.json")
@@ -120,10 +120,13 @@ function splitHeaderAndSlots(text) {
   return { header: lines.slice(0, first), slots: lines.slice(first) }
 }
 
-function refreshComment(now, scoresGeneratedAt) {
+function refreshComment(now, scoresGeneratedAt, goMode) {
   const when = now instanceof Date ? now.toISOString() : String(now)
   const gen = scoresGeneratedAt ? ` (scores generated ${scoresGeneratedAt})` : ""
-  return `# Refreshed ${when} from model-scores.json${gen}: opencode-go first (weight 4), small-context providers (weight 2), large-context providers (weight 1), opencode last (max 1).`
+  const layout = goMode
+    ? "opencode-go first (weight 4), small-context providers (weight 2), large-context providers (weight 1), opencode last (max 1)."
+    : "score-ranked models, small-context providers (weight 2), large-context providers (weight 1)."
+  return `# Refreshed ${when} from model-scores.json${gen}: ${layout}`
 }
 
 function withRefreshComment(headerLines, comment) {
@@ -178,7 +181,8 @@ export function buildPool(input) {
   const { header } = splitHeaderAndSlots(input?.currentPoolText ?? "")
   const outSlots = selection.map((entry) => formatGeneratedLine(entry.model, entry.weight, entry.bucket, entry.context, ceilingOf(entry)))
   const outFallback = fallback.map((entry) => formatGeneratedLine(entry.model, entry.weight, entry.bucket, entry.context, ceilingOf(entry)))
-  const comment = refreshComment(input?.now ?? new Date(), scores.generatedAt)
+  const goMode = parsePoolSlots(outSlots.join("\n")).some((slot) => providerOf(slot.model) === "opencode-go")
+  const comment = refreshComment(input?.now ?? new Date(), scores.generatedAt, goMode)
   const outHeader = withRefreshComment(header, comment)
   const text = [...outHeader, "", ...outSlots, ...(outFallback.length > 0 ? ["", FALLBACK_MARKER, ...outFallback] : []), ""].join("\n")
   return {
@@ -354,21 +358,29 @@ export function applyScanBench({ dir, bench, clear }) {
 
 /**
  * Pure fail-closed guard. A refresh must never break the pool's structure or
- * replace a working pool with a degenerate selection: the new pool must keep
- * the opencode-go head and the opencode tail the current pool has, and hold at
- * least half of POOL_SIZE. The baseline is the contract size, never the
- * current file — a previously shrunk pool can always grow back, but no write
- * may shrink or behead it. There is no previous pool on a first-ever run, so
- * there is nothing to protect and the guard passes. `--force-write` is the
- * human override for a genuinely changed catalogue.
+ * replace a working pool with a degenerate selection. In opencode-go mode the
+ * new pool must keep the opencode-go head and the opencode tail and hold at
+ * least half of POOL_SIZE; a provider-neutral pool is protected from an
+ * empty/zero-slot selection but has no large keep threshold. The baseline is
+ * the contract size, never the current file — a previously shrunk pool can
+ * always grow back, but no write may shrink or behead it. There is no previous
+ * pool on a first-ever run, so there is nothing to protect and the guard passes.
+ * `--force-write` is the human override for a genuinely changed catalogue.
  */
 export function shouldKeepPool({ currentPoolText, newSlots }) {
   const prev = poolSlotCount(currentPoolText ?? "")
   if (prev <= 0) return { keep: false, prev, threshold: 0, reason: "no previous pool to protect" }
   const slots = Array.isArray(newSlots) ? newSlots : []
-  const threshold = Math.max(MIN_POOL_SLOTS, Math.floor(POOL_SIZE / 2))
-  const currentCheck = poolStructureValid(currentPoolText)
-  const newCheck = poolStructureValid(slots)
+  const proposedText = Array.isArray(newSlots) ? newSlots.join("\n") : String(newSlots ?? "")
+  // Apply the opencode-go head/tail contract only when opencode-go is part of
+  // the pool (present now or being introduced); a provider-neutral pool validates
+  // generically and must not be refused forever for being below the Go size.
+  const goMode =
+    parsePoolSlots(currentPoolText).some((slot) => providerOf(slot.model) === "opencode-go") ||
+    parsePoolSlots(proposedText).some((slot) => providerOf(slot.model) === "opencode-go")
+  const threshold = goMode ? Math.max(MIN_POOL_SLOTS, Math.floor(POOL_SIZE / 2)) : 1
+  const currentCheck = poolStructureValid(currentPoolText, { go: goMode })
+  const newCheck = poolStructureValid(slots, { go: goMode })
   if (currentCheck.valid && !newCheck.valid) {
     return {
       keep: true,
@@ -393,12 +405,12 @@ export function shouldKeepPool({ currentPoolText, newSlots }) {
  * means recheck on the cadence. No retry information at all also means the
  * cadence.
  */
-export function degradedRetryDelay(retry, now = Date.now()) {
+export function degradedRetryDelay(retry, now = Date.now(), cap = DEGRADED_RETRY_S) {
   const at = Date.parse(retry?.after ?? "")
-  if (!Number.isFinite(at)) return DEGRADED_RETRY_S
+  if (!Number.isFinite(at)) return cap
   const wait = Math.ceil((at - now) / 1000)
-  if (wait <= 0) return DEGRADED_RETRY_S
-  return Math.min(wait, DEGRADED_RETRY_S)
+  if (wait <= 0) return cap
+  return Math.min(wait, cap)
 }
 
 export function scheduleRetryIn(seconds, options = {}) {
@@ -544,6 +556,8 @@ function usage() {
   --canary          probe only the current pool members; run a full scan only
                     when one stops answering (used by degraded rechecks)
   --max N           models per provider passed to the scorer (default: 50)
+  --retry-interval <seconds>  degraded retry cadence in seconds (clamped to 60..86400, default ${DEGRADED_RETRY_S})
+  --retry-jitter <seconds>    add random jitter in [0, N] seconds to retry cadence (clamped to 0..3600, default 0)
   --scores PATH     scores file (default: ${DEFAULT_SCORES_PATH})
   --pool PATH       pool file to read/compare/write (default: ${DEFAULT_POOL_PATH})
   --force-write   write the new selection even when the fail-closed guard would
@@ -555,11 +569,12 @@ https://status.opencode.ai/api/status. The page is a hint, never a verdict:
 sick providers are only probed last, and nothing is ever skipped or benched
 because of it. A canary (--canary, used by every degraded recheck) probes only
 the current pool members and runs a full scan solely when one stops answering.
-After a scan, a selection that breaks the pool structure or falls below half
-the contract pool size (minimum ${MIN_POOL_SLOTS} slots) is never written; the
-previous pool is kept, transiently failed members are still benched in place,
-and a 5-minute canary recheck is scheduled. A retry is always rechecked
-within 5 minutes while anything failed, even when the stated reset is hours out.`)
+After a scan, a selection that breaks the pool structure or (when opencode-go
+is available, the default layout) falls below half the contract pool size
+(minimum ${MIN_POOL_SLOTS} slots) is never written; the previous pool is kept,
+transiently failed members are still benched in place, and a 5-minute canary
+recheck is scheduled. A retry is always rechecked within 5 minutes while
+anything failed, even when the stated reset is hours out.`)
 }
 
 async function main() {
@@ -581,6 +596,13 @@ async function main() {
   const max = Math.max(1, Number(value("--max", "50")) || 50)
   const scoresPath = value("--scores", DEFAULT_SCORES_PATH)
   const poolPath = value("--pool", DEFAULT_POOL_PATH)
+  let retryInterval = Number(value("--retry-interval", String(DEGRADED_RETRY_S)))
+  if (!Number.isFinite(retryInterval) || retryInterval < 60 || retryInterval > 86400) retryInterval = DEGRADED_RETRY_S
+  let retryJitter = Number(value("--retry-jitter", "0"))
+  if (!Number.isFinite(retryJitter)) retryJitter = 0
+  retryJitter = Math.floor(retryJitter)
+  if (retryJitter < 0) retryJitter = 0
+  if (retryJitter > 3600) retryJitter = 3600
 
   if (!printOnly) {
     if (!acquireRefreshLock()) {
@@ -624,7 +646,8 @@ async function main() {
     } catch (error) {
       console.error(`scorer failed; pool.txt not written: ${String(error?.message ?? error)}`)
       if (!printOnly && !noRetry) {
-        const scheduled = scheduleRetrySoon()
+        const delay = retryInterval + (retryJitter > 0 ? Math.floor(Math.random() * (retryJitter + 1)) : 0)
+        const scheduled = scheduleRetrySoon(delay)
         console.log(
           scheduled.scheduled
             ? `scheduled degraded recheck in ${scheduled.seconds}s`
@@ -651,7 +674,8 @@ async function main() {
   } catch (error) {
     console.error(`refresh refused (fail closed): ${String(error?.message ?? error)}`)
     if (!printOnly && !noRetry) {
-      const scheduled = scheduleRetrySoon()
+      const delay = retryInterval + (retryJitter > 0 ? Math.floor(Math.random() * (retryJitter + 1)) : 0)
+      const scheduled = scheduleRetrySoon(delay)
       console.log(
         scheduled.scheduled
           ? `scheduled degraded recheck in ${scheduled.seconds}s`
@@ -694,7 +718,8 @@ async function main() {
     if (kept.keep) {
       console.error(`refresh refused (fail closed): ${kept.reason}`)
       if (!noRetry) {
-        const scheduled = scheduleRetrySoon()
+        const delay = retryInterval + (retryJitter > 0 ? Math.floor(Math.random() * (retryJitter + 1)) : 0)
+        const scheduled = scheduleRetrySoon(delay)
         console.log(
           scheduled.scheduled
             ? `scheduled degraded recheck in ${scheduled.seconds}s`
@@ -707,7 +732,8 @@ async function main() {
   }
 
   if (!printOnly && !noRetry && scores.retry) {
-    const scheduled = scheduleRetrySoon(degradedRetryDelay(scores.retry))
+    const delay = degradedRetryDelay(scores.retry, Date.now(), retryInterval) + (retryJitter > 0 ? Math.floor(Math.random() * (retryJitter + 1)) : 0)
+    const scheduled = scheduleRetrySoon(delay)
     if (scheduled.scheduled) {
       console.log(`scheduled retry in ${scheduled.seconds}s for ${scores.retry.models.length} model(s) (reset ${scores.retry.after})`)
     } else {

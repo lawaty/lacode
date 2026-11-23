@@ -49,17 +49,45 @@ own bucket. `pool_status` shows each shared bucket's effective capacity.
 Each slot gets a `notify` flag that controls the desktop "rate-limit reset"
 notice raised when a slot that was cooling for a quota/rate-limit reason becomes
 usable again. The default is **provider-based**: on for `opencode` and
-`opencode-go` slots, off for every other provider. On a `pool.txt` line, set
+`opencode-go` slots, off for every other provider, and that default is
+configurable with `notifyProviders` (see below). On a `pool.txt` line, set
 `notify:on` to opt a quiet provider's slot into the notice, or `notify:off` to
 silence an `opencode`/`opencode-go` slot; `notify:on`/`notify:off` are accepted
-explicitly. In `pool.json`, set `"notify": true` or `"notify": false`
+explicitly. In `pool.json`, set `"notify": true` or `"notify": false"
 (booleans; `on/off/1/0/yes/no` strings are also accepted). If the same model
 appears on several lines, it is announced if **any** of its slots has `notify`
 on — to fully silence a model, set `notify:off` on all of its lines. An
-invalid `notify` value falls back to the provider default and produces a
-warning. The flag gates only the desktop reset notice, not pool routing or
+invalid per-slot `notify` value falls back to the provider default and produces
+a warning. The flag gates only the desktop reset notice, not pool routing or
 status, and pool files are hot-reloaded so changes take effect without a
 restart.
+
+The plugin option `notifyProviders` sets the provider default:
+
+- Absent → the default stays `["opencode", "opencode-go"]` (unchanged).
+- `"all"` → every provider's slots announce the rate-limit-reset notice by default.
+- `"none"` → none announce by default.
+- `string[]` → exactly those provider ids.
+
+Per-slot `notify:on|off` (or JSON `notify: true/false`) still overrides the
+provider default. Invalid `notifyProviders` values produce one warning and fall
+back to the built-in default; they never throw.
+
+## Using providers other than opencode
+
+The pool accepts any `provider/model-id` slot. The bundled preset is only an
+example, built from opencode/opencode-go models; it is not a requirement. If the
+resolved pool came from the bundled preset or the built-in fallback and none of
+the providers it names is configured in opencode, the plugin logs one warning
+naming the configured providers and pointing at `~/.config/lacode/pool.txt` or
+the `models` option. It deliberately does not auto-select or route to models the
+user did not choose.
+
+`pool_status` reports a provider-neutral structure line when opencode-go is not
+available in the running opencode (`pool structure: N slot(s) across M
+provider(s); head=..., tail=...`, with no intact/BROKEN verdict). When
+opencode-go is available, the existing Go contract verdict (`intact`/`BROKEN`,
+opencode-go head / opencode tail) is unchanged.
 
 ## Modes
 

@@ -15,9 +15,11 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   createChunkNormalizer,
+  flattenTextContent,
   installProviderCompat,
   isOpencodeInferenceChat,
   isReplayableInit,
+  isSchemaRejection,
   isTransientUpstreamResponse,
   normalizeChunk,
   normalizeSseLine,
@@ -268,6 +270,17 @@ const transient400 = () =>
     { status: 400, headers: { "content-type": "application/json" } },
   )
 
+const schema400 = () =>
+  new Response(
+    JSON.stringify({
+      errors: [{ message: "AiError: Bad input: Error: oneOf at '/' not met, 0 matches", code: 5006 }],
+      success: false,
+      result: {},
+      messages: [],
+    }),
+    { status: 400, headers: { "content-type": "application/json" } },
+  )
+
 const okJson = () =>
   new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] }), {
     status: 200,
@@ -385,4 +398,130 @@ test("a successful SSE stream is returned without retry and still normalized", a
   const out = await wrapped(GO_CHAT, { method: "POST", body: "{}" })
   assert.equal(calls, 1)
   assert.equal(JSON.parse((await out.text()).slice("data: ".length)).choices[0].delta.reasoning, "**")
+})
+
+test("flattenTextContent joins array content parts and preserves plain content", () => {
+  const body = JSON.stringify({
+    messages: [
+      { role: "user", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] },
+      { role: "assistant", content: "plain" },
+    ],
+  })
+  const out = flattenTextContent(body)
+  assert.equal(typeof out, "string")
+  const parsed = JSON.parse(out)
+  assert.equal(parsed.messages[0].content, "a\nb")
+  assert.equal(parsed.messages[1].content, "plain")
+})
+
+test("flattenTextContent returns undefined when a content array contains a non-text part", () => {
+  const body = JSON.stringify({
+    messages: [{ role: "user", content: [{ type: "text", text: "a" }, { type: "image", image: "..." }] }],
+  })
+  assert.equal(flattenTextContent(body), undefined)
+})
+
+test("flattenTextContent returns undefined when no message has array content", () => {
+  const body = JSON.stringify({ messages: [{ role: "user", content: "plain" }] })
+  assert.equal(flattenTextContent(body), undefined)
+})
+
+test("flattenTextContent returns undefined for a non-string body and for invalid JSON", () => {
+  assert.equal(flattenTextContent({ messages: [] }), undefined)
+  assert.equal(flattenTextContent("{not json"), undefined)
+})
+
+test("isSchemaRejection returns true for a 400 with the schema rejection body", async () => {
+  const body = '{"errors":[{"message":"AiError: Bad input: Error: oneOf at \'/\' not met, 0 matches: required properties at \'/\' are \'prompt\'","code":5006}],"success":false,"result":{},"messages":[]}'
+  const response = new Response(body, { status: 400 })
+  assert.equal(await isSchemaRejection(response), true)
+})
+
+test("isSchemaRejection returns false for a 500 with the same body and for a 400 with an unrelated body", async () => {
+  const body = '{"errors":[{"message":"AiError: Bad input: Error: oneOf at \'/\' not met, 0 matches: required properties at \'/\' are \'prompt\'","code":5006}],"success":false,"result":{},"messages":[]}'
+  assert.equal(await isSchemaRejection(new Response(body, { status: 500 })), false)
+  assert.equal(await isSchemaRejection(new Response(JSON.stringify({ error: "invalid request" }), { status: 400 })), false)
+})
+
+test("isSchemaRejection does not consume the original response", async () => {
+  const body = '{"errors":[{"message":"AiError: Bad input: Error: oneOf at \'/\' not met, 0 matches: required properties at \'/\' are \'prompt\'","code":5006}],"success":false,"result":{},"messages":[]}'
+  const response = new Response(body, { status: 400 })
+  assert.equal(await isSchemaRejection(response), true)
+  assert.equal(await response.text(), body)
+})
+
+test("a schema-rejected request is replayed once with text content flattened, on any host", async () => {
+  let calls = 0
+  const inits = []
+  const original = async (input, init) => {
+    calls++
+    inits.push(init)
+    return calls === 1 ? schema400() : okJson()
+  }
+  const wrapped = wrapFetch(original, { delayMs: 0 })
+  const body = JSON.stringify({
+    messages: [
+      { role: "system", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] },
+      { role: "user", content: "hi" },
+    ],
+  })
+  const out = await wrapped("https://example.test/v1/chat/completions", { method: "POST", body })
+  assert.equal(calls, 2)
+  assert.equal(out.status, 200)
+  const parsed = JSON.parse(inits[1].body)
+  assert.equal(parsed.messages[0].content, "a\nb")
+  assert.equal(parsed.messages[1].content, "hi")
+})
+
+test("the schema retry happens at most once", async () => {
+  let calls = 0
+  const original = async () => {
+    calls++
+    return schema400()
+  }
+  const wrapped = wrapFetch(original, { delayMs: 0 })
+  const body = JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] })
+  const out = await wrapped("https://example.test/v1/chat/completions", { method: "POST", body })
+  assert.equal(calls, 2)
+  assert.equal(out.status, 400)
+})
+
+test("a schema rejection with a non-text part is not retried", async () => {
+  let calls = 0
+  const original = async () => {
+    calls++
+    return schema400()
+  }
+  const wrapped = wrapFetch(original, { delayMs: 0 })
+  const body = JSON.stringify({
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }, { type: "image", image: "x" }] }],
+  })
+  const out = await wrapped("https://example.test/v1/chat/completions", { method: "POST", body })
+  assert.equal(calls, 1)
+  assert.equal(out.status, 400)
+})
+
+test("a non-replayable body is not retried on a schema rejection", async () => {
+  let calls = 0
+  const original = async () => {
+    calls++
+    return schema400()
+  }
+  const wrapped = wrapFetch(original, { delayMs: 0 })
+  const out = await wrapped("https://example.test/v1/chat/completions", { method: "POST", body: new ReadableStream() })
+  assert.equal(calls, 1)
+  assert.equal(out.status, 400)
+})
+
+test("a non-schema 400 is not retried", async () => {
+  let calls = 0
+  const original = async () => {
+    calls++
+    return new Response("nope", { status: 400 })
+  }
+  const wrapped = wrapFetch(original, { delayMs: 0 })
+  const body = JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] })
+  const out = await wrapped("https://example.test/v1/chat/completions", { method: "POST", body })
+  assert.equal(calls, 1)
+  assert.equal(out.status, 400)
 })

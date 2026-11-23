@@ -199,6 +199,21 @@ export function estimateContextTokens(prompt: unknown): number | undefined {
   return Math.ceil(prompt.length / 4) + CONTEXT_HEADROOM_TOKENS
 }
 
+/**
+ * The text a `task` tool result actually carries. opencode wraps a subagent's
+ * answer in `<task id="…" state="…">\n<task_result>…</task_result>\n</task>`,
+ * so an empty answer arrives as a NON-empty string with an empty result BODY --
+ * never `""`. Reading `output.output` alone therefore misses every empty
+ * completion and the model keeps winning spawns while callers see a blank
+ * result. Falls back to the whole string when the markup is absent (older
+ * opencode shapes, plain-text tools, and tests).
+ */
+export function taskResultBody(text: string): { state?: string; body: string } {
+  const state = /<task\b[^>]*\bstate="([^"]*)"/i.exec(text)?.[1]?.toLowerCase()
+  const body = /<task_result>([\s\S]*?)<\/task_result>/i.exec(text)?.[1] ?? text
+  return { state, body }
+}
+
 type AbortReport = {
   slot: number
   model: string
@@ -227,6 +242,8 @@ export type AgentPoolOptions = {
   modelsFile?: string
   /** Inline `{ slots: [...] }`, highest priority in the resolution chain. */
   models?: unknown
+  /** Per-slot reset-notification provider default: "all", "none", or provider ids. */
+  notifyProviders?: string[] | "all" | "none"
   /** Desktop notice seam; tests inject their own. Defaults to the notification helper. */
   notify?: (title: string, message: string) => void
   /** How often to watch for cooldowns that simply expire; 15s default, 0 disables. */
@@ -248,16 +265,25 @@ export type AgentPoolOptions = {
  * and the live status-page hint. Every source is best-effort — a missing file
  * drops its line instead of failing the status.
  */
-const poolHealthLines = (slots: pool.Slot[], now: number): string[] => {
+const poolHealthLines = (slots: pool.Slot[], now: number, goContract: boolean): string[] => {
   const lines: string[] = []
-  const heads = slots.filter((slot) => slot.model.startsWith("opencode-go/"))
-  const headOk = heads.length > 0 && slots.slice(0, heads.length).every((slot) => slot.model.startsWith("opencode-go/"))
-  const tail = slots[slots.length - 1]
-  const tailOk = !!tail && tail.model.startsWith("opencode/") && tail.bucket === "opencode"
-  const verdict = headOk && tailOk ? "intact" : "BROKEN"
-  lines.push(
-    `pool structure: ${verdict} (${slots.length}/10 slots, head=${headOk ? `${heads.length} opencode-go` : "missing"}, tail=${tailOk ? tail.model : "missing"})`,
-  )
+  const head = slots[0]?.model ?? "missing"
+  const tail = slots[slots.length - 1]?.model ?? "missing"
+  if (goContract) {
+    const heads = slots.filter((slot) => slot.model.startsWith("opencode-go/"))
+    const headOk = heads.length > 0 && slots.slice(0, heads.length).every((slot) => slot.model.startsWith("opencode-go/"))
+    const tailSlot = slots[slots.length - 1]
+    const tailOk = !!tailSlot && tailSlot.model.startsWith("opencode/") && tailSlot.bucket === "opencode"
+    const verdict = headOk && tailOk ? "intact" : "BROKEN"
+    lines.push(
+      `pool structure: ${verdict} (${slots.length}/10 slots, head=${headOk ? `${heads.length} opencode-go` : "missing"}, tail=${tailOk ? tailSlot.model : "missing"})`,
+    )
+  } else {
+    const providerCount = new Set(slots.map((slot) => pool.providerOf(slot.model))).size
+    lines.push(
+      `pool structure: ${slots.length} slot(s) across ${providerCount} provider(s); head=${head}, tail=${tail}`,
+    )
+  }
   try {
     const text = readFileSync(join(homedir(), ".config", "lacode", "pool.txt"), "utf8")
     const stamp = /^#\s*Refreshed\s+(\S+)/m.exec(text)?.[1]
@@ -957,7 +983,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
   const announceReady = (models: string[]) => {
     // A slot can opt out (notify:off); filter before claiming so a silenced
     // slot does not consume the cross-process claim.
-    const wanted = models.filter((model) => pool.announcesReset(s.slots, model))
+    const wanted = models.filter((model) => pool.announcesReset(s.slots, model, s.notifyPolicy))
     // Several opencode processes share one pool; only the first claim speaks.
     const fresh = wanted.filter((model) => claimDesktopNotice(model))
     if (fresh.length === 0) return
@@ -1083,6 +1109,21 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       if (typeof options?.apiKey === "string" && options.apiKey.trim() !== "") configCreds.add(id)
     }
     s.configCreds = configCreds
+    if (pool.isDefaultPoolOrigin(s.origin) && providers && typeof providers === "object" && !Array.isArray(providers)) {
+      const configured = Object.keys(providers)
+      if (configured.length > 0) {
+        const slotProviders: string[] = []
+        for (const slot of slots) {
+          const provider = pool.providerOf(slot.model)
+          if (!slotProviders.includes(provider)) slotProviders.push(provider)
+        }
+        if (!slotProviders.some((provider) => configured.includes(provider))) {
+          await warnOnce(
+            `the bundled pool (${s.origin}) targets ${slotProviders.join(", ")}, but opencode has ${configured.join(", ")} configured; add your own slots to ${pool.USER_MODELS_TXT} (one "provider/model-id [weight]" per line) or set the "models" plugin option`,
+          )
+        }
+      }
+    }
     const known = new Set<string>()
     for (const [name, def] of Object.entries(cfg.agent ?? {})) if (def?.model) s.models.set(name, def.model)
 
@@ -1522,6 +1563,14 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
                 slot: own.claim.k,
                 session: sessionID,
               })
+            } else if (sessionID && !pool.isAbortText(haystack)) {
+              // without an owned claim there is nothing to release or bench, so the warning is the only trace; do not strike.
+              const pooled = await identifyPooledSession(sessionID)
+              if (pooled) {
+                await warnOnce(
+                  `unclassified provider error on ${pooled.model} (slot ${pooled.slot}) with no bound claim; not benched (session ${sessionID})`,
+                )
+              }
             }
             return
           }
@@ -1751,6 +1800,14 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
               }
               pool.release(s, ownMsgUnclassified.key)
             }
+          } else if (info.sessionID && !pool.isAbortText(haystack)) {
+            // without an owned claim there is nothing to release or bench, so the warning is the only trace; do not strike.
+            const pooled = await identifyPooledSession(info.sessionID)
+            if (pooled) {
+              await warnOnce(
+                `unclassified provider error on ${pooled.model} (slot ${pooled.slot}) with no bound claim; not benched (session ${info.sessionID})`,
+              )
+            }
           }
           return
         }
@@ -1951,12 +2008,18 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       pool.release(s, key)
       const text = typeof output.output === "string" ? output.output : ""
       const cancelled = abortReports.has(key) || /task\s+cancel+ed/i.test(text)
-      // A completed task with no text is a model failure, not a success. Without
-      // this the slot keeps winning every small task and every caller gets an
-      // empty result: the exact "routed only to slot N, and it returns nothing"
-      // symptom. Bench the model so the next spawn takes another slot; the
-      // strike backoff lengthens the window if it keeps happening.
-      if (!cancelled && spawn && typeof output.output === "string" && text.trim() === "") {
+      // A completed task with no text is a model failure, not a success. The
+      // answer is wrapped in `<task …><task_result>…</task_result></task>`, so
+      // check the BODY, not the raw string -- a blank answer is a full wrapper,
+      // never "". Without this the slot keeps winning every small task and every
+      // caller gets an empty result: the exact "routed only to slot N, and it
+      // returns nothing" symptom. Bench the model so the next spawn takes
+      // another slot; the strike backoff lengthens the window if it keeps
+      // happening. Only `completed` counts: an `error` state is opencode's own
+      // failure (a DB or transport fault) and must not bench a healthy model.
+      const { state, body } = taskResultBody(text)
+      const emptyResult = body.trim() === "" && (state === undefined || state === "completed")
+      if (!cancelled && spawn && typeof output.output === "string" && emptyResult) {
         const strike = pool.recordStrike(s, spawn.model, "empty response")
         const seconds = strike ? Math.max(1, Math.round((strike.until - Date.now()) / 1000)) : 0
         await log("warn", `empty response from ${spawn.model} on slot ${spawn.slot}; benched ${seconds}s`)
@@ -1966,7 +2029,7 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       // Real text is the strongest proof a slot works: trust it for the preflight
       // TTL so the next spawn need not ask the same model again. A recorded
       // failure deletes the entry, so this can only ever suppress a probe.
-      if (!cancelled && spawn && text.trim() !== "") s.verifiedAt.set(spawn.model, Date.now())
+      if (!cancelled && spawn && body.trim() !== "") s.verifiedAt.set(spawn.model, Date.now())
       spawns.delete(key)
       const report = abortReports.get(key)
       if (!report) return
@@ -2099,7 +2162,11 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
                 ? [`provider degraded: ${degradedProviders.join(", ")} (flat window; a probe re-admits a model when it answers)`]
                 : []),
               ...slots.map(line),
-              ...poolHealthLines(slots.filter((slot) => !slot.fallback), now),
+              (() => {
+                const primary = slots.filter((slot) => !slot.fallback)
+                const goContract = pool.providerAvailable(s, "opencode-go") && primary.some((slot) => slot.model.startsWith("opencode-go/"))
+                return poolHealthLines(primary, now, goContract)
+              })(),
               "",
               "by process:",
               `  ${s.id} (this process): ${snap.own.size} claim(s)`,

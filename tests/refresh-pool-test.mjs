@@ -187,6 +187,21 @@ test("a selection entry with context null produces no c: token", () => {
   assert.equal(slots[0], "openrouter/no-context:free  2")
 })
 
+test("header is go-specific for go-bearing selections and provider-neutral otherwise", () => {
+  const go = buildPool({ scores: makeScores(), currentPoolText: CURRENT_POOL, now: NOW })
+  const goLine = go.text.split("\n").find((line) => /^#\s*Refreshed\b/.test(line))
+  assert.match(goLine, /opencode-go first \(weight 4\)/)
+
+  const generic = buildPool({
+    scores: makeScores({ selection: [{ model: "anthropic/claude", weight: 1, context: null }, { model: "openai/gpt", weight: 1, context: null }] }),
+    currentPoolText: "anthropic/claude  1\nopenai/gpt  1\n",
+    now: NOW,
+  })
+  const genericLine = generic.text.split("\n").find((line) => /^#\s*Refreshed\b/.test(line))
+  assert.match(genericLine, /score-ranked models/)
+  assert.ok(!genericLine.includes("opencode-go first"), "provider-neutral header must not claim an opencode-go-first layout")
+})
+
 test("scheduleRetry runs systemd-run at the reset", () => {
   const calls = []
   const exec = (file, args) => calls.push([file, ...args])
@@ -417,6 +432,32 @@ test("shouldKeepPool passes a healthy selection and a first-ever run", () => {
   assert.equal(shouldKeepPool({ currentPoolText: "# header only\n", newSlots: full.slice(0, 1) }).keep, false)
 })
 
+const GENERIC_POOL = "anthropic/claude  1\nopenai/gpt  1\n"
+
+test("shouldKeepPool allows a small provider-neutral selection", () => {
+  const kept = shouldKeepPool({ currentPoolText: GENERIC_POOL, newSlots: ["anthropic/claude  1", "openai/gpt  1"] })
+  assert.equal(kept.keep, false)
+  assert.equal(kept.threshold, 1)
+})
+
+test("shouldKeepPool refuses an empty provider-neutral selection", () => {
+  const kept = shouldKeepPool({ currentPoolText: GENERIC_POOL, newSlots: [] })
+  assert.equal(kept.keep, true)
+  assert.equal(kept.threshold, 1)
+})
+
+test("shouldKeepPool applies go rules when go is removed or introduced", () => {
+  const removed = shouldKeepPool({ currentPoolText: TEN_SLOT_POOL, newSlots: ["anthropic/claude  1", "openai/gpt  1"] })
+  assert.equal(removed.keep, true)
+  assert.match(removed.reason, /breaks the pool structure/)
+
+  const introduced = shouldKeepPool({ currentPoolText: GENERIC_POOL, newSlots: ["groq/a  2", "opencode-go/a  4"] })
+  assert.equal(introduced.keep, true)
+  // Introducing opencode-go activates the go contract: refused for broken
+  // go structure or for failing the go keep threshold (below half pool).
+  assert.match(introduced.reason, /breaks the pool structure|keep threshold|refusing to shrink/)
+})
+
 test("computeScanBench benches transient failures and clears answered members", () => {
   const now = 1_000_000
   const providers = [
@@ -515,6 +556,71 @@ test("scheduleRetrySoon schedules a recheck on the degraded cadence", () => {
   })
   assert.deepEqual(result, { scheduled: true, seconds: 300 })
   assert.ok(calls[0].includes("--on-active=300"))
+})
+
+test("--retry-interval 1800 schedules degraded retry with --on-active=1800", () => {
+  const home = mkdtempSync(join(tmpdir(), "refresh-pool-retry-interval-"))
+  const conf = join(home, ".config", "lacode")
+  mkdirSync(conf, { recursive: true })
+  const scoresPath = join(conf, "model-scores.json")
+  const poolPath = join(conf, "pool.txt")
+  writeFileSync(scoresPath, JSON.stringify({ generatedAt: GENERATED, providers: [], selection: SELECTION, warnings: [], retry: { after: "2026-11-06T13:00:00.000Z", models: ["openrouter/limited:free"] } }))
+  writeFileSync(poolPath, CURRENT_POOL)
+  const stubDir = join(home, "stub-bin")
+  mkdirSync(stubDir, { recursive: true })
+  writeFileSync(join(stubDir, "systemd-run"), "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + join(home, "args.txt") + "\"\nexit 0\n", { mode: 0o755 })
+  const script = fileURLToPath(new URL("../scripts/refresh-pool.mjs", import.meta.url))
+  const result = spawnSync(process.execPath, [script, "--from-scores", "--scores", scoresPath, "--pool", poolPath, "--retry-interval", "1800"], {
+    env: { ...process.env, HOME: home, PATH: `${stubDir}:${process.env.PATH}` },
+    encoding: "utf8",
+  })
+  assert.equal(result.status, 0, result.stderr)
+  const args = readFileSync(join(home, "args.txt"), "utf8")
+  assert.ok(args.includes("--on-active=1800"), `expected --on-active=1800 in args:\n${args}`)
+  rmSync(home, { recursive: true, force: true })
+})
+
+test("--retry-jitter 0 keeps --on-active=300 exactly (deterministic default)", () => {
+  const home = mkdtempSync(join(tmpdir(), "refresh-pool-retry-jitter0-"))
+  const conf = join(home, ".config", "lacode")
+  mkdirSync(conf, { recursive: true })
+  const scoresPath = join(conf, "model-scores.json")
+  const poolPath = join(conf, "pool.txt")
+  writeFileSync(scoresPath, JSON.stringify({ generatedAt: GENERATED, providers: [], selection: SELECTION, warnings: [], retry: { after: "2026-11-06T12:00:05.000Z", models: ["openrouter/limited:free"] } }))
+  writeFileSync(poolPath, CURRENT_POOL)
+  const stubDir = join(home, "stub-bin")
+  mkdirSync(stubDir, { recursive: true })
+  writeFileSync(join(stubDir, "systemd-run"), "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + join(home, "args.txt") + "\"\nexit 0\n", { mode: 0o755 })
+  const script = fileURLToPath(new URL("../scripts/refresh-pool.mjs", import.meta.url))
+  const result = spawnSync(process.execPath, [script, "--from-scores", "--scores", scoresPath, "--pool", poolPath, "--retry-jitter", "0"], {
+    env: { ...process.env, HOME: home, PATH: `${stubDir}:${process.env.PATH}` },
+    encoding: "utf8",
+  })
+  assert.equal(result.status, 0, result.stderr)
+  const args = readFileSync(join(home, "args.txt"), "utf8")
+  assert.ok(args.includes("--on-active=300"), `expected --on-active=300 in args:\n${args}`)
+  rmSync(home, { recursive: true, force: true })
+})
+
+test("--no-retry still schedules nothing", () => {
+  const home = mkdtempSync(join(tmpdir(), "refresh-pool-noretry-"))
+  const conf = join(home, ".config", "lacode")
+  mkdirSync(conf, { recursive: true })
+  const scoresPath = join(conf, "model-scores.json")
+  const poolPath = join(conf, "pool.txt")
+  writeFileSync(scoresPath, JSON.stringify({ generatedAt: GENERATED, providers: [], selection: SELECTION, warnings: [], retry: { after: "2026-11-06T13:00:00.000Z", models: ["openrouter/limited:free"] } }))
+  writeFileSync(poolPath, CURRENT_POOL)
+  const stubDir = join(home, "stub-bin")
+  mkdirSync(stubDir, { recursive: true })
+  writeFileSync(join(stubDir, "systemd-run"), "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + join(home, "args.txt") + "\"\nexit 0\n", { mode: 0o755 })
+  const script = fileURLToPath(new URL("../scripts/refresh-pool.mjs", import.meta.url))
+  const result = spawnSync(process.execPath, [script, "--from-scores", "--scores", scoresPath, "--pool", poolPath, "--no-retry"], {
+    env: { ...process.env, HOME: home, PATH: `${stubDir}:${process.env.PATH}` },
+    encoding: "utf8",
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.ok(!existsSync(join(home, "args.txt")), "systemd-run should not be called when --no-retry is set")
+  rmSync(home, { recursive: true, force: true })
 })
 
 test("a degenerate scan never replaces a healthy pool file", () => {

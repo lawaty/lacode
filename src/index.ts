@@ -104,6 +104,8 @@ import { timerMigrationHooks } from "./plugins/timer-migration.ts"
 export type LacodeOptions = {
   enabled?: boolean
   models?: unknown
+  /** Per-slot reset-notification provider default: "all", "none", or provider ids. Absent = built-in defaults. */
+  notifyProviders?: string[] | "all" | "none"
   omniroute?: unknown
   reapMs?: number
   id?: string
@@ -171,7 +173,7 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
   // Resolve the slot table once here so the injected agent set carries exactly the
   // variants the pool will route to. The pool re-binds against the live table and
   // creates any variant added by a later reload.
-  const agentSet = buildAgentSet(resolveModels({ models: opts.models, modelsFile: opts.modelsFile }).slots.length)
+  const agentSet = buildAgentSet(resolveModels({ models: opts.models, modelsFile: opts.modelsFile, notifyProviders: opts.notifyProviders }).slots.length)
   const pool = (await settled("agent-pool", () => agentPoolHooks(input, options))) ?? inertHooks
   const autoupdate = opts.contextAutoUpdate === false
     ? inertHooks

@@ -141,7 +141,7 @@ const rowsOf = (providers) =>
     ? providers.flatMap((entry) => (Array.isArray(entry?.rows) ? entry.rows : []))
     : []
 
-const providerOf = (model) => String(model ?? "").split("/")[0]
+export const providerOf = (model) => String(model ?? "").split("/")[0]
 
 // Which providers spend ONE shared quota window across their free models.
 // `opencode` (Zen) is the known case: every free model draws from the same free
@@ -233,12 +233,14 @@ export function parsePoolSlots(text) {
 
 /**
  * Pure structural verdict for a pool slot list (formatted lines or selection
- * entries). The contract: an opencode-go head (every go slot first, weight 4),
- * exactly one opencode tail (last, weight 2, b:opencode), POOL_SIZE slots.
- * Returns { valid, problems[] } — valid covers head+tail; count is reported
- * separately so a short-but-structured pool reads as short, not broken.
+ * entries). The opencode-go head/tail/10-slot layout is a Go-contract default
+ * that only applies when opencode-go is available; other provider sets validate
+ * generically.
+ * Returns { valid, problems[] } — valid covers head+tail in Go mode; count is
+ * reported separately so a short-but-structured pool reads as short, not broken.
  */
-export function poolStructureValid(slots) {
+export function poolStructureValid(slots, options = {}) {
+  const go = options.go !== false
   const problems = []
   const parsed =
     typeof slots === "string"
@@ -252,15 +254,19 @@ export function poolStructureValid(slots) {
     bucket: entry?.bucket,
     fallback: entry?.fallback === true,
   })).filter((entry) => entry.model.includes("/") && !entry.fallback)
-  const go = lines.filter((entry) => providerOf(entry.model) === "opencode-go")
+  if (!go) {
+    if (lines.length === 0) problems.push("no slots")
+    return { valid: lines.length > 0, problems, count: lines.length }
+  }
+  const goSlots = lines.filter((entry) => providerOf(entry.model) === "opencode-go")
   const tails = lines.filter((entry) => providerOf(entry.model) === "opencode")
-  if (go.length === 0) problems.push("missing opencode-go head")
-  for (let i = 0; i < go.length; i++) {
-    if (lines[i] !== go[i]) {
+  if (goSlots.length === 0) problems.push("missing opencode-go head")
+  for (let i = 0; i < goSlots.length; i++) {
+    if (lines[i] !== goSlots[i]) {
       problems.push("opencode-go slots must all come first")
       break
     }
-    if (go[i].weight !== 4) {
+    if (goSlots[i].weight !== 4) {
       problems.push("opencode-go head slots must have weight 4")
       break
     }
@@ -293,6 +299,7 @@ export function selectPool({
   minScore = MIN_SCORE,
   poolSize = POOL_SIZE,
   maxZen = MAX_ZEN,
+  goStructure,
   now = Date.now,
 } = {}) {
   const rankable = (row) =>
@@ -362,9 +369,20 @@ export function selectPool({
     return out.sort(byScore)
   }
 
-  const go = merge((row) => providerOf(row.model) === "opencode-go")
-  const other = merge((row) => providerOf(row.model) !== "opencode-go" && providerOf(row.model) !== "opencode")
-  const zen = merge((row) => providerOf(row.model) === "opencode")
+  // The go head/tail layout is the default contract only while go is actually
+  // available (a rankable go row, or go slots already in the current pool so a
+  // transient outage does not reshape the pool); otherwise every provider is
+  // selected uniformly.
+  const goAll = merge((row) => providerOf(row.model) === "opencode-go")
+  const currentHasGo = (Array.isArray(currentSlots) ? currentSlots : []).some(
+    (slot) => providerOf(slot?.model) === "opencode-go",
+  )
+  const useGoStructure = goStructure !== undefined ? !!goStructure : goAll.length > 0 || currentHasGo
+  const go = useGoStructure ? goAll : []
+  const zen = useGoStructure ? merge((row) => providerOf(row.model) === "opencode") : []
+  const other = useGoStructure
+    ? merge((row) => providerOf(row.model) !== "opencode-go" && providerOf(row.model) !== "opencode")
+    : merge(() => true)
 
   const small = other
     .filter((row) => row.context != null && row.context < SMALL_CONTEXT_MAX)
@@ -438,9 +456,9 @@ export function selectPool({
     const model = String(slot?.model ?? "")
     if (!shouldRetain(model)) continue
     const weight = Number(slot?.weight)
-    if (providerOf(model) === "opencode-go") {
+    if (useGoStructure && providerOf(model) === "opencode-go") {
       retainedHead.push({ model, weight: 4, context: slot?.context ?? null, retained: true })
-    } else if (providerOf(model) === "opencode") {
+    } else if (useGoStructure && providerOf(model) === "opencode") {
       if (!retainedTail) retainedTail = { model, weight: 2, bucket: "opencode", context: slot?.context ?? null, retained: true }
     } else {
       retainedMiddle.push({
@@ -572,7 +590,7 @@ export function selectPool({
   }
   const total = selection.length
   if (total === 0) warnings.push("no scorable model at or above the minimum score is available")
-  else if (total < poolSize) warnings.push(`only ${total} scorable model(s) available, wanted ${poolSize}`)
+  else if (useGoStructure && total < poolSize) warnings.push(`only ${total} scorable model(s) available, wanted ${poolSize}`)
 
   const limited = rows.filter((row) => row?.ok === false && isTransientFailure(row) && Number.isFinite(row.retryAfter))
   const retry =

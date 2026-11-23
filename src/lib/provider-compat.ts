@@ -24,6 +24,10 @@
 // number of times at the transport seam; a later attempt lands on a healthy
 // upstream and the spawn proceeds. Nothing is disabled and no field is invented.
 //
+// A 400 matching the schema-rejection pattern is replayed once with text-only
+// `messages[].content` arrays flattened to strings. A non-text part disables the
+// retry.
+//
 // WHY A FETCH WRAPPER AND NOT A SCHEMA EDIT. The schema lives inside the
 // compiled opencode binary, not in this package and not in any node_modules tree
 // a patch could reach. The AI SDK resolves its transport lazily -- it reads
@@ -139,6 +143,7 @@ export const UPSTREAM_RETRY_DELAY_MS = 250
  * cannot influence it (see the module header); it only clears on a retry.
  */
 const TRANSIENT_UPSTREAM_PATTERN = /reasoning_display/i
+const SCHEMA_REJECTION_PATTERN = /oneOf at '\/' not met/i
 
 /** The URL a fetch input names, or "" when it cannot be read without doing work. */
 export function requestUrl(input: unknown): string {
@@ -197,6 +202,52 @@ export async function isTransientUpstreamResponse(response: Response): Promise<b
   try {
     const text = await response.clone().text()
     return TRANSIENT_UPSTREAM_PATTERN.test(text) && /not\s+a\s+supported\s+value|unsupported/i.test(text)
+  } catch {
+    return false
+  }
+}
+
+export function flattenTextContent(body: unknown): string | undefined {
+  if (typeof body !== "string") return undefined
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return undefined
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined
+  const messages = (parsed as Record<string, unknown>).messages
+  if (!Array.isArray(messages)) return undefined
+
+  let flattened = false
+  for (const message of messages) {
+    if (!message || typeof message !== "object") return undefined
+    const content = (message as Record<string, unknown>).content
+    if (!Array.isArray(content)) continue
+
+    if (content.length === 0) return undefined
+    const parts: string[] = []
+    for (const part of content) {
+      if (!part || typeof part !== "object") return undefined
+      const p = part as Record<string, unknown>
+      if (p.type !== "text" || typeof p.text !== "string") return undefined
+      parts.push(p.text)
+    }
+    ;(message as Record<string, unknown>).content = parts.join("\n")
+    flattened = true
+  }
+
+  if (!flattened) return undefined
+  return JSON.stringify(parsed)
+}
+
+export async function isSchemaRejection(response: Response): Promise<boolean> {
+  if (response.status !== 400) return false
+  try {
+    const text = await response.clone().text()
+    return SCHEMA_REJECTION_PATTERN.test(text)
   } catch {
     return false
   }
@@ -300,6 +351,24 @@ export function wrapFetch(original: FetchLike, options: WrapFetchOptions = {}): 
       }
       await sleep(delayMs)
       response = await original(input, init)
+    }
+
+    if (isReplayableInit(init)) {
+      try {
+        if (await isSchemaRejection(response)) {
+          const flat = flattenTextContent((init as Record<string, unknown>).body)
+          if (flat !== undefined) {
+            try {
+              await response.body?.cancel()
+            } catch {
+              /* ignore */
+            }
+            response = await original(input, { ...(init as Record<string, unknown>), body: flat })
+          }
+        }
+      } catch {
+        /* fail open: keep the response already obtained */
+      }
     }
 
     try {

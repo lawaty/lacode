@@ -455,10 +455,12 @@ kept = []
 new_cur = dict(cur)
 
 for pid, val in providers.items():
+    if pid not in replace_set:
+        continue
     if not isinstance(val, dict) or not val.get("key"):
         continue
     if pid in cur:
-        if pid in replace_set and cur.get(pid) != val:
+        if cur.get(pid) != val:
             new_cur[pid] = val
             updated.append(pid)
         else:
@@ -555,7 +557,7 @@ function syncAuth(host, auth, opts = {}) {
   const dryRun = !!(opts && opts.dryRun)
   const replace = (opts && Array.isArray(opts.replace))
     ? opts.replace
-    : String((process.env.OC_AUTH_PROVIDERS || "opencode-go opencode")).split(/\s+/).filter(Boolean)
+    : String(process.env.OC_AUTH_PROVIDERS || "").split(/\s+/).filter(Boolean)
   const envelope = { replace: replace, providers: auth || {}, dryRun: dryRun }
   const result = runSsh(host, `python3 -c '${AUTH_HELPER}'`, JSON.stringify(envelope))
   if (!result.ok) {
@@ -675,10 +677,14 @@ function syncHost(host, version, auth, opts = {}) {
   if (auth) {
     const replace = (opts && Array.isArray(opts.replace))
       ? opts.replace
-      : String((process.env.OC_AUTH_PROVIDERS || "opencode-go opencode")).split(/\s+/).filter(Boolean)
-    const authResult = syncAuth(host, auth, { replace: replace, dryRun: !!(opts && opts.dryRun) })
-    authText = authResult.text
-    authFailed = !authResult.ok
+      : String(process.env.OC_AUTH_PROVIDERS || "").split(/\s+/).filter(Boolean)
+    if (replace.length === 0) {
+      authText = "auth: OC_AUTH_PROVIDERS is empty; skipping credential sync"
+    } else {
+      const authResult = syncAuth(host, auth, { replace: replace, dryRun: !!(opts && opts.dryRun) })
+      authText = authResult.text
+      authFailed = !authResult.ok
+    }
   }
 
   if (authFailed) {
@@ -748,7 +754,7 @@ export function main(env = process.env) {
   }
 
   const envFile = env.OC_SYNC_ENV_FILE || envFileDefault()
-  const authProviders = env.OC_AUTH_PROVIDERS ?? readEnvValue(envFile, "OC_AUTH_PROVIDERS") ?? "opencode-go opencode"
+  const authProviders = env.OC_AUTH_PROVIDERS ?? readEnvValue(envFile, "OC_AUTH_PROVIDERS") ?? ""
   const replace = authProviders.split(/\s+/).filter(Boolean)
 
   const seconds = waitSeconds(env)
@@ -760,11 +766,11 @@ export function main(env = process.env) {
       console.log(`dry run: would wait for ${PACKAGE}@${version} in the registry (up to ${seconds}s)`)
     }
     printDryRun(hosts, version)
-    // A dry run must not touch a host. It used to call `syncAuth()` for every
-    // host whenever a local auth store existed, which opened real SSH
-    // connections and sent provider credentials under a "runs nothing" banner.
+    // A dry run must not touch a host. It must not send local providers over SSH.
     // Print the local half of the plan instead; provider NAMES only, never keys.
-    if (auth) {
+    if (replace.length === 0) {
+      console.log("auth: OC_AUTH_PROVIDERS is empty; skipping credential sync")
+    } else if (auth) {
       const providers = Object.keys(auth).sort()
       console.log(
         `auth: would sync ${providers.length} provider${providers.length === 1 ? "" : "s"} (${providers.join(", ") || "none"}); dry run contacts no host`,

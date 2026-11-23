@@ -229,6 +229,34 @@ test("pool_status judges structure on the primary and tags the fallback section"
   await hooks.dispose()
 })
 
+test("pool_status uses provider-neutral structure line when opencode-go is unavailable", async () => {
+  const text = [
+    "primary/a  1  c:1048576",
+    "other/b  1  c:1048576",
+  ].join("\n")
+  const parsed = pool.parseSlotText(text, "e2e")
+  const stub = stubInput()
+  const dir = scratch()
+  const file = join(scratch(), "pool.txt")
+  writeFileSync(file, text)
+  const hooks = await bootLaCode(stub, { id: "e2e-neutral-status", dir, modelsFile: file })
+  await hooks.config(configFor(parsed.slots.map((slot) => slot.model)))
+
+  const status = (await hooks.tool.pool_status.execute({}, {})).output
+  const lines = status.split("\n")
+  const structure = lines.find((line) => line.startsWith("pool structure:"))
+  assert.ok(structure, `expected a pool structure line:\n${status}`)
+  assert.ok(structure.startsWith("pool structure:"), `structure line must start with prefix:\n${status}`)
+  assert.match(
+    structure,
+    /\d+ slot\(s\) across \d+ provider\(s\); head=.*, tail=/,
+    `expected provider-neutral structure shape:\n${status}`,
+  )
+  assert.ok(!structure.includes("BROKEN"), `neutral structure line must not include BROKEN:\n${status}`)
+  assert.ok(!structure.includes("intact"), `neutral structure line must not include intact:\n${status}`)
+  await hooks.dispose()
+})
+
 test("structure and slot counts judge the primary only", () => {
   const text = [
     "opencode-go/a  4",

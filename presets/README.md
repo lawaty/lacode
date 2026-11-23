@@ -3,6 +3,12 @@
 A preset is the pool's slot list: which models your pooled subagents share, and
 how many concurrent sessions each one gets. It is one JSON file.
 
+> **Note:** The bundled preset is an opencode/opencode-go example, not a
+> requirement. Put any `provider/model-id` slots in `pool.txt` or `pool.json`.
+> The Go head/tail layout is the maintained default only while opencode-go is
+> available; otherwise the refresh/selection tooling builds and validates a
+> provider-neutral, score-ranked pool.
+
 ## Resolution chain
 
 LaCode reads the first source that yields usable slots, in this order:

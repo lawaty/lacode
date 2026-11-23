@@ -27,9 +27,9 @@
 #   bin/oc-sync                 sync `oc` AND the whole opencode setup to every host
 #   bin/oc-sync --scripts-only  sync only `oc`, skipping the config
 #   bin/oc-sync --no-config     alias for --scripts-only
-#   bin/oc-sync --with-auth     sync credentials (default on)
+#   bin/oc-sync --with-auth     sync credentials (default on, requires OC_AUTH_PROVIDERS)
 #   bin/oc-sync --no-auth       skip credential sync entirely
-#   credentials sync by default (allowlist: opencode-go, opencode); --no-auth skips them
+#   credential sync has no built-in provider allowlist; set OC_AUTH_PROVIDERS to sync specific providers
 #   bin/oc-sync --dry-run ...   show what would change, write nothing
 #   bin/oc-sync --host NAME ... limit to one host
 #
@@ -641,15 +641,16 @@ fi
 PREPARED_CONFIG=""
 PREPARED_CONFIG_VERSION=""
 PREPARED_CONFIG_REPLACED=""
+PREPARED_CONFIG_INLINED=""
 cleanup_prepared_config() { [[ -n "$PREPARED_CONFIG" ]] && rm -f "$PREPARED_CONFIG"; }
 trap cleanup_prepared_config EXIT
 prepare_config() {
   local src="$CONFIG_DIR/opencode.jsonc" tmp info
   tmp="$(mktemp "${TMPDIR:-/tmp}/oc-sync-opencode.XXXXXX.jsonc")" || return 1
-  info="$(python3 - "$src" "$tmp" "$REPO_DIR" <<'PY'
+  info="$(python3 - "$src" "$tmp" "$REPO_DIR" "$CONFIG_DIR" <<'PY'
 import json, os, re, sys
 
-src, dest, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+src, dest, repo, config_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 with open(os.path.join(repo, "package.json"), encoding="utf-8") as fh:
     version = json.load(fh)["version"]
 with open(src, encoding="utf-8") as fh:
@@ -660,23 +661,52 @@ spec = f"@lawaty/lacode@{version}"
 # left a package spec. Both become the version this run is syncing.
 pattern = re.compile(r'"file://[^"]*/lacode/dist/index\.js"|"@lawaty/lacode(?:@[^"]+)?"')
 new, count = pattern.subn(f'"{spec}"', raw)
+
+# Hosts run opencode from arbitrary project directories. A prompt written as
+# {file:./.opencode/prompts/NAME} would then be resolved against the project,
+# which usually has no .opencode, and every such agent would lose its prompt.
+# Inline the text here so the pushed config is self-contained.
+prompts_dir = os.path.join(config_dir, ".opencode", "prompts")
+inlined = 0
+missing = []
+
+def inline_prompt(match):
+    global inlined
+    name = match.group(1)
+    path = os.path.join(prompts_dir, name)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        missing.append(name)
+        return match.group(0)
+    inlined += 1
+    return json.dumps(text, ensure_ascii=False)
+
+new = re.sub(r'"\{file:\./\.opencode/prompts/([^}"]+)\}"', inline_prompt, new)
+if missing:
+    print(
+        "oc-sync: prompt file(s) missing from " + prompts_dir + ": " + ", ".join(missing),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 with open(dest, "w", encoding="utf-8") as fh:
     fh.write(new)
-print(f"{version} {count}")
+print(f"{version} {count} {inlined}")
 PY
 )" || { rm -f "$tmp"; return 1; }
   PREPARED_CONFIG="$tmp"
-  PREPARED_CONFIG_VERSION="${info%% *}"
-  PREPARED_CONFIG_REPLACED="${info##* }"
+  read -r PREPARED_CONFIG_VERSION PREPARED_CONFIG_REPLACED PREPARED_CONFIG_INLINED <<<"$info" || return 1
   return 0
 }
 
 if [[ $WITH_CONFIG -eq 1 && $DRY_RUN -eq 0 ]]; then
   if prepare_config; then
-    if [[ "$PREPARED_CONFIG_REPLACED" -gt 0 ]]; then
-      ok "opencode.jsonc prepared: LaCode entry -> @lawaty/lacode@${PREPARED_CONFIG_VERSION} (${PREPARED_CONFIG_REPLACED} replaced)"
+    if [[ "$PREPARED_CONFIG_REPLACED" -gt 0 || "$PREPARED_CONFIG_INLINED" -gt 0 ]]; then
+      ok "opencode.jsonc prepared: LaCode entry -> @lawaty/lacode@${PREPARED_CONFIG_VERSION} (${PREPARED_CONFIG_REPLACED} replaced, ${PREPARED_CONFIG_INLINED} prompt file(s) inlined)"
     else
-      ok "opencode.jsonc prepared: no LaCode dev path found (synced unchanged)"
+      ok "opencode.jsonc prepared: nothing to rewrite (synced unchanged)"
     fi
   else
     bad "could not prepare opencode.jsonc for remote sync"
@@ -783,7 +813,7 @@ DONE=()
 # never written to a temp file here and never appears in a command line (where
 # it would land in the remote shell history and in this process's argv).
 AUTH_FILE="${OC_AUTH_FILE:-$HOME/.local/share/opencode/auth.json}"
-AUTH_PROVIDERS="${OC_AUTH_PROVIDERS:-opencode-go opencode}"
+AUTH_PROVIDERS="${OC_AUTH_PROVIDERS:-}"
 
 # Names only: provider -> its key, for the ones listed in $2. Used to build the
 # payload without ever printing a key.
@@ -897,6 +927,8 @@ added = []
 kept = []
 new_cur = dict(cur)
 for pid, val in providers.items():
+    if pid not in replace_set:
+        continue
     if not isinstance(val, dict) or not val.get("key"):
         continue
     if pid in cur:
@@ -960,6 +992,10 @@ REMOTE_TAIL
 
 sync_auth() {
   local host="$1"
+  if [[ -z "${AUTH_PROVIDERS//[[:space:]]/}" ]]; then
+    echo "[auth] OC_AUTH_PROVIDERS is empty; skipping credential sync"
+    return 0
+  fi
   if [[ ! -f "$AUTH_FILE" ]]; then
     warn "auth: no local auth.json at $AUTH_FILE; skipping credentials"
     return 0
