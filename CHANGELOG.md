@@ -7,7 +7,7 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
-## [2.3.1-beta.0] — empty answers are detected, benched, and scored
+## [2.3.1-beta.1] — empty answers are detected, benched, and scored
 
 ### Changed
 
