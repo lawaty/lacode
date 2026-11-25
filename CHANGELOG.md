@@ -7,7 +7,7 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
-## [2.3.1-beta.1] — empty answers are detected, benched, and scored
+## [2.3.1] — YOLO permission handling and empty-answer scoring
 
 ### Changed
 
@@ -18,6 +18,7 @@ commit as the changelog entry it describes.
 - Pool: an empty task result is now also written to the failure journal (`failures.jsonl`) as `reason: "empty response"`, so `pool_status` and the score file can see it; previously only a cooldown file was written and the model looked like it had never failed. A completed task whose wrapper has a blank body and no `<task_result>` tag is now recognised as empty too.
 - Scoring: a probe that returns HTTP 200 with a well-formed `choices` array but empty message content (or an opencode session message with no non-empty text part and no tool call) is no longer scored as `answered`. Such a model is recorded as `ok: false, reason: "empty completion"` and cannot rank. The predicates live in `scripts/probe-result.mjs` and are applied to both the direct and session probe paths.
 - Refresh: a pool member retained because its provider's scan degraded but with no score row of its own is now bench-in-place (`scan-kept`) for one refresh window instead of being left fully routable. Retention is no longer a free pass back into rotation; a newly selected model on a merely unscanned provider keeps the previous behaviour.
+- YOLO now relaxes permission rules (`ask` → `allow`, preserving explicit `deny`) at config load, so permission prompts — including `external_directory` and per-agent `read`/`bash` asks — are no longer raised. Failed auto-approvals are now logged instead of silently ignored.
 
 ## [2.3.0] — provider-neutral pools and wrapper-aware empty responses
 
@@ -1341,6 +1342,7 @@ experimental; `latest` remains 0.4.2.
 [Unreleased]: https://github.com/lawaty/lacode/compare/v2.1.0-beta.0...HEAD
 [2.1.0-beta.0]: https://github.com/lawaty/lacode/compare/v2.0.0-beta.0...v2.1.0-beta.0
 [2.0.0-beta.0]: https://github.com/lawaty/lacode/compare/v1.3.1...v2.0.0-beta.0
+[2.3.1]: https://github.com/lawaty/lacode/compare/v2.3.0...v2.3.1
 [2.3.0-beta.3]: https://github.com/lawaty/lacode/compare/v2.3.0-beta.2...v2.3.0-beta.3
 [2.3.0-beta.2]: https://github.com/lawaty/lacode/compare/v2.3.0-beta.1...v2.3.0-beta.2
 [2.3.0-beta.1]: https://github.com/lawaty/lacode/compare/v2.3.0-beta.0...v2.3.0-beta.1
