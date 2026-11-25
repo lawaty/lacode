@@ -486,6 +486,48 @@ test("computeScanBench falls back to the next-refresh window without a stated re
   assert.equal(bench[0].until, now + 6 * 60 * 60 * 1000)
 })
 
+test("a retained member on a degraded provider is benched instead of left routable", () => {
+  const now = 1_000_000
+  const { bench, clear } = computeScanBench({
+    selectionModels: ["empty/a"],
+    providers: [{ provider: "empty", degraded: true, rows: [] }],
+    retainedModels: new Set(["empty/a"]),
+    degradedProviders: new Set(["empty"]),
+    now,
+  })
+  assert.equal(bench.length, 1)
+  assert.equal(bench[0].model, "empty/a")
+  assert.equal(bench[0].kind, "unscanned")
+  assert.ok(bench[0].until > now)
+  assert.deepEqual(clear, [])
+})
+
+test("a newly selected member on a degraded provider is not benched", () => {
+  const now = 1_000_000
+  const { bench, clear } = computeScanBench({
+    selectionModels: ["empty/a"],
+    providers: [{ provider: "empty", degraded: true, rows: [] }],
+    retainedModels: new Set(),
+    degradedProviders: new Set(["empty"]),
+    now,
+  })
+  assert.deepEqual(bench, [])
+  assert.deepEqual(clear, [])
+})
+
+test("a retained member on an unscanned provider keeps the old behaviour", () => {
+  const now = 1_000_000
+  const { bench, clear } = computeScanBench({
+    selectionModels: ["empty/a"],
+    providers: [],
+    retainedModels: new Set(["empty/a"]),
+    degradedProviders: new Set(),
+    now,
+  })
+  assert.deepEqual(bench, [])
+  assert.deepEqual(clear, [])
+})
+
 test("applyScanBench writes atomic limit files and clears only its own scan bench", () => {
   const home = mkdtempSync(join(tmpdir(), "refresh-pool-bench-"))
   const dir = join(home, ".local", "share", "opencode", "agent-pool")

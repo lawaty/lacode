@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { parseTextSlots, recordStrike, slotBucket, state } from "../src/lib/pool.ts"
+import { EMPTY_RESPONSE_COOLDOWN_BASE_MS, parseTextSlots, recordStrike, slotBucket, state } from "../src/lib/pool.ts"
 
 const scratchState = (slots) => {
   const dir = mkdtempSync(join(tmpdir(), "bucket-"))
@@ -67,6 +67,25 @@ test("a limit on an unbucketed model benches only that model", () => {
     recordStrike(s, "opencode/a", "rate_limit", 60_000)
     assert.deepEqual([...s.cooling.keys()], ["opencode/a"])
     assert.equal(s.cooling.has("opencode/b"), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("an empty response is benched longer than a generic blip and escalates", () => {
+  const { s, dir } = scratchState([{ model: "empty/a", weight: 1 }])
+  try {
+    const first = recordStrike(s, "empty/a", "empty response")
+    const firstUntil = s.cooling.get("empty/a").until
+    assert.equal(first.reason, "empty response")
+    assert.ok(firstUntil - Date.now() >= EMPTY_RESPONSE_COOLDOWN_BASE_MS - 2000)
+    assert.ok(firstUntil - Date.now() > 60_000)
+
+    const second = recordStrike(s, "empty/a", "empty response")
+    const secondUntil = s.cooling.get("empty/a").until
+    assert.equal(second.strikes, 2)
+    assert.ok(secondUntil - Date.now() >= 18 * 60 * 1000 - 2000)
+    assert.ok(secondUntil > firstUntil)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

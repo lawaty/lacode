@@ -52,6 +52,7 @@ import {
   retryAfterMs,
   selectPool,
 } from "./pool-selection.mjs"
+import { hasDirectAnswer, hasSessionAnswer } from "./probe-result.mjs"
 
 const AUTH = join(homedir(), ".local", "share", "opencode", "auth.json")
 const DEFAULT_OUT = join(homedir(), ".config", "lacode", "model-scores.json")
@@ -446,6 +447,9 @@ async function probeDirect(candidate, provider) {
     if (!Array.isArray(parsed?.choices) || parsed.choices.length === 0) {
       return { ok: false, ms, reason: "no choices in response", status: response.status, kind: "unknown" }
     }
+    if (!hasDirectAnswer(parsed)) {
+      return { ok: false, ms, reason: "empty completion", status: response.status, kind: "unknown" }
+    }
     return { ok: true, ms, reason: "answered", status: response.status, kind: null }
   } catch (error) {
     const ms = Math.round(performance.now() - started)
@@ -528,6 +532,9 @@ async function probeViaSession(candidate, provider) {
     }
     if (!parsed?.info) {
       return { ok: false, ms, reason: "no response", status: msgRes.status, kind: "unknown" }
+    }
+    if (!hasSessionAnswer(parsed)) {
+      return { ok: false, ms, reason: "empty completion", status: msgRes.status, kind: "unknown" }
     }
     return { ok: true, ms, reason: "answered", status: msgRes.status, kind: null }
   } catch (error) {

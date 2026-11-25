@@ -288,11 +288,14 @@ export const scanBenchFile = (model) => `limit.${String(model).replace(/[^a-zA-Z
 /**
  * Pure bench plan for the current pool members. A member whose current row
  * failed transiently is benched until its stated reset (else until the next
- * scheduled refresh); a member that answered has any stale bench cleared; an
- * unscanned member is left alone for lack of evidence. Only pool members are
+ * scheduled refresh); a member that answered has any stale bench cleared; a
+ * no-row member is left alone unless it was retained and its provider's scan
+ * degraded, in which case it is benched for one window. Only pool members are
  * ever touched.
  */
-export function computeScanBench({ selectionModels, providers, now = Date.now() }) {
+export function computeScanBench({ selectionModels, providers, retainedModels, degradedProviders, now = Date.now() }) {
+  const retained = retainedModels instanceof Set ? retainedModels : new Set(retainedModels ?? [])
+  const degraded = degradedProviders instanceof Set ? degradedProviders : new Set(degradedProviders ?? [])
   const currentByModel = new Map()
   for (const entry of Array.isArray(providers) ? providers : []) {
     for (const row of Array.isArray(entry?.rows) ? entry.rows : []) {
@@ -303,7 +306,17 @@ export function computeScanBench({ selectionModels, providers, now = Date.now() 
   const clear = []
   for (const model of selectionModels ?? []) {
     const row = currentByModel.get(model)
-    if (!row) continue
+    if (!row) {
+      // A member kept only because its provider scan degraded has no row to
+      // convict it, but also no evidence it works. Bench it in place for one
+      // refresh window instead of handing it live spawns: retention must not
+      // be a free pass back into rotation. A newly selected model on a merely
+      // unscanned provider keeps the old behaviour (left alone).
+      if (retained.has(model) && degraded.has(providerOf(model))) {
+        bench.push({ model, until: now + SCAN_BENCH_WINDOW_MS, kind: "unscanned" })
+      }
+      continue
+    }
     if (row.ok !== false) {
       clear.push(model)
       continue
@@ -695,7 +708,17 @@ async function main() {
   // Runs on the write path and the refusal path alike — a kept pool still
   // learns what the scan found.
   if (!printOnly) {
-    const plan = computeScanBench({ selectionModels: built.chosen.selected, providers: scores.providers })
+    const retainedModels = new Set(
+      (Array.isArray(scores.selection) ? scores.selection : [])
+        .filter((entry) => entry && entry.retained)
+        .map((entry) => entry.model),
+    )
+    const degradedProviders = new Set(
+      (Array.isArray(scores.providers) ? scores.providers : [])
+        .filter((entry) => entry && entry.degraded)
+        .map((entry) => String(entry.provider ?? "")),
+    )
+    const plan = computeScanBench({ selectionModels: built.chosen.selected, providers: scores.providers, retainedModels, degradedProviders })
     const applied = applyScanBench({ dir: scanBenchDir(), bench: plan.bench, clear: plan.clear })
     if (applied.benched.length > 0) {
       const detail = plan.bench.map((entry) => `${entry.model} (${entry.kind})`).join(", ")

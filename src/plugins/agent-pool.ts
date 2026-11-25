@@ -205,12 +205,17 @@ export function estimateContextTokens(prompt: unknown): number | undefined {
  * so an empty answer arrives as a NON-empty string with an empty result BODY --
  * never `""`. Reading `output.output` alone therefore misses every empty
  * completion and the model keeps winning spawns while callers see a blank
- * result. Falls back to the whole string when the markup is absent (older
- * opencode shapes, plain-text tools, and tests).
+ * result. When the `<task_result>` tag is absent the wrapper's inner text is
+ * used, so a wrapper-only blank answer is still recognised as empty; falls back
+ * to the whole string when neither markup is present (older opencode shapes,
+ * plain-text tools, and tests).
  */
 export function taskResultBody(text: string): { state?: string; body: string } {
   const state = /<task\b[^>]*\bstate="([^"]*)"/i.exec(text)?.[1]?.toLowerCase()
-  const body = /<task_result>([\s\S]*?)<\/task_result>/i.exec(text)?.[1] ?? text
+  const body =
+    /<task_result>([\s\S]*?)<\/task_result>/i.exec(text)?.[1] ??
+    /<task\b[^>]*>([\s\S]*?)<\/task>/i.exec(text)?.[1] ??
+    text
   return { state, body }
 }
 
@@ -2021,6 +2026,18 @@ export const agentPoolHooks = (async ({ client, serverUrl, directory }, options?
       const emptyResult = body.trim() === "" && (state === undefined || state === "completed")
       if (!cancelled && spawn && typeof output.output === "string" && emptyResult) {
         const strike = pool.recordStrike(s, spawn.model, "empty response")
+        pool.recordFailure(s, {
+          ts: Date.now(),
+          source: "pool",
+          base: undefined,
+          slot: spawn.slot,
+          model: spawn.model,
+          session: input.sessionID,
+          reason: "empty response",
+          elapsedMs: Date.now() - spawn.t,
+          released: true,
+          detail: "task completed with an empty <task_result> body",
+        })
         const seconds = strike ? Math.max(1, Math.round((strike.until - Date.now()) / 1000)) : 0
         await log("warn", `empty response from ${spawn.model} on slot ${spawn.slot}; benched ${seconds}s`)
         await markProviderDegradation(log, spawn.model, "empty response")

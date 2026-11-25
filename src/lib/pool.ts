@@ -177,6 +177,10 @@ export const announcesReset = (slots: Slot[], model: string, policy: NotifyPolic
 export const SLOTS_WARN_AT = 64
 const COOLDOWN_BASE_MS = 60 * 1000
 const COOLDOWN_MAX_MS = 15 * 60 * 1000
+// A blank answer is a model defect, not a momentary blip, so it must outlive the
+// gap between two spawns.
+export const EMPTY_RESPONSE_COOLDOWN_BASE_MS = 10 * 60 * 1000
+export const EMPTY_RESPONSE_COOLDOWN_MAX_MS = 60 * 60 * 1000
 // A provider quota/limit is not a transient blip: it reopens on the provider's
 // own schedule, so a limit-shaped failure is cooled on a far longer curve than a
 // generic rate-limit guess. Without this a daily quota produced a fresh 60s window
@@ -1490,8 +1494,9 @@ export function recordStrike(s: State, model: string, reason: string, stated?: n
     .reduce<Strike | undefined>((worst, candidate) => (!worst || candidate.strikes > worst.strikes ? candidate : worst), undefined)
   const strikes = prior && now - prior.last < STRIKE_DECAY_MS ? prior.strikes + 1 : 1
   const quota = isQuotaReason(reason)
-  const base = quota ? QUOTA_COOLDOWN_BASE_MS : COOLDOWN_BASE_MS
-  const cap = quota ? QUOTA_COOLDOWN_MAX_MS : COOLDOWN_MAX_MS
+  const emptyAnswer = reason === "empty response"
+  const base = quota ? QUOTA_COOLDOWN_BASE_MS : emptyAnswer ? EMPTY_RESPONSE_COOLDOWN_BASE_MS : COOLDOWN_BASE_MS
+  const cap = quota ? QUOTA_COOLDOWN_MAX_MS : emptyAnswer ? EMPTY_RESPONSE_COOLDOWN_MAX_MS : COOLDOWN_MAX_MS
   const backoff = Math.min(cap, base * 2 ** (strikes - 1))
   const statedOk = typeof stated === "number" && Number.isFinite(stated) && stated > 0 && stated <= STATED_COOLDOWN_MAX_MS
   const until = now + (statedOk ? stated : backoff)

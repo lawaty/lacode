@@ -167,10 +167,41 @@ test("[US-4] an empty task result benches the model and the next spawn goes else
   assert.match(out.output, /empty response.*empty\/a.*benched/i, `the result must explain the bench, got ${out.output}`)
   assert.ok(existsSync(limitFile(dir, "empty/a")), "the empty model must be benched")
 
+  const journal = join(dir, "failures.jsonl")
+  const records = readFileSync(journal, "utf8")
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line))
+  assert.ok(
+    records.some((r) => r.model === "empty/a" && r.reason === "empty response"),
+    `failure journal must record empty/a empty response, got ${JSON.stringify(records)}`,
+  )
+
   const second = await spawn(hooks, cfg, { subagent: "explore", callID: "c2", sessionID: "s2" })
   assert.equal(second.routed, "explore-2", `the next spawn must leave the empty model, got ${second.routed}`)
   assert.equal(second.model, "empty/b", `the next spawn must use the other model, got ${second.model}`)
   assert.equal(models.length, 2)
+  await hooks.dispose()
+})
+
+test("[US-4] a wrapper-only blank task result is benched even without a <task_result> tag", async () => {
+  const { hooks, cfg, dir } = await bootPool(
+    [
+      { model: "empty/a", weight: 1 },
+      { model: "empty/b", weight: 1 },
+    ],
+    "us4-empty-wrapper",
+  )
+
+  const first = await spawn(hooks, cfg, { subagent: "explore", callID: "c1", sessionID: "s1" })
+  assert.equal(first.routed, "explore-1", `control: the first spawn must take slot 1, got ${first.routed}`)
+  await emit(hooks, "session.created", { info: { id: "child-1", parentID: "s1" } })
+
+  const out = { output: '<task id="child-1" state="completed">\n\n</task>' }
+  await hooks["tool.execute.after"]({ tool: "task", sessionID: "s1", callID: "c1", args: {} }, out)
+  assert.match(out.output, /empty response.*empty\/a.*benched/i, `the result must explain the bench, got ${out.output}`)
+  assert.ok(existsSync(limitFile(dir, "empty/a")), "the empty model must be benched")
+
   await hooks.dispose()
 })
 
