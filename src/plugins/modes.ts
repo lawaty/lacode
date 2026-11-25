@@ -28,10 +28,15 @@ export async function modesHooks(input: PluginInput, options?: PluginOptions): P
         const sessionID = typeof properties?.sessionID === "string" ? properties.sessionID : ""
         if (!requestID || !sessionID) return
         try {
-          await input.client.postSessionIdPermissionsPermissionId({
+          const result = await input.client.postSessionIdPermissionsPermissionId({
             path: { id: sessionID, permissionID: requestID },
             body: { response: "once" },
           })
+          if (result?.error) {
+            warn(`could not auto-approve permission ${requestID}: ${String(result.error)}`)
+          } else if (result?.data === false) {
+            warn(`could not auto-approve permission ${requestID}: server did not approve the request`)
+          }
         } catch (error) {
           warn(`could not auto-approve permission ${requestID}: ${String(error)}`)
         }

@@ -84,9 +84,11 @@
 import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { applyAgents, buildAgentSet } from "./agents.ts"
 import { applyCommands } from "./commands.ts"
+import { readModes } from "./lib/modes.ts"
 import { PACKAGE_ROOT } from "./lib/package-root.ts"
 import { resolveModels } from "./lib/pool.ts"
 import { readInstalledVersion } from "./lib/selfupdate.ts"
+import { applyYoloPermissions } from "./lib/yolo-permissions.ts"
 import { agentPoolHooks } from "./plugins/agent-pool.ts"
 import { contextAutoUpdateHooks } from "./plugins/context-autoupdate.ts"
 import { feedbackHooks } from "./plugins/feedback.ts"
@@ -197,6 +199,10 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       const injected = applyAgents(cfg as Record<string, unknown>, agentSet)
       if (injected.added.length > 0) {
         await log("info", `agents: added ${injected.added.length}, kept ${injected.kept.length} already defined by the user`)
+      }
+      if (readModes({ yolo: opts.yolo }).yolo) {
+        const relaxed = applyYoloPermissions(cfg as Record<string, unknown>)
+        if (relaxed) await log("info", "yolo: relaxed permission rules to allow")
       }
       const cmds = applyCommands(cfg as Record<string, unknown>)
       if (cmds.added.length > 0) {
