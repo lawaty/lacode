@@ -139,9 +139,10 @@ const withStubbedChannels = async (names, fn, { prints = "" } = {}) => {
     const log = join(bin, `${name}.log`)
     logs[name] = log
     const answer = prints ? `printf '%s\\n' ${JSON.stringify(prints)}\n` : ""
+    const helpOut = name === "notify-send" ? "printf '%s\\n' '--action=ACTION:...'\nprintf '%s\\n' '--id-fd=FD'\n" : ""
     writeFileSync(
       join(bin, name),
-      `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done\n${answer}exit 0\n`,
+      `#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "--help" ]; then\n    ${helpOut}exit 0\n  fi\ndone\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done\n${answer}exit 0\n`,
     )
     chmodSync(join(bin, name), 0o755)
   }
@@ -385,7 +386,7 @@ test("[US-29] the chime starts before an actionable notification blocks", async 
     const sequence = join(bin, "sequence.log")
     writeFileSync(
       join(bin, "notify-send"),
-      `#!/bin/sh\nsleep 0.3\nprintf 'notify-send done\\n' >> ${JSON.stringify(sequence)}\nexit 0\n`,
+      `#!/bin/sh\nfor a in "$@"; do if [ "$a" = "--help" ]; then printf '%s\\n' '--action=ACTION:...'; printf '%s\\n' '--id-fd=FD'; exit 0; fi; done\nsleep 0.3\nprintf 'notify-send done\\n' >> ${JSON.stringify(sequence)}\nexit 0\n`,
     )
     writeFileSync(
       join(bin, "paplay"),
@@ -692,6 +693,7 @@ test("[US-12] a question and a completion inside one cooldown window are not ded
   const { sent, emit } = await notifier({ sessions: { s1: { id: "s1", title: "Add a migration" } } })
   await busy(emit, "s1")
   await emit("question.asked", { sessionID: "s1", questions: [{ question: "Reversible?" }] })
+  await settle()
   await emit("question.replied", { sessionID: "s1" })
   await idle(emit, "s1")
   await settle()

@@ -436,6 +436,15 @@ export class Notifier {
     this.evict(now)
   }
 
+  /**
+   * Forget the cooldown for a key, but only if it is still the timestamp this
+   * caller recorded. A later attempt has its own timestamp and must survive
+   * an older attempt's rollback.
+   */
+  forget(sessionID: string, at: number) {
+    if (this.lastSent.get(sessionID) === at) this.lastSent.delete(sessionID)
+  }
+
   private evict(now: number) {
     if (this.lastSent.size <= MAX_TRACKED) return
     // Drop oldest-first, not oldest-that-happens-to-be-expired: a burst of
@@ -748,17 +757,28 @@ export const claimNotification = (sessionID: string, kind: string, instanceId: s
 /**
  * Give the claim of one (session, kind) pair back.
  *
- * The file is removed ONLY while it still holds this process's pid: a claim
- * another process has since taken must never be removed by the previous
- * holder. A file that is gone, unreadable, or held by somebody else is left
- * exactly as it is.
+ * The file is removed ONLY while it still belongs to this process and, when an
+ * instance token is provided, to that instance. The claim is whitespace-separated
+ * fields: pid, and optionally an instance token and kind. A claim whose first field
+ * is not this process's pid is left alone. If `instanceId` is provided and the file
+ * has a non-empty second field (the token), it must match; otherwise the claim is
+ * left alone. A legacy 2-field claim (pid + kind, no token) is released on PID
+ * match for backward compatibility. Non-throwing: a gone, unreadable, or foreign
+ * claim is left exactly as it is.
  */
-export const releaseNotificationClaim = (sessionID: string, kind: string): void => {
+export const releaseNotificationClaim = (sessionID: string, kind: string, instanceId?: string): void => {
   const path = claimFile(sessionID, kind)
   try {
-    const parsed = Number.parseInt(readFileSync(path, "utf8").trim(), 10)
+    const raw = readFileSync(path, "utf8").trim()
+    const fields = raw.split(/\s+/).filter((entry) => entry.length > 0)
+    const parsed = Number.parseInt(fields[0] ?? "", 10)
     if (!Number.isFinite(parsed) || parsed <= 0) return
     if (parsed !== process.pid) return
+    if (instanceId !== undefined) {
+      const hasToken = fields.length >= 3
+      const fileToken = hasToken ? (fields[1] ?? "") : ""
+      if (hasToken && fileToken !== "" && fileToken !== instanceId) return
+    }
     unlinkSync(path)
   } catch {
     // Gone, or unreadable: there is nothing of ours to release.
@@ -778,13 +798,13 @@ const completionFile = (sessionID: string): string =>
  * session, whatever pid it names and however old it is. The plugin deletes it
  * when the session goes busy (a new turn) or is deleted.
  */
-export const claimCompletion = (sessionID: string, kind: string): boolean => {
+export const claimCompletion = (sessionID: string, kind: string, owner?: string): boolean => {
   const path = completionFile(sessionID)
   try {
     mkdirSync(notificationStateDir(), { recursive: true })
     const fd = openSync(path, "wx")
     try {
-      writeFileSync(fd, `${process.pid} ${kind}\n`)
+      writeFileSync(fd, owner === undefined ? `${process.pid} ${kind}\n` : `${process.pid} ${kind} ${owner}\n`)
     } finally {
       closeSync(fd)
     }
@@ -797,9 +817,20 @@ export const claimCompletion = (sessionID: string, kind: string): boolean => {
 }
 
 /** Delete the completion marker for a session. Safe if absent; ignores errors. */
-export const releaseCompletion = (sessionID: string): void => {
+export const releaseCompletion = (sessionID: string, owner?: string): void => {
+  const path = completionFile(sessionID)
   try {
-    unlinkSync(completionFile(sessionID))
+    if (owner === undefined) {
+      unlinkSync(path)
+      return
+    }
+    // Best-effort check: read then unlink is not atomic, so a concurrent writer
+    // could interleave. Do not add a new locking protocol here.
+    const raw = readFileSync(path, "utf8").trim()
+    const fields = raw.split(/\s+/).filter((entry) => entry.length > 0)
+    const claimed = fields[2]
+    if (claimed === undefined || claimed !== owner) return
+    unlinkSync(path)
   } catch {
     // already gone, or the state dir is not writable
   }
@@ -811,12 +842,12 @@ export const releaseCompletion = (sessionID: string): void => {
  * follows it in the same turn quiet, so it overwrites any marker left by an
  * earlier outcome.
  */
-export const markCompletion = (sessionID: string, kind: string): void => {
+export const markCompletion = (sessionID: string, kind: string, owner?: string): void => {
   try {
     mkdirSync(notificationStateDir(), { recursive: true })
     const path = completionFile(sessionID)
     const tmp = `${path}.${process.pid}.tmp`
-    writeFileSync(tmp, `${process.pid} ${kind}\n`)
+    writeFileSync(tmp, owner === undefined ? `${process.pid} ${kind}\n` : `${process.pid} ${kind} ${owner}\n`)
     renameSync(tmp, path)
   } catch {
     // The marker is an optimisation; failing to write it must not block the popup.

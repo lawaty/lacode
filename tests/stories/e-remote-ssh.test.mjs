@@ -174,8 +174,13 @@ const runReceiver = async ({ command, args = [], click, notifyId, notifyDir } = 
   const dir = notifyDir ?? scratch("receiver-notify-")
   if (notifyId !== undefined || click !== undefined) {
     const log = join(transports.bin, "notify-send.log")
-    const lines = ["#!/bin/sh", `for a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done`]
+    const lines = [
+      "#!/bin/sh",
+      `for a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(log)}; done`,
+      `for a in "$@"; do if [ "$a" = "--help" ]; then printf '%s\\n' "Usage: notify-send [OPTION...]\\n  --id-fd=FD  Print notification ID to file descriptor\\n  --print-id  Print notification ID\\n"; exit 0; fi; done`,
+    ]
     if (notifyId !== undefined) {
+      lines.push(`for a in "$@"; do case "$a" in --id-fd=*) fd=\${a#--id-fd=}; printf '%s\\n' ${JSON.stringify(notifyId)} >&"$fd" ;; esac; done`)
       lines.push(`for a in "$@"; do if [ "$a" = "--print-id" ]; then printf '%s\\n' ${JSON.stringify(notifyId)}; break; fi; done`)
     }
     if (click !== undefined) lines.push(`printf '%s\\n' ${JSON.stringify(click)}`)
@@ -983,7 +988,25 @@ test("[US-26] doctor names the channel this platform would use, not a binary it 
     // switched off delivery for anyone running notify-send from a non-libnotify
     // package on a FreeBSD or a WSL-less Unix.
     assert.equal(localChannel("sunos"), "notify-send")
+  })
+
+  // On win32 the probe is `where`, not `sh -c 'command -v …'`, so the stub
+  // must be `where` and it must report notify-send as present.
+  withStubs(["notify-send", "where"], ({ bin }) => {
+    writeFileSync(
+      join(bin, "where"),
+      `#!/bin/sh\nfor c in "$@"; do if command -v "$c" >/dev/null 2>&1; then command -v "$c"; else exit 1; fi; done\n`,
+    )
+    chmodSync(join(bin, "where"), 0o755)
     assert.equal(localChannel("win32"), "notify-send")
+  })
+
+  // And when `where` reports absence, win32 resolves to "none" rather than
+  // guessing.
+  withStubs(["where"], ({ bin }) => {
+    writeFileSync(join(bin, "where"), `#!/bin/sh\nexit 1\n`)
+    chmodSync(join(bin, "where"), 0o755)
+    assert.equal(localChannel("win32"), "none")
   })
 
   withStubs([], () => {
@@ -1398,9 +1421,10 @@ test("[US-30] the receiver records the notification id under its correlation key
   })
 
   assert.equal(landed.code, 0, `the receiver must succeed: ${landed.stderr}`)
+  const idArgv = landed.notifyArgv
   assert.ok(
-    landed.notifyArgv.includes("--print-id"),
-    `the notifier must be asked for the id, or the popup can never be found again: ${JSON.stringify(landed.notifyArgv)}`,
+    idArgv.includes("--print-id") || idArgv.some((a) => a.startsWith("--id-fd=")),
+    `the notifier must be asked for the id, or the popup can never be found again: ${JSON.stringify(idArgv)}`,
   )
   assert.equal(landed.idFile("ses_abc123.ids"), "42\n", "the id must be recorded under the correlation key")
   // stdout is the answer that travels home. The id is the daemon's handle on
@@ -1469,7 +1493,7 @@ test("[US-30] a six-field payload from an older sender still works, and is not t
 
   assert.equal(landed.code, 0, `the receiver must succeed: ${landed.stderr}`)
   assert.ok(
-    !landed.notifyArgv.includes("--print-id"),
+    !landed.notifyArgv.includes("--print-id") && !landed.notifyArgv.some((a) => a.startsWith("--id-fd=")),
     `a notification with no correlation key must not ask for an id: ${JSON.stringify(landed.notifyArgv)}`,
   )
   assert.deepEqual(landed.idFiles(), [], "no id may be written for a notification that carries no correlation key")

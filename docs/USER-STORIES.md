@@ -382,12 +382,12 @@ A cooldown that was a rate limit is the one kind of recovery worth announcing: w
 **Story ID(s) for tests:** US-26
 **Acceptance criteria:**
 - [ ] Given the notification is raised on macOS, When it is delivered locally, Then it goes to `osascript` — or to `terminal-notifier` if `osascript` is not installed — and not to `notify-send`, which does not exist there.
-- [ ] Given the channel is chosen, When it is picked, Then it is decided by `process.platform` and by which binary is actually installed, never by guessing, and every platform other than macOS keeps the `notify-send` call it has always made.
+- [ ] Given the channel is chosen, When it is picked, Then it is decided by `process.platform` and by which binary is actually installed, never by guessing, every non-macOS/non-Windows platform keeps the `notify-send` call it has always made, and Windows 10/11 uses `powershell-toast` as its first choice.
 - [ ] Given the title and the body reach `osascript`, When the script runs, Then they are passed as arguments to an `on run argv` handler and never concatenated into the script source, because both fields are attacker-influenced text — a session title, a file path, a command.
 - [ ] Given a body containing `"`, `'`, `;`, `$(…)` or backticks, When the macOS send runs, Then it reaches `display notification` byte-for-byte as data and nothing is executed.
 - [ ] Given a machine has no notifier for its platform, When a notification is sent, Then the result is a failed delivery with a reason and no exception, and `lacode doctor` names the channel that would run — or reports that there is none — instead of reporting a binary that is not used there.
 - [ ] Given the CLI runs on macOS, When the send does not complete, Then it is still bounded by a timeout, exactly as on Linux.
-- [ ] Given the notification hop, When it is documented, Then the doc leads with the shipped path — the npm-installed plugin, a direct ssh hop (`ControlMaster`) set up by `lacode tunnel setup`, and the portable `lacode receive` forced command that delivers through the platform channel (`notify-send` or `osascript`) — and marks the reverse-forward scripts (`bin/oc`, `bin/oc-notify`, `bin/oc-notify-receiver`, `bin/oc-sync`) as the author's own scripts, so a Mac user is not sent to debug a script that was never meant to run on their machine.
+- [ ] Given the notification hop, When it is documented, Then the doc leads with the shipped path — the npm-installed plugin, a direct ssh hop (`ControlMaster`) set up by `lacode tunnel setup`, and the portable `lacode receive` forced command that delivers through the cross-platform adapter chain (`notify-send`, `osascript`/`terminal-notifier`, or Windows toast) — and marks the reverse-forward scripts (`bin/oc`, `bin/oc-notify`, `bin/oc-notify-receiver`, `bin/oc-sync`) as the author's own scripts, so a user is not sent to debug a script that was never meant to run on their machine.
 - [ ] Given a machine without GNU `timeout` or with bash older than 4.0, When `bin/oc-sync` runs, Then it refuses **before** touching anything, names each missing prerequisite, and names the `lacode` subcommand to use instead. It must never report a misleading cause: the host list is read with `mapfile`, so without it the run dies at "no hosts configured" — a confident wrong answer that sends the reader to edit `.env`.
 - [ ] Given `bin/oc-notify-receiver` runs where `notify-send` does not exist, When it is invoked, Then it exits non-zero and names both the missing channel and the portable path, because its stderr reaches whoever opened the ssh connection and nobody else, and a bare "command not found" reads as a desktop that quietly stopped notifying.
 - [ ] Given the payload is parsed, When the receiver splits `$SSH_ORIGINAL_COMMAND`, Then it splits on newlines only using constructs that exist in bash 3.2 as well as bash 5, and the suite **proves the split by running the receiver** rather than by finding the word `mapfile` in the file. Under bash 3.2 — the version macOS ships — a bash-4-only builtin leaves every field at its default, so the popup says "LaCode" with an empty body and no error anywhere: the same silent blank notification the argv bug causes, reached through a different door.
@@ -613,6 +613,42 @@ A question costs a full turn and a human decision, even when the agent has a cle
 - [ ] Given YOLO and YKB are both on, When permission and question events arrive, Then each mode acts only on its own event and the other mode's behavior is unchanged.
 - [ ] Given the README and configuration reference, Then the `ykb` option and the `/ykb` and `/modes` commands are documented.
 
+### US-42: Prompt critique is opt-in and reaches only primary and planner agents
+**As a** user who wants the agent to challenge my request against the standards, **I want** an opt-in `promptCritique` option that prepends a fixed critique instruction only to primary and planner agents, **so that** I get an explicit warning when my prompt conflicts with the global rules without making every subagent slower or changing behavior by default.
+
+The option defaults to off, so upgrading changes nothing. When it is on, the instruction is prepended to `build`, `plan`, and any `basic`/`expert` agent present. Subagents (`explore`, `implement`, `context`), the hidden `instructions` writer, and pooled variants are left untouched. The prefix carries a marker and is idempotent, so a reload never duplicates it. The instruction is advisory: the agent may warn and recommend, but it must still carry out the request unless the user changes their mind.
+
+**Story ID(s) for tests:** US-42
+**Acceptance criteria:**
+- [ ] Given the option is absent or `false`, When the config hook runs, Then no agent prompt contains the critique marker.
+- [ ] Given `promptCritique: true`, When the config hook runs, Then `build` and `plan` prompts start with the critique instruction and still contain their original text.
+- [ ] Given `promptCritique: true` and user-defined `basic`/`expert` agents, When the config hook runs, Then their prompts are prefixed too.
+- [ ] Given `promptCritique: true`, When the config hook runs, Then `explore`, `implement`, `context`, `instructions`, and pooled variant prompts do not contain the marker.
+- [ ] Given the config hook runs twice with the option on, Then the instruction appears exactly once in each prefixed prompt.
+- [ ] Given the README and `docs/PROMPT-CRITIQUE.md`, Then the option, its default, the affected agents, and the beta status are documented.
+
+### US-43: A local notification is delivered on Windows through a PowerShell toast
+**As a** user on Windows, **I want** local notifications delivered through a PowerShell toast, **so that** session outcomes reach me on the desktop without depending on Linux-only notification tools.
+
+**Story ID(s) for tests:** US-43
+**Acceptance criteria:**
+- [ ] Given `win32` with `powershell.exe` present, When the adapter chain selects a notification channel, Then it selects `powershell-toast` before the `notify-send` fallback.
+- [ ] Given a Windows toast is sent, When the adapter builds the notification, Then title and body are written to a temp XML file and never appear in process argv.
+- [ ] Given a Windows toast is delivered, When the user sees it, Then it is non-actionable, cannot be closed from this side, and self-expires; critical uses `duration="long"`.
+- [ ] Given Windows sound playback, When a notification sound is requested, Then it uses `powershell-sound` (`System.Media.SoundPlayer`, `SystemSounds` fallback).
+- [ ] Given `LACODE_NOTIFY_ADAPTER` can force or mute selection, When PowerShell is missing, Then selection degrades to `notify-send` then `none` without throwing.
+- [ ] Given `lacode doctor` reports notification diagnostics, When it runs on Windows, Then it reports the selected adapter, chain, capabilities, sound, and state dir.
+
+### US-44: Web access is available only with explicit user permission
+**As a** user, **I want** web tools enabled but gated by explicit per-request permission, **so that** agents can fetch current information when I ask them to without reaching the web implicitly.
+
+**Story ID(s) for tests:** US-44
+**Acceptance criteria:**
+- [ ] Given the injected agent configs for `build`, `plan`, `explore`, `implement`, and `instructions`, When their permissions are inspected, Then `webfetch` and `websearch` are `allow`.
+- [ ] Given the build agent prompt body, When it is inspected, Then it states web access is available only with explicit user permission for the current request and does not claim web access is denied or cannot be used.
+- [ ] Given `.opencode/prompts/build.txt`, When it is inspected, Then it states web access is available only with explicit user permission for the current request.
+- [ ] Given the injected agent configs for `build` and `plan`, When their permissions are inspected, Then `read`, `glob`, `grep`, and `list` remain `deny`.
+
 ---
 
 ## Coverage
@@ -668,11 +704,14 @@ table was filled in.
 | US-33 | H | `tests/prune-old-events-test.mjs` |
 | US-37 | K | `tests/stories/k-autonomy-modes.test.mjs` |
 | US-38 | K | `tests/stories/k-autonomy-modes.test.mjs` |
+| US-42 | M | `tests/stories/m-prompt-critique.test.mjs` |
+| US-43 | D | `tests/notify-adapter-test.mjs` |
+| US-44 | A | `tests/stories/n-web-access.test.mjs` |
 
 The root-level suites under `tests/` are unit-style; the `tests/stories/` suites are
 the behavioural layer, written one epic per file with every test name carrying
 its story id. Run everything with `npm test`.
 
-41/41 stories covered by 380 test case(s); thinnest story has 1.
+44/44 stories covered by 421 test case(s); thinnest story has 1.
 No story is untested. The scan covers the `tests/stories/` suites and the root-level
 `tests/*-test.mjs` suites.

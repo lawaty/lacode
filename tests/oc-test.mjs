@@ -46,7 +46,14 @@ const check = (name, fn, options = {}) => {
     return
   }
   try {
-    fn()
+    const result = fn()
+    if (result && typeof result.then === "function") {
+      nodeTest(name, async () => { await result })
+      return result.then(
+        () => { passed++ },
+        (error) => { failures.push(`${name}: ${error.message}`) },
+      )
+    }
     passed++
     nodeTest(name, () => {})
   } catch (error) {
@@ -757,17 +764,22 @@ check("receiver fails cleanly, with a way out, where notify-send does not exist"
 /**
  * A stub PATH with the notifier and the session bus stubbed out.
  *
- * `notify-send` prints the id the daemon would have assigned, but ONLY when it
- * is asked for one with `--print-id`: that id is the only handle on the popup,
- * and a notifier that printed it unasked would put a number where an answer
- * belongs. `gdbus` records the notification ids it was asked to close.
+ * `notify-send --help` advertises `--id-fd`, so the modern path records the id
+ * before the notifier blocks. When invoked with `--id-fd=N` the stub writes the
+ * id to that fd immediately; it still honors `--print-id` for the fallback path.
+ * `gdbus` records the notification ids it was asked to close.
  */
-const stubDesktop = (dir, { notifyId = "42" } = {}) => {
+const stubDesktop = (dir, { notifyId = "42", supportsIdFd = true } = {}) => {
   const notifyLog = path.join(dir, "notify-send.log")
   const gdbusLog = path.join(dir, "gdbus.log")
+  const help = supportsIdFd
+    ? "Usage: notify-send [OPTION...] <SUMMARY> [BODY]\n  --id-fd=FD  Print notification ID to file descriptor\n  --print-id  Print notification ID\n"
+    : "Usage: notify-send [OPTION...] <SUMMARY> [BODY]\n  --print-id  Print notification ID\n"
   writeFileSync(
     path.join(dir, "notify-send"),
     `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(notifyLog)}; done\n` +
+      `for a in "$@"; do if [ "$a" = "--help" ]; then printf '%s' ${JSON.stringify(help)}; exit 0; fi; done\n` +
+      `for a in "$@"; do case "$a" in --id-fd=*) fd=\${a#--id-fd=}; printf '%s\\n' ${JSON.stringify(notifyId)} >&"$fd" ;; esac; done\n` +
       `for a in "$@"; do if [ "$a" = "--print-id" ]; then printf '%s\\n' ${JSON.stringify(notifyId)}; break; fi; done\n` +
       `exit 0\n`,
   )
@@ -813,8 +825,9 @@ check("the helper records the notification id under its correlation key", () => 
     )
 
     assert(result.status === 0, `the notification must succeed: ${result.stderr}`)
-    assert(desktop.notifyArgv().includes("--print-id"),
-      `the notifier must be asked for the id: ${JSON.stringify(desktop.notifyArgv())}`)
+    const argv = desktop.notifyArgv()
+    assert(argv.includes("--id-fd=9") || argv.includes("--print-id"),
+      `the notifier must be asked for the id: ${JSON.stringify(argv)}`)
     const ids = readFileSync(path.join(state, "ses_abc123.ids"), "utf8")
     assert(ids === "42\n", `the id must be recorded under the correlation key: ${JSON.stringify(ids)}`)
     assert(!result.stdout.includes("42"), `the id must never reach stdout: ${JSON.stringify(result.stdout)}`)
@@ -845,6 +858,208 @@ check("the helper closes a session's popups when it is asked to, and sends nothi
     assert(!existsSync(path.join(state, "ses_abc123.ids")), "the id file must be spent once its ids are closed")
     assert(desktop.notifyArgv().length === 0, `a close request must send no notification: ${JSON.stringify(desktop.notifyArgv())}`)
     assert((result.stdout || "") === "", `a close request must print nothing: ${JSON.stringify(result.stdout)}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(state, { recursive: true, force: true })
+  }
+})
+
+check("sendLocal records --id-fd notification id before notify-send exits", async () => {
+  // The defect: the id was recorded only after notify-send exited, so a close
+  // request arriving while the popup was up had nothing to close. With --id-fd
+  // the id is written before the --action wait, so the .ids file is populated
+  // while the notifier is still alive.
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-idfd-"))
+  const state = mkdtempSync(path.join(tmpdir(), "ocsync-idfd-state-"))
+  const release = path.join(dir, "release")
+  const notifyLog = path.join(dir, "notify-send.log")
+  try {
+    writeFileSync(
+      path.join(dir, "notify-send"),
+      `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(notifyLog)}; done\n` +
+        `for a in "$@"; do if [ "$a" = "--help" ]; then printf '%s\\n' "--id-fd=FD\n--action=ACTION:..."; exit 0; fi; done\n` +
+        `for a in "$@"; do case "$a" in --id-fd=*) fd=\${a#--id-fd=}; printf '42\\n' >&"$fd" ;; esac; done\n` +
+        `while [ ! -f ${JSON.stringify(release)} ]; do sleep 0.05; done\nexit 0\n`,
+    )
+    chmodSync(path.join(dir, "notify-send"), 0o755)
+
+    const child = spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import { sendLocal, resetNotifyIdFdSupport } from ${JSON.stringify(path.join(REPO, "src/tunnel/index.ts"))};\n` +
+          `resetNotifyIdFdSupport();\n` +
+          // requestID makes it actionable so sendLocal uses the long action
+          // wait, not the 5s fire-and-forget timeout the stub would outlast.
+          `const r = sendLocal({ title: "T", message: "M", urgency: "normal", icon: "utilities-terminal", correlationKey: "ses_wait", requestID: "req_1" }, "linux");\n` +
+          `if (!r.ok) { console.error(r.detail); process.exit(2); }\n`,
+      ],
+      {
+        env: {
+          ...process.env,
+          PATH: `${dir}${path.delimiter}${process.env.PATH}`,
+          HOME: dir,
+          LACODE_NOTIFY_DIR: state,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    )
+
+    let stderr = ""
+    child.stderr.on("data", (d) => { stderr += String(d) })
+    const idsFile = path.join(state, "ses_wait.ids")
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline && !existsSync(idsFile)) {
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    assert(existsSync(idsFile), "the .ids file must exist while notify-send is still waiting")
+    const ids = readFileSync(idsFile, "utf8")
+    assert(ids === "42\n", `the id must be recorded before exit: ${JSON.stringify(ids)}`)
+    assert(child.exitCode === null, "notify-send must still be running when the id is recorded")
+
+    writeFileSync(release, "go\n")
+    const code = await new Promise((resolve) => child.on("close", resolve))
+    assert(code === 0, `sendLocal must exit cleanly after release: ${code} stderr=${stderr}`)
+    const argv = existsSync(notifyLog) ? readFileSync(notifyLog, "utf8").split("\0") : []
+    assert(argv.includes("--id-fd=3"), `notify-send must receive --id-fd=3: ${JSON.stringify(argv)}`)
+    assert(!argv.includes("--print-id"), `--id-fd path must not use --print-id: ${JSON.stringify(argv)}`)
+  } finally {
+    try { writeFileSync(release, "go\n") } catch {}
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(state, { recursive: true, force: true })
+  }
+})
+
+check("sendLocal falls back to --print-id when notify-send lacks --id-fd", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-idfd-fallback-"))
+  const state = mkdtempSync(path.join(tmpdir(), "ocsync-idfd-fallback-state-"))
+  const notifyLog = path.join(dir, "notify-send.log")
+  try {
+    writeFileSync(
+      path.join(dir, "notify-send"),
+      `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> ${JSON.stringify(notifyLog)}; done\n` +
+        `for a in "$@"; do if [ "$a" = "--help" ]; then printf '%s\\n' "--print-id\n--action=ACTION:..."; exit 0; fi; done\n` +
+        `for a in "$@"; do if [ "$a" = "--print-id" ]; then printf '42\\n'; break; fi; done\nexit 0\n`,
+    )
+    chmodSync(path.join(dir, "notify-send"), 0o755)
+
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import { sendLocal, resetNotifyIdFdSupport } from ${JSON.stringify(path.join(REPO, "src/tunnel/index.ts"))};\n` +
+          `resetNotifyIdFdSupport();\n` +
+          `const r = sendLocal({ title: "T", message: "M", urgency: "normal", icon: "utilities-terminal", correlationKey: "ses_fallback" }, "linux");\n` +
+          `if (!r.ok) { console.error(r.detail); process.exit(2); }\n`,
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${dir}${path.delimiter}${process.env.PATH}`,
+          HOME: dir,
+          LACODE_NOTIFY_DIR: state,
+        },
+      },
+    )
+
+    assert(child.status === 0, `sendLocal fallback must succeed: ${child.stderr || child.stdout}`)
+    const ids = readFileSync(path.join(state, "ses_fallback.ids"), "utf8")
+    assert(ids === "42\n", `fallback must record id after exit: ${JSON.stringify(ids)}`)
+    const argv = existsSync(notifyLog) ? readFileSync(notifyLog, "utf8").split("\0").filter(Boolean) : []
+    assert(argv.includes("--print-id"), `fallback must use --print-id: ${JSON.stringify(argv)}`)
+    assert(!argv.some((a) => a.startsWith("--id-fd=")), `fallback must not use --id-fd: ${JSON.stringify(argv)}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(state, { recursive: true, force: true })
+  }
+})
+
+
+check("oc-notify-receiver records --id-fd notification id before notify-send exits", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-recv-idfd-"))
+  const state = mkdtempSync(path.join(tmpdir(), "ocsync-recv-idfd-state-"))
+  const release = path.join(dir, "release")
+  const notifyLog = path.join(dir, "notify-send.log")
+  try {
+    writeFileSync(
+      path.join(dir, "notify-send"),
+      `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a" >> ${JSON.stringify(notifyLog)}; done\n` +
+        `for a in "$@"; do if [ "$a" = "--help" ]; then printf '%s\n' "--id-fd=FD"; exit 0; fi; done\n` +
+        `for a in "$@"; do case "$a" in --id-fd=*) fd=\${a#--id-fd=}; printf '42\n' >&"$fd" ;; esac; done\n` +
+        `while [ ! -f ${JSON.stringify(release)} ]; do sleep 0.05; done\nexit 0\n`,
+    )
+    chmodSync(path.join(dir, "notify-send"), 0o755)
+
+    const child = spawn("bash", [path.join(BIN, "oc-notify-receiver")], {
+      env: {
+        ...process.env,
+        PATH: `${dir}${path.delimiter}${process.env.PATH}`,
+        HOME: dir,
+        LACODE_NOTIFY_DIR: state,
+        SSH_ORIGINAL_COMMAND: "T\nM\nnormal\nutilities-terminal\nnone\n\nses_wait",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+
+    let stderr = ""
+    let stdout = ""
+    child.stderr.on("data", (d) => { stderr += String(d) })
+    child.stdout.on("data", (d) => { stdout += String(d) })
+    const idsFile = path.join(state, "ses_wait.ids")
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline && !existsSync(idsFile)) {
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    assert(existsSync(idsFile), "the .ids file must exist while notify-send is still waiting")
+    assert(readFileSync(idsFile, "utf8") === "42\n", "the id must be recorded before notify-send exits")
+    assert(child.exitCode === null, "the receiver must still be running when the id is recorded")
+
+    writeFileSync(release, "go\n")
+    const code = await new Promise((resolve) => child.on("close", resolve))
+    assert(code === 0, `receiver must exit cleanly after release: ${code} stderr=${stderr}`)
+    assert(stdout === "", `a plain correlated popup must print nothing: ${JSON.stringify(stdout)}`)
+    const argv = existsSync(notifyLog) ? readFileSync(notifyLog, "utf8").split("\n").filter(Boolean) : []
+    assert(argv.includes("--id-fd=9"), `notify-send must receive --id-fd=9: ${JSON.stringify(argv)}`)
+    assert(!argv.includes("--print-id"), `--id-fd path must not use --print-id: ${JSON.stringify(argv)}`)
+  } finally {
+    try { writeFileSync(release, "go\n") } catch {}
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(state, { recursive: true, force: true })
+  }
+})
+
+check("oc-notify-receiver falls back to --print-id when notify-send lacks --id-fd", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ocsync-recv-idfd-fb-"))
+  const state = mkdtempSync(path.join(tmpdir(), "ocsync-recv-idfd-fb-state-"))
+  const notifyLog = path.join(dir, "notify-send.log")
+  try {
+    writeFileSync(
+      path.join(dir, "notify-send"),
+      `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a" >> ${JSON.stringify(notifyLog)}; done\n` +
+        `for a in "$@"; do if [ "$a" = "--help" ]; then printf '%s\n' "--print-id"; exit 0; fi; done\n` +
+        `for a in "$@"; do if [ "$a" = "--print-id" ]; then printf '42\n'; break; fi; done\nexit 0\n`,
+    )
+    chmodSync(path.join(dir, "notify-send"), 0o755)
+
+    const child = spawnSync("bash", [path.join(BIN, "oc-notify-receiver")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${dir}${path.delimiter}${process.env.PATH}`,
+        HOME: dir,
+        LACODE_NOTIFY_DIR: state,
+        SSH_ORIGINAL_COMMAND: "T\nM\nnormal\nutilities-terminal\nnone\n\nses_fallback",
+      },
+    })
+
+    assert(child.status === 0, `receiver fallback must succeed: ${child.stderr || child.stdout}`)
+    assert(readFileSync(path.join(state, "ses_fallback.ids"), "utf8") === "42\n", "fallback must record id after exit")
+    const argv = existsSync(notifyLog) ? readFileSync(notifyLog, "utf8").split("\n").filter(Boolean) : []
+    assert(argv.includes("--print-id"), `fallback must use --print-id: ${JSON.stringify(argv)}`)
+    assert(!argv.some((a) => a.startsWith("--id-fd=")), `fallback must not use --id-fd: ${JSON.stringify(argv)}`)
   } finally {
     rmSync(dir, { recursive: true, force: true })
     rmSync(state, { recursive: true, force: true })

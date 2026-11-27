@@ -67,6 +67,7 @@ const {
   notifyMessage,
   questionHeadline,
   releaseCompletion,
+  releaseNotificationClaim,
   safeCorrelationKey,
   safeTitle,
   shouldNotify,
@@ -441,6 +442,15 @@ await check("cooldown is per session", () => {
   assert(notifier.allow("s2", 1_100), "a different session is unaffected")
 })
 
+await check("forget rolls back only the matching timestamp", () => {
+  const notifier = new Notifier(5_000)
+  assert(notifier.allow("s1", 1_000), "first should be allowed")
+  notifier.forget("s1", 2_000)
+  assert(!notifier.allow("s1", 1_001), "a different timestamp must not remove the cooldown")
+  notifier.forget("s1", 1_000)
+  assert(notifier.allow("s1", 1_001), "forgetting the recorded timestamp should allow an immediate retry")
+})
+
 await check("the rate limiter bounds its bookkeeping", () => {
   const notifier = new Notifier(1_000)
   for (let i = 0; i < 600; i++) notifier.allow(`session-${i}`, i)
@@ -736,6 +746,7 @@ await check("a question clears when the session errors instead", async () => {
   await hooks.event({
     event: { type: "question.asked", properties: { sessionID: "root", questions: [{ question: "A or B?" }] } },
   })
+  await new Promise((resolve) => setTimeout(resolve, 600))
   await hooks.event({ event: { type: "session.error", properties: { sessionID: "root", error: { message: "boom" } } } })
   await new Promise((resolve) => setTimeout(resolve, 5_200))
   await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
@@ -775,6 +786,55 @@ await check("a failed delivery is logged as a failure, not as notified", async (
   assert(
     client.logs.some((line) => line.includes("could not reach")),
     `the helper's own diagnostic should reach the log: ${JSON.stringify(client.logs)}`,
+  )
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("a failed done can retry immediately within the cooldown", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const counter = join(dir, "count")
+  const helper = join(dir, "oc-notify")
+  writeFileSync(
+    helper,
+    [
+      "#!/usr/bin/env bash",
+      `[[ -n "\${LACODE_NOTIFY_CLOSE:-}" ]] && exit 0`,
+      `count=0`,
+      `[[ -f ${JSON.stringify(counter)} ]] && count=$(cat ${JSON.stringify(counter)})`,
+      `count=$((count + 1))`,
+      `printf '%s\n' "$count" > ${JSON.stringify(counter)}`,
+      `printf '%s\n' "$*" >> ${JSON.stringify(sent)}`,
+      `if [[ "$count" -eq 1 ]]; then echo "oc: could not reach the local desktop" >&2; exit 1; fi`,
+      "exit 0",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  )
+
+  const client = makeClient({ root: { id: "root", title: "Remote task" } })
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 800))
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 800))
+
+  const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
+  assert(lines.length === 2, `expected two delivery attempts, got ${lines.length}: ${JSON.stringify(lines)}`)
+  assert(
+    client.logs.some((line) => line.startsWith("info notified")),
+    `the second delivery should be logged as notified: ${JSON.stringify(client.logs)}`,
+  )
+  assert(
+    !client.logs.some((line) => line.includes("suppressed: cooldown")),
+    `a failed-done retry must not be suppressed by cooldown: ${JSON.stringify(client.logs)}`,
   )
 
   delete process.env.OC_NOTIFY_HELPER
@@ -837,9 +897,10 @@ await check("a second question within the cooldown still notifies", async () => 
 })
 
 await check("a rejected question stops suppressing later completions", async () => {
-  // Dismissing a question rather than answering it is a real path. If `pending`
-  // survives it, every later "Task finished" for that session is silently
-  // dropped -- the notification stops working for that session entirely.
+  // Dismissing a question rather than answering it is a real path. If an
+  // outstanding question survives it, every later "Task finished" for that
+  // session is silently dropped -- the notification stops working for that
+  // session entirely.
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
   const sent = join(dir, "sent.log")
   const helper = fakeHelper(dir, sent)
@@ -869,6 +930,123 @@ await check("a rejected question stops suppressing later completions", async () 
   rmSync(dir, { recursive: true, force: true })
 })
 
+await check("two question ids: partial reply keeps session suppressed until the last reply", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = fakeHelper(dir, sent)
+
+  const client = makeClient({ root: { id: "root", title: "Deploy" } })
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({
+    event: { type: "question.asked", properties: { sessionID: "root", id: "q1", questions: [{ question: "Q1?" }] } },
+  })
+  await hooks.event({
+    event: { type: "question.asked", properties: { sessionID: "root", id: "q2", questions: [{ question: "Q2?" }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  await hooks.event({ event: { type: "question.replied", properties: { sessionID: "root", requestID: "q1" } } })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await new Promise((resolve) => setTimeout(resolve, 5_200))
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const afterFirst = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
+  assert(afterFirst.length === 2, `partial reply must still suppress done: ${JSON.stringify(afterFirst)}`)
+  assert(afterFirst.every((line) => !line.includes("Task finished")), `no finish before q2 is answered: ${JSON.stringify(afterFirst)}`)
+
+  await hooks.event({ event: { type: "question.replied", properties: { sessionID: "root", requestID: "q2" } } })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await new Promise((resolve) => setTimeout(resolve, 5_200))
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const afterSecond = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
+  assert(afterSecond.length === 3, `done should notify after last reply: ${JSON.stringify(afterSecond)}`)
+  assert(afterSecond[2].includes("Task finished"), `expected finished wording: ${afterSecond[2]}`)
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("two question ids: partial reject keeps session suppressed until the last reject", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = fakeHelper(dir, sent)
+
+  const client = makeClient({ root: { id: "root", title: "Deploy" } })
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({
+    event: { type: "question.asked", properties: { sessionID: "root", id: "q1", questions: [{ question: "Q1?" }] } },
+  })
+  await hooks.event({
+    event: { type: "question.asked", properties: { sessionID: "root", id: "q2", questions: [{ question: "Q2?" }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  await hooks.event({ event: { type: "question.rejected", properties: { sessionID: "root", requestID: "q1" } } })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await new Promise((resolve) => setTimeout(resolve, 5_200))
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const afterFirst = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
+  assert(afterFirst.length === 2, `partial reject must still suppress done: ${JSON.stringify(afterFirst)}`)
+  assert(afterFirst.every((line) => !line.includes("Task finished")), `no finish before q2 is rejected: ${JSON.stringify(afterFirst)}`)
+
+  await hooks.event({ event: { type: "question.rejected", properties: { sessionID: "root", requestID: "q2" } } })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await new Promise((resolve) => setTimeout(resolve, 5_200))
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const afterSecond = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
+  assert(afterSecond.length === 3, `done should notify after last reject: ${JSON.stringify(afterSecond)}`)
+  assert(afterSecond[2].includes("Task finished"), `expected finished wording: ${afterSecond[2]}`)
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("no-id question asked is cleared by a rejected reply carrying requestID", async () => {
+  // Existing behavior: older runtimes may emit question.asked without an id.
+  // A later question.rejected with a requestID must clear the placeholder so
+  // the session does not remain parked forever.
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = fakeHelper(dir, sent)
+
+  const client = makeClient({ root: { id: "root", title: "Deploy" } })
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({
+    event: { type: "question.asked", properties: { sessionID: "root", questions: [{ question: "A or B?" }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  await hooks.event({
+    event: { type: "question.rejected", properties: { sessionID: "root", requestID: "que_1" } },
+  })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await new Promise((resolve) => setTimeout(resolve, 5_200))
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const lines = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
+  assert(lines.length === 2, `placeholder question should clear on rejected requestID: ${JSON.stringify(lines)}`)
+  assert(lines[1].includes("Task finished"), `expected finished wording: ${lines[1]}`)
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
 await check("deleting a session clears its parked question and busy marker", async () => {
   // The in-process maps must not outlive the session, or a deleted session that
   // had asked a question would keep suppressing anything reusing its id.
@@ -884,6 +1062,7 @@ await check("deleting a session clears its parked question and busy marker", asy
   await hooks.event({
     event: { type: "question.asked", properties: { sessionID: "root", questions: [{ question: "A or B?" }] } },
   })
+  await new Promise((resolve) => setTimeout(resolve, 600))
   await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "root", title: "Deploy" } } } })
   await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
   await new Promise((resolve) => setTimeout(resolve, 5_200))
@@ -897,14 +1076,8 @@ await check("deleting a session clears its parked question and busy marker", asy
   // being swallowed as "still waiting for you", and the busy marker works
   // again, so the session counts as having done work.
   //
-  // The count says NOTHING about the popup record, in either direction.
-  // `announce()` awaits session.get before it records the popup, so a deletion
-  // that lands inside that window is lost and the popup record is created
-  // afterwards: a stray record for a session that is gone. That is a known
-  // trade-off in the plugin (the helper is asked to close it, and the desktop
-  // has nothing to close for a session that does not exist), so this check
-  // asserts the parked question and the busy marker, and neither the presence
-  // nor the absence of that record.
+  // The pending-lookup deletion race has its own check; here the question is
+  // delivered first so this assertion isolates state cleanup.
   assert(lines.length === 2, `state must be cleared on delete: ${JSON.stringify(lines)}`)
 
   delete process.env.OC_NOTIFY_HELPER
@@ -959,16 +1132,217 @@ await check("a title seen before the idle event is used as a fallback", async ()
   rmSync(dir, { recursive: true, force: true })
 })
 
-await check("the handler swallows a session.get failure", async () => {
+const deferred = () => {
+  let resolve
+  const promise = new Promise((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+const waitForSignal = async (signal, message) => {
+  let timer
+  try {
+    await Promise.race([
+      signal,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), 1_000)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// Hold session.get open until the test has emitted the event that makes the
+// pending announcement stale. The started promise proves the await was reached;
+// the lookup promise then lets the test choose exactly when it completes.
+const deferSessionGet = (client, sessionID) => {
+  const started = deferred()
+  const lookup = deferred()
+  client.session.get = ({ path: { id } }) => {
+    assert(id === sessionID, `unexpected session lookup: ${id}`)
+    started.resolve()
+    return lookup.promise
+  }
+  return { started: started.promise, resolve: (info) => lookup.resolve({ data: info }) }
+}
+
+const watchForStaleSuppression = (client) => {
+  const suppressed = deferred()
+  client.app.log = async ({ body }) => {
+    client.logs.push(`${body.level} ${body.message}`)
+    if (body.message === "suppressed: stale after lookup") suppressed.resolve()
+  }
+  return suppressed.promise
+}
+
+await check("a new turn while session.get is pending suppresses the stale done", async () => {
   const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = fakeHelper(dir, sent)
+  const client = makeClient({ root: { id: "root", title: "Deploy" } })
+  const lookup = deferSessionGet(client, "root")
+  const suppressed = watchForStaleSuppression(client)
+  const hooks = await Notify({ client, directory: dir })
+  const previousHelper = process.env.OC_NOTIFY_HELPER
+  process.env.OC_NOTIFY_HELPER = helper
+
+  try {
+    await hooks.event({ event: { type: "session.updated", properties: { info: { id: "root", title: "Cached deploy" } } } })
+    await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+    await waitForSignal(lookup.started, "session.get did not start for the done announcement")
+
+    await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+    lookup.resolve({ id: "root" })
+    await waitForSignal(suppressed, "the stale done was not suppressed after lookup")
+
+    const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
+    assert(lines.length === 0, `a done from the previous turn must not be delivered: ${JSON.stringify(lines)}`)
+  } finally {
+    if (previousHelper === undefined) delete process.env.OC_NOTIFY_HELPER
+    else process.env.OC_NOTIFY_HELPER = previousHelper
+    await hooks.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check("a question answered while session.get is pending is not delivered", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = fakeHelper(dir, sent)
+  const client = makeClient({ root: { id: "root", title: "Deploy" } })
+  const lookup = deferSessionGet(client, "root")
+  const suppressed = watchForStaleSuppression(client)
+  const hooks = await Notify({ client, directory: dir })
+  const previousHelper = process.env.OC_NOTIFY_HELPER
+  process.env.OC_NOTIFY_HELPER = helper
+
+  try {
+    await hooks.event({
+      event: { type: "question.asked", properties: { sessionID: "root", id: "q1", questions: [{ question: "Deploy now?" }] } },
+    })
+    await waitForSignal(lookup.started, "session.get did not start for the question announcement")
+
+    await hooks.event({ event: { type: "question.replied", properties: { sessionID: "root", requestID: "q1" } } })
+    lookup.resolve({ id: "root", title: "Deploy" })
+    await waitForSignal(suppressed, "the answered question was not suppressed after lookup")
+
+    const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
+    assert(lines.length === 0, `an answered question must not be delivered: ${JSON.stringify(lines)}`)
+  } finally {
+    if (previousHelper === undefined) delete process.env.OC_NOTIFY_HELPER
+    else process.env.OC_NOTIFY_HELPER = previousHelper
+    await hooks.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check("a session deleted while session.get is pending is not delivered", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = fakeHelper(dir, sent)
+  const client = makeClient({ root: { id: "root", title: "Deploy" } })
+  const lookup = deferSessionGet(client, "root")
+  const suppressed = watchForStaleSuppression(client)
+  const hooks = await Notify({ client, directory: dir })
+  const previousHelper = process.env.OC_NOTIFY_HELPER
+  process.env.OC_NOTIFY_HELPER = helper
+
+  try {
+    await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+    await waitForSignal(lookup.started, "session.get did not start before deletion")
+
+    await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "root" } } } })
+    lookup.resolve({ id: "root", title: "Deploy" })
+    await waitForSignal(suppressed, "the deleted session announcement was not suppressed after lookup")
+
+    const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
+    assert(lines.length === 0, `a deleted session must not be delivered: ${JSON.stringify(lines)}`)
+  } finally {
+    if (previousHelper === undefined) delete process.env.OC_NOTIFY_HELPER
+    else process.env.OC_NOTIFY_HELPER = previousHelper
+    await hooks.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check("a permission answered while session.get is pending is not delivered", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = fakeHelper(dir, sent)
+  const client = makeClient({ root: { id: "root", title: "Deploy" } })
+  const lookup = deferSessionGet(client, "root")
+  const suppressed = watchForStaleSuppression(client)
+  const hooks = await Notify({ client, directory: dir })
+  const previousHelper = process.env.OC_NOTIFY_HELPER
+  process.env.OC_NOTIFY_HELPER = helper
+
+  try {
+    await hooks.event({
+      event: { type: "permission.asked", properties: { sessionID: "root", id: "p1", permission: "bash", patterns: ["*"], metadata: { command: "ls" } } },
+    })
+    await waitForSignal(lookup.started, "session.get did not start for the permission announcement")
+
+    await hooks.event({ event: { type: "permission.replied", properties: { sessionID: "root", requestID: "p1" } } })
+    lookup.resolve({ id: "root", title: "Deploy" })
+    await waitForSignal(suppressed, "the answered permission was not suppressed after lookup")
+
+    const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
+    assert(lines.length === 0, `an answered permission must not be delivered: ${JSON.stringify(lines)}`)
+  } finally {
+    if (previousHelper === undefined) delete process.env.OC_NOTIFY_HELPER
+    else process.env.OC_NOTIFY_HELPER = previousHelper
+    await hooks.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check("session.get failure falls back to cached title evidence and still delivers", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = fakeHelper(dir, sent)
   const client = {
     logs: [],
     app: { log: async () => {} },
     session: { get: async () => { throw new Error("boom") } },
   }
   const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.updated", properties: { info: { id: "root", title: "Cached title" } } } })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
+  assert(lines.length === 1, `expected one fallback notification, got ${lines.length}: ${JSON.stringify(lines)}`)
+  assert(lines[0].includes("Cached title"), `expected cached title in notification: ${lines[0]}`)
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("session.get failure with no cached title and no active mark does not notify and does not throw", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = fakeHelper(dir, sent)
+  const client = {
+    logs: [],
+    app: { log: async () => {} },
+    session: { get: async () => { throw new Error("boom") } },
+  }
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
   await hooks.event({ event: { type: "session.idle", properties: { sessionID: "nope" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
   assert(true, "a failed lookup must not throw out of the handler")
+  const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
+  assert(lines.length === 0, `expected no notification without evidence: ${JSON.stringify(lines)}`)
+
+  delete process.env.OC_NOTIFY_HELPER
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -1328,6 +1702,53 @@ test("claimNotification: legacy two-field file, same pid -> returns true", async
   }
 })
 
+test("releaseNotificationClaim: different instance token leaves claim, matching token removes it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-claim-release-instance-"))
+  const sessionID = `rel-inst-${process.pid}-${Date.now()}`
+  const kind = "done"
+  const path = claimPath(dir, sessionID, kind)
+  try {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path, `${process.pid} inst-B ${kind}`)
+    await withClaimDir(dir, () => releaseNotificationClaim(sessionID, kind, "inst-A"))
+    nodeAssert.equal(existsSync(path), true, "a claim owned by another instance must be left alone")
+    await withClaimDir(dir, () => releaseNotificationClaim(sessionID, kind, "inst-B"))
+    nodeAssert.equal(existsSync(path), false, "the owning instance must be able to release its claim")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("releaseNotificationClaim: legacy 2-field claim releases on PID match", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-claim-release-legacy-"))
+  const sessionID = `rel-legacy-${process.pid}-${Date.now()}`
+  const kind = "done"
+  const path = claimPath(dir, sessionID, kind)
+  try {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path, `${process.pid} ${kind}`)
+    await withClaimDir(dir, () => releaseNotificationClaim(sessionID, kind, "inst-A"))
+    nodeAssert.equal(existsSync(path), false, "a legacy claim without a token must release on PID match")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("releaseNotificationClaim: foreign PID leaves claim", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-claim-release-foreign-"))
+  const sessionID = `rel-foreign-${process.pid}-${Date.now()}`
+  const kind = "done"
+  const path = claimPath(dir, sessionID, kind)
+  try {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path, `${process.pid + 1} inst-A ${kind}`)
+    await withClaimDir(dir, () => releaseNotificationClaim(sessionID, kind, "inst-A"))
+    nodeAssert.equal(existsSync(path), true, "a claim held by another process must not be released")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // ---------------------------------------------------------------------------
 // The per-session completion marker
 // ---------------------------------------------------------------------------
@@ -1355,6 +1776,45 @@ test("completion: release allows re-claim", async () => {
     await withClaimDir(dir, () => releaseCompletion(sessionID))
     const again = await withClaimDir(dir, () => claimCompletion(sessionID, "done"))
     nodeAssert.equal(again, true, "after release a new claim should win")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("completion: owner-scoped release only removes matching owner", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-completion-owner-"))
+  const sessionID = `owner-${process.pid}-${Date.now()}`
+  try {
+    const claimed = await withClaimDir(dir, () => claimCompletion(sessionID, "done", "owner-A"))
+    nodeAssert.equal(claimed, true, "owner-A should claim")
+
+    await withClaimDir(dir, () => releaseCompletion(sessionID, "owner-B"))
+    const stillClaimed = await withClaimDir(dir, () => claimCompletion(sessionID, "done", "owner-C"))
+    nodeAssert.equal(stillClaimed, false, "marker must remain when release owner does not match")
+
+    await withClaimDir(dir, () => releaseCompletion(sessionID, "owner-A"))
+    const reclaimed = await withClaimDir(dir, () => claimCompletion(sessionID, "done", "owner-D"))
+    nodeAssert.equal(reclaimed, true, "matching owner release must remove marker")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("completion: legacy marker survives owner-scoped release but not unconditional release", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lacode-completion-legacy-owner-"))
+  const sessionID = `legacy-owner-${process.pid}-${Date.now()}`
+  try {
+    mkdirSync(dir, { recursive: true })
+    const path = join(dir, `completion.${safeCorrelationKey(sessionID)}`)
+    writeFileSync(path, `${process.pid} done\n`)
+
+    await withClaimDir(dir, () => releaseCompletion(sessionID, "owner-A"))
+    const stillThere = await withClaimDir(dir, () => claimCompletion(sessionID, "done", "owner-B"))
+    nodeAssert.equal(stillThere, false, "legacy two-field marker must survive owner-scoped release")
+
+    await withClaimDir(dir, () => releaseCompletion(sessionID))
+    const gone = await withClaimDir(dir, () => claimCompletion(sessionID, "done", "owner-C"))
+    nodeAssert.equal(gone, true, "unconditional release must remove legacy marker")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

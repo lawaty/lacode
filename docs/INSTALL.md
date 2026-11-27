@@ -157,7 +157,8 @@ Three things differ, and all three are worth reading rather than assuming:
 - **Notifications** are delivered through `osascript`, or through
   `terminal-notifier` when `osascript` is not installed, rather than through the
   Linux `notify-send` (US-26). `lacode doctor` reports which channel your machine
-  would actually use.
+  would actually use. See [Notifications](NOTIFICATIONS.md) for the full platform
+  matrix and caveats.
 - **The repository's shell scripts are Linux-only by design**, and are not in the
   published package. They drive one person's SSH topology, so each is on the side
   it belongs to:
@@ -177,6 +178,15 @@ Linux, so "it works on a Mac" is a supported claim rather than an intention. The
 few checks that exercise the Linux-only shell scripts above skip themselves on a
 machine that cannot run them, naming the reason — a bash 3.2 with no `mapfile`,
 or no GNU `timeout` — rather than passing silently or failing confusingly.
+
+
+## Windows
+
+Windows 10/11 notifications use the `powershell-toast` adapter (PowerShell 5.1 +
+WinRT toast). Windows toasts are non-actionable and self-expiring, so permission
+answers still have to be given in the terminal. `lacode doctor` reports the
+selected adapter, capability chain, sound channel, and state directory. See
+[Notifications](NOTIFICATIONS.md) for the full platform matrix and caveats.
 
 
 ## The `lacode` CLI

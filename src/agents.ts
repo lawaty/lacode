@@ -105,7 +105,7 @@ export const POOLED_BASES = ["explore", "implement", "context"] as const
  */
 export const AGENTS: Record<string, AgentDef> = {
   "build": {
-    "description": "Default root agent. Orchestrates rather than investigates: read/glob/grep/list/webfetch/websearch are denied by permission, so every question goes to @explore and every code change to @implement. Keeps edit/write/bash for applying and verifying what comes back.",
+    "description": "Default root agent. Orchestrates rather than investigates: read/glob/grep/list are denied by permission; web access is available only after explicit user permission, so every question goes to @explore and every code change to @implement. Keeps edit/write/bash for applying and verifying what comes back.",
     "mode": "primary",
     "temperature": 0.1,
     prompt: `# Role
@@ -113,8 +113,10 @@ export const AGENTS: Record<string, AgentDef> = {
 You are the default root agent. You orchestrate work — you do not perform
 investigation or implementation yourself.
 
-You CANNOT read files, grep, glob, or list directories, and you cannot fetch
-or search the web. Those tools are denied by configuration, not by convention.
+You CANNOT read files, grep, glob, or list directories. Those tools are denied
+by configuration, not by convention. You DO have web access (\`webfetch\` and
+\`websearch\`), but you must not use it unless the user explicitly grants
+permission for the current request. If web access would help, ask first.
 Every question of the form "what does this file do", "where is X handled", or
 "what does this error come from" belongs to an explorer, not to you.
 
@@ -295,8 +297,8 @@ missing). Never paste context file contents into the report.
         "*/AGENTS.md": "deny"
       },
       "bash": "allow",
-      "webfetch": "deny",
-      "websearch": "deny",
+      "webfetch": "allow",
+      "websearch": "allow",
       "question": "allow",
       "task": {
         "*": "deny",
@@ -378,8 +380,8 @@ Once the plan is complete, present it clearly so the caller can implement it ste
         "../../.local/share/opencode/plans/*.md": "allow"
       },
       "bash": "deny",
-      "webfetch": "deny",
-      "websearch": "deny",
+      "webfetch": "allow",
+      "websearch": "allow",
       "question": "allow",
       "task": {
         "*": "deny",
@@ -605,8 +607,8 @@ if the blocker is understanding rather than execution, report that instead.`,
         "*": "deny",
         "$HOME/.local/share/opencode/tool-output/*": "allow"
       },
-      "webfetch": "deny",
-      "websearch": "deny",
+      "webfetch": "allow",
+      "websearch": "allow",
       "question": "deny",
       "task": {
         "*": "deny"
@@ -711,8 +713,8 @@ Report briefly what you changed and where. Do not edit any other file.`,
       "*/AGENTS.md": "allow",
     },
     bash: "deny",
-    webfetch: "deny",
-    websearch: "deny",
+    webfetch: "allow",
+    websearch: "allow",
     question: "allow",
     task: {
       "*": "deny",

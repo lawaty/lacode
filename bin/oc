@@ -466,18 +466,25 @@ send_notify() {
         # An empty answer means the popup was dismissed without choosing.
         #
         # With a correlation key the id is captured as well, because only the
-        # desktop knows it and it is what closes this popup later. notify-send
-        # prints the id on its FIRST line and the action's name after it, so
-        # the two are split apart: the id is recorded, the action is printed.
-        # The id NEVER reaches stdout -- stdout is the published answer
-        # channel, and the answer is the action.
+        # desktop knows it and it is what closes this popup later. With
+        # --id-fd the id is written to fd 9 before the action wait, so a
+        # concurrent close can find the popup while it is still up; stdout
+        # then carries only the action. Older notify-send falls back to
+        # --print-id, which records the id only after exit.
         local action
         if [[ -n "$correlation_key" ]]; then
-          local output
-          output="$(notify-send "$title" "$msg" --app-name=LaCode --urgency="$urgency" --icon="$icon" --expire-time=0 --print-id --action=once='Allow once' --action=always='Always allow' --action=reject='Deny' 2>/dev/null)" || return 1
-          record_notification_id "$correlation_key" "${output%%$'\n'*}"
-          action=""
-          [[ "$output" == *$'\n'* ]] && action="${output#*$'\n'}"
+          if notify-send --help 2>&1 | grep -q -- '--id-fd'; then
+            mkdir -p "$(notify_state_dir)" 2>/dev/null || true
+            exec 9>>"$(notify_id_file "$correlation_key")"
+            action="$(notify-send "$title" "$msg" --app-name=LaCode --urgency="$urgency" --icon="$icon" --expire-time=0 --id-fd=9 --action=once='Allow once' --action=always='Always allow' --action=reject='Deny' 2>/dev/null)" || { exec 9>&-; return 1; }
+            exec 9>&-
+          else
+            local output
+            output="$(notify-send "$title" "$msg" --app-name=LaCode --urgency="$urgency" --icon="$icon" --expire-time=0 --print-id --action=once='Allow once' --action=always='Always allow' --action=reject='Deny' 2>/dev/null)" || return 1
+            record_notification_id "$correlation_key" "${output%%$'\n'*}"
+            action=""
+            [[ "$output" == *$'\n'* ]] && action="${output#*$'\n'}"
+          fi
         else
           action="$(notify-send "$title" "$msg" --app-name=LaCode --urgency="$urgency" --icon="$icon" --expire-time=0 --action=once='Allow once' --action=always='Always allow' --action=reject='Deny' 2>/dev/null)" || return 1
         fi
@@ -487,10 +494,18 @@ send_notify() {
       if [[ -n "$correlation_key" ]]; then
         # A plain popup with a correlation key: the id is captured and
         # recorded, so this popup can be closed later, and NOTHING is printed
-        # -- there is no answer to publish, and the id is not one.
-        local output
-        output="$(notify-send "$title" "$msg" --app-name=LaCode --urgency="$urgency" --icon="$icon" --expire-time=0 --print-id 2>/dev/null)" || return 1
-        record_notification_id "$correlation_key" "${output%%$'\n'*}"
+        # -- there is no answer to publish, and the id is not one. --id-fd
+        # writes the id before notify-send exits; --print-id is the fallback.
+        if notify-send --help 2>&1 | grep -q -- '--id-fd'; then
+          mkdir -p "$(notify_state_dir)" 2>/dev/null || true
+          exec 9>>"$(notify_id_file "$correlation_key")"
+          notify-send "$title" "$msg" --app-name=LaCode --urgency="$urgency" --icon="$icon" --expire-time=0 --id-fd=9 >/dev/null 2>&1 || { exec 9>&-; return 1; }
+          exec 9>&-
+        else
+          local output
+          output="$(notify-send "$title" "$msg" --app-name=LaCode --urgency="$urgency" --icon="$icon" --expire-time=0 --print-id 2>/dev/null)" || return 1
+          record_notification_id "$correlation_key" "${output%%$'\n'*}"
+        fi
         return 0
       fi
       # --expire-time=0: never auto-dismissed — the notification waits for the user to close it.

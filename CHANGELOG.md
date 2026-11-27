@@ -7,6 +7,22 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [2.4.0-beta.1] — opt-in prompt critique for primary agents
+
+### Added
+
+- Prompt critique (beta): a new `promptCritique` plugin option, default `false`. When `true`, LaCode prepends a short instruction to the prompts of the primary and planner agents (`build`, `plan`, and any user-defined `basic`/`expert` present), telling them to critique the user's request against the global standards before acting and to warn plainly on a conflict without blocking or substituting their own preference. Subagents (`explore`, `implement`, `context`), the hidden `instructions` writer, and pooled variants are left untouched. The prefix is marked and idempotent, so a reload never duplicates it. See `docs/PROMPT-CRITIQUE.md`.
+- Web access policy: `webfetch` and `websearch` are enabled for `build`, `plan`, `explore`, `implement`, and `instructions`, but agents must not use them unless the user explicitly grants permission for the current request. Build/plan read/glob/grep/list permissions remain denied.
+- Cross-platform notification adapters: Linux freedesktop (`notify-send`, actions, close), macOS `osascript` with `terminal-notifier` fallback, and Windows 10/11 PowerShell toast; Windows sound; adapter registry/probes; `LACODE_NOTIFY_ADAPTER`; and `lacode doctor` adapter/capability reporting.
+
+### Fixed
+
+- Notification reliability: per-request question tracking/partial replies, stale-lookup turn guard, done-cooldown rollback, owner-aware completion markers, instance-aware claim release, notification ID recorded before the action wait (`--id-fd` with `--print-id` fallback), and plain-notice degradation on old `notify-send` without `--action`.
+
+### Documented
+
+- README capability row, configure-table row, a `## Prompt critique (beta)` section, a Further-reading link, `docs/PROMPT-CRITIQUE.md`, and user story US-42.
+
 ## [2.3.1] — YOLO permission handling and empty-answer scoring
 
 ### Changed
@@ -1342,6 +1358,7 @@ experimental; `latest` remains 0.4.2.
 [Unreleased]: https://github.com/lawaty/lacode/compare/v2.1.0-beta.0...HEAD
 [2.1.0-beta.0]: https://github.com/lawaty/lacode/compare/v2.0.0-beta.0...v2.1.0-beta.0
 [2.0.0-beta.0]: https://github.com/lawaty/lacode/compare/v1.3.1...v2.0.0-beta.0
+[2.4.0-beta.1]: https://github.com/lawaty/lacode/compare/v2.3.1...v2.4.0-beta.1
 [2.3.1]: https://github.com/lawaty/lacode/compare/v2.3.0...v2.3.1
 [2.3.0-beta.3]: https://github.com/lawaty/lacode/compare/v2.3.0-beta.2...v2.3.0-beta.3
 [2.3.0-beta.2]: https://github.com/lawaty/lacode/compare/v2.3.0-beta.1...v2.3.0-beta.2

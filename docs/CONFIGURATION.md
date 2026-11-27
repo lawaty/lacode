@@ -109,6 +109,22 @@ Two runtime modes live on the lacode plugin entry and can be toggled from the TU
 
 The toggles edit the `yolo` / `ykb` options on the lacode plugin entry in your global opencode config (`~/.config/opencode/opencode.jsonc`, or `$XDG_CONFIG_HOME/opencode/opencode.jsonc`), preserving comments. The server reads that file on the next decision — no restart. Turning a mode on also answers requests that are already pending. The lacode plugin entry must already exist in the global config; a project-only entry cannot be toggled. A free-text question with no options is left for the user, since there is no option to choose.
 
+## Plugin options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `promptCritique` | `false` | Opt-in (beta). Prepend a short critique instruction to the prompts of the primary and planner agents (`build`, `plan`, and any user-defined `basic`/`expert` present). The agent warns plainly when a request conflicts with global standards and still does what the user asked. Subagents (`explore`, `implement`, `context`), the hidden `instructions` writer, and pooled variants are untouched. |
+
+```jsonc
+{
+  "plugin": [
+    ["@lawaty/lacode", { "promptCritique": true }]
+  ]
+}
+```
+
+See [Prompt critique](PROMPT-CRITIQUE.md) for the exact behavior and agent scope.
+
 
 ## Which models run which agent
 

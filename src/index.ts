@@ -87,6 +87,7 @@ import { applyCommands } from "./commands.ts"
 import { readModes } from "./lib/modes.ts"
 import { PACKAGE_ROOT } from "./lib/package-root.ts"
 import { resolveModels } from "./lib/pool.ts"
+import { applyPromptCritique } from "./lib/prompt-critique.ts"
 import { readInstalledVersion } from "./lib/selfupdate.ts"
 import { applyYoloPermissions } from "./lib/yolo-permissions.ts"
 import { agentPoolHooks } from "./plugins/agent-pool.ts"
@@ -115,6 +116,7 @@ export type LacodeOptions = {
   modelsFile?: string
   selfUpdate?: boolean
   feedbackHint?: boolean
+  promptCritique?: boolean
   yolo?: boolean
   ykb?: boolean
   imagePaste?: ImagePasteOptions
@@ -199,6 +201,10 @@ const LaCode = (async (input: PluginInput, options?: PluginOptions) => {
       const injected = applyAgents(cfg as Record<string, unknown>, agentSet)
       if (injected.added.length > 0) {
         await log("info", `agents: added ${injected.added.length}, kept ${injected.kept.length} already defined by the user`)
+      }
+      const critiqued = applyPromptCritique(cfg as Record<string, unknown>, opts.promptCritique === true)
+      if (critiqued.length > 0) {
+        await log("info", `prompt-critique: prefixed ${critiqued.join(", ")}`)
       }
       if (readModes({ yolo: opts.yolo }).yolo) {
         const relaxed = applyYoloPermissions(cfg as Record<string, unknown>)

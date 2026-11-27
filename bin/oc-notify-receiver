@@ -307,19 +307,38 @@ fi
 # recorded and NEVER printed, because stdout is the answer that travels home
 # and the answer is the action.
 if [[ -n "$CORRELATION_KEY" ]]; then
-  output=""
-  if [[ -n "$REQUEST_ID" ]]; then
-    output="$(notify-send "$TITLE" "$MSG" --app-name=LaCode --urgency="$URGENCY" --icon="$ICON" --expire-time=0 --print-id --action=once='Allow once' --action=always='Always allow' --action=reject='Deny')" || exit 1
+  if notify-send --help 2>&1 | grep -q -- '--id-fd'; then
+    mkdir -p "$(notify_state_dir)" 2>/dev/null || true
+    exec 9>>"$(notify_id_file "$CORRELATION_KEY")"
+    output=""
+    if [[ -n "$REQUEST_ID" ]]; then
+      output="$(notify-send "$TITLE" "$MSG" --app-name=LaCode --urgency="$URGENCY" --icon="$ICON" --expire-time=0 --id-fd=9 --action=once='Allow once' --action=always='Always allow' --action=reject='Deny')" || { exec 9>&-; exit 1; }
+    else
+      output="$(notify-send "$TITLE" "$MSG" --app-name=LaCode --urgency="$URGENCY" --icon="$ICON" --expire-time=0 --id-fd=9)" || { exec 9>&-; exit 1; }
+    fi
+    exec 9>&-
+    # With --id-fd the id went to fd 9 before the action wait, so stdout now
+    # carries only the clicked action (or nothing). An actionable popup
+    # answers with that name; a plain one has no answer to publish.
+    if [[ -n "$REQUEST_ID" ]]; then
+      printf '%s\n' "$output"
+    fi
+    exit 0
   else
-    output="$(notify-send "$TITLE" "$MSG" --app-name=LaCode --urgency="$URGENCY" --icon="$ICON" --expire-time=0 --print-id)" || exit 1
+    output=""
+    if [[ -n "$REQUEST_ID" ]]; then
+      output="$(notify-send "$TITLE" "$MSG" --app-name=LaCode --urgency="$URGENCY" --icon="$ICON" --expire-time=0 --print-id --action=once='Allow once' --action=always='Always allow' --action=reject='Deny')" || exit 1
+    else
+      output="$(notify-send "$TITLE" "$MSG" --app-name=LaCode --urgency="$URGENCY" --icon="$ICON" --expire-time=0 --print-id)" || exit 1
+    fi
+    record_notification_id "$CORRELATION_KEY" "${output%%$'\n'*}"
+    # An actionable popup answers with the name of the button the user clicked;
+    # a plain one has no answer to publish and prints nothing at all.
+    if [[ -n "$REQUEST_ID" && "$output" == *$'\n'* ]]; then
+      printf '%s\n' "${output#*$'\n'}"
+    fi
+    exit 0
   fi
-  record_notification_id "$CORRELATION_KEY" "${output%%$'\n'*}"
-  # An actionable popup answers with the name of the button the user clicked;
-  # a plain one has no answer to publish and prints nothing at all.
-  if [[ -n "$REQUEST_ID" && "$output" == *$'\n'* ]]; then
-    printf '%s\n' "${output#*$'\n'}"
-  fi
-  exit 0
 fi
 
 # An actionable notification carries buttons, so the user can answer without

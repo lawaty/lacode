@@ -281,15 +281,27 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   // consulted before notifying; this exists so an idle event racing the title
   // update still names the session rather than falling back to "session".
   const titles = new Map<string, string | undefined>()
-  // Sessions with an unanswered question outstanding. A question parks the turn:
-  // the user has been asked and the task cannot continue, which is a different
-  // (and more urgent) reason to look than "finished". Tracked so the idle event
-  // that follows a question does not also claim the task finished.
-  const pending = new Set<string>()
+  // Monotonic turn counter per session. A new busy transition or a deletion
+  // invalidates any announce() that is still awaiting session.get.
+  const turns = new Map<string, number>()
+  const bumpTurn = (sessionID: string) => {
+    const next = (turns.get(sessionID) ?? 0) + 1
+    // Refresh insertion order so a long-lived session is not the FIFO victim.
+    turns.delete(sessionID)
+    turns.set(sessionID, next)
+    while (turns.size > MAX_TRACKED_SESSIONS) turns.delete(turns.keys().next().value as string)
+  }
+  // Outstanding question requests per session, tracked by request id like
+  // permissions. A question parks the turn: the user has been asked and the
+  // task cannot continue, which is a different (and more urgent) reason to
+  // look than "finished". Tracked as a set so one answered question does not
+  // clear others that are still outstanding, and so the idle event that
+  // follows a partial reply does not also claim the task finished.
+  const questions = new Map<string, Set<string>>()
   // Sessions with an unanswered PERMISSION request outstanding, and the ids of
-  // those requests. Tracked separately from `pending` rather than sharing the
-  // set, because the two have independent lifecycles: a question can be
-  // answered while a permission is still open, and one set would drop the
+  // those requests. Tracked separately from `questions` rather than sharing the
+  // map, because the two have independent lifecycles: a question can be
+  // answered while a permission is still open, and one structure would drop the
   // other's block and let a parked session announce itself as finished.
   //
   // A MAP, not a set of session ids: one session can have SEVERAL requests
@@ -366,6 +378,27 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
     if (!outstanding) return
     outstanding.delete(requestID)
     if (outstanding.size === 0) permissions.delete(sessionID)
+  }
+  // Outstanding question requests for a session, bounded like permissions so a
+  // long-running server cannot grow the map without limit.
+  const rememberQuestions = (sessionID: string, requests: Set<string>) => {
+    questions.set(sessionID, requests)
+    while (questions.size > MAX_TRACKED_SESSIONS) {
+      const oldest = questions.keys().next().value as string
+      questions.delete(oldest)
+    }
+  }
+  // Drop one answered question request from a session's outstanding set.
+  // A reply that carries no id clears one unknown placeholder, because older
+  // question.asked payloads may lack an id and a later reply would otherwise
+  // leave the session parked forever.
+  const forgetQuestion = (sessionID: string, requestID?: string) => {
+    const outstanding = questions.get(sessionID)
+    if (!outstanding) return
+    if (requestID && outstanding.has(requestID)) outstanding.delete(requestID)
+    else if (outstanding.has(UNANSWERABLE_REQUEST)) outstanding.delete(UNANSWERABLE_REQUEST)
+    else if (!requestID) outstanding.clear()
+    if (outstanding.size === 0) questions.delete(sessionID)
   }
   // The popup a session's permission batch is waiting to raise is cancelled
   // with the session: a popup about a session that is gone is a popup about
@@ -698,21 +731,21 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
   // The claim's release, one timer per (session, kind).
   //
   // The window is the same five seconds the cooldown uses, so the claim is
-  // never held longer than the thing it mirrors. The timer is unref'd, like
-  // every other timer in this file: a claim's lifetime is never a reason to
-  // hold the server open.
+  // held for 5s after the MOST RECENT claim of that kind, not 5s after the
+  // first. The timer is unref'd, like every other timer in this file: a
+  // claim's lifetime is never a reason to hold the server open.
   //
-  // ONE timer per claim, not one per notification: the claim is a single file,
-  // and a second timer would delete a claim this process has since taken
-  // again.
+  // A new claim refreshes the timer instead of leaving an old one in place,
+  // so a claim taken again cannot be released early by the stale timer.
   const claimReleases = new Map<string, NodeJS.Timeout>()
   const scheduleClaimRelease = (sessionID: string, kind: string) => {
     const key = `${kind}:${sessionID}`
-    if (claimReleases.has(key)) return
+    const existing = claimReleases.get(key)
+    if (existing) clearTimeout(existing)
     const timer = setTimeout(() => {
       claimReleases.delete(key)
       try {
-        releaseNotificationClaim(sessionID, kind)
+        releaseNotificationClaim(sessionID, kind, instanceId)
       } catch (error) {
         void log("warn", `claim release failed: ${String(error)}`, { sessionID, kind })
       }
@@ -757,15 +790,34 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
 
   const announce = async (sessionID: string, outcome: Outcome, detail?: string, requestID?: string) => {
     try {
+      const startedTurn = turns.get(sessionID) ?? 0
+      const cachedTitle = titles.get(sessionID)
       const info = await fetchInfo(sessionID)
-      if (!info) {
+      // session.get is authoritative, but an idle event can arrive before the
+      // title update lands; fall back to the last title this process saw rather
+      // than announcing "session". If the lookup fails entirely, deliver only
+      // when this process already saw evidence the session did work.
+      const titled: SessionInfo | undefined = info
+        ? { ...info, title: info.title ?? cachedTitle, directory: info.directory ?? directory }
+        : titles.has(sessionID) || active.has(sessionID)
+          ? { id: sessionID, title: cachedTitle, directory }
+          : undefined
+      if ((turns.get(sessionID) ?? 0) !== startedTurn) {
+        void log("debug", "suppressed: stale after lookup", { sessionID, outcome })
+        return
+      }
+      if (outcome === "question" && !questions.has(sessionID)) {
+        void log("debug", "suppressed: stale after lookup", { sessionID, outcome })
+        return
+      }
+      if (outcome === "permission" && !(permissions.get(sessionID)?.size)) {
+        void log("debug", "suppressed: stale after lookup", { sessionID, outcome })
+        return
+      }
+      if (!titled) {
         void log("debug", "session info unavailable; not notifying", { sessionID })
         return
       }
-      // session.get is authoritative, but an idle event can arrive before the
-      // title update lands; fall back to the last title this process saw rather
-      // than announcing "session".
-      const titled = { ...info, title: info.title ?? titles.get(sessionID), directory: info.directory ?? directory }
       // isRemote mirrors what bin/oc decides for itself, so the message says the
       // useful thing: a remote session needs the tunnel, a local one does not.
       const isRemote = Boolean(process.env.SSH_CLIENT || process.env.SSH_TTY)
@@ -775,8 +827,8 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         detail,
         sawMessage: active.has(sessionID),
         // Either kind of block suppresses the idle event's "finished": a session
-        // parked on a permission prompt has not finished, it is waiting.
-        awaitingResponse: pending.has(sessionID) || permissions.has(sessionID),
+        // parked on a permission or question prompt has not finished, it is waiting.
+        awaitingResponse: questions.has(sessionID) || permissions.has(sessionID),
         requestID,
       })
       if (!decision.notify) {
@@ -802,6 +854,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       const key = `${kind}:${sessionID}`
       const blocking = kind !== "done"
       const now = Date.now()
+      const completionOwner = randomUUID()
       if (blocking) {
         notifier.record(key, now)
       } else if (!notifier.allow(key, now)) {
@@ -836,7 +889,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       // so a single process does exactly what it did before for those. The done
       // marker is different: it deliberately suppresses a same-process repeat.
       if (outcome === "done") {
-        if (!claimCompletion(sessionID, "done")) {
+        if (!claimCompletion(sessionID, "done", completionOwner)) {
           void log("debug", "suppressed: completion already announced", { sessionID })
           return
         }
@@ -846,7 +899,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       } else if (outcome === "error") {
         // An error always announces, but it marks the turn so the done that follows
         // it in the same turn stays quiet.
-        markCompletion(sessionID, "error")
+        markCompletion(sessionID, "error", completionOwner)
       }
       const message = isRemote ? `${decision.message} (remote)` : decision.message
       // The outcome IS the sound name: four outcomes, four bundled WAVs, one each,
@@ -875,12 +928,14 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
       try {
         sent = await deliver(decision.title, message, decision.urgency, sound, requestID, sessionID)
       } catch (error) {
-        if (outcome === "done" || outcome === "error") releaseCompletion(sessionID)
+        if (outcome === "done" || outcome === "error") releaseCompletion(sessionID, completionOwner)
+        if (outcome === "done") notifier.forget(key, now)
         throw error
       } finally {
         if (outcome !== "done") scheduleClaimRelease(sessionID, kind)
       }
-      if ((outcome === "done" || outcome === "error") && !sent.ok) releaseCompletion(sessionID)
+      if ((outcome === "done" || outcome === "error") && !sent.ok) releaseCompletion(sessionID, completionOwner)
+      if (outcome === "done" && !sent.ok) notifier.forget(key, now)
       // An actionable notification only returns once the user clicks or the wait
       // ends, so an action means the click answered the permission. With no action
       // the popup was raised and dismissed without a choice, which is still a
@@ -921,6 +976,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           if (status.type === "busy" && sessionID) {
             rememberActive(sessionID)
             releaseCompletion(sessionID)
+            bumpTurn(sessionID)
             // NOT an interaction. The runtime raises `busy` whenever the
             // session STARTS EXECUTING -- a retry, a resumption, an automatic
             // continuation -- so it says the machine is working, not that
@@ -960,11 +1016,15 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         if (event.type === "question.asked") {
           const properties = event.properties as {
             sessionID?: string
+            id?: string
             questions?: Array<{ question?: string }>
           }
           const sessionID = properties?.sessionID
           if (!sessionID) return
-          pending.add(sessionID)
+          const requestID = typeof properties.id === "string" && properties.id ? properties.id : undefined
+          const outstanding = questions.get(sessionID) ?? new Set<string>()
+          outstanding.add(requestID ?? UNANSWERABLE_REQUEST)
+          rememberQuestions(sessionID, outstanding)
           // A question is also proof of work, so it must not be suppressed by the
           // never-went-busy rule -- and if it was never seen busy, treat it as busy.
           rememberActive(sessionID)
@@ -975,15 +1035,19 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
 
         // The question was answered OR dismissed -- `rejected` is what the runtime
         // emits when it is dropped rather than answered, and it is the path that
-        // would otherwise leave `pending` set forever, silently suppressing every
+        // would otherwise leave `questions` set forever, silently suppressing every
         // later "Task finished" for that session.
         //
         // Both are read off the wire rather than from the pinned types, for the same
         // reason as question.asked: the SDK types here predate these events.
         if (event.type === "question.replied" || event.type === "question.rejected") {
-          const sessionID = (event.properties as { sessionID?: string })?.sessionID
+          const properties = event.properties as { sessionID?: string; requestID?: string }
+          const sessionID = properties?.sessionID
           if (sessionID) {
-            pending.delete(sessionID)
+            const requestID =
+              typeof properties.requestID === "string" && properties.requestID ? properties.requestID : undefined
+            if (requestID) forgetQuestion(sessionID, requestID)
+            else questions.delete(sessionID)
             // The question was answered (or dropped) in the TUI: the user is
             // looking at the answer, so the popup may fade.
             noteInteraction(sessionID)
@@ -1078,7 +1142,7 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
           // An error unblocks the session: whatever question was parked is no
           // longer what the user must act on.
           if (sessionID) {
-            pending.delete(sessionID)
+            questions.delete(sessionID)
             permissions.delete(sessionID)
             // Only an unrecognized failure interrupts. Rate limits and quota
             // errors are the pool's to handle -- it cools the model and the
@@ -1101,9 +1165,10 @@ export const notifyHooks = (async ({ client, directory }, options?: unknown, dep
         if (event.type === "session.deleted") {
           const sessionID = (event.properties as { info?: { id?: string } })?.info?.id
           if (sessionID) {
+            bumpTurn(sessionID)
             active.delete(sessionID)
             titles.delete(sessionID)
-            pending.delete(sessionID)
+            questions.delete(sessionID)
             permissions.delete(sessionID)
             // Its popup goes with it, and so does the dismissal waiting to
             // close it: the session is gone, so there is nothing to fade.

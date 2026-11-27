@@ -14,9 +14,9 @@ gets it back.
   │      │           │ ───────────────────────► │  (authorized_keys      │
   │      ▼           │   ONE argument:          │   forced command)      │
   │ lacode notify    │   title\nmessage\n       │      │                 │
-  │                  │   urgency\nicon\nsound   │      ▼                 │
-  │                  │   \nrequestID            │  notify-send /         │
-  │                  │                          │  osascript             │
+  │                  │   urgency\nicon\nsound\n │      ▼                 │
+  │                  │   requestID\n            │  notify-send /         │
+  │                  │   correlationKey         │  osascript / toast     │
   │      ▲           │ ◄─────────────────────── │                        │
   │                  │   the clicked button's   │                        │
   │                  │   name, on the forced    │                        │
@@ -31,26 +31,33 @@ listening port, no systemd unit and nothing to sync: the plugin owns the
 transport, and it exists only while opencode runs — which is the only time a
 notification matters.
 
-**One argument, not six.** ssh concatenates everything after the host into a
+**One argument, not seven.** ssh concatenates everything after the host into a
 single command string, and a forced command starts with *no* positional
-parameters. A sender that passes six quoted arguments arrives as the single
-string `"a b c d e f"`; a receiver reading `$1..$6` sees six empty strings,
-falls back to six defaults, and pops up a blank notification. So the payload
-crosses as one newline-delimited argument:
+parameters. A sender that passes fields as separate argv arrives as one
+flattened string; a receiver reading `$1..$N` sees empty strings and can render
+a blank notification. So the payload crosses as one newline-delimited argument:
 
 ```
-title\nmessage\nurgency\nicon\nsound\nrequestID
+title\nmessage\nurgency\nicon\nsound\nrequestID\ncorrelationKey
 ```
 
-Six fields — `title`, `message`, `urgency`, `icon`, `sound`, `requestID`.
-`sound` is `none`, `done`, `question`, `permission` or `error`. The request id
-is **last**, and it is opaque: it is never shown to you, never passed to a
-command, and never used to build an argument — the only thing it decides is
-whether the notification carries buttons. A sender that stops at `icon`
-simply leaves the rest empty, and an empty or unrecognised name is `none`, so a
-four-field payload is a valid one; a payload with fewer than six fields carries
-no request id at all, and therefore no buttons, so an older sender still works
-against a receiver that expects six.
+Seven fields, in order:
+
+| Field | Meaning |
+| --- | --- |
+| `title` | Notification title. |
+| `message` | Notification body. |
+| `urgency` | `low`, `normal`, or `critical`. |
+| `icon` | Icon name. |
+| `sound` | `none`, `done`, `question`, `permission`, or `error`. |
+| `requestID` | Opaque permission request id; empty when there is no actionable request. Never shown, never passed to a command, never used to build an argument — only its emptiness is tested. |
+| `correlationKey` | Opaque session/correlation key used to close a popup on that desktop; empty when there is no key. A `close:`-prefixed value is a close request, not a notification. |
+
+The request id and correlation key travel as the sixth and seventh fields; both
+are empty when absent so the field count stays stable. A sender that omits
+trailing fields leaves them empty, so older shorter payloads still parse, and a
+newer seven-field payload reaches an older receiver that ignores fields it does
+not know.
 
 Newline is safe as the delimiter because both ends strip control characters from
 the free-text fields before assembling or reading it, and `urgency`, `icon` and
@@ -87,10 +94,11 @@ The wait is bounded: ten minutes on the desktop side, and the hop's own
 deadline is stretched to outlast it, because an answer cut off by a timeout is
 worse than no answer at all.
 
-The buttons are **Linux-only**. `notify-send --action` is the only one of the
-three channels that can offer one — `osascript` and `terminal-notifier` have no
-action support — so a macOS desktop gets a plain notice, and the answer there
-still has to be given in the terminal.
+The buttons are **Linux-only**. `notify-send --action` is the only channel that
+can offer one — `osascript`, `terminal-notifier`, and Windows toasts have no
+action support in this adapter set — so macOS and Windows desktops get plain
+non-actionable notices, and the answer there still has to be given in the
+terminal.
 
 ## Setting it up
 
@@ -124,9 +132,12 @@ not on the forced command's `PATH`.
 ## Sending
 
 The CLI picks the transport by where it is running — `SSH_CLIENT` or `SSH_TTY`
-means remote, so it forwards; otherwise it delivers locally through whichever
-desktop notifier this platform has: `notify-send` on Linux, `osascript` on macOS,
-with `terminal-notifier` as the macOS fallback when `osascript` is missing.
+means remote, so it forwards; otherwise it delivers locally through the
+cross-platform adapter chain: Linux freedesktop (`notify-send`), macOS
+`osascript` with `terminal-notifier` fallback, and Windows PowerShell toast.
+`lacode receive` uses the same portable adapter chain on the desktop, while the
+legacy bash `bin/oc-notify-receiver` remains Linux-only. See
+[Notifications](NOTIFICATIONS.md) for the adapter matrix and Windows caveats.
 
 ```bash
 lacode notify "build finished" "4 files changed" normal dialog-information
@@ -163,18 +174,17 @@ useful on a Mac rather than reporting only whether a Linux binary is installed.
 
 `lacode receive` is the forced command. It reads the newline payload from
 `$SSH_ORIGINAL_COMMAND`, sanitizes each field again at the trust boundary, and
-delivers locally through the platform channel — `notify-send` on Linux,
-`osascript`/`terminal-notifier` on macOS. Because it delegates to the same local
-channel as a local send, **the desktop half is not Linux-only**: a Mac desktop
-receives notifications too.
+delivers locally through the cross-platform adapter chain. Because it delegates
+to the same local channel as a local send, **the desktop half is not
+Linux-only**: macOS and Windows desktops receive notifications too.
 
 The buttons are the exception to that. Only `notify-send` can offer one, so a
 payload with a request id is an actionable notification on Linux and a plain
-notice — one that prints nothing — on macOS. What the receiver prints on stdout
-is the chosen button's name, and that stdout is what carries the answer back up
-the connection (see [The way back](#the-way-back)). The request id itself is
-never passed to a command and never printed — only its emptiness is ever
-tested.
+notice — one that prints nothing — on macOS and Windows. What the receiver
+prints on stdout is the chosen button's name, and that stdout is what carries
+the answer back up the connection (see [The way back](#the-way-back)). The
+request id and correlation key are never passed to a command and never printed —
+only their emptiness and the close prefix are tested.
 
 It never forwards: `SSH_CLIENT` is set for a forced command as well, so it calls
 the local channel directly rather than `notify()` (which would loop back).
@@ -184,9 +194,10 @@ on the desktop, so that is the only place a tone can be heard: the remote host
 runs the session and has no speakers. The name is validated against the sound
 whitelist at the same trust boundary as `urgency` and `icon`, and the receiver
 looks the file up in the package's own `sounds/` directory — the sender's word
-never becomes a path. `afplay` plays it on macOS, `paplay`, `aplay` or
-`pw-play` on Linux, and a machine with none of them gets the notification
-regardless.
+never becomes a path. `afplay` plays it on macOS; `paplay`, `aplay` or
+`pw-play` on Linux; and `powershell-sound` (`System.Media.SoundPlayer`, with
+`SystemSounds` fallback) on Windows. A machine with no player gets the
+notification regardless.
 
 ## Configuration
 
@@ -216,7 +227,9 @@ sound on, because a misspelt variable must not be how you turn a feature off.
 `LACODE_REQUEST_ID` is absent for the same kind of reason, and it is not yours
 to set either: the plugin puts the permission request id on the helper
 process, and the helper carries it as the payload's sixth field. The hop only
-ever asks whether it is there.
+ever asks whether it is there. The correlation key is carried the same way as
+the seventh field and in `LACODE_NOTIFY_SESSION`; a close request travels in
+`LACODE_NOTIFY_CLOSE` and is marked by the `close:` prefix.
 
 ## The reverse forward
 
@@ -224,9 +237,9 @@ A host that sets `OC_TUNNEL_PORT` and leaves `OC_LOCAL_HOST` unset reaches the
 desktop through a reverse forward: `sendRemote` falls back to an ssh call to
 `localhost:<port>`, where a `systemd --user` unit on the desktop holds an
 `ssh -R` forward open and delivers to a `notify-send`-only bash receiver
-(`bin/oc-notify-receiver`). That receiver is the Linux end of the hop: it
-delivers through `notify-send`, and libnotify is a Linux thing, so a Mac cannot
-be this end of the tunnel.
+(`bin/oc-notify-receiver`). That receiver is the Linux-only legacy end of the
+hop: it delivers through `notify-send`, and libnotify is a Linux thing, so a
+macOS or Windows desktop cannot be this end of that bash receiver.
 
 The way back works the same way here: the receiver's stdout comes back down
 the forward, on the connection the notification went up, so a click on one of
