@@ -1872,6 +1872,42 @@ check("a tunnel unit never names a preflight that is not installed", () => {
   }
 })
 
+check("the tunnel unit owns a dedicated, non-multiplexed ssh connection", () => {
+  // A long-lived reverse forward must not multiplex onto a user's ControlMaster
+  // (VS Code Remote-SSH, an interactive shell, ...). With ControlMaster=auto in
+  // ~/.ssh/config the unit's ssh piggybacks on that master and returns at once
+  // while the master holds the forward -- with Restart=always the unit then
+  // restart-loops and no process owns the forward. The unit must open its own
+  // connection instead. Asserted on the RENDERED unit, not the template, so a
+  // change to how the ExecStart is assembled cannot slip past.
+  const home = mkdtempSync(path.join(tmpdir(), "ocsync-unit-mux-"))
+  try {
+    const { unit, result } = runInstallTunnelUnit(home, { preflight: false })
+    assert(unit !== "", `the unit must be written: ${result.stdout}${result.stderr}`)
+    const execStart = unit.split("\n").find((line) => line.startsWith("ExecStart=")) || ""
+    assert(execStart.includes("ControlMaster=no"),
+      `the unit must not act as or join a multiplexed master: ${execStart}`)
+    assert(execStart.includes("ControlPath=none"),
+      `the unit must disable connection sharing entirely: ${execStart}`)
+    assert(execStart.includes("ExitOnForwardFailure=yes"),
+      `the unit must still fail fast when the forward cannot be bound: ${execStart}`)
+    assert(/-R 10022:localhost:22 host-a/.test(execStart),
+      `the unit must still hold the reverse forward: ${execStart}`)
+    // The mux options belong on the ssh command line, before -R.
+    assert(execStart.indexOf("ControlPath=none") < execStart.indexOf("-R "),
+      `the mux options must precede -R on the ssh command: ${execStart}`)
+
+    // The rewrite guard must recognise the new options: an already-installed
+    // unit with the old ExecStart has to be rewritten, or the fix never reaches
+    // the very unit that is restart-looping.
+    const src = read("oc-sync")
+    assert(/grep -qF -- "-o ControlMaster=no -o ControlPath=none" "\$unit_file" \|\| stale=1/.test(src),
+      "the up-to-date guard must demand the non-multiplexed options")
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
 check("the preflight is installed by content, and a dry run installs nothing", () => {
   // A stale copy is exactly the one that misbehaves: an older preflight does
   // not know how to probe a listener, so the port stays stuck and the tunnel

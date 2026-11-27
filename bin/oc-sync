@@ -400,8 +400,15 @@ Type=simple
 # ClearAllForwardings is NOT used here: this process exists to hold a forward.
 # The RemoteForward lines in ~/.ssh/config are dropped by oc-sync instead, because
 # leaving them in is what made every login race this unit for the same port.
+#
+# This forward is long-lived, so it must NOT multiplex onto a user's ControlMaster
+# (VS Code Remote-SSH, an interactive shell, ...): with ControlMaster=auto in
+# ~/.ssh/config the mux client returns immediately while the master holds the
+# forward, and with Restart=always the unit restart-loops owning nothing.
+# ControlPath=none disables sharing; ControlMaster=no keeps this ssh from becoming
+# a master that other sessions join.
 $preflight_block
-ExecStart=/usr/bin/ssh -N -T -o ExitOnForwardFailure=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R $port:localhost:22 $host
+ExecStart=/usr/bin/ssh -N -T -o ExitOnForwardFailure=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=no -o ControlPath=none -o ControlPersist=no -R $port:localhost:22 $host
 Restart=always
 RestartSec=10
 # Nothing to keep alive locally: this process exists only to hold the forward.
@@ -434,6 +441,7 @@ UNIT
     stale=1
   else
     grep -qF -- "-R $port:localhost:22 $host" "$unit_file" || stale=1
+    grep -qF -- "-o ControlMaster=no -o ControlPath=none" "$unit_file" || stale=1
     grep -qF "Restart=always" "$unit_file" || stale=1
     if [[ -n "$preflight_line" ]]; then
       grep -qF -- "$preflight_line" "$unit_file" || stale=1
