@@ -23,6 +23,7 @@ import { execFileSync } from "node:child_process"
 import { homedir, tmpdir, userInfo } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+import { c, createSpinner, isTTY, symbols } from "./cli-display.mjs"
 import { fetchProviderStatus, statusDeprioritizedProviders } from "./provider-status.mjs"
 import { POOL_SIZE, isTransientFailure, parsePoolSlots, poolStructureValid, providerOf } from "./pool-selection.mjs"
 
@@ -35,6 +36,8 @@ export const STABLE_SCRIPT = (home = HOME) => join(STABLE_LIB_DIR(home), "refres
 export const STABLE_SCORER = (home = HOME) => join(STABLE_LIB_DIR(home), "score-models.mjs")
 export const STABLE_SELECTION = (home = HOME) => join(STABLE_LIB_DIR(home), "pool-selection.mjs")
 export const STABLE_STATUS = (home = HOME) => join(STABLE_LIB_DIR(home), "provider-status.mjs")
+export const STABLE_DISPLAY = (home = HOME) => join(STABLE_LIB_DIR(home), "cli-display.mjs")
+export const STABLE_PROBE_RESULT = (home = HOME) => join(STABLE_LIB_DIR(home), "probe-result.mjs")
 export const REFRESH_SERVICE_NAME = "lacode-refresh-pool.service"
 export const REFRESH_TIMER_NAME = "lacode-refresh-pool.timer"
 
@@ -97,6 +100,11 @@ function releaseRefreshLock() {
   try {
     rmSync(REFRESH_LOCK_DIR, { recursive: true, force: true })
   } catch {}
+}
+
+function phaseHeading(text) {
+  if (!isTTY) return
+  console.error(c.bold(c.cyan(symbols.arrow + " " + text)))
 }
 
 const isSlotLine = (line) => {
@@ -222,12 +230,12 @@ function writeFileAtomic(path, text) {
   renameSync(tmp, path)
 }
 
-function runScorer(max, extraArgs = []) {
+function runScorer(max, extraArgs = [], printOnly = false) {
   const here = dirname(fileURLToPath(import.meta.url))
   const scorer = resolve(here, "score-models.mjs")
   if (!existsSync(scorer)) throw new Error(`scorer not found: ${scorer}`)
   const args = [scorer, "--max", String(max), ...extraArgs]
-  execFileSync(process.execPath, args, { stdio: "inherit" })
+  execFileSync(process.execPath, args, { stdio: printOnly ? ["inherit", 2, "inherit"] : "inherit" })
 }
 
 /**
@@ -236,12 +244,16 @@ function runScorer(max, extraArgs = []) {
  * retry, back to the 6-hour cadence. Anything else → false, and the caller
  * runs a full scan to verify. Returns true when the pool stands.
  */
-function runCanary({ currentPoolText, scorerArgs, max }) {
+function runCanary({ currentPoolText, scorerArgs, max, printOnly = false }) {
   const members = parsePoolSlots(currentPoolText).map((slot) => slot.model)
   if (members.length === 0) return false
+  const report = (message) => {
+    if (printOnly) console.error(message)
+    else console.log(message)
+  }
   const tmp = join(tmpdir(), `lacode-canary-${process.pid}.json`)
   try {
-    runScorer(Math.max(max, members.length), [...scorerArgs, "--probe-models", members.join(","), "--out", tmp])
+    runScorer(Math.max(max, members.length), [...scorerArgs, "--probe-models", members.join(","), "--out", tmp], printOnly)
     const payload = JSON.parse(readFileSync(tmp, "utf8"))
     const answered = new Set()
     for (const entry of payload?.providers ?? []) {
@@ -251,10 +263,10 @@ function runCanary({ currentPoolText, scorerArgs, max }) {
     }
     const missing = members.filter((model) => !answered.has(model))
     if (missing.length === 0) {
-      console.log(`canary healthy: all ${members.length} pool member(s) answered; pool stands, no full scan`)
+      report(c.green(`canary healthy: all ${members.length} pool member(s) answered; pool stands, no full scan`))
       return true
     }
-    console.log(`canary: ${missing.length} member(s) not answering (${missing.join(", ")}); running a full scan`)
+    report(c.yellow(`canary: ${missing.length} member(s) not answering (${missing.join(", ")}); running a full scan`))
     return false
   } finally {
     try {
@@ -526,6 +538,8 @@ function installTimerUnits(stable = false) {
       copyFileSync(resolve(dirname(live), "score-models.mjs"), STABLE_SCORER(HOME))
       copyFileSync(resolve(dirname(live), "pool-selection.mjs"), STABLE_SELECTION(HOME))
       copyFileSync(resolve(dirname(live), "provider-status.mjs"), STABLE_STATUS(HOME))
+      copyFileSync(resolve(dirname(live), "cli-display.mjs"), STABLE_DISPLAY(HOME))
+      copyFileSync(resolve(dirname(live), "probe-result.mjs"), STABLE_PROBE_RESULT(HOME))
     }
     mkdirSync(dirname(units.servicePath), { recursive: true })
     writeFileAtomic(units.servicePath, units.service)
@@ -546,7 +560,7 @@ function installTimerUnits(stable = false) {
     process.exitCode = 1
     return false
   }
-  if (stable) console.log(`copied ${live}, score-models.mjs and pool-selection.mjs to ${STABLE_LIB_DIR(HOME)}`)
+  if (stable) console.log(`copied ${live}, score-models.mjs, pool-selection.mjs, provider-status.mjs, cli-display.mjs and probe-result.mjs to ${STABLE_LIB_DIR(HOME)}`)
   console.log(`installed ${units.servicePath}`)
   console.log(`installed ${units.timerPath}`)
   console.log(`enabled ${REFRESH_TIMER_NAME}`)
@@ -625,6 +639,7 @@ async function main() {
     process.once("exit", releaseRefreshLock)
   }
 
+  phaseHeading("Refreshing pool")
   const currentPoolText = readTextFile(poolPath)
   const canary = argv.includes("--canary")
 
@@ -635,9 +650,14 @@ async function main() {
   // protects the pool if the scan comes back degenerate.
   let deprioritized = []
   if (!printOnly && !fromScores) {
+    const statusSpinner = createSpinner({ label: "checking provider status" })
+    statusSpinner.start()
     try {
       deprioritized = statusDeprioritizedProviders(await fetchProviderStatus())
+      if (isTTY) statusSpinner.succeed("provider status checked")
+      else statusSpinner.stop()
     } catch (error) {
+      statusSpinner.stop()
       console.log(`live status unreadable (${String(error?.message ?? error)}); scanning in default order`)
     }
     if (deprioritized.length > 0) {
@@ -647,24 +667,27 @@ async function main() {
   const scorerArgs = [`--current-pool`, poolPath]
   if (deprioritized.length > 0) scorerArgs.push(`--deprioritize-providers`, deprioritized.join(","))
 
-  const runFullScan = () => runScorer(max, scorerArgs)
+  const runFullScan = () => runScorer(max, scorerArgs, printOnly)
 
   if (!fromScores) {
     try {
       if (canary) {
-        runCanary({ poolPath, currentPoolText, scorerArgs, max })
+        phaseHeading("Running canary")
+        runCanary({ poolPath, currentPoolText, scorerArgs, max, printOnly })
       } else {
+        phaseHeading("Full model scan")
         runFullScan()
+        if (isTTY) console.error(c.green(symbols.ok + " full model scan complete"))
       }
     } catch (error) {
-      console.error(`scorer failed; pool.txt not written: ${String(error?.message ?? error)}`)
+      console.error(c.red(`scorer failed; pool.txt not written: ${String(error?.message ?? error)}`))
       if (!printOnly && !noRetry) {
         const delay = retryInterval + (retryJitter > 0 ? Math.floor(Math.random() * (retryJitter + 1)) : 0)
         const scheduled = scheduleRetrySoon(delay)
         console.log(
           scheduled.scheduled
-            ? `scheduled degraded recheck in ${scheduled.seconds}s`
-            : `degraded recheck not scheduled: ${scheduled.reason}`,
+            ? c.yellow(`scheduled degraded recheck in ${scheduled.seconds}s`)
+            : c.red(`degraded recheck not scheduled: ${scheduled.reason}`),
         )
       }
       process.exitCode = 1
@@ -672,6 +695,7 @@ async function main() {
     }
   }
 
+  phaseHeading("Rebuilding pool from scores")
   let scores
   try {
     scores = readJsonFile(scoresPath)
@@ -685,15 +709,15 @@ async function main() {
   try {
     built = buildPool({ scores, currentPoolText, now: new Date() })
   } catch (error) {
-    console.error(`refresh refused (fail closed): ${String(error?.message ?? error)}`)
+    console.error(c.red(`refresh refused (fail closed): ${String(error?.message ?? error)}`))
     if (!printOnly && !noRetry) {
       const delay = retryInterval + (retryJitter > 0 ? Math.floor(Math.random() * (retryJitter + 1)) : 0)
       const scheduled = scheduleRetrySoon(delay)
-      console.log(
-        scheduled.scheduled
-          ? `scheduled degraded recheck in ${scheduled.seconds}s`
-          : `degraded recheck not scheduled: ${scheduled.reason}`,
-      )
+        console.log(
+          scheduled.scheduled
+            ? c.yellow(`scheduled degraded recheck in ${scheduled.seconds}s`)
+            : c.red(`degraded recheck not scheduled: ${scheduled.reason}`),
+        )
     }
     process.exitCode = 1
     return
@@ -722,9 +746,9 @@ async function main() {
     const applied = applyScanBench({ dir: scanBenchDir(), bench: plan.bench, clear: plan.clear })
     if (applied.benched.length > 0) {
       const detail = plan.bench.map((entry) => `${entry.model} (${entry.kind})`).join(", ")
-      console.log(`scan benched in place: ${detail}`)
+      console.log(c.yellow(`scan benched in place: ${detail}`))
     }
-    if (applied.cleared.length > 0) console.log(`scan cleared stale benches: ${applied.cleared.join(", ")}`)
+    if (applied.cleared.length > 0) console.log(c.green(`scan cleared stale benches: ${applied.cleared.join(", ")}`))
   }
   const dropped = scores.providers.flatMap((entry) => (Array.isArray(entry?.excluded) ? entry.excluded : []))
   const summary = [
@@ -739,14 +763,14 @@ async function main() {
   if (!printOnly && !forceWrite) {
     const kept = shouldKeepPool({ currentPoolText, newSlots: built.slots })
     if (kept.keep) {
-      console.error(`refresh refused (fail closed): ${kept.reason}`)
+      console.error(c.red(`refresh refused (fail closed): ${kept.reason}`))
       if (!noRetry) {
         const delay = retryInterval + (retryJitter > 0 ? Math.floor(Math.random() * (retryJitter + 1)) : 0)
         const scheduled = scheduleRetrySoon(delay)
         console.log(
           scheduled.scheduled
-            ? `scheduled degraded recheck in ${scheduled.seconds}s`
-            : `degraded recheck not scheduled: ${scheduled.reason}`,
+            ? c.yellow(`scheduled degraded recheck in ${scheduled.seconds}s`)
+            : c.red(`degraded recheck not scheduled: ${scheduled.reason}`),
         )
       }
       process.exitCode = 1
@@ -758,9 +782,9 @@ async function main() {
     const delay = degradedRetryDelay(scores.retry, Date.now(), retryInterval) + (retryJitter > 0 ? Math.floor(Math.random() * (retryJitter + 1)) : 0)
     const scheduled = scheduleRetrySoon(delay)
     if (scheduled.scheduled) {
-      console.log(`scheduled retry in ${scheduled.seconds}s for ${scores.retry.models.length} model(s) (reset ${scores.retry.after})`)
+      console.log(c.yellow(`scheduled retry in ${scheduled.seconds}s for ${scores.retry.models.length} model(s) (reset ${scores.retry.after})`))
     } else {
-      console.log(`retry not scheduled: ${scheduled.reason}`)
+      console.log(c.red(`retry not scheduled: ${scheduled.reason}`))
     }
   }
 
@@ -774,20 +798,21 @@ async function main() {
     try {
       const existing = readFileSync(poolPath, "utf8")
       if (existing === built.text) {
-        console.log(`unchanged: ${poolPath} (${newSlotCount} slots). ${summary}`)
+        console.log(c.green(`unchanged: ${poolPath} (${newSlotCount} slots). ${summary}`))
         return
       }
     } catch {}
   }
 
+  phaseHeading("Writing pool")
   try {
     atomicWriteSimple(poolPath, built.text)
   } catch (error) {
-    console.error(`failed to write ${poolPath}: ${String(error?.message ?? error)}`)
+    console.error(c.red(`failed to write ${poolPath}: ${String(error?.message ?? error)}`))
     process.exitCode = 1
     return
   }
-  console.log(`wrote ${poolPath}: ${oldSlotCount} -> ${newSlotCount} slots. ${summary}`)
+  console.log(c.green(`wrote ${poolPath}: ${oldSlotCount} -> ${newSlotCount} slots. ${summary}`))
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)

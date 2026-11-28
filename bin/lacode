@@ -24,6 +24,7 @@
 import { fileURLToPath } from "node:url"
 import { existsSync, readFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
+import { c, symbols, createSpinner } from "../scripts/cli-display.mjs"
 // A STATIC import, not a computed one: this file is an esbuild entry point
 // (scripts/build.mjs -> dist/lacode.js), and a bundler can only follow a
 // specifier it can read at build time. The old `import(join(here, "..", "src",
@@ -167,26 +168,35 @@ switch (command) {
 
   case "doctor": {
     const info = describe()
-    for (const [key, value] of Object.entries(info)) console.log(`${key.padEnd(11)} ${String(value)}`)
+    for (const [key, value] of Object.entries(info)) {
+      const text = String(value)
+      const color =
+        text.startsWith("running local") || text === "true"
+          ? c.green
+          : text.startsWith("running remote") || text === "(unset)" || text === "none" || text === "false"
+            ? c.yellow
+            : (v) => v
+      console.log(`${key.padEnd(11)} ${color(text)}`)
+    }
     if (info.running.startsWith("remote")) {
-      if (info.user === "(unset)") console.log("\nOC_LOCAL_USER is unset: the hop cannot name the desktop user, and guessing with `id -un` is wrong on most remote accounts.")
-      console.log("Set OC_LOCAL_USER, OC_TUNNEL_PORT and OC_NOTIFY_KEY, or point OC_NOTIFY_HELPER at a helper that knows them.")
+      if (info.user === "(unset)") console.log(c.yellow("\nOC_LOCAL_USER is unset: the hop cannot name the desktop user, and guessing with `id -un` is wrong on most remote accounts."))
+      console.log(c.yellow("Set OC_LOCAL_USER, OC_TUNNEL_PORT and OC_NOTIFY_KEY, or point OC_NOTIFY_HELPER at a helper that knows them."))
     } else if (info.channel === "none") {
       // The silent case this report exists to rule out: nothing is wrong, and
       // nothing will ever pop up here either.
-      console.log("\nNo local notification channel: `lacode notify` on this machine has nothing to deliver with, and every send will be reported as failed rather than shown.")
+      console.log(c.red("\nNo local notification channel: `lacode notify` on this machine has nothing to deliver with, and every send will be reported as failed rather than shown."))
     }
     process.exit(0)
     break
   }
 
   case "feedback": {
-    console.log("Bugs and feature requests:")
-    console.log(`  ${ISSUES_URL}`)
-    console.log('Questions and "how are you using it":')
-    console.log(`  ${DISCUSSIONS_URL}`)
+    console.log(c.bold("Bugs and feature requests:"))
+    console.log(`  ${c.cyan(ISSUES_URL)}`)
+    console.log(c.bold('Questions and "how are you using it":'))
+    console.log(`  ${c.cyan(DISCUSSIONS_URL)}`)
     console.log("")
-    console.log("No browser is opened and nothing is sent.")
+    console.log(c.dim("No browser is opened and nothing is sent."))
     process.exit(0)
     break
   }
@@ -205,7 +215,10 @@ switch (command) {
 
   case "update": {
     const checkOnly = argv.includes("--check")
+    const checkSpinner = createSpinner({ label: "checking for updates" })
+    checkSpinner.start()
     const check = await checkForUpdate({ packageRoot: PACKAGE_ROOT })
+    checkSpinner.stop()
     if (!check.installed) {
       console.error("lacode update: could not read the installed version (run from an installed package).")
       process.exit(1)
@@ -228,7 +241,10 @@ switch (command) {
       console.error("lacode update: no opencode binary found to perform the install.")
       process.exit(1)
     }
+    const installSpinner = createSpinner({ label: `installing lacode ${check.latest}` })
+    installSpinner.start()
     const result = await refreshCache({ cacheRoot: check.cacheRoot, bin: check.bin, latest: check.latest })
+    installSpinner.stop()
     if (!result.ok) {
       console.error(`lacode update: install failed (${result.detail}).`)
       process.exit(1)

@@ -25,6 +25,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
+import { c, symbols, createSpinner } from "./cli-display.mjs"
 
 export const STATUS_API_URL = "https://status.opencode.ai/api/status"
 export const STATUS_TIMEOUT_MS = 10_000
@@ -179,20 +180,28 @@ export async function fetchProviderStatus(options = {}) {
 const isMain = process.argv[1] && String(process.argv[1]).endsWith("provider-status.mjs")
 if (isMain) {
   const json = process.argv.includes("--json")
+  const spinner = json ? null : createSpinner({ label: "checking provider status" })
+  if (spinner) spinner.start()
   fetchProviderStatus().then((status) => {
+    if (spinner) spinner.stop()
     if (json) {
       console.log(JSON.stringify(status, null, 2))
       return
     }
     if (!status.ok) {
-      console.log(`opencode status unreachable (${status.reason}); proceeding without a live signal`)
+      console.log(c.red(`${symbols.fail} opencode status unreachable (${status.reason}); proceeding without a live signal`))
       return
     }
     if (status.providers.length === 0) {
-      console.log(`opencode status ${status.overall}${status.cached ? " (cached)" : ""}: no routing component degraded`)
+      console.log(c.green(`${symbols.ok} opencode status ${status.overall}${status.cached ? " (cached)" : ""}: no routing component degraded`))
       return
     }
     const detail = status.services.map((entry) => `${entry.service}=${entry.status}`).join(", ")
-    console.log(`opencode status degraded: ${detail} -> bench ${status.providers.join(", ")}${status.cached ? " (cached)" : ""}`)
+    const providers = status.providers.map((name) => c.cyan(name)).join(", ")
+    const down = Array.isArray(status.down) && status.down.length > 0
+    const statusColor = down ? c.red : c.yellow
+    const symbol = down ? symbols.fail : symbols.warn
+    const cached = status.cached ? " (cached)" : ""
+    console.log(`${statusColor(`${symbol} opencode status degraded: ${detail} -> bench `)}${providers}${cached ? statusColor(cached) : ""}`)
   })
 }

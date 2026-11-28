@@ -1,6 +1,6 @@
 {
   "name": "@lawaty/lacode",
-  "version": "2.4.0-beta.1",
+  "version": "2.4.0-beta.2",
   "description": "Ultimate opencode setup for Go users — cost-controlled pooled subagents, hang recovery, and notifications for opencode.",
   "license": "MIT",
   "type": "module",
@@ -53,6 +53,8 @@
     "scripts/probe-result.mjs",
     "scripts/score-models.mjs",
     "scripts/pool-selection.mjs",
+    "scripts/cli-display.mjs",
+    "scripts/provider-status.mjs",
     "scripts/refresh-pool.mjs"
   ],
   "scripts": {

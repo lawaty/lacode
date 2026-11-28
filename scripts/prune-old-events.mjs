@@ -46,6 +46,7 @@ import { appendFileSync, existsSync, mkdirSync } from "fs"
 import { homedir } from "os"
 import path from "path"
 import { fileURLToPath } from "url"
+import { c, symbols } from "./cli-display.mjs"
 
 const DAY_MS = 86400000
 const HOUR_MS = 3600000
@@ -304,6 +305,7 @@ const accountSelection = (bin, ids) => {
 const selectIds = (bin, cutoff, graceCutoff, limit) => {
   const ids = []
   let afterId = ""
+  let page = 0
   for (;;) {
     const left = limit > 0 ? limit - ids.length : PAGE_SIZE
     if (left <= 0) break
@@ -312,6 +314,9 @@ const selectIds = (bin, cutoff, graceCutoff, limit) => {
     if (rows.length === 0) break
     for (const row of rows) ids.push(row.id)
     afterId = ids[ids.length - 1]
+    page += 1
+    const target = limit > 0 ? ` of ${limit}` : ""
+    console.error(c.grey(`selecting: ${ids.length}${target} candidate row(s) found`))
     if (rows.length < want) break
   }
   return ids
@@ -334,7 +339,7 @@ const run = (argv) => {
   try {
     options = parseArgs(argv)
   } catch (error) {
-    console.error(`prune-old-events: ${error.message}`)
+    console.error(c.red(`prune-old-events: ${error.message}`))
     console.error(USAGE)
     return error.exitCode ? error.exitCode : 2
   }
@@ -351,7 +356,9 @@ const run = (argv) => {
   const cutoff = cutoffId(now, window.days)
   if (window.clamped) {
     console.warn(
-      `prune-old-events: a window of ${options.days} days reaches past the start of the id era; the cutoff was clamped to ${window.days} days, and rows older than that are left to the session sweep`,
+      c.yellow(
+        `prune-old-events: a window of ${options.days} days reaches past the start of the id era; the cutoff was clamped to ${window.days} days, and rows older than that are left to the session sweep`,
+      ),
     )
   }
 
@@ -361,7 +368,7 @@ const run = (argv) => {
   try {
     totals = runSql(bin, summarySql(cutoff, graceCutoff))[0] || {}
   } catch (error) {
-    console.error(`prune-old-events: ${error.message}`)
+    console.error(c.red(`prune-old-events: ${error.message}`))
     return 1
   }
   const candidateRows = Number(totals.rows) || 0
@@ -369,7 +376,7 @@ const run = (argv) => {
   const candidateAggregates = Number(totals.aggregates) || 0
 
   if (candidateRows === 0) {
-    console.log("nothing to prune")
+    console.log(c.yellow("nothing to prune"))
     return 0
   }
 
@@ -381,7 +388,7 @@ const run = (argv) => {
     try {
       ids = selectIds(bin, cutoff, graceCutoff, options.limit)
     } catch (error) {
-      console.error(`prune-old-events: ${error.message}`)
+      console.error(c.red(`prune-old-events: ${error.message}`))
       return 1
     }
   }
@@ -399,7 +406,7 @@ const run = (argv) => {
       bytes = measured.bytes
       aggregates = measured.aggregates
     } catch (error) {
-      console.error(`prune-old-events: ${error.message}`)
+      console.error(c.red(`prune-old-events: ${error.message}`))
       return 1
     }
   }
@@ -407,16 +414,19 @@ const run = (argv) => {
   if (!options.dryRun) {
     let deleted = 0
     let page = 0
+    const total = ids.length
     for (const chunk of chunkIds(ids, PAGE_SIZE)) {
       page += 1
       try {
         runSql(bin, deleteStatement(chunk))
       } catch (error) {
-        console.error(`prune-old-events: ${error.message}`)
-        console.error(`prune-old-events: stopped at page ${page}; ${deleted} row(s) had already been deleted`)
+        console.error(c.red(`prune-old-events: ${error.message}`))
+        console.error(c.red(`prune-old-events: stopped at page ${page}; ${deleted} row(s) had already been deleted`))
         return 1
       }
       deleted += chunk.length
+      const remaining = total - deleted
+      console.error(c.grey(`deleting: ${deleted} row(s) removed, ${remaining} to go [chunk ${page}]`))
     }
     rows = deleted
   }
@@ -438,24 +448,28 @@ const run = (argv) => {
   try {
     written = writeLog(record)
   } catch (error) {
-    console.warn(`prune-old-events: could not write the log (${error.message})`)
+    console.warn(c.yellow(`prune-old-events: could not write the log (${error.message})`))
   }
 
-  console.log(summarize({ dryRun: options.dryRun, rows, bytes, aggregates }))
+  const summaryText = summarize({ dryRun: options.dryRun, rows, bytes, aggregates })
+  const hasWork = rows > 0
+  console.log(hasWork ? c.green(summaryText) : c.yellow(summaryText))
   console.log(
-    `cutoff ${cutoff}   window ${window.days} day(s)   grace ${options.graceHours} hour(s)   elapsed ${elapsedMs} ms`,
+    c.grey(
+      `cutoff ${cutoff}   window ${window.days} day(s)   grace ${options.graceHours} hour(s)   elapsed ${elapsedMs} ms`,
+    ),
   )
   if (ids.length > 0 && ids.length < candidateRows) {
-    console.log(`${candidateRows - ids.length} more candidate row(s) were left for a later run`)
+    console.log(c.yellow(`${candidateRows - ids.length} more candidate row(s) were left for a later run`))
   }
-  if (written) console.log(`log: ${written}`)
+  if (written) console.log(c.grey(`log: ${written}`))
 
   if (options.vacuum && !options.dryRun) {
     try {
       runSql(bin, "VACUUM")
-      console.log("vacuumed the database")
+      console.log(c.green("vacuumed the database"))
     } catch (error) {
-      console.warn(`prune-old-events: vacuum failed (${error.message}); the deletions are done`)
+      console.warn(c.yellow(`prune-old-events: vacuum failed (${error.message}); the deletions are done`))
     }
   }
 
@@ -470,7 +484,7 @@ export const main = async (argv) => {
   try {
     return run(argv)
   } catch (error) {
-    console.error(`prune-old-events: ${error && error.message ? error.message : String(error)}`)
+    console.error(c.red(`prune-old-events: ${error && error.message ? error.message : String(error)}`))
     return 1
   }
 }
@@ -481,7 +495,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       process.exitCode = code
     },
     (error) => {
-      console.error(`prune-old-events: ${error && error.message ? error.message : String(error)}`)
+      console.error(c.red(`prune-old-events: ${error && error.message ? error.message : String(error)}`))
       process.exitCode = 1
     },
   )

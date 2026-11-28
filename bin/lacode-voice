@@ -15,6 +15,7 @@ import { resolveVoiceConfig, VOICE_DATA_DIR } from "../src/voice/config.ts"
 import { createVoiceClient } from "../src/voice/transport.ts"
 import { VOICE_PROTOCOL_VERSION } from "../src/voice/protocol.ts"
 import { planCapture } from "../src/voice/capture.ts"
+import { c, symbols, createProgress, createSpinner, humanBytes } from "../scripts/cli-display.mjs"
 
 const require = createRequire(import.meta.url)
 
@@ -183,9 +184,9 @@ switch (command) {
     process.on("SIGTERM", () => { void shutdown() })
     const result = await daemon.start()
     const wake = result.wake ? "on" : "off"
-    console.log(`voice daemon listening on ${config.host}:${result.port} (wake: ${wake})`)
+    console.log(c.green(`${symbols.ok} voice daemon listening on ${config.host}:${result.port} (wake: ${wake})`))
     if (result.wakeError) {
-      console.log(`warning: wake word unavailable: ${result.wakeError}`)
+      console.log(c.yellow(`${symbols.warn} warning: wake word unavailable: ${result.wakeError}`))
     }
     break
   }
@@ -194,9 +195,9 @@ switch (command) {
     const config = resolveVoiceConfig()
     const home = homedir()
     if (config.groqKey) {
-      console.log(`ok groq key: ${config.groqSource ?? "unknown"}`)
+      console.log(c.green(`${symbols.ok} ok groq key: ${config.groqSource ?? "unknown"}`))
     } else {
-      console.log("fail groq key: missing")
+      console.log(c.red(`${symbols.fail} fail groq key: missing`))
     }
     console.log(`wake engine: ${config.wakeEngine}`)
     let engineUsable = false
@@ -208,23 +209,23 @@ switch (command) {
         try { modelExists = existsSync(modelPath) } catch { modelExists = false }
       }
       if (modelExists) {
-        console.log(`ok vosk model: ${modelDisplay} (exists)`)
+        console.log(c.green(`${symbols.ok} ok vosk model: ${modelDisplay} (exists)`))
       } else {
-        console.log(`fail vosk model: ${modelDisplay} (not found)`)
+        console.log(c.red(`${symbols.fail} fail vosk model: ${modelDisplay} (not found)`))
         console.log('hint: run "lacode-voice model" to download it')
       }
       const vk = voskInfo()
       if (vk.installed) {
-        console.log(`ok vosk module: ${vk.version}`)
+        console.log(c.green(`${symbols.ok} ok vosk module: ${vk.version}`))
       } else {
-        console.log("fail vosk module: not installed")
+        console.log(c.red(`${symbols.fail} fail vosk module: not installed`))
       }
       engineUsable = modelExists && vk.installed
     } else {
       if (config.picovoiceKey) {
-        console.log("ok picovoice key: present")
+        console.log(c.green(`${symbols.ok} ok picovoice key: present`))
       } else {
-        console.log("warn picovoice key: missing")
+        console.log(c.yellow(`${symbols.warn} warn picovoice key: missing`))
       }
       const ww = config.wakeWordPath
       const wwDisplay = ww ? ww : "(none)"
@@ -244,24 +245,26 @@ switch (command) {
       const pp = porcupineInfo()
       const wakeAvailable = Boolean(config.picovoiceKey) && wwAvailable && pp.installed
       const wwPrefix = wakeAvailable ? "ok" : "fail"
-      console.log(`${wwPrefix} wake word: ${wwDisplay} (${wwStatus})`)
+      const wwLine = `${wwPrefix} wake word: ${wwDisplay} (${wwStatus})`
+      console.log(wakeAvailable ? c.green(`${symbols.ok} ${wwLine}`) : c.red(`${symbols.fail} ${wwLine}`))
       if (pp.installed) {
-        console.log(`ok porcupine module: ${pp.version}`)
+        console.log(c.green(`${symbols.ok} ok porcupine module: ${pp.version}`))
       } else {
-        console.log("warn porcupine module: not installed")
+        console.log(c.yellow(`${symbols.warn} warn porcupine module: not installed`))
       }
       engineUsable = wakeAvailable
     }
     const plan = planCapture()
     if (plan) {
-      console.log(`ok capture: ${plan.bin} ${plan.args.join(" ")}`)
+      console.log(c.green(`${symbols.ok} ok capture: ${plan.bin} ${plan.args.join(" ")}`))
     } else {
-      console.log("warn capture: no recorder found (install ffmpeg)")
+      console.log(c.yellow(`${symbols.warn} warn capture: no recorder found (install ffmpeg)`))
     }
     const bindable = await canBind(config.port, config.host)
     const portPrefix = bindable ? "ok" : "fail"
     const portStatus = bindable ? "available" : "in use"
-    console.log(`${portPrefix} port: ${config.port} ${portStatus}`)
+    const portLine = `${portPrefix} port: ${config.port} ${portStatus}`
+    console.log(bindable ? c.green(`${symbols.ok} ${portLine}`) : c.red(`${symbols.fail} ${portLine}`))
     const groqMissing = !config.groqKey
     const exitCode = groqMissing || !engineUsable ? 1 : 0
     process.exit(exitCode)
@@ -275,7 +278,7 @@ switch (command) {
     const force = rawArgv.includes("--force")
     try {
       if (!force && modelPath && modelPath.trim() !== "" && existsSync(modelPath)) {
-        console.log(`vosk model already present: ${modelPath}`)
+        console.log(c.green(`${symbols.ok} vosk model already present: ${modelPath}`))
         process.exit(0)
       }
       const dataDir = VOICE_DATA_DIR()
@@ -287,26 +290,51 @@ switch (command) {
       if (!response.ok || !response.body) {
         throw new Error(`download failed: HTTP ${response.status} ${response.statusText}`)
       }
+      const length = Number(response.headers.get("content-length"))
+      const totalBytes = Number.isFinite(length) && length > 0 ? length : undefined
       let bytes = 0
+      const progress = totalBytes !== undefined
+        ? createProgress({ total: totalBytes, label: "downloading model" })
+        : null
+      const spinner = totalBytes === undefined
+        ? createSpinner({ label: "downloading model" })
+        : null
+      if (spinner) spinner.start("downloading model")
       const counter = new Transform({
         transform(chunk, _encoding, callback) {
           bytes += chunk.length
+          if (progress) {
+            progress.update(bytes, humanBytes(bytes) + " / " + humanBytes(totalBytes))
+          } else if (spinner) {
+            spinner.update("downloading model " + humanBytes(bytes))
+          }
           callback(null, chunk)
         },
       })
-      await pipeline(Readable.fromWeb(response.body), counter, createWriteStream(zip))
+      try {
+        await pipeline(Readable.fromWeb(response.body), counter, createWriteStream(zip))
+      } catch (err) {
+        if (progress) progress.fail("downloading model")
+        if (spinner) spinner.fail("downloading model")
+        throw err
+      }
+      if (progress) {
+        progress.done(humanBytes(totalBytes) + " downloaded")
+      } else if (spinner) {
+        spinner.stop()
+      }
       console.log(`downloaded ${(bytes / (1024 * 1024)).toFixed(1)} MB`)
       const code = await runUnzip(zip, dataDir)
       if (code !== 0) throw new Error(`unzip failed with exit code ${code}`)
       if (!existsSync(modelPath)) {
         throw new Error(`vosk model not found after extraction: ${modelPath}`)
       }
-      console.log(`vosk model ready: ${modelPath}`)
+      console.log(c.green(`${symbols.ok} vosk model ready: ${modelPath}`))
       rmSync(zip, { force: true })
       process.exit(0)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      console.error(`lacode-voice: ${message}`)
+      console.error(c.red(`${symbols.fail} lacode-voice: ${message}`))
       process.exit(1)
     }
     break
@@ -333,15 +361,15 @@ switch (command) {
     while (!got && Date.now() < deadline) await delay(10)
     try { client.stop() } catch {}
     if (!got) {
-      console.log("daemon not running")
+      console.log(c.red(`${symbols.fail} daemon not running`))
       process.exit(1)
     }
     if (got.t === "state") {
-      console.log(`armed: ${got.armed} phase: ${got.phase}`)
+      console.log(c.green(`${symbols.ok} armed: ${got.armed} phase: ${got.phase}`))
     } else if (got.t === "welcome") {
-      console.log(`armed: ${got.armed} wake: ${got.wake ? "on" : "off"}`)
+      console.log(c.green(`${symbols.ok} armed: ${got.armed} wake: ${got.wake ? "on" : "off"}`))
     } else {
-      console.log("daemon running")
+      console.log(c.green(`${symbols.ok} daemon running`))
     }
     process.exit(0)
     break

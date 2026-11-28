@@ -33,6 +33,7 @@ import { existsSync, mkdirSync, writeFileSync } from "fs"
 import { homedir } from "os"
 import path from "path"
 import { fileURLToPath } from "url"
+import { c, symbols } from "./cli-display.mjs"
 
 const DAY_MS = 86400000
 const HOUR_MS = 3600000
@@ -348,12 +349,12 @@ const run = (argv) => {
   try {
     options = parseArgs(argv)
   } catch (error) {
-    console.error(`retire-old-sessions: ${error.message}`)
-    console.error(USAGE)
+    console.error(c.red(`retire-old-sessions: ${error.message}`))
+    console.error(c.cyan(USAGE))
     return error.exitCode ? error.exitCode : 2
   }
   if (options.help) {
-    console.log(USAGE)
+    console.log(c.cyan(USAGE))
     return 0
   }
 
@@ -365,7 +366,7 @@ const run = (argv) => {
   try {
     candidates = runSql(bin, candidateSql(cutoffs, options.directories))
   } catch (error) {
-    console.error(`retire-old-sessions: ${error.message}`)
+    console.error(c.red(`retire-old-sessions: ${error.message}`))
     return 1
   }
 
@@ -388,7 +389,7 @@ const run = (argv) => {
     const tableRows = runSql(bin, childTableSql())
     childTables = tableRows.map((row) => row.tbl).filter(Boolean)
   } catch (error) {
-    console.error(`retire-old-sessions: ${error.message}`)
+    console.error(c.red(`retire-old-sessions: ${error.message}`))
     return 1
   }
 
@@ -404,7 +405,7 @@ const run = (argv) => {
     }
     for (const table of childTables) childRows += countRows(bin, table, "session_id", ids)
   } catch (error) {
-    console.error(`retire-old-sessions: ${error.message}`)
+    console.error(c.red(`retire-old-sessions: ${error.message}`))
     return 1
   }
 
@@ -415,12 +416,13 @@ const run = (argv) => {
       console.log(`  ${row.id}  ${row.title || "(untitled)"}  ${row.directory || ""}`)
     }
     if (selected.length > shown.length) console.log(`  ... and ${selected.length - shown.length} more session(s)`)
-    console.log(summarize({ dryRun: true, sessions: selected.length, events: eventRows, children: childRows }))
+    const summary = summarize({ dryRun: true, sessions: selected.length, events: eventRows, children: childRows })
+    console.log(selected.length === 0 ? c.yellow(summary) : c.grey(summary))
     return 0
   }
 
   if (ids.length === 0) {
-    console.log(summarize({ dryRun: false, sessions: 0, events: 0, children: 0 }))
+    console.log(c.yellow(summarize({ dryRun: false, sessions: 0, events: 0, children: 0 })))
     return 0
   }
 
@@ -433,15 +435,22 @@ const run = (argv) => {
     statements.push(...deleteStatement("event_sequence", "aggregate_id", ids))
   }
   for (const table of childTables) statements.push(...deleteStatement(table, "session_id", ids))
+  const sessionDeleteStart = statements.length
   statements.push(...deleteStatement("session", "id", ids))
 
-  for (const statement of statements) {
+  let retired = 0
+  for (let index = 0; index < statements.length; index++) {
+    const statement = statements[index]
     try {
       runSql(bin, statement)
     } catch (error) {
-      console.error(`retire-old-sessions: ${error.message}`)
-      console.error("retire-old-sessions: stopped; the ids that are left go on the next run")
+      console.error(c.red(`retire-old-sessions: ${error.message}`))
+      console.error(c.red("retire-old-sessions: stopped; the ids that are left go on the next run"))
       return 1
+    }
+    if (index >= sessionDeleteStart) {
+      retired = Math.min(ids.length, (index - sessionDeleteStart + 1) * CHUNK_SIZE)
+      console.error(c.grey(`retired ${retired} session(s) so far`))
     }
   }
 
@@ -451,16 +460,16 @@ const run = (argv) => {
     survivors = survivingIds(bin, ids)
     orphans = options.noEvents ? 0 : orphanEvents(bin)
   } catch (error) {
-    console.error(`retire-old-sessions: ${error.message}`)
+    console.error(c.red(`retire-old-sessions: ${error.message}`))
     return 1
   }
   if (survivors.length > 0) {
-    console.error(`retire-old-sessions: ${survivors.length} session(s) survived the delete:`)
-    for (const id of survivors) console.error(`  ${id}`)
+    console.error(c.red(`retire-old-sessions: ${survivors.length} session(s) survived the delete:`))
+    for (const id of survivors) console.error(c.red(`  ${id}`))
     return 1
   }
   if (orphans > 0) {
-    console.error(`retire-old-sessions: ${orphans} orphan event row(s) left behind`)
+    console.error(c.red(`retire-old-sessions: ${orphans} orphan event row(s) left behind`))
     return 1
   }
 
@@ -469,7 +478,7 @@ const run = (argv) => {
       runSql(bin, "VACUUM")
       console.log("vacuumed the database")
     } catch (error) {
-      console.warn(`retire-old-sessions: vacuum failed (${error.message}); the deletions are done`)
+      console.warn(c.yellow(`retire-old-sessions: vacuum failed (${error.message}); the deletions are done`))
     }
   }
 
@@ -491,12 +500,12 @@ const run = (argv) => {
       mkdirSync(directory, { recursive: true })
       writeFileSync(archivePath, JSON.stringify({ retired: records }, null, 2))
     } catch (error) {
-      console.warn(`retire-old-sessions: could not write the archive (${error.message})`)
+      console.warn(c.yellow(`retire-old-sessions: could not write the archive (${error.message})`))
       archivePath = null
     }
   }
 
-  console.log(summarize({ dryRun: false, sessions: selected.length, events: eventRows, children: childRows }))
+  console.log(c.green(summarize({ dryRun: false, sessions: selected.length, events: eventRows, children: childRows })))
   if (archivePath) console.log(`records: ${archivePath}`)
   return 0
 }
@@ -509,7 +518,7 @@ export const main = async (argv) => {
   try {
     return run(argv)
   } catch (error) {
-    console.error(`retire-old-sessions: ${error && error.message ? error.message : String(error)}`)
+    console.error(c.red(`retire-old-sessions: ${error && error.message ? error.message : String(error)}`))
     return 1
   }
 }
@@ -520,7 +529,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       process.exitCode = code
     },
     (error) => {
-      console.error(`retire-old-sessions: ${error && error.message ? error.message : String(error)}`)
+      console.error(c.red(`retire-old-sessions: ${error && error.message ? error.message : String(error)}`))
       process.exitCode = 1
     },
   )

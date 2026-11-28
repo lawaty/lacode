@@ -34,6 +34,10 @@ It is a small, deliberately mechanical scenario. It is not a representative
 workload for you, and the harness does not claim it is. Its only job is to make
 the two sides of the ratio comparable.
 
+In a real terminal the benchmark prints a colorized, spinner-assisted report on
+stderr; generated Markdown and `--out` output stay plain. The
+no-guessed-prices/no-savings-figure policy is unchanged.
+
 ## Commands
 
 | Command | What it does |

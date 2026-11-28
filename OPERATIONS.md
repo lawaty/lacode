@@ -32,7 +32,7 @@ wrong bytes.
 | `~/.local/share/opencode/agent-pool/` | state | live cross-process claims + cooldowns |
 | `~/.local/share/opencode/auth.json` | state | credentials — deliberately outside both trees |
 | `.opencode/context/` | state | each project's context map — derived, not in git (see below) |
-| `tests/` | repo | 19 suites, 132 tests, no network, no running server |
+| `tests/` | repo | the full `node --test tests/` suite; offline, no network, no running server |
 
 ## Health checks
 
@@ -212,6 +212,8 @@ bin/oc-sync --dry-run          # preview, writes nothing
 bin/oc-sync --host <alias>     # one host
 bin/oc-sync --scripts-only     # only `oc`, NOT the config
 ```
+
+`oc-sync` keeps its existing status, per-host banner, and summary lines on stdout. TTY-gated phase markers, `[i/N]` host counters, and a final TTY summary are written to stderr.
 
 Pushes, with a remote backup first:
 
@@ -434,6 +436,9 @@ the next sync.
 
 ### Publishing installs the published version on every host
 
+The full deploy chain is `npm publish` → `prepack` build → `postpublish`
+(`scripts/sync-hosts.mjs`, then `bin/oc-sync`).
+
 `npm publish` runs `scripts/sync-hosts.mjs` from `postpublish`, so a release reaches the
 hosts without a separate deploy run. Hosts come from `OC_HOSTS` in
 `~/.config/opencode/.env`, then `~/.oc-hosts` when no `.env` names any.
@@ -627,6 +632,8 @@ them per machine:
 
 ```bash
 mkdir -p ~/.local/lib/lacode ~/.config/systemd/user
+# cli-display.mjs is a required shared dependency of retire-old-sessions.mjs
+cp scripts/cli-display.mjs ~/.local/lib/lacode/cli-display.mjs
 cp scripts/retire-old-sessions.mjs ~/.local/lib/lacode/retire-old-sessions.mjs
 cp systemd/lacode-retire-sessions.service ~/.config/systemd/user/
 cp systemd/lacode-retire-sessions.timer ~/.config/systemd/user/
@@ -714,6 +721,8 @@ machine:
 
 ```bash
 mkdir -p ~/.local/lib/lacode ~/.config/systemd/user
+# cli-display.mjs is a required shared dependency of prune-old-events.mjs
+cp scripts/cli-display.mjs ~/.local/lib/lacode/cli-display.mjs
 cp scripts/prune-old-events.mjs ~/.local/lib/lacode/prune-old-events.mjs
 cp systemd/lacode-prune-events.service ~/.config/systemd/user/
 cp systemd/lacode-prune-events.timer ~/.config/systemd/user/

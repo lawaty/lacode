@@ -29,6 +29,8 @@ import { homedir } from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
+import { c, symbols, stripAnsi } from "./cli-display.mjs"
+
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const REPO_DIR = path.resolve(SCRIPT_DIR, "..")
 const PACKAGE = "@lawaty/lacode"
@@ -68,10 +70,7 @@ function helperDetail(output) {
   return match ? match[1] : "unknown"
 }
 
-/** Strip ANSI escape sequences (CSI color/style codes and similar) from a string. */
-function stripAnsi(text) {
-  return String(text).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
-}
+
 
 /**
  * The remote config is `opencode.jsonc`, not JSON: comments and trailing commas
@@ -204,14 +203,14 @@ function noWait(env) {
 function waitForRegistry(version, seconds) {
   if (registryHasVersion(version)) return true
 
-  console.log(`waiting for ${PACKAGE}@${version} in the registry (up to ${seconds}s)`)
+  console.log(c.yellow(`waiting for ${PACKAGE}@${version} in the registry (up to ${seconds}s)`))
   const deadline = Date.now() + seconds * 1000
   while (Date.now() < deadline) {
     sleepSync(Math.min(WAIT_INTERVAL_MS, deadline - Date.now()))
     if (registryHasVersion(version)) return true
   }
 
-  console.log(`warn: ${version} not in the registry after ${seconds}s; attempting anyway`)
+  console.log(c.yellow(`warn: ${version} not in the registry after ${seconds}s; attempting anyway`))
   return false
 }
 
@@ -735,13 +734,13 @@ export { loadLocalAuth, syncAuth, syncHost, hostList, splitHosts, readEnvHosts, 
 export function main(env = process.env) {
   const disabled = env.LACODE_SYNC
   if (disabled !== undefined && DISABLED_VALUES.has(String(disabled).trim().toLowerCase())) {
-    console.log(`lacode sync: disabled (LACODE_SYNC=${disabled})`)
+    console.log(c.yellow(`lacode sync: disabled (LACODE_SYNC=${disabled})`))
     return 0
   }
 
   const hosts = hostList(env)
   if (hosts.length === 0) {
-    console.log("lacode sync: no hosts configured")
+    console.log(c.yellow("lacode sync: no hosts configured"))
     return 0
   }
 
@@ -749,7 +748,7 @@ export function main(env = process.env) {
 
   const version = readPackageVersion(env)
   if (!version) {
-    console.log("lacode sync: package version is unknown; skipping")
+    console.log(c.yellow("lacode sync: package version is unknown; skipping"))
     return 0
   }
 
@@ -761,58 +760,70 @@ export function main(env = process.env) {
 
   if (env.LACODE_SYNC_DRY_RUN === "1") {
     if (noWait(env)) {
-      console.log(`dry run: would not wait for ${PACKAGE}@${version} in the registry (LACODE_SYNC_NO_WAIT=1)`)
+      console.log(c.cyan(`dry run: would not wait for ${PACKAGE}@${version} in the registry (LACODE_SYNC_NO_WAIT=1)`))
     } else {
-      console.log(`dry run: would wait for ${PACKAGE}@${version} in the registry (up to ${seconds}s)`)
+      console.log(c.cyan(`dry run: would wait for ${PACKAGE}@${version} in the registry (up to ${seconds}s)`))
     }
     printDryRun(hosts, version)
     // A dry run must not touch a host. It must not send local providers over SSH.
     // Print the local half of the plan instead; provider NAMES only, never keys.
     if (replace.length === 0) {
-      console.log("auth: OC_AUTH_PROVIDERS is empty; skipping credential sync")
+      console.log(c.yellow("auth: OC_AUTH_PROVIDERS is empty; skipping credential sync"))
     } else if (auth) {
       const providers = Object.keys(auth).sort()
       console.log(
-        `auth: would sync ${providers.length} provider${providers.length === 1 ? "" : "s"} (${providers.join(", ") || "none"}); dry run contacts no host`,
+        c.cyan(`auth: would sync ${providers.length} provider${providers.length === 1 ? "" : "s"} (${providers.join(", ") || "none"}); dry run contacts no host`),
       )
     } else {
-      console.log("auth: no local auth store; nothing would be synced")
+      console.log(c.yellow("auth: no local auth store; nothing would be synced"))
     }
     return 0
   }
 
   if (!noWait(env)) waitForRegistry(version, seconds)
 
+  if (process.stderr.isTTY) {
+    console.error(c.bold(c.cyan(`${symbols.arrow} syncing ${hosts.length} host${hosts.length === 1 ? "" : "s"}`)))
+  }
+
   const results = hosts.map((host) => syncHost(host, version, auth, { replace: replace }))
 
   console.log("")
-  for (const result of results) {
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i]
+    const prefix = `[${i + 1}/${results.length}] `
     if (Array.isArray(result.shims)) {
       const shims = result.shims
       if (shims.length > 0) {
-        for (const name of shims) console.log(`${result.host}: shim disabled: ${name}`)
+        for (const name of shims) console.log(c.yellow(`${result.host}: shim disabled: ${name}`))
       } else {
-        console.log(`${result.host}: no stale shim`)
+        console.log(c.dim(`${result.host}: no stale shim`))
       }
     }
     if (result.status === "ok") {
-      console.log(`${result.host}: ok`)
-      if (result.retried) console.log(`${result.host}: retried after clearing the installer cache`)
-      if (result.auth) console.log(`${result.host}: ${result.auth}`)
+      console.log(`${prefix}${c.green(symbols.ok)} ${result.host}: ok`)
+      if (result.retried) console.log(c.yellow(`${result.host}: retried after clearing the installer cache`))
+      if (result.auth) console.log(c.cyan(`${result.host}: ${result.auth}`))
     } else if (result.status === "warn") {
-      console.log(`${result.host}: warn (${result.reason})`)
-      if (result.auth) console.log(`${result.host}: ${result.auth}`)
-    } else if (result.status === "skipped") console.log(`${result.host}: skipped (${result.reason})`)
-    else console.log(`${result.host}: failed (${result.reason})`)
+      console.log(`${prefix}${c.yellow(symbols.warn)} ${result.host}: warn (${result.reason})`)
+      if (result.auth) console.log(c.cyan(`${result.host}: ${result.auth}`))
+    } else if (result.status === "skipped") {
+      console.log(`${prefix}${c.yellow(symbols.warn)} ${result.host}: skipped (${result.reason})`)
+    } else {
+      console.log(`${prefix}${c.red(symbols.fail)} ${result.host}: failed (${result.reason})`)
+    }
   }
 
   const ok = results.filter((result) => result.status === "ok").length
   const warn = results.filter((result) => result.status === "warn").length
   const skipped = results.filter((result) => result.status === "skipped").length
   const failed = results.filter((result) => result.status === "failed").length
-  console.log(
-    `summary: ${ok} ok, ${warn} warn, ${skipped} skipped, ${failed} failed (${results.length} host${results.length === 1 ? "" : "s"})`,
-  )
+  const summary = `summary: ${ok} ok, ${warn} warn, ${skipped} skipped, ${failed} failed (${results.length} host${results.length === 1 ? "" : "s"})`
+  if (process.stderr.isTTY) {
+    const done = failed > 0 ? c.red(symbols.fail + " sync complete") : c.green(symbols.ok + " sync complete")
+    console.error(done)
+  }
+  console.log(summary)
 
   return failed > 0 && env.LACODE_SYNC_STRICT === "1" ? 1 : 0
 }
@@ -827,7 +838,7 @@ if (invokedDirectly) {
     // Never print the thrown value: a JSON.parse error can quote the config,
     // and the config can contain provider credentials. A publish also must not
     // fail on an unexpected error unless the caller asked for strict mode.
-    console.log("lacode sync: failed (unexpected error)")
+    console.log(c.red("lacode sync: failed (unexpected error)"))
     process.exitCode = process.env.LACODE_SYNC_STRICT === "1" ? 1 : 0
   }
 }

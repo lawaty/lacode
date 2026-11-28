@@ -13,6 +13,7 @@
 import { auditMap } from "../src/lib/map-schema.ts"
 import { checkFixture, judge } from "../tests/fixtures/context-map/lib.mjs"
 import { join } from "node:path"
+import { c, symbols } from "./cli-display.mjs"
 
 const args = process.argv.slice(2)
 const json = args.includes("--json")
@@ -54,13 +55,13 @@ for (const name of which) {
 
   if (json) continue
 
-  console.log(`\n=== ${name} ===`)
-  console.log(`before: ${result.before.violations.length} violation(s) ${JSON.stringify(counts(result.before.violations))}`)
-  console.log(`lifecycle removed: ${result.lifecycle.removedTotal}`)
+  console.log(`\n${c.bold(c.cyan(`=== ${name} ===`))}`)
+  console.log(`${c.dim("before:")} ${result.before.violations.length} violation(s) ${JSON.stringify(counts(result.before.violations))}`)
+  console.log(`${c.dim("lifecycle removed:")} ${result.lifecycle.removedTotal}`)
   for (const file of result.lifecycle.files) {
     for (const entry of file.removed) console.log(`  - ${file.file}: ${entry.text || entry.title}`)
   }
-  console.log(`after:  ${result.after.violations.length} violation(s)`)
+  console.log(`${c.dim("after:")}  ${result.after.violations.length} violation(s)`)
   for (const [file, diff] of Object.entries(result.files)) {
     console.log(
       `  ${file}: ${diff.beforeLines} -> ${diff.afterLines} non-blank lines (${diff.lineDelta >= 0 ? "+" : ""}${diff.lineDelta}), ` +
@@ -69,15 +70,21 @@ for (const name of which) {
     for (const entry of diff.changed) console.log(`    meaning changed at ${entry.home}: "${entry.before}" -> "${entry.after}"`)
   }
   const failed = Object.entries(verdict).filter(([, passed]) => !passed)
-  console.log(`pass conditions: ${Object.keys(verdict).length - failed.length}/${Object.keys(verdict).length}`)
-  for (const [condition, passed] of Object.entries(verdict)) console.log(`  ${passed ? "PASS" : "FAIL"} ${condition}`)
-}
-
-if (report.live) {
-  if (!json) {
-    console.log(`\n=== live map (this repository, read-only) ===`)
-    console.log(`${report.live.violations} violation(s) ${JSON.stringify(report.live.kinds)}`)
+  console.log(`${c.dim("pass conditions:")} ${Object.keys(verdict).length - failed.length}/${Object.keys(verdict).length}`)
+  for (const [condition, passed] of Object.entries(verdict)) {
+    if (passed) {
+      console.log(`  ${c.green(symbols.ok)} ${condition}`)
+    } else {
+      console.log(`  ${c.red(symbols.fail)} ${condition}`)
+    }
   }
 }
+
+  if (report.live) {
+    if (!json) {
+      console.log(`\n${c.bold(c.cyan("=== live map (this repository, read-only) ==="))}`)
+      console.log(`${c.dim("violations:")} ${report.live.violations} ${JSON.stringify(report.live.kinds)}`)
+    }
+  }
 
 if (json) console.log(JSON.stringify(report, null, 2))

@@ -287,7 +287,7 @@ test("renderTimerUnits returns user systemd service and a 6-hourly timer", () =>
   assert.match(units.timer, /WantedBy=timers\.target/)
 })
 
-test("--install-timer --stable copies all four modules and points ExecStart at the stable script", () => {
+test("--install-timer --stable copies every module and points ExecStart at the stable script", () => {
   const home = mkdtempSync(join(tmpdir(), "refresh-pool-install-"))
   const stubDir = join(home, "stub-bin")
   mkdirSync(stubDir, { recursive: true })
@@ -301,16 +301,33 @@ test("--install-timer --stable copies all four modules and points ExecStart at t
   })
   assert.equal(result.status, 0, result.stderr)
 
-  const stable = join(home, ".local", "lib", "lacode", "refresh-pool.mjs")
-  assert.ok(existsSync(stable), "stable copy must exist")
-  assert.ok(existsSync(join(home, ".local", "lib", "lacode", "score-models.mjs")), "stable scorer must exist")
-  assert.ok(existsSync(join(home, ".local", "lib", "lacode", "pool-selection.mjs")), "stable selection module must exist")
-  assert.ok(existsSync(join(home, ".local", "lib", "lacode", "provider-status.mjs")), "stable status module must exist")
+  const stableLib = join(home, ".local", "lib", "lacode")
+  const stable = join(stableLib, "refresh-pool.mjs")
+  const copied = [
+    "refresh-pool.mjs",
+    "score-models.mjs",
+    "pool-selection.mjs",
+    "provider-status.mjs",
+    "cli-display.mjs",
+    "probe-result.mjs",
+  ]
+  for (const name of copied) {
+    assert.ok(existsSync(join(stableLib, name)), `stable copy must exist: ${name}`)
+  }
 
   const service = readFileSync(join(home, ".config", "systemd", "user", "lacode-refresh-pool.service"), "utf8")
   assert.ok(service.includes(`ExecStart=${process.execPath} ${stable}`), service)
   const timer = readFileSync(join(home, ".config", "systemd", "user", "lacode-refresh-pool.timer"), "utf8")
   assert.match(timer, /OnCalendar=\*-\*-\* 00\/6:00:00/)
+
+  // Regression guard: the copied scorer must resolve its own imports when run
+  // from the stable directory (score-models.mjs imports ./probe-result.mjs).
+  const help = spawnSync(process.execPath, [join(stableLib, "score-models.mjs"), "--help"], {
+    env: { ...process.env, HOME: home },
+    encoding: "utf8",
+  })
+  assert.equal(help.status, 0, `stable scorer --help failed:\n${help.stderr}\n${help.stdout}`)
+  assert.match(help.stdout + help.stderr, /--probe-models|Usage:/)
 
   rmSync(home, { recursive: true, force: true })
 })

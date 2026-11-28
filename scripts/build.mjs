@@ -30,6 +30,7 @@ import { chmod, mkdir, readdir, rename, rm, stat } from "node:fs/promises"
 import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import * as esbuild from "esbuild"
+import { c, createProgress, symbols } from "./cli-display.mjs"
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 
@@ -96,56 +97,71 @@ const exists = async (path) => {
 export const build = async ({ log = false } = {}) => {
   const dist = join(ROOT, "dist")
   await mkdir(dist, { recursive: true })
+  const progress = log ? createProgress({ total: ENTRY_POINTS.length, label: "building" }) : null
 
-  // Build each entry to a temp file and RENAME it into place, rather than
-  // wiping dist first.
-  //
-  // Wiping is what the old build did, and it left a window in which
-  // `dist/index.js` did not exist. A running opencode imports the plugin by
-  // absolute file URL; a process that started in that window failed to load
-  // LaCode entirely and then ran every `task` spawn on the caller's model. The
-  // rename is atomic, so a reader sees either the previous build or the new one
-  // and never an absent file. Stale files are removed AFTER the live entries are
-  // in place, which keeps the old "no stale dist" guarantee.
-  for (const entry of ENTRY_POINTS) {
-    const outfile = join(ROOT, entry.out)
-    const staged = join(dirname(outfile), `.${basename(outfile)}.${process.pid}.tmp`)
-    await esbuild.build({
-      entryPoints: [join(ROOT, entry.in)],
-      outfile: staged,
-      bundle: true,
-      format: "esm",
-      platform: "node",
-      target: "node22",
-      jsx: "automatic",
-      external: EXTERNAL,
-      // esbuild hoists a leading `#!` to the top of the output on its own, so
-      // dist/lacode.js keeps its shebang and stays directly executable.
-      logLevel: log ? "info" : "silent",
-    })
-    // npm only guarantees the executable bit on `bin` targets at INSTALL time.
-    // Setting it here means the tarball, a `git archive`, and a plain `cp -r` of
-    // dist/ all carry a runnable CLI rather than one that needs a chmod first.
-    if (entry.executable) await chmod(staged, 0o755)
-    await rename(staged, outfile)
-    if (log) console.log(`  ${entry.in} -> ${entry.out}`)
+  try {
+    // Build each entry to a temp file and RENAME it into place, rather than
+    // wiping dist first.
+    //
+    // Wiping is what the old build did, and it left a window in which
+    // `dist/index.js` did not exist. A running opencode imports the plugin by
+    // absolute file URL; a process that started in that window failed to load
+    // LaCode entirely and then ran every `task` spawn on the caller's model. The
+    // rename is atomic, so a reader sees either the previous build or the new one
+    // and never an absent file. Stale files are removed AFTER the live entries are
+    // in place, which keeps the old "no stale dist" guarantee.
+    for (const entry of ENTRY_POINTS) {
+      const outfile = join(ROOT, entry.out)
+      const staged = join(dirname(outfile), `.${basename(outfile)}.${process.pid}.tmp`)
+      await esbuild.build({
+        entryPoints: [join(ROOT, entry.in)],
+        outfile: staged,
+        bundle: true,
+        format: "esm",
+        platform: "node",
+        target: "node22",
+        jsx: "automatic",
+        external: EXTERNAL,
+        // esbuild hoists a leading `#!` to the top of the output on its own, so
+        // dist/lacode.js keeps its shebang and stays directly executable.
+        logLevel: log ? "info" : "silent",
+      })
+      // npm only guarantees the executable bit on `bin` targets at INSTALL time.
+      // Setting it here means the tarball, a `git archive`, and a plain `cp -r` of
+      // dist/ all carry a runnable CLI rather than one that needs a chmod first.
+      if (entry.executable) await chmod(staged, 0o755)
+      await rename(staged, outfile)
+      if (progress) {
+        progress.tick(entry.in)
+        console.log(`  ${c.green(symbols.ok)} ${entry.in} -> ${entry.out}`)
+      }
+    }
+
+    // Now that every live entry has been swapped in, drop anything else. A temp
+    // file left by a failed build goes too.
+    const expected = new Set(ENTRY_POINTS.map((entry) => basename(entry.out)))
+    for (const name of await readdir(dist)) {
+      if (!expected.has(name)) await rm(join(dist, name), { recursive: true, force: true })
+    }
+
+    const { default: manifest } = await import(pathToFileURL(join(ROOT, "package.json")).href, { with: { type: "json" } })
+    await assertManifestIsBuilt(manifest)
+    if (progress) progress.done()
+    return ENTRY_POINTS.map((entry) => entry.out)
+  } catch (error) {
+    if (progress) progress.fail("build failed")
+    throw error
   }
-
-  // Now that every live entry has been swapped in, drop anything else. A temp
-  // file left by a failed build goes too.
-  const expected = new Set(ENTRY_POINTS.map((entry) => basename(entry.out)))
-  for (const name of await readdir(dist)) {
-    if (!expected.has(name)) await rm(join(dist, name), { recursive: true, force: true })
-  }
-
-  const { default: manifest } = await import(pathToFileURL(join(ROOT, "package.json")).href, { with: { type: "json" } })
-  await assertManifestIsBuilt(manifest)
-  return ENTRY_POINTS.map((entry) => entry.out)
 }
 
 // Run as `npm run build`, and also importable — `node --test tests/` builds the
 // fixtures from the same function, so the tests and the tarball cannot disagree.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const outputs = await build({ log: true })
-  console.log(`built ${outputs.length} entry points into dist/`)
+  try {
+    const outputs = await build({ log: true })
+    console.log(c.green(`built ${outputs.length} entry points into dist/`))
+  } catch (error) {
+    console.error(c.red(`build failed: ${error instanceof Error ? error.message : String(error)}`))
+    process.exit(1)
+  }
 }

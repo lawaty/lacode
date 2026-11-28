@@ -7,6 +7,27 @@ All notable changes to LaCode are recorded here. The format follows
 Versions come from git release commits; the npm version is bumped in the same
 commit as the changelog entry it describes.
 
+## [2.4.0-beta.2] — consistent, readable CLI output
+
+### Added
+
+- CLI: new zero-dependency shared terminal-display helper `scripts/cli-display.mjs` (colors, progress bars, spinners, tables, humanized ms/bytes; ES2019/Node-12-safe; TTY-gated; progress on stderr; stdout machine-readable; honors `NO_COLOR`/`FORCE_COLOR`).
+
+### Changed
+
+- CLI: prettier output across `score-models`, `refresh-pool`, `provider-status`, `sync-hosts`, `prune-old-events`, `retire-old-sessions`, `retire-cartographer-sessions`, `build`, `bin/lacode` (update/doctor; notify/receive/forward intentionally untouched), `bin/lacode-voice` (byte progress for model download), `bin/oc-sync` (host N/M counter + color), the benchmark, and the model-snapshot tool.
+- Pool: `refresh-pool --print` keeps stdout to pool text only; scorer output is routed to stderr in print mode; `--json` paths stay valid.
+
+### Fixed
+
+- Packaging: published `files` now includes `scripts/provider-status.mjs` and `scripts/cli-display.mjs`.
+- Pool: `refresh-pool --install-timer --stable` now also copies `probe-result.mjs`, so the stable scorer can resolve its imports.
+- Tunnel: `oc-tunnel` systemd units use a dedicated SSH connection (from work since `v2.4.0-beta.1`).
+
+### Documented
+
+- Docs: added US-45 and updated README/INSTALL/OPERATIONS for the new CLI output behavior.
+
 ## [2.4.0-beta.1] — opt-in prompt critique for primary agents
 
 ### Added
@@ -1355,18 +1376,33 @@ experimental; `latest` remains 0.4.2.
 
 - First published release: pooled subagents over a shared set of models.
 
-[Unreleased]: https://github.com/lawaty/lacode/compare/v2.1.0-beta.0...HEAD
-[2.1.0-beta.0]: https://github.com/lawaty/lacode/compare/v2.0.0-beta.0...v2.1.0-beta.0
-[2.0.0-beta.0]: https://github.com/lawaty/lacode/compare/v1.3.1...v2.0.0-beta.0
+[Unreleased]: https://github.com/lawaty/lacode/compare/v2.4.0-beta.2...HEAD
+[2.4.0-beta.2]: https://github.com/lawaty/lacode/compare/v2.4.0-beta.1...v2.4.0-beta.2
 [2.4.0-beta.1]: https://github.com/lawaty/lacode/compare/v2.3.1...v2.4.0-beta.1
 [2.3.1]: https://github.com/lawaty/lacode/compare/v2.3.0...v2.3.1
+[2.3.0]: https://github.com/lawaty/lacode/releases/tag/v2.3.0
+[2.3.0-beta.8]: https://github.com/lawaty/lacode/releases/tag/v2.3.0-beta.8
+[2.3.0-beta.7]: https://github.com/lawaty/lacode/releases/tag/v2.3.0-beta.7
+[2.3.0-beta.6]: https://github.com/lawaty/lacode/releases/tag/v2.3.0-beta.6
+[2.3.0-beta.5]: https://github.com/lawaty/lacode/releases/tag/v2.3.0-beta.5
+[2.3.0-beta.4]: https://github.com/lawaty/lacode/releases/tag/v2.3.0-beta.4
 [2.3.0-beta.3]: https://github.com/lawaty/lacode/compare/v2.3.0-beta.2...v2.3.0-beta.3
 [2.3.0-beta.2]: https://github.com/lawaty/lacode/compare/v2.3.0-beta.1...v2.3.0-beta.2
 [2.3.0-beta.1]: https://github.com/lawaty/lacode/compare/v2.3.0-beta.0...v2.3.0-beta.1
 [2.3.0-beta.0]: https://github.com/lawaty/lacode/releases/tag/v2.3.0-beta.0
+[2.2.0-beta.0]: https://github.com/lawaty/lacode/releases/tag/v2.2.0-beta.0
+[2.1.0-beta.0]: https://github.com/lawaty/lacode/compare/v2.0.0-beta.0...v2.1.0-beta.0
+[2.0.0-beta.0]: https://github.com/lawaty/lacode/compare/v1.3.1...v2.0.0-beta.0
 [1.3.1]: https://github.com/lawaty/lacode/releases/tag/v1.3.1
 [1.3.0-beta.9]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.9
 [1.3.0-beta.8]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.8
+[1.3.0-beta.7]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.7
+[1.3.0-beta.6]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.6
+[1.3.0-beta.5]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.5
+[1.3.0-beta.4]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.4
+[1.3.0-beta.3]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.3
+[1.3.0-beta.2]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.2
+[1.3.0-beta.1]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.1
 [1.3.0-beta.0]: https://github.com/lawaty/lacode/releases/tag/v1.3.0-beta.0
 [1.2.0]: https://github.com/lawaty/lacode/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/lawaty/lacode/compare/v1.0.0...v1.1.0

@@ -26,6 +26,7 @@ import { mkdirSync, writeFileSync, existsSync } from "node:fs"
 import { createRequire } from "node:module"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { c, symbols, createSpinner } from "./cli-display.mjs"
 
 const BASE = process.env.OPENCODE_SERVER_URL ?? "http://127.0.0.1:4097"
 const USER = process.env.OPENCODE_SERVER_USERNAME ?? "opencode"
@@ -146,13 +147,15 @@ const compact = (session, messages) => {
 
 const directories = wanted.length ? wanted : [...new Set([...(await projectDirectories()), ...databaseDirectories()])]
 if (directories.length === 0) {
-  console.error("no project directories to scan; pass them as arguments")
+  console.error(c.red(`${symbols.fail} no project directories to scan; pass them as arguments`))
   process.exit(1)
 }
 
 let retired = 0
 let failed = 0
 const records = []
+const scan = createSpinner({ label: "scanning sessions" })
+scan.start()
 
 for (const directory of directories) {
   const query = `?directory=${encodeURIComponent(directory)}`
@@ -160,7 +163,7 @@ for (const directory of directories) {
   try {
     sessions = await listSessions(directory)
   } catch (error) {
-    console.error(`  ${directory}: could not list sessions (${error.message})`)
+    console.error(c.red(`  ${symbols.fail} ${directory}: could not list sessions (${error.message})`))
     continue
   }
   const targets = sessions.filter(
@@ -183,7 +186,7 @@ for (const directory of directories) {
       retired++
     } catch (error) {
       failed++
-      console.error(`  ${session.id}: ${error.message}`)
+      console.error(c.red(`  ${symbols.fail} ${session.id}: ${error.message}`))
     }
   }
 }
@@ -217,9 +220,11 @@ for (const row of databaseSessions()) {
     retired++
   } catch (error) {
     failed++
-    console.error(`  ${row.id}: ${error.message}`)
+    console.error(c.red(`  ${symbols.fail} ${row.id}: ${error.message}`))
   }
 }
+
+scan.stop()
 
 if (!dryRun && records.length) {
   mkdirSync(ARCHIVE, { recursive: true })
@@ -227,9 +232,9 @@ if (!dryRun && records.length) {
   writeFileSync(join(ARCHIVE, `${stamp}.json`), JSON.stringify({ retired: records }, null, 2))
 }
 
-console.log(
+const summary =
   dryRun
     ? `would retire ${retired} cartographer session(s) across ${directories.length} project(s)`
-    : `retired ${retired} cartographer session(s) across ${directories.length} project(s)${failed ? `, ${failed} failed` : ""}`,
-)
+    : `retired ${retired} cartographer session(s) across ${directories.length} project(s)${failed ? `, ${failed} failed` : ""}`
+console.log(c.green(`${symbols.ok} ${summary}`))
 if (!dryRun && records.length) console.log(`records: ${join(ARCHIVE, "<timestamp>.json")}`)

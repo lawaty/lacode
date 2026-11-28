@@ -514,6 +514,11 @@ Configuration, the payload format, the receiver contract and holding the forward
 open are in [docs/TUNNEL.md](docs/TUNNEL.md).
 Platform adapter matrix, env vars and Windows caveats: [Notifications](docs/NOTIFICATIONS.md).
 
+### `lacode-voice`
+
+`lacode-voice` manages the local voice sidecar: `start`, `doctor`, `status`, and
+`model fetch-model`. The model download shows a byte progress bar on a TTY.
+
 ## Further reading
 
 Optional. Nothing above needs any of it — this is where the detail lives once you
@@ -539,9 +544,15 @@ npm run build          # esbuild -> dist/ (what the tarball ships)
 npm test               # node --test tests/ — offline, no network, no running server
 npm run benchmark      # the cost harness; see docs/BENCHMARKS.md
 npm run score          # rank free models by context, output and measured latency
+npm run refresh-pool   # refresh the local free-tier pool; --print/--dry-run keep generated pool text on stdout
 ```
 
 Node ≥ 22.18.
+
+Shared terminal presentation lives in `scripts/cli-display.mjs`. It is
+zero-dependency and ES2019/Node-12-safe; color and progress are enabled only on
+a TTY, progress writes to stderr, and `NO_COLOR`/`FORCE_COLOR` are honored.
+The Node CLI scripts keep result output on stdout and write progress/headings to stderr; `--print`/`--json` output is unchanged.
 
 `npm run build` compiles each entry point in `package.json` (`exports` and
 `bin`) into `dist/` with esbuild, one bundle per entry point, so nothing in

@@ -53,6 +53,7 @@ import {
   selectPool,
 } from "./pool-selection.mjs"
 import { hasDirectAnswer, hasSessionAnswer } from "./probe-result.mjs"
+import { c, symbols, createProgress, humanMs, formatTable } from "./cli-display.mjs"
 
 const AUTH = join(homedir(), ".local", "share", "opencode", "auth.json")
 const DEFAULT_OUT = join(homedir(), ".config", "lacode", "model-scores.json")
@@ -609,7 +610,7 @@ async function main() {
   let scanned = providers ? providers.map((provider) => freeModels(provider)) : freeModelsAll()
   if (excludedProviders.size > 0) {
     scanned = scanned.filter((entry) => !excludedProviders.has(entry.provider))
-    if (scanned.length === 0) console.log(`every provider was excluded by pool.txt directives; nothing to probe`)
+    if (scanned.length === 0) console.log(c.yellow(`every provider was excluded by pool.txt directives; nothing to probe`))
   }
   // Core providers first, then the free-only middle tier, then the slow paid
   // catalogues — and explicitly deprioritized providers last. Ordering only;
@@ -643,20 +644,23 @@ async function main() {
     if (Date.now() >= deadline) {
       budgetHit = true
       skippedProviders.push(entry.provider)
-      console.log(`\n${entry.provider}: skipped (scan budget of ${budgetMin}m reached)`)
+      console.log(c.yellow(`\n${entry.provider}: skipped (scan budget of ${budgetMin}m reached)`))
       continue
     }
     if (entry.error) {
-      console.log(`\n${entry.provider}: ${entry.error}`)
+      console.log(c.red(`\n${entry.provider}: ${entry.error}`))
       results.push({ provider: entry.provider, error: entry.error, rows: [], excluded: [] })
       continue
     }
     const candidates = entry.models.slice(0, maxPerProvider)
-    const excludedNote = entry.excluded.length ? `, ${entry.excluded.length} excluded (context < ${minContext})` : ""
-    console.log(`\n${entry.provider}: probing ${candidates.length} candidate model(s)${entry.models.length > candidates.length ? ` of ${entry.models.length}` : ""}${excludedNote}`)
+    console.log(`\n${c.bold(c.cyan(`${symbols.arrow} ${entry.provider} — ${candidates.length} candidate(s)`))}`)
+    const scopeNotes = []
+    if (entry.models.length > candidates.length) scopeNotes.push(`of ${entry.models.length}`)
+    if (entry.excluded.length) scopeNotes.push(`${entry.excluded.length} excluded (context < ${minContext})`)
+    if (scopeNotes.length) console.log(c.grey(`  ${scopeNotes.join(", ")}`))
     if (entry.excluded.length) {
-      console.log(`  excluded — context below ${minContext}:`)
-      for (const x of entry.excluded) console.log(`    ${pad(x.model.replace(`${entry.provider}/`, ""), 52)} ${padL(x.context, 9)}`)
+      console.log(c.yellow(`  excluded — context below ${minContext}:`))
+      for (const x of entry.excluded) console.log(c.grey(`    ${pad(x.model.replace(`${entry.provider}/`, ""), 52)} ${padL(x.context, 9)}`))
     }
     if (candidates.length === 0) {
       results.push({ provider: entry.provider, error: null, rows: [], excluded: entry.excluded })
@@ -664,58 +668,78 @@ async function main() {
     }
     const rows = []
     let consecutiveTransient = 0
-    for (const candidate of candidates) {
-      if (Date.now() >= deadline) {
-        budgetHit = true
-        entry.truncated = true
-        console.log(`  scan budget reached; stopped ${entry.provider} after ${rows.length}/${candidates.length}`)
-        break
-      }
-      let outcome = await probe(candidate, entry.provider)
-      for (let attempt = 1; attempt < PROBE_ATTEMPTS && !outcome.ok && retryableProbe(outcome); attempt++) {
-        console.log(`  retrying ${candidate.model.replace(`${entry.provider}/`, "")} after ${String(outcome.reason).slice(0, 60)}`)
+    const progress = createProgress({ total: candidates.length, label: entry.provider })
+    let progressBudgetReached = false
+    let progressFailed = false
+    try {
+      for (let index = 0; index < candidates.length; index++) {
+        const candidate = candidates[index]
+        if (Date.now() >= deadline) {
+          budgetHit = true
+          entry.truncated = true
+          console.log(c.yellow(`  scan budget reached; stopped ${entry.provider} after ${rows.length}/${candidates.length}`))
+          progressBudgetReached = true
+          break
+        }
+        progress.update(index, candidate.model)
+        let outcome = await probe(candidate, entry.provider)
+        for (let attempt = 1; attempt < PROBE_ATTEMPTS && !outcome.ok && retryableProbe(outcome); attempt++) {
+          console.log(c.yellow(`  ${symbols.warn} retrying ${candidate.model.replace(`${entry.provider}/`, "")} after ${String(outcome.reason).slice(0, 60)}`))
+          await sleep(delayMs)
+          progress.update(index, candidate.model)
+          outcome = await probe(candidate, entry.provider)
+        }
+        const kind = outcome.kind ?? classifyFailure({ status: outcome.status, reason: outcome.reason })
+        // Only cheap-failure kinds that also stall the scan count toward the
+        // breaker. A rate limit is deliberately NOT included: a 429 answers in
+        // milliseconds, so truncating on it saves little, and it would leave the
+        // provider's pool members unscanned -- which means no current failure row,
+        // so their consecutive-failure streak could never advance and they could
+        // never retire. Probe every model and record the evidence instead.
+        const providerFault = !outcome.ok && ["timeout", "network", "server"].includes(kind)
+        consecutiveTransient = providerFault ? consecutiveTransient + 1 : 0
+        const row = { provider: entry.provider, ...candidate, ...outcome, score: null }
+        row.score = score(row)
+        if (row.score && row.score.value < minScore) {
+          entry.excluded.push({
+            model: row.model,
+            context: row.context,
+            output: row.output,
+            score: row.score.value,
+            reason: `score ${row.score.value} < minimum ${minScore}`,
+          })
+        }
+        rows.push(row)
+        const verdict = outcome.ok ? humanMs(outcome.ms) : outcome.reason.slice(0, 60)
+        const model = candidate.model.replace(`${entry.provider}/`, "")
+        if (outcome.ok) console.log(`  ${c.green(`${symbols.ok} ${model} ${verdict}`)}`)
+        else console.log(`  ${c.red(`${symbols.fail} ${model} ${verdict}`)}`)
+        progress.tick()
+        if (consecutiveTransient >= PROVIDER_BREAKER_AFTER) {
+          entry.truncated = true
+          entry.degraded = true
+          console.log(c.red(
+            `  ${symbols.warn} provider degraded: ${consecutiveTransient} consecutive ${kind} failures; stopped ${entry.provider} after ${rows.length}/${candidates.length}`,
+          ))
+          progressFailed = true
+          break
+        }
         await sleep(delayMs)
-        outcome = await probe(candidate, entry.provider)
       }
-      const kind = outcome.kind ?? classifyFailure({ status: outcome.status, reason: outcome.reason })
-      // Only cheap-failure kinds that also stall the scan count toward the
-      // breaker. A rate limit is deliberately NOT included: a 429 answers in
-      // milliseconds, so truncating on it saves little, and it would leave the
-      // provider's pool members unscanned -- which means no current failure row,
-      // so their consecutive-failure streak could never advance and they could
-      // never retire. Probe every model and record the evidence instead.
-      const providerFault = !outcome.ok && ["timeout", "network", "server"].includes(kind)
-      consecutiveTransient = providerFault ? consecutiveTransient + 1 : 0
-      const row = { provider: entry.provider, ...candidate, ...outcome, score: null }
-      row.score = score(row)
-      if (row.score && row.score.value < minScore) {
-        entry.excluded.push({
-          model: row.model,
-          context: row.context,
-          output: row.output,
-          score: row.score.value,
-          reason: `score ${row.score.value} < minimum ${minScore}`,
-        })
-      }
-      rows.push(row)
-      const verdict = outcome.ok ? `${outcome.ms}ms` : outcome.reason.slice(0, 60)
-      console.log(`  ${pad(candidate.model.replace(`${entry.provider}/`, ""), 52)} ${padL(verdict, 16)}`)
-      if (consecutiveTransient >= PROVIDER_BREAKER_AFTER) {
-        entry.truncated = true
-        entry.degraded = true
-        console.log(
-          `  provider degraded: ${consecutiveTransient} consecutive ${kind} failures; stopped ${entry.provider} after ${rows.length}/${candidates.length}`,
-        )
-        break
-      }
-      await sleep(delayMs)
+    } catch (error) {
+      progressFailed = true
+      throw error
+    } finally {
+      if (progressFailed) progress.fail()
+      else if (progressBudgetReached) progress.done(c.yellow("budget reached"))
+      else progress.done()
     }
     results.push({ provider: entry.provider, error: null, rows, excluded: entry.excluded, truncated: !!entry.truncated, degraded: !!entry.degraded })
   }
   if (budgetHit) {
-    console.log(
+    console.log(c.yellow(
       `\nscan budget of ${budgetMin}m reached; ${skippedProviders.length} provider(s) skipped and any truncated provider keeps its previous rows.`,
-    )
+    ))
   }
   stopSessionServer()
 
@@ -748,34 +772,47 @@ async function main() {
   // Per-provider ranked tables.
   for (const entry of results) {
     if (entry.error || entry.rows.length === 0) continue
-    console.log(`\n${entry.provider} — ranked`)
-    console.log(`  ${pad("#", 3)}${pad("model", 52)}${padL("ctx", 9)}${padL("out", 9)}${padL("ms", 7)}${padL("score", 7)}`)
+    console.log(c.bold(c.cyan(`\n${entry.provider} — ranked`)))
     const ranked = [...entry.rows].filter((r) => r.score && r.score.value >= minScore).sort((a, b) => b.score.value - a.score.value)
-    ranked.forEach((r, i) => {
-      console.log(`  ${pad(i + 1, 3)}${pad(r.model.replace(`${entry.provider}/`, ""), 52)}${padL(r.context ?? "?", 9)}${padL(r.output ?? "?", 9)}${padL(r.ms ?? "?", 7)}${padL(r.score.value, 7)}`)
-    })
+    console.log(formatTable({
+      headers: ["#", "model", "ctx", "out", "ms", "score"].map((header) => c.bold(c.cyan(header))),
+      rows: ranked.map((r, i) => [
+        i + 1,
+        r.model.replace(`${entry.provider}/`, ""),
+        r.context ?? "?",
+        r.output ?? "?",
+        r.ms == null ? "?" : humanMs(r.ms),
+        r.score.value,
+      ]),
+      align: ["right", "left", "right", "right", "right", "right"],
+    }))
     const failed = entry.rows.filter((r) => !r.ok)
     if (failed.length) {
-      console.log(`  unreachable (not ranked):`)
-      for (const r of failed) console.log(`    ${pad(r.model.replace(`${entry.provider}/`, ""), 52)} ${r.reason.slice(0, 90)}`)
+      console.log(c.bold(c.cyan("  unreachable (not ranked):")))
+      console.log(formatTable({
+        rows: failed.map((r) => [r.model.replace(`${entry.provider}/`, ""), r.reason.slice(0, 90)]),
+        align: ["left", "left"],
+      }))
     }
   }
 
   // Models dropped for a too-small context or a too-low score are reported, never ranked.
   const excluded = results.flatMap((e) => e.excluded ?? [])
   if (excluded.length) {
-    console.log(`\nexcluded — below the context or score floor (not ranked)`)
-    for (const x of excluded) console.log(`  ${pad(x.model, 58)}${padL(x.context ?? "?", 9)}  ${x.reason}`)
+    console.log(c.yellow(`\nexcluded — below the context or score floor (not ranked)`))
+    for (const x of excluded) console.log(c.grey(`  ${pad(x.model, 58)}${padL(x.context ?? "?", 9)}  ${x.reason}`))
   }
 
   // Overall ranking across providers.
   const all = results.flatMap((e) => e.rows).filter((r) => r.score && r.score.value >= minScore)
   all.sort((a, b) => b.score.value - a.score.value)
   if (all.length) {
-    console.log(`\noverall — best candidate models right now`)
-    all.slice(0, 12).forEach((r, i) => {
-      console.log(`  ${pad(i + 1, 3)}${pad(r.model, 58)}${padL(`${r.ms}ms`, 8)}${padL(r.score.value, 7)}`)
-    })
+    console.log(c.bold(c.cyan(`\noverall — best candidate models right now`)))
+    console.log(formatTable({
+      headers: ["#", "model", "ms", "score"].map((header) => c.bold(c.cyan(header))),
+      rows: all.slice(0, 12).map((r, i) => [i + 1, r.model, r.ms == null ? "?" : humanMs(r.ms), r.score.value]),
+      align: ["right", "left", "right", "right"],
+    }))
   }
 
   // Previous scores let a transient outage keep the pool it had.
@@ -892,7 +929,7 @@ async function main() {
         ],
       }
       writeFileSync(OUT, JSON.stringify(payload, null, 2) + "\n")
-      console.log(`\nwrote ${OUT}`)
+      console.log(`\n${c.green(`${symbols.ok} wrote ${OUT}`)}`)
     } catch (error) {
       console.error(`\ncould not write ${OUT}: ${String(error?.message ?? error)}`)
       process.exitCode = 1

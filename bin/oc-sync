@@ -130,9 +130,15 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-ok()   { printf '  \xe2\x9c\x93 %s\n' "$*"; }
-bad()  { printf '  \xe2\x9c\x97 %s\n' "$*"; }
-warn() { printf '  \xe2\x9a\xa0 %s\n' "$*"; }
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'; C_GREY=$'\033[90m'; C_BOLD=$'\033[1m'
+else
+  C_RESET=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''; C_GREY=''; C_BOLD=''
+fi
+
+ok()   { printf '  %b\xe2\x9c\x93%b %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+bad()  { printf '  %b\xe2\x9c\x97%b %s\n' "$C_RED" "$C_RESET" "$*"; }
+warn() { printf '  %b\xe2\x9a\xa0%b %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 
 # ---------------------------------------------------------------------------
 # Refuse to run at all on a machine that cannot do the job, and say why.
@@ -1303,16 +1309,35 @@ sync_cloudflare() {
 # host's port in hand, and by then one unit may already be running.
 assert_ports_unique
 
+SYNC_TOTAL=0
+for _h in "${HOSTS[@]}"; do
+  _h="${_h%$'\r'}"; _s="${_h//[[:space:]]/}"
+  [[ -z "$_s" || "$_h" == \#* ]] && continue
+  [[ -n "$ONLY_HOST" && "$_h" != "$ONLY_HOST" ]] && continue
+  SYNC_TOTAL=$((SYNC_TOTAL + 1))
+done
+SYNC_INDEX=0
+
+phase_tty() {
+  [ -t 2 ] || return 0
+  printf '  %b[%s]%b %s\n' "$C_CYAN" "$1" "$C_RESET" "$2" >&2
+}
+
 for HOST in "${HOSTS[@]}"; do
   HOST="${HOST%$'\r'}"
   stripped="${HOST//[[:space:]]/}"
   [[ -z "$stripped" || "$HOST" == \#* ]] && continue
   [[ -n "$ONLY_HOST" && "$HOST" != "$ONLY_HOST" ]] && continue
 
+  SYNC_INDEX=$((SYNC_INDEX + 1))
+  if [ -t 2 ]; then
+    printf '%b[%s/%s]%b deploying to %s\n' "$C_BOLD$C_CYAN" "$SYNC_INDEX" "$SYNC_TOTAL" "$C_RESET" "$HOST" >&2
+  fi
   echo "━━━ Syncing to $HOST ━━━"
 
   HOST_PORT="$(host_tunnel_port "$HOST")"
 
+  phase_tty "prepare" "preparing remote host"
   PREP="$(remote_prepare "$HOST")"
   if [[ -z "$PREP" ]]; then
     bad "unreachable or too slow (>${SSH_TIMEOUT}s) - skipping, run continues"
@@ -1335,8 +1360,10 @@ for HOST in "${HOSTS[@]}"; do
 
   # The persistent forward. Installed after the key is in place so the unit is
   # never left retrying against a host whose receiver is not ready.
+  phase_tty "tunnel" "installing notification tunnel"
   install_tunnel_unit "$HOST" "$HOST_PORT" || warn "tunnel unit for $HOST not installed -- notifications from it will be unreliable"
 
+  phase_tty "sync" "syncing scripts and config"
   if [[ $DRY_RUN -eq 1 ]]; then
     ok "[dry-run] would rsync oc, oc-notify -> ~/bin/"
     [[ $TUNNEL_AUTH_FAILED -eq 0 && -f "$TUNNEL_KEY" ]] && ok "[dry-run] would send tunnel key -> ~/.ssh/oc_notify"
@@ -1463,6 +1490,7 @@ for HOST in "${HOSTS[@]}"; do
   fi
 
   if [[ $WITH_AUTH -eq 1 ]]; then
+    phase_tty "auth" "syncing credentials"
     sync_auth "$HOST"
     sync_cloudflare "$HOST"
   fi
@@ -1491,6 +1519,13 @@ else
   echo "  failed : none"
 fi
 [[ $DRY_RUN -eq 1 ]] && echo "  dry run: nothing was written"
+if [ -t 2 ]; then
+  if [[ ${#FAILED[@]} -gt 0 ]]; then
+    printf '%boc-sync: %s host(s) done, %s failed%b\n' "$C_YELLOW" "${#DONE[@]}" "${#FAILED[@]}" "$C_RESET" >&2
+  else
+    printf '%boc-sync: %s host(s) done%b\n' "$C_GREEN" "${#DONE[@]}" "$C_RESET" >&2
+  fi
+fi
 if [[ $WITH_CONFIG -eq 0 ]]; then
   echo
   echo "  note: --scripts-only, so AGENTS.md and the opencode config were NOT synced."

@@ -53,6 +53,7 @@ import { execFileSync } from "node:child_process"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { c, createSpinner } from "../../scripts/cli-display.mjs"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, "..", "..")
@@ -222,6 +223,16 @@ const runReal = async (bin, model, creds) => {
   return { calls: SCENARIO.length, inputTokens: input, outputTokens: output, credentials: creds }
 }
 
+const runStage = async (label, run) => {
+  const spinner = createSpinner({ label })
+  spinner.start()
+  try {
+    return await run()
+  } finally {
+    spinner.stop()
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Table
 // ---------------------------------------------------------------------------
@@ -253,6 +264,17 @@ const renderTable = (rows, { heading, source, modeNote }) => {
   return out.join("\n")
 }
 
+const colorizeTable = (table) =>
+  table
+    .split("\n")
+    .map((line) => {
+      if (line.startsWith("**LaCode cost benchmark — ")) return c.green(line)
+      if (line.startsWith("| configuration |")) return c.cyan(line)
+      if (line.startsWith("Difference:") || line.startsWith("Recompute it yourself:")) return c.green(line)
+      return line
+    })
+    .join("\n")
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -279,8 +301,8 @@ if (wantReal) {
   try {
     const bin = opencodeBin()
     const creds = credentials()
-    const baseline = await runReal(bin, baselineModel, creds)
-    const pooled = await runReal(bin, pooledModels[0], creds)
+    const baseline = await runStage("running baseline session", () => runReal(bin, baselineModel, creds))
+    const pooled = await runStage("running candidate session", () => runReal(bin, pooledModels[0], creds))
     const baselinePrice = priceOf(snapshot, baselineModel)
     const pooledPrice = priceOf(snapshot, pooledModels[0])
     const rows = [
@@ -303,7 +325,7 @@ if (wantReal) {
       modeNote: `Real run: token counts read from the run's own output. Credentials: ${creds.join(", ")}.`,
       source: `Pricing from tests/models-snapshot.json (models.dev, fetched ${snapshot._fetched}).`,
     })
-    console.log(table)
+    console.log(colorizeTable(table))
     writeOut(table)
     if (unknown.length > 0) {
       console.error(`\nbenchmark: no price in the snapshot for ${unknown.join(", ")} — cost is unknown, NOT 0.`)
@@ -355,7 +377,7 @@ const modeNote =
 const source = `Pricing from tests/models-snapshot.json (models.dev, fetched ${snapshot._fetched}) — offline, reproducible.`
 
 const table = renderTable(rows, { heading: `projected on ${today()} — simulation, nothing was run`, source, modeNote })
-console.log(table)
+console.log(colorizeTable(table))
 writeOut(table)
 
 const unknown = rows.filter((row) => row.cost === null).flatMap((row) => row.models)

@@ -649,6 +649,21 @@ The option defaults to off, so upgrading changes nothing. When it is on, the ins
 - [ ] Given `.opencode/prompts/build.txt`, When it is inspected, Then it states web access is available only with explicit user permission for the current request.
 - [ ] Given the injected agent configs for `build` and `plan`, When their permissions are inspected, Then `read`, `glob`, `grep`, and `list` remain `deny`.
 
+### US-45: CLI presentation keeps machine output clean
+**As a** user and script consumer, **I want** CLI presentation to be human-friendly in terminals while keeping machine-consumed output parseable, **so that** progress and color do not corrupt piped results, JSON, or pool text.
+
+CLI display helpers add color, symbols, progress bars, and humanized units for interactive use, but automation depends on stable stdout contracts. Piped output must not contain ANSI escapes, `NO_COLOR` must suppress color, `FORCE_COLOR` may opt in, progress/headings belong on stderr, and machine modes like `--json`/`--print` must keep stdout pure.
+
+**Story ID(s) for tests:** US-45
+**Acceptance criteria:**
+- [ ] Given CLI help is run with piped stdio (non-TTY), When `node scripts/score-models.mjs --help` and `node scripts/refresh-pool.mjs --help` emit output, Then stdout+stderr contain no ANSI escape codes.
+- [ ] Given `NO_COLOR=1`, When CLI display colors text, Then color is suppressed even if `FORCE_COLOR` is also present.
+- [ ] Given `FORCE_COLOR=1`, When CLI display colors text, Then ANSI color escapes are emitted.
+- [ ] Given a progress display updates and completes, When it renders, Then progress and completion headings go to stderr and stdout remains empty.
+- [ ] Given `refresh-pool --print --from-scores` is run against a valid scores fixture, When it reports the proposed pool, Then stdout contains only pool text/slot lines and any human heading such as `Refreshing pool` or `Writing pool` appears on stderr.
+- [ ] Given `provider-status --json` runs, When it succeeds, Then stdout is valid JSON; if the network path is genuinely required and unavailable, the test may skip with a clear reason instead of asserting failure.
+- [ ] Given `context-map-fixture small --json` runs, When it succeeds, Then stdout is valid JSON and styled headings are absent from stdout; if a TS loader is genuinely required and unavailable, the test may skip with a clear reason.
+
 ---
 
 ## Coverage
@@ -707,11 +722,12 @@ table was filled in.
 | US-42 | M | `tests/stories/m-prompt-critique.test.mjs` |
 | US-43 | D | `tests/notify-adapter-test.mjs` |
 | US-44 | A | `tests/stories/n-web-access.test.mjs` |
+| US-45 | O | `tests/stories/o-cli-display.test.mjs` |
 
 The root-level suites under `tests/` are unit-style; the `tests/stories/` suites are
 the behavioural layer, written one epic per file with every test name carrying
 its story id. Run everything with `npm test`.
 
-44/44 stories covered by 421 test case(s); thinnest story has 1.
+45/45 stories covered by 428 test case(s); thinnest story has 1.
 No story is untested. The scan covers the `tests/stories/` suites and the root-level
 `tests/*-test.mjs` suites.

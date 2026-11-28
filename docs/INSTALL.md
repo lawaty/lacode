@@ -217,3 +217,9 @@ Two things are worth knowing about what npm actually hands you:
   package that ships `.ts` fails on install — `lacode --help` exits with
   `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`. A published package cannot
   depend on its consumer's loader being lenient.
+- **The published package also ships script modules.** `scripts/cli-display.mjs`,
+  `scripts/provider-status.mjs`, and the other script modules used by the CLI
+  and maintenance tools are included in the package. Shared terminal
+  presentation is zero-dependency and ES2019/Node-12-safe; color and animation
+  degrade cleanly when stdout/stderr are not a TTY (pipes, systemd), progress
+  writes to stderr, and `NO_COLOR`/`FORCE_COLOR` are honored.
